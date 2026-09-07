@@ -723,14 +723,17 @@ ProfileSummary ProfileOfficial(
                         std::string(openError == nullptr ? "unknown" : openError));
                 }
                 dlerror();
-                void *symbol = dlsym(privateOpApi.ptr, "aclnnMatmulGetWorkspaceSize");
+                void *symbol = dlsym(
+                    privateOpApi.ptr,
+                    "aclnnMatmulSourceRouteGetWorkspaceSize");
                 const char *symbolError = dlerror();
                 if (symbolError != nullptr || symbol == nullptr) {
                     throw std::runtime_error(
-                        "private MatMul opapi lacks aclnnMatmulGetWorkspaceSize: " +
+                        "private MatMul opapi lacks the dedicated source-route planner: " +
                         std::string(symbolError == nullptr ? "unknown" : symbolError));
                 }
                 getWorkspace = reinterpret_cast<GetWorkspaceFunction>(symbol);
+                std::cout << "SOURCE_ROUTE_PLANNER dedicated_matmul_v3" << std::endl;
             }
         }
         CheckAclnn(getWorkspace(

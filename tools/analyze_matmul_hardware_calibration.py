@@ -32,6 +32,20 @@ def valid_profile(row: dict[str, str]) -> bool:
     )
 
 
+def has_production_dispatcher_provenance(row: dict[str, str]) -> bool:
+    try:
+        provenance = json.loads(row.get("source_route_provenance") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return any(
+        item.get("source") == "production_dispatcher"
+        and item.get("route") == "ALL"
+        and int(item.get("core_cap", 0)) == 20
+        for item in provenance
+        if isinstance(item, dict)
+    )
+
+
 def paired_result(
     official: dict[str, str], selected: dict[str, str]
 ) -> dict[str, float | str]:
@@ -300,6 +314,19 @@ def main() -> int:
             raise RuntimeError(
                 f"{workload_id}: successful={len(common_ranks)}, required={required}"
             )
+        required_source_ranks = {
+            rank for rank, candidate in candidate_map.items()
+            if candidate.get("source_anchor") == "1"
+            and candidate.get("is_reserve") != "1"
+        }
+        missing_source_ranks = sorted(
+            required_source_ranks - set(profile_map), key=int
+        )
+        if missing_source_ranks:
+            raise RuntimeError(
+                f"{workload_id}: original source anchors were not all measured: "
+                f"missing_ranks={missing_source_ranks}"
+            )
 
         joined = []
         for output_rank in common_ranks:
@@ -325,6 +352,9 @@ def main() -> int:
                 "source_core_cap": candidate.get("source_core_cap", ""),
                 "source_validator_violations": candidate.get(
                     "source_validator_violations", ""
+                ),
+                "production_dispatcher_provenance": (
+                    has_production_dispatcher_provenance(candidate)
                 ),
                 "single_core": {
                     axis: int(candidate[f"single_core_{axis}"])
@@ -366,8 +396,7 @@ def main() -> int:
         production_source_anchors = [
             row for row in joined
             if row["source_anchor"]
-            and "ALL" in row["source_route"].split("+")
-            and "20" in row["source_core_cap"].split(",")
+            and row["production_dispatcher_provenance"]
         ]
         if not production_source_anchors:
             raise RuntimeError(

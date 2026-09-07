@@ -35,8 +35,6 @@
 #include "matmul_util.h"
 #include "op_api_def.h"
 
-#include <cstdlib>
-
 #define OP_LOGI(...) do {std::printf(__VA_ARGS__); std::printf("\n");} while(0)
 
 using namespace op;
@@ -50,12 +48,6 @@ static const std::initializer_list<op::DataType> DTYPE_SUPPORT_LIST = {DataType:
                                                                        DataType::DT_BF16};
 static const std::initializer_list<op::DataType> DTYPE_SUPPORT_LIST_WITHOUT_BF16 = {DataType::DT_FLOAT,
                                                                                     DataType::DT_FLOAT16};
-
-static bool ForceSourceMatMulV3(void)
-{
-  const char* value = std::getenv("MATMUL_SOURCE_FORCE_V3");
-  return value != nullptr && value[0] == '1' && value[1] == '\0';
-}
 
 inline static bool CheckNotNull(const aclTensor* self, const aclTensor* mat2, const aclTensor* out)
 {
@@ -320,13 +312,7 @@ static const aclTensor* BuildMatMulGraph(const aclTensor* self, const aclTensor*
 
     // Tensor1 dims number 2 && Tensor2 dims number 2
   } else if (dimTensor1 == 2 && dimTensor2 == 2) {
-    if (ForceSourceMatMulV3()) {
-      // The source-route campaign audits MatMulV3 itself.  The normal
-      // high-level helper may select MatMulV2 for some valid matrix shapes.
-      matmulOut = l0op::MatMulV3Nd(self, mat2, nullptr, false, false, false, false, executor);
-    } else {
-      matmulOut = ExecMmOp(self, mat2, cubeMathType, executor);
-    }
+    matmulOut = ExecMmOp(self, mat2, cubeMathType, executor);
 
     // Tensor1 dims number > 3 & Tensor2 dim number is 1 or 2
   } else if (dimTensor1 >= 3 && (dimTensor2 == 1 || dimTensor2 == 2)) {
@@ -407,6 +393,33 @@ aclnnStatus aclnnMatmulGetWorkspaceSize(const aclTensor* self, const aclTensor* 
   // 获取workspace
   *workspaceSize = unique_executor->GetWorkspaceSize();
   unique_executor.ReleaseTo(executor);
+  return ACLNN_SUCCESS;
+}
+
+// This private entry point exists only for source-route planning.  Using a
+// unique exported symbol makes the caller independent of the normal MatMul
+// API's shape-dependent MatMulV2/MatMulV3 dispatch and of ELF interposition
+// on aclnnMatmulGetWorkspaceSize.
+aclnnStatus aclnnMatmulSourceRouteGetWorkspaceSize(
+    const aclTensor* self, const aclTensor* mat2, aclTensor* out,
+    int8_t cubeMathType, size_t* workspaceSize, aclOpExecutor** executor)
+{
+  auto uniqueExecutor = CREATE_EXECUTOR();
+  CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
+  auto ret = CheckParam(self, mat2, out, cubeMathType);
+  CHECK_RET(ret == ACLNN_SUCCESS, ret);
+  CHECK_RET(self->GetViewShape().GetDimNum() == 2 &&
+            mat2->GetViewShape().GetDimNum() == 2,
+            ACLNN_ERR_PARAM_INVALID);
+
+  auto matmulOut = l0op::MatMulV3Nd(
+      self, mat2, nullptr, false, false, false, false, uniqueExecutor.get());
+  CHECK_RET(matmulOut != nullptr, ACLNN_ERR_INNER_NULLPTR);
+  auto viewCopyResult = l0op::ViewCopy(matmulOut, out, uniqueExecutor.get());
+  CHECK_RET(viewCopyResult != nullptr, ACLNN_ERR_INNER_NULLPTR);
+
+  *workspaceSize = uniqueExecutor->GetWorkspaceSize();
+  uniqueExecutor.ReleaseTo(executor);
   return ACLNN_SUCCESS;
 }
 

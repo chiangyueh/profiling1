@@ -562,6 +562,11 @@ def main() -> int:
                     "candidate": candidate, "runner": result,
                 })
                 attempted.add(key)
+                if truthy(candidate.get("source_anchor")):
+                    direct_failure = (
+                        "original source-route anchor failed direct numeric "
+                        f"validation: {key}: {result.get('error', '')}"
+                    )
                 continue
             profile = candidate_profile(
                 candidate, result, args.warmup, args.repeat, args.samples

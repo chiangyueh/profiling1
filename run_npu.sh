@@ -112,7 +112,7 @@ cp "${CATALOG_TMP}" "${CATALOG}"
 if [[ -s "${ANALYSIS}" ]] && \
    grep -q '"status": "complete"' "${ANALYSIS}"; then
     echo "MATMUL_SOURCE_FRONTIER_COMPLETE shapes=3 records=2163"
-    echo "analysis=${ANALYSIS} logs=${LOG_DIR}"
+    echo "analysis=${ANALYSIS} logs=${LOG_DIR} measurement_log=${CAMPAIGN_DIR}/measurement_progress.log"
     exit 0
 fi
 
@@ -250,6 +250,7 @@ export SOURCE_ROUTE_AUDIT
 candidate_contract() {
 python3 - "${WORKLOADS}" "${CANDIDATES}" "${ALL_CANDIDATES}" "${SOURCE_AUDIT}" <<'PY'
 import csv
+import json
 import sys
 from collections import Counter
 from pathlib import Path
@@ -270,6 +271,7 @@ searched = Counter(
 )
 hashes = {}
 source_all = set()
+production_all = set()
 for row in candidates:
     hashes.setdefault(row["workload_id"], set()).add(
         row.get("model_schedule_sha256", "")
@@ -282,6 +284,17 @@ for row in candidates:
         and len(row.get("source_raw_tiling_hex", "")) == 544
     ):
         source_all.add(row["workload_id"])
+    try:
+        provenance = json.loads(row.get("source_route_provenance") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        provenance = []
+    if row.get("source_anchor") == "1" and any(
+        item.get("source") == "production_dispatcher"
+        and item.get("route") == "ALL"
+        and int(item.get("core_cap", 0)) == 20
+        for item in provenance if isinstance(item, dict)
+    ):
+        production_all.add(row["workload_id"])
 if (
     len(workloads) != 3
     or len(set(workload_ids)) != 3
@@ -303,6 +316,7 @@ if (
     or len(hashes) != 3
     or any(len(hashes[row["workload_id"]]) != searched[row["workload_id"]] for row in workloads)
     or source_all != set(workload_ids)
+    or production_all != set(workload_ids)
     or not all_candidates
     or not all(row.get("global_model_rank", "").isdigit() for row in candidates)
     or not all(row.get("controlled_factor", "") for row in candidates)
@@ -404,4 +418,4 @@ python3 tools/analyze_matmul_hardware_calibration.py \
     --require-direct-tiling-applied
 analysis_wall_ms=$(( ($(date +%s%N) - analysis_started_ns) / 1000000 ))
 echo "CAMPAIGN_STAGE_TIMING stage=analysis wall_ms=${analysis_wall_ms}"
-echo "analysis=${ANALYSIS}"
+echo "analysis=${ANALYSIS} logs=${LOG_DIR} measurement_log=${PROFILE_LOG}"

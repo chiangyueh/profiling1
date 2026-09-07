@@ -38,9 +38,24 @@ def complete(rows: list[dict], workload_ids: list[str], max_cores: int) -> bool:
     for row in rows:
         by_workload[str(row.get("workload_id", ""))].append(row)
     return all(
-        any(
-            row.get("route") == "ALL"
+        all(
+            any(
+                row.get("source") == "forced_route"
+                and row.get("route") == "ALL"
+                and int(row.get("core_cap", 0)) == core_cap
+                and int(row.get("available_core_count", 0)) == max_cores
+                and row.get("status") == "success"
+                and row.get("route_matched") is True
+                and len(str(row.get("raw_tiling_hex", ""))) == 544
+                for row in by_workload[workload_id]
+            )
+            for core_cap in range(1, max_cores + 1)
+        )
+        and any(
+            row.get("source") == "production_dispatcher"
+            and row.get("route") == "ALL"
             and int(row.get("core_cap", 0)) == max_cores
+            and int(row.get("available_core_count", 0)) == max_cores
             and row.get("status") == "success"
             and row.get("route_matched") is True
             and len(str(row.get("raw_tiling_hex", ""))) == 544
@@ -51,15 +66,27 @@ def complete(rows: list[dict], workload_ids: list[str], max_cores: int) -> bool:
 
 
 def required_anchor_detail(rows: list[dict], workload_id: str, max_cores: int) -> str:
-    matching = [
+    workload_rows = [
         row for row in rows
         if row.get("workload_id") == workload_id
-        and row.get("route") == "ALL"
-        and int(row.get("core_cap", 0)) == max_cores
     ]
-    if not matching:
+    if not workload_rows:
         return "rows=0"
-    return ";".join(
+    valid_forced_caps = sorted({
+        int(row.get("core_cap", 0))
+        for row in workload_rows
+        if row.get("source") == "forced_route"
+        and row.get("route") == "ALL"
+        and row.get("status") == "success"
+        and row.get("route_matched") is True
+        and len(str(row.get("raw_tiling_hex", ""))) == 544
+    })
+    production = [
+        row for row in workload_rows
+        if row.get("source") == "production_dispatcher"
+        and row.get("route") == "ALL"
+    ]
+    production_detail = ";".join(
         "source={source},status={status},matched={matched},key={key},raw_bytes={raw_bytes}".format(
             source=row.get("source", "unknown"),
             status=row.get("status", "missing"),
@@ -67,7 +94,11 @@ def required_anchor_detail(rows: list[dict], workload_id: str, max_cores: int) -
             key=row.get("tiling_key", "missing"),
             raw_bytes=len(str(row.get("raw_tiling_hex", ""))) // 2,
         )
-        for row in matching
+        for row in production
+    )
+    return (
+        f"rows={len(workload_rows)},valid_forced_ALL_caps={valid_forced_caps},"
+        f"expected_caps=1..{max_cores},production=[{production_detail}]"
     )
 
 
@@ -123,7 +154,6 @@ def main() -> int:
             "MATMUL_SOURCE_ROUTE_AUDIT_PATH": str(args.audit.resolve()),
             "MATMUL_SOURCE_ROUTE_MAX_CORES": str(args.max_cores),
             "MATMUL_SOURCE_ROUTE_WORKLOAD_ID": workload["workload_id"],
-            "MATMUL_SOURCE_FORCE_V3": "1",
             "LD_LIBRARY_PATH": (
                 str(private_lib.parent) + ":" + str(private_tiling.parent) + ":"
                 + env.get("LD_LIBRARY_PATH", "")
@@ -146,6 +176,10 @@ def main() -> int:
             tail = "\n".join((result.stdout + result.stderr).splitlines()[-12:])
             raise RuntimeError(
                 f"source route planning failed for {workload['workload_id']} rc={result.returncode}\n{tail}"
+            )
+        if "SOURCE_ROUTE_PLANNER dedicated_matmul_v3" not in result.stdout:
+            raise RuntimeError(
+                f"dedicated MatMulV3 planner was not attested for {workload['workload_id']}"
             )
         current = load_audit(args.audit)
         if not complete(current, workload_ids[:index], args.max_cores):

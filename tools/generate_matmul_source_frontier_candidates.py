@@ -79,6 +79,11 @@ OBSOLETE_EXECUTION_COLUMNS = {
 }
 BMN_VALUES = tuple(range(16, 257, 16)) + (288, 320, 384, 448, 512)
 BK_VALUES = (16, 32, 64, 96, 128, 192, 256)
+DIRECT_KERNEL_SUFFIXES = {
+    "fp16": {0, 1, 20, 21, 30, 31, 201, 10201},
+    "bf16": {0, 1, 20, 21, 30, 31, 201, 10201},
+    "fp32": {1, 21, 31, 101, 201, 10201, 20201},
+}
 
 
 def truthy(value: object) -> bool:
@@ -297,7 +302,7 @@ def read_source_anchors(
                 f"key={tiling_key} block={block_dim}: {error}"
             ) from error
         suffix = source_suffix(tiling_key)
-        if suffix not in {0, 1, 20, 21, 30, 31, 101, 201, 10201, 20201}:
+        if suffix not in DIRECT_KERNEL_SUFFIXES.get(workload.dtype, set()):
             continue
         routes = sorted({str(row["route"]) for row in provenance})
         caps = sorted({int(row["core_cap"]) for row in provenance})
@@ -325,6 +330,19 @@ def read_source_anchors(
         })
     if not anchors:
         raise old.SearchError(f"{workload.workload_id}: no executable source anchors")
+    if not any(
+        any(
+            item.get("source") == "production_dispatcher"
+            and item.get("route") == "ALL"
+            and int(item.get("core_cap", 0)) == platform.aic_cores
+            for item in json.loads(anchor["source_route_provenance"])
+        )
+        for anchor in anchors
+    ):
+        raise old.SearchError(
+            f"{workload.workload_id}: production MatMulV3 source anchor is not "
+            "supported by the direct runner"
+        )
     return anchors
 
 
@@ -377,8 +395,6 @@ def source_frontier_candidates(
     expanded_geometries: dict[tuple[int, ...], dict[str, int]] = {}
     for seed_index, seed in enumerate(base_seeds.values()):
         pair_id = f"base_source_{seed_index:03d}"
-        m_blocks = max(1, old.ceil_div(seed["singleCoreM"], seed["baseM"]))
-        n_blocks = max(1, old.ceil_div(seed["singleCoreN"], seed["baseN"]))
         base_ms = sorted({
             old.align_up(max(16, seed["baseM"] * numerator // denominator), 16)
             for numerator, denominator in ((1, 2), (3, 4), (1, 1), (5, 4), (3, 2), (2, 1))
@@ -397,13 +413,19 @@ def source_frontier_candidates(
             geometry = dict(seed)
             geometry.update(
                 baseM=base_m, baseN=base_n, baseK=base_k,
-                singleCoreM=base_m * m_blocks,
-                singleCoreN=base_n * n_blocks,
+                singleCoreM=base_m, singleCoreN=base_n,
+                singleCoreK=workload.k,
+                stepM=1, stepN=1, iterateOrder=0,
+                stepKa=1, stepKb=1, depthA1=1, depthB1=1,
+                dbL0A=1, dbL0B=1, dbL0C=1,
             )
-            tasks = old.ceil_div(workload.m, geometry["singleCoreM"]) * old.ceil_div(
-                workload.n, geometry["singleCoreN"]
-            )
+            m_total = old.ceil_div(workload.m, geometry["singleCoreM"])
+            n_total = old.ceil_div(workload.n, geometry["singleCoreN"])
+            tasks = m_total * n_total
             geometry["usedCoreNum"] = min(platform.aic_cores, tasks)
+            geometry = l2_schedule(
+                workload, geometry, m_total, n_total, 0
+            )
             if add(geometry, "source_mnk_geometry", pair_id,
                    f"baseM={base_m}:baseN={base_n}:baseK={base_k}"):
                 expanded_geometries.setdefault(signature(geometry), geometry)
@@ -465,6 +487,12 @@ def legal(
     ):
         return False
     try:
+        suffix = source_kernel_suffix(
+            workload.m, workload.n, workload.k, workload.dtype,
+            workload.trans_a, workload.trans_b, knowledge,
+        )
+        if suffix not in DIRECT_KERNEL_SUFFIXES.get(workload.dtype, set()):
+            return False
         plan_from_cann(
             workload.m, workload.n, workload.k, knowledge,
             dtype=workload.dtype, trans_a=workload.trans_a,
