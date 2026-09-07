@@ -1,0 +1,5 @@
+/.benchmark_state/
+/results/
+__pycache__/
+*.pyc
+*.[mM][dD]
