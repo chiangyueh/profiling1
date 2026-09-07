@@ -332,25 +332,52 @@ fi
 
 SEARCH_LOG="${CAMPAIGN_DIR}/candidate_generation.log"
 search_started_ns="$(date +%s%N)"
-PROFILE_WORKLOADS="${WORKLOADS}"
 set +e
-source "${ROOT}/scripts/run_search.sh" "${CATALOG}" \
-    > >(tee "${SEARCH_LOG}" | awk '
+"${ROOT}/scripts/run_search.sh" "${CATALOG}" 2>&1 | \
+    tee "${SEARCH_LOG}" | awk '
         /SOURCE_FRONTIER_CANDIDATES \[/ {
             split(substr($2,2,length($2)-2), a, "/");
             if (a[1] == 1 || a[1] == a[2] || a[1] % 20 == 0) print;
         }
         /MATMUL_SOURCE_FRONTIER_CANDIDATES|fatal:/ {print}
-    ') 2>&1
-search_rc=$?
+    '
+search_pipeline_status=("${PIPESTATUS[@]}")
+search_rc="${search_pipeline_status[0]}"
+if [[ "${search_rc}" -eq 0 && \
+      ( "${search_pipeline_status[1]}" -ne 0 || "${search_pipeline_status[2]}" -ne 0 ) ]]; then
+    search_rc=1
+fi
 set -e
-WORKLOADS="${PROFILE_WORKLOADS}"
 search_wall_ms=$(( ($(date +%s%N) - search_started_ns) / 1000000 ))
 echo "CAMPAIGN_STAGE_TIMING stage=tiling_selection wall_ms=${search_wall_ms}" | tee -a "${SEARCH_LOG}"
 if [[ "${search_rc}" -ne 0 ]]; then
     echo "CANDIDATE_GENERATION_FAILED log=${SEARCH_LOG}"
     exit "${search_rc}"
 fi
+
+PLATFORM_LINE="$(sed -n '/^CANN platform=/{p;q;}' "${SEARCH_LOG}")"
+platform_field() {
+    printf '%s\n' "${PLATFORM_LINE}" |
+        sed -n "s/.*[[:space:]]$1=\\([0-9][0-9.]*\\).*/\\1/p"
+}
+PLATFORM_AIC_CORES="$(platform_field cores)"
+PLATFORM_L0A_BYTES="$(platform_field L0A)"
+PLATFORM_L0B_BYTES="$(platform_field L0B)"
+PLATFORM_L0C_BYTES="$(platform_field L0C)"
+PLATFORM_L1_BYTES="$(platform_field L1)"
+PLATFORM_L2_BYTES="$(platform_field L2)"
+PLATFORM_L2_BPC="$(platform_field L2_Bpc_per_core)"
+PLATFORM_HBM_BPC="$(platform_field HBM_Bpc_per_core)"
+for value in \
+    "${PLATFORM_AIC_CORES}" "${PLATFORM_L0A_BYTES}" \
+    "${PLATFORM_L0B_BYTES}" "${PLATFORM_L0C_BYTES}" \
+    "${PLATFORM_L1_BYTES}" "${PLATFORM_L2_BYTES}" \
+    "${PLATFORM_L2_BPC}" "${PLATFORM_HBM_BPC}"; do
+    if [[ -z "${value}" ]]; then
+        echo "CANDIDATE_GENERATION_FAILED invalid_platform_log=${SEARCH_LOG}"
+        exit 1
+    fi
+done
 export PLATFORM_AIC_CORES PLATFORM_L0A_BYTES PLATFORM_L0B_BYTES
 export PLATFORM_L0C_BYTES PLATFORM_L1_BYTES PLATFORM_L2_BYTES
 export PLATFORM_L2_BPC PLATFORM_HBM_BPC
@@ -383,12 +410,17 @@ profile_started_ns="$(date +%s%N)"
 set +e
 "${ROOT}/scripts/profile_npu.sh" \
     "${CANDIDATES}" "${OUT_STEM}" "${WORKLOADS}" \
-    > >(awk '
+    2>&1 | awk '
         /OFFICIAL_BASELINE_|DIRECT_VARIANT_|DIRECT_MEASUREMENT_|NPU_RESULTS_READY|fatal:|Traceback/ {
             print; fflush();
         }
-    ' | tee "${PROFILE_LOG}") 2>&1
-profile_rc=$?
+    ' | tee "${PROFILE_LOG}"
+profile_pipeline_status=("${PIPESTATUS[@]}")
+profile_rc="${profile_pipeline_status[0]}"
+if [[ "${profile_rc}" -eq 0 && \
+      ( "${profile_pipeline_status[1]}" -ne 0 || "${profile_pipeline_status[2]}" -ne 0 ) ]]; then
+    profile_rc=1
+fi
 set -e
 profile_wall_ms=$(( ($(date +%s%N) - profile_started_ns) / 1000000 ))
 echo "CAMPAIGN_STAGE_TIMING stage=npu_measurement wall_ms=${profile_wall_ms}" | tee -a "${PROFILE_LOG}"
