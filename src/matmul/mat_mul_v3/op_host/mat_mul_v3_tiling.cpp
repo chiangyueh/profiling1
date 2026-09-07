@@ -155,18 +155,23 @@ bool RouteMatches(const TilingCalcSelect selector, const uint64_t tilingKey)
     }
 }
 
-uint64_t RequestedCoreCap(gert::TilingContext *context)
+uint64_t AvailableCoreCount(gert::TilingContext *context)
 {
     const auto *compileInfo = reinterpret_cast<const MatmulV3CompileInfo *>(context->GetCompileInfo());
     if (compileInfo == nullptr || compileInfo->aicNum == 0) {
         return 0;
     }
-    uint64_t coreCap = compileInfo->aicNum;
+    return compileInfo->aicNum;
+}
+
+uint64_t RequestedCoreCap(gert::TilingContext *context)
+{
+    uint64_t coreCap = AvailableCoreCount(context);
     if (const char *requested = std::getenv("MATMUL_SOURCE_ROUTE_MAX_CORES")) {
         char *end = nullptr;
         const unsigned long parsed = std::strtoul(requested, &end, 10);
         if (end != requested && *end == '\0' && parsed > 0) {
-            coreCap = std::min<uint64_t>(coreCap, parsed);
+            coreCap = parsed;
         }
     }
     return coreCap;
@@ -178,8 +183,10 @@ void AppendSourceRouteAudit(gert::TilingContext *context)
     if (path == nullptr || *path == '\0') {
         return;
     }
-    const uint64_t maxCoreCap = RequestedCoreCap(context);
-    if (maxCoreCap == 0) {
+    const uint64_t availableCoreCount = AvailableCoreCount(context);
+    const uint64_t requestedCoreCap = RequestedCoreCap(context);
+    const uint64_t maxCoreCap = std::min(availableCoreCount, requestedCoreCap);
+    if (maxCoreCap == 0 || requestedCoreCap == 0) {
         return;
     }
     const char *workloadId = std::getenv("MATMUL_SOURCE_ROUTE_WORKLOAD_ID");
@@ -199,6 +206,8 @@ void AppendSourceRouteAudit(gert::TilingContext *context)
                   << ",\"source\":\"forced_route\""
                   << ",\"route\":\"" << route.name << "\""
                   << ",\"core_cap\":" << coreCap
+                  << ",\"requested_core_cap\":" << requestedCoreCap
+                  << ",\"available_core_count\":" << availableCoreCount
                   << ",\"status\":\"" << (status == ge::GRAPH_SUCCESS ? "success" : "failed") << "\""
                   << ",\"route_matched\":" << (matched ? "true" : "false");
             if (status == ge::GRAPH_SUCCESS) {
@@ -224,7 +233,8 @@ void AppendProductionAllAudit(gert::TilingContext *context, const ge::graphStatu
 {
     const char *path = std::getenv("MATMUL_SOURCE_ROUTE_AUDIT_PATH");
     const uint64_t coreCap = RequestedCoreCap(context);
-    if (path == nullptr || *path == '\0' || coreCap == 0) {
+    const uint64_t availableCoreCount = AvailableCoreCount(context);
+    if (path == nullptr || *path == '\0' || coreCap == 0 || availableCoreCount == 0) {
         return;
     }
     const char *workloadId = std::getenv("MATMUL_SOURCE_ROUTE_WORKLOAD_ID");
@@ -241,6 +251,8 @@ void AppendProductionAllAudit(gert::TilingContext *context, const ge::graphStatu
           << ",\"source\":\"production_dispatcher\""
           << ",\"route\":\"ALL\""
           << ",\"core_cap\":" << coreCap
+          << ",\"requested_core_cap\":" << coreCap
+          << ",\"available_core_count\":" << availableCoreCount
           << ",\"status\":\"" << (status == ge::GRAPH_SUCCESS ? "success" : "failed") << "\""
           << ",\"route_matched\":" << (matched ? "true" : "false");
     if (status == ge::GRAPH_SUCCESS && raw != nullptr) {
