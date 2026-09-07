@@ -35,6 +35,8 @@
 #include "matmul_util.h"
 #include "op_api_def.h"
 
+#include <cstdlib>
+
 #define OP_LOGI(...) do {std::printf(__VA_ARGS__); std::printf("\n");} while(0)
 
 using namespace op;
@@ -48,6 +50,12 @@ static const std::initializer_list<op::DataType> DTYPE_SUPPORT_LIST = {DataType:
                                                                        DataType::DT_BF16};
 static const std::initializer_list<op::DataType> DTYPE_SUPPORT_LIST_WITHOUT_BF16 = {DataType::DT_FLOAT,
                                                                                     DataType::DT_FLOAT16};
+
+static bool ForceSourceMatMulV3(void)
+{
+  const char* value = std::getenv("MATMUL_SOURCE_FORCE_V3");
+  return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
 
 inline static bool CheckNotNull(const aclTensor* self, const aclTensor* mat2, const aclTensor* out)
 {
@@ -312,7 +320,13 @@ static const aclTensor* BuildMatMulGraph(const aclTensor* self, const aclTensor*
 
     // Tensor1 dims number 2 && Tensor2 dims number 2
   } else if (dimTensor1 == 2 && dimTensor2 == 2) {
-    matmulOut = ExecMmOp(self, mat2, cubeMathType, executor);
+    if (ForceSourceMatMulV3()) {
+      // The source-route campaign audits MatMulV3 itself.  The normal
+      // high-level helper may select MatMulV2 for some valid matrix shapes.
+      matmulOut = l0op::MatMulV3Nd(self, mat2, nullptr, false, false, false, false, executor);
+    } else {
+      matmulOut = ExecMmOp(self, mat2, cubeMathType, executor);
+    }
 
     // Tensor1 dims number > 3 & Tensor2 dim number is 1 or 2
   } else if (dimTensor1 >= 3 && (dimTensor2 == 1 || dimTensor2 == 2)) {

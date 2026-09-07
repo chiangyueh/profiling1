@@ -123,6 +123,7 @@ def main() -> int:
             "MATMUL_SOURCE_ROUTE_AUDIT_PATH": str(args.audit.resolve()),
             "MATMUL_SOURCE_ROUTE_MAX_CORES": str(args.max_cores),
             "MATMUL_SOURCE_ROUTE_WORKLOAD_ID": workload["workload_id"],
+            "MATMUL_SOURCE_FORCE_V3": "1",
             "LD_LIBRARY_PATH": (
                 str(private_lib.parent) + ":" + str(private_tiling.parent) + ":"
                 + env.get("LD_LIBRARY_PATH", "")
