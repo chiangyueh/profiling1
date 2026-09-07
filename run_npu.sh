@@ -105,7 +105,7 @@ OUT_STEM="${CAMPAIGN_DIR}/measurement"
 DETAILS_DIR="${OUT_STEM}_details"
 LOG_DIR="${CAMPAIGN_DIR}/logs"
 ANALYSIS="${CAMPAIGN_DIR}/analysis.json"
-SOURCE_AUDIT="${CAMPAIGN_DIR}/source_routes.jsonl"
+SOURCE_ROUTE_AUDIT="${CAMPAIGN_DIR}/source_routes.jsonl"
 mkdir -p "${CAMPAIGN_DIR}" "${TILING_DIR}" "${LOG_DIR}"
 cp "${CATALOG_TMP}" "${CATALOG}"
 
@@ -227,7 +227,7 @@ source_route_started_ns="$(date +%s%N)"
 python3 tools/collect_matmul_source_routes.py \
     --runner "${ROOT}/build/official_matmul_runner" \
     --workloads "${CATALOG}" \
-    --audit "${SOURCE_AUDIT}" \
+    --audit "${SOURCE_ROUTE_AUDIT}" \
     --state-dir "${CAMPAIGN_DIR}/source_route_state" \
     --package-root "${SOURCE_PACKAGE_ROOT}" \
     --opapi "${SOURCE_OPAPI}" \
@@ -248,7 +248,7 @@ export MEASUREMENT_JSONL_LOG_MAX_BYTES=52428800
 export SOURCE_ROUTE_AUDIT
 
 candidate_contract() {
-python3 - "${WORKLOADS}" "${CANDIDATES}" "${ALL_CANDIDATES}" "${SOURCE_AUDIT}" <<'PY'
+python3 - "${WORKLOADS}" "${CANDIDATES}" "${ALL_CANDIDATES}" "${SOURCE_ROUTE_AUDIT}" <<'PY'
 import csv
 import json
 import sys
