@@ -47,16 +47,16 @@ def has_production_dispatcher_provenance(row: dict[str, str]) -> bool:
 
 
 def paired_result(
-    official: dict[str, str], selected: dict[str, str]
+    reference: dict[str, str], selected: dict[str, str]
 ) -> dict[str, float | str]:
-    official_ms = number(official, "median_ms")
+    reference_ms = number(reference, "median_ms")
     selected_ms = number(selected, "median_ms")
-    delta_pct = 100.0 * (selected_ms - official_ms) / official_ms
+    delta_pct = 100.0 * (selected_ms - reference_ms) / reference_ms
     noise_pct = max(
         1.0,
         200.0 * math.hypot(
-            number(official, "stddev_ms"), number(selected, "stddev_ms")
-        ) / official_ms,
+            number(reference, "stddev_ms"), number(selected, "stddev_ms")
+        ) / reference_ms,
     )
     verdict = (
         "improved" if delta_pct < -noise_pct
@@ -64,9 +64,9 @@ def paired_result(
         else "within_noise"
     )
     return {
-        "official_ms": official_ms,
-        "selected_ms": selected_ms,
-        "speedup_vs_official": official_ms / selected_ms,
+        "reference_ms": reference_ms,
+        "candidate_ms": selected_ms,
+        "speedup_vs_reference": reference_ms / selected_ms,
         "delta_pct": delta_pct,
         "noise_pct": noise_pct,
         "verdict": verdict,
@@ -163,19 +163,32 @@ def paired_hardware_effects(rows: list[dict]) -> dict[str, dict]:
 def aggregate(rows: list[dict]) -> dict:
     if not rows:
         return {"shape_count": 0}
-    top = [row["model_top1_vs_official"] for row in rows]
-    best = [row["measured_best_vs_official"] for row in rows]
+    top = [row["model_top1_vs_installed_public_reference"] for row in rows]
+    best = [row["measured_best_vs_installed_public_reference"] for row in rows]
+    best_vs_callback = [
+        row["measured_best_vs_default_callback"] for row in rows
+    ]
     verdicts = lambda values: dict(Counter(row["verdict"] for row in values))
     return {
         "shape_count": len(rows),
         "model_candidate_measurements": sum(
             row["successful_model_tilings"] for row in rows
         ),
-        "latency_records_including_official": sum(
+        "latency_records_including_installed_public_reference": sum(
             row["successful_model_tilings"] + 1 for row in rows
         ),
-        "model_top1_verdicts": verdicts(top),
-        "measured_best_verdicts": verdicts(best),
+        "model_top1_vs_installed_public_reference_verdicts": verdicts(top),
+        "measured_best_vs_installed_public_reference_verdicts": verdicts(best),
+        "measured_best_vs_default_callback_verdicts": verdicts(
+            best_vs_callback
+        ),
+        "measured_best_vs_default_callback_delta_pct": {
+            "median": statistics.median(
+                row["delta_pct"] for row in best_vs_callback
+            ),
+            "minimum": min(row["delta_pct"] for row in best_vs_callback),
+            "maximum": max(row["delta_pct"] for row in best_vs_callback),
+        },
         "median_spearman": statistics.median(
             row["spearman_predicted_vs_measured"] for row in rows
         ),
@@ -201,13 +214,17 @@ def aggregate(rows: list[dict]) -> dict:
             == row["measured_best_kernel_family"]
             for row in rows
         ) / len(rows),
-        "production_source_anchor_delta_pct": {
+        "production_source_anchor_vs_installed_public_reference_delta_pct": {
             "median": statistics.median(
-                row["production_source_anchor_vs_official"]["delta_pct"]
+                row[
+                    "production_source_anchor_vs_installed_public_reference"
+                ]["delta_pct"]
                 for row in rows
             ),
             "maximum_absolute": max(
-                abs(row["production_source_anchor_vs_official"]["delta_pct"])
+                abs(row[
+                    "production_source_anchor_vs_installed_public_reference"
+                ]["delta_pct"])
                 for row in rows
             ),
         },
@@ -278,6 +295,13 @@ def main() -> int:
                 and row.get("full_output_validated") == "1"
                 and row.get("actual_tiling_sha256", "")
                 and row.get("actual_tiling_fnv1a64", "")
+                and candidate.get("official_callback_fixed_point") == "1"
+                and candidate.get("tiling_provenance")
+                    == "installed_cann81_matmulv3_callback_bytes"
+                and candidate.get("callback_tiling_sha256")
+                    == candidate.get("model_schedule_sha256")
+                and row.get("actual_tiling_sha256")
+                    == candidate.get("callback_tiling_sha256")
                 and row.get("model_schedule_sha256")
                     == candidate.get("model_schedule_sha256")
                 and row.get("actual_kernel_suffix")
@@ -309,7 +333,9 @@ def main() -> int:
         official = official_by_id.get(workload_id)
         common_ranks = sorted(set(candidate_map) & set(profile_map), key=int)
         if official is None:
-            raise RuntimeError(f"{workload_id}: valid official baseline is missing")
+            raise RuntimeError(
+                f"{workload_id}: valid installed public reference is missing"
+            )
         if len(common_ranks) != required:
             raise RuntimeError(
                 f"{workload_id}: successful={len(common_ranks)}, required={required}"
@@ -353,6 +379,16 @@ def main() -> int:
                 "source_validator_violations": candidate.get(
                     "source_validator_violations", ""
                 ),
+                "tiling_parameter_origin": candidate.get(
+                    "tiling_parameter_origin", ""
+                ),
+                "tiling_provenance": candidate.get("tiling_provenance", ""),
+                "official_callback_fixed_point": (
+                    candidate.get("official_callback_fixed_point") == "1"
+                ),
+                "official_default_callback": (
+                    candidate.get("official_default_callback") == "1"
+                ),
                 "production_dispatcher_provenance": (
                     has_production_dispatcher_provenance(candidate)
                 ),
@@ -368,7 +404,9 @@ def main() -> int:
                 "predicted_breakdown": json.loads(
                     candidate.get("new_model_breakdown") or "{}"
                 ),
-                "versus_official": paired_result(official, measured),
+                "versus_installed_public_reference": paired_result(
+                    official, measured
+                ),
             })
 
         predicted_order = sorted(
@@ -405,6 +443,19 @@ def main() -> int:
         production_source_anchor = min(
             production_source_anchors, key=lambda row: row["measured_ms"]
         )
+        default_callback_anchors = [
+            row for row in joined if row["official_default_callback"]
+        ]
+        if not default_callback_anchors:
+            raise RuntimeError(
+                f"{workload_id}: installed default MatMulV3 callback was not measured"
+            )
+        default_callback_anchor = min(
+            default_callback_anchors, key=lambda row: row["measured_ms"]
+        )
+        default_callback_profile = profile_map[
+            str(default_callback_anchor["output_rank"])
+        ]
         model_top_profile = profile_map[str(model_top["output_rank"])]
         measured_best_profile = profile_map[str(measured_best["output_rank"])]
         noise_pct = max(
@@ -422,7 +473,7 @@ def main() -> int:
             "partition": workload["calibration_partition"],
             "coverage_intent": workload["coverage_intent"],
             "successful_model_tilings": len(joined),
-            "official": {
+            "installed_public_operator_reference": {
                 "median_ms": number(official, "median_ms"),
                 "stddev_ms": number(official, "stddev_ms"),
             },
@@ -443,10 +494,33 @@ def main() -> int:
             "measured_best_kernel_family": measured_best["kernel_family"],
             "model_top1_regret_pct": regret,
             "model_top1_within_measured_best_noise": regret <= noise_pct,
-            "model_top1_vs_official": model_top["versus_official"],
-            "measured_best_vs_official": measured_best["versus_official"],
+            "model_top1_vs_installed_public_reference": (
+                model_top["versus_installed_public_reference"]
+            ),
+            "measured_best_vs_installed_public_reference": (
+                measured_best["versus_installed_public_reference"]
+            ),
+            "default_callback_anchor": {
+                "output_rank": default_callback_anchor["output_rank"],
+                "median_ms": default_callback_anchor["measured_ms"],
+                "stddev_ms": number(default_callback_profile, "stddev_ms"),
+                "kernel_family": default_callback_anchor["kernel_family"],
+                "kernel_suffix": default_callback_anchor["kernel_suffix"],
+                "used_core_num": default_callback_anchor["used_core_num"],
+                "tiling_provenance": default_callback_anchor["tiling_provenance"],
+            },
+            "model_top1_vs_default_callback": paired_result(
+                default_callback_profile, model_top_profile
+            ),
+            "measured_best_vs_default_callback": paired_result(
+                default_callback_profile, measured_best_profile
+            ),
             "production_source_anchor_output_rank": production_source_anchor["output_rank"],
-            "production_source_anchor_vs_official": production_source_anchor["versus_official"],
+            "production_source_anchor_vs_installed_public_reference": (
+                production_source_anchor[
+                    "versus_installed_public_reference"
+                ]
+            ),
             "paired_hardware_effects": paired_hardware_effects(joined),
             "candidates": sorted(joined, key=lambda row: row["output_rank"]),
         })
@@ -454,16 +528,21 @@ def main() -> int:
     partitions = sorted({row["partition"] for row in per_shape})
     coverage_intents = sorted({row["coverage_intent"] for row in per_shape})
     result = {
-        "schema": "matmul_hardware_frontier_measurement_v2",
+        "schema": "matmul_callback_frontier_measurement_v3",
         "status": "complete",
         "method": {
             "candidate_selection": (
-                "every applicable original source route/core-cap anchor plus "
-                "hardware-local factor strata; model scored only after freeze"
+                "all installed-callback accepted families plus original source "
+                "anchors and hardware-factor strata; model scored only after freeze"
             ),
             "measurement": "one warmup, three device-event launches, full validation of final timed output",
             "candidate_latency_records": formal_total,
-            "official_baselines": len(workloads),
+            "installed_public_operator_references": len(workloads),
+            "installed_public_operator_tiling_captured": False,
+            "candidate_tiling_bytes_source": (
+                "installed CANN 8.1 MatMulV3 callback; injected parameters "
+                "must be returned unchanged"
+            ),
             "latency_records": record_total,
             "latency_history_or_cce_table_used_by_model": False,
             "candidate_set_frozen_before_simulator_scoring": True,
@@ -486,7 +565,12 @@ def main() -> int:
         },
         "per_shape": per_shape,
     }
-    if result["aggregate"]["latency_records_including_official"] != record_total:
+    if (
+        result["aggregate"][
+            "latency_records_including_installed_public_reference"
+        ]
+        != record_total
+    ):
         raise RuntimeError(
             f"formal latency record count is not {record_total}"
         )
@@ -502,7 +586,7 @@ def main() -> int:
             {"record_type": "hardware_factor_ranking", **row},
         )
     log.append_once(
-        "campaign:source_frontier_analysis_complete",
+        "campaign:callback_frontier_analysis_complete",
         {
             "schema": result["schema"],
             "record_type": "hardware_factor_analysis_summary",
@@ -515,7 +599,7 @@ def main() -> int:
     log.close()
     summary = result["aggregate"]
     print(
-        "MATMUL_SOURCE_FRONTIER_COMPLETE "
+        "MATMUL_CALLBACK_FRONTIER_COMPLETE "
         f"shapes={summary['shape_count']} records={record_total} "
         f"median_spearman={summary['median_spearman']:.6f} "
         f"median_top1_regret_pct={summary['median_top1_regret_pct']:.6f}",

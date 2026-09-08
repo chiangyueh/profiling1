@@ -51,7 +51,8 @@ python3 tools/profile_direct_matmul.py \
     --warmup "${WARMUP:-1}" \
     --repeat "${REPEAT:-1}" \
     --samples "${SAMPLES:-3}" \
-    --progress-every "${PROFILE_PROGRESS_EVERY:-20}"
+    --progress-every "${PROFILE_PROGRESS_EVERY:-20}" \
+    --require-official-callback
 
 python3 tools/rank_npu_results.py \
     --input "${PROFILE_CSV}" \

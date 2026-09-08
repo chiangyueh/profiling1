@@ -308,7 +308,13 @@ class MaterializedTiling:
     nd2nz_b: int
 
 
-def materialize(row: dict[str, str], *, l2_bytes: int, aic_cores: int) -> MaterializedTiling:
+def materialize(
+    row: dict[str, str],
+    *,
+    l2_bytes: int,
+    aic_cores: int,
+    require_official_callback: bool = False,
+) -> MaterializedTiling:
     m, n, k = (int(row[name]) for name in ("m", "n", "k"))
     dtype = row["dtype"].lower()
     trans_a = truthy(row.get("trans_a"))
@@ -326,21 +332,40 @@ def materialize(row: dict[str, str], *, l2_bytes: int, aic_cores: int) -> Materi
     )
     from dataclasses import replace
     hardware = replace(hardware, core_counts=core_counts, capacities=capacities)
+    callback_hex = row.get("callback_raw_tiling_hex", "").strip()
     source_hex = row.get("source_raw_tiling_hex", "").strip()
+    raw_hex = callback_hex or source_hex
+    if require_official_callback and not callback_hex:
+        raise ValueError(
+            "candidate lacks raw tiling bytes returned by the installed "
+            "MatMulV3 callback"
+        )
+    if callback_hex and (
+        row.get("official_callback_fixed_point") != "1"
+        or row.get("tiling_provenance")
+            != "installed_cann81_matmulv3_callback_bytes"
+    ):
+        raise ValueError(
+            "candidate callback bytes lack fixed-point/provenance attestation"
+        )
     violations = validate_cann_tiling(
         m, n, k, dtype, trans_a, trans_b, knowledge, hardware
     )
-    if violations and not source_hex:
+    if violations and not raw_hex:
         raise ValueError("validator rejected candidate: " + ",".join(violations))
 
     derived_suffix = source_kernel_suffix(
         m, n, k, dtype, trans_a, trans_b, knowledge
     )
-    if source_hex:
-        source_key = int(row.get("source_tiling_key") or 0)
-        suffix = source_key - 10_000_000_000_000_000_000
+    if raw_hex:
+        raw_key = int(
+            (row.get("callback_tiling_key") if callback_hex
+             else row.get("source_tiling_key"))
+            or 0
+        )
+        suffix = raw_key - 10_000_000_000_000_000_000
         if suffix < 0:
-            raise ValueError("source raw tiling key is below the MatMulV3 offset")
+            raise ValueError("raw tiling key is below the MatMulV3 offset")
     else:
         suffix = derived_suffix
     declared_suffix = int(row.get("model_kernel_suffix") or suffix)
@@ -348,21 +373,27 @@ def materialize(row: dict[str, str], *, l2_bytes: int, aic_cores: int) -> Materi
         raise ValueError(
             f"kernel suffix mismatch model={declared_suffix} materialized={suffix}"
         )
+    if callback_hex and derived_suffix != suffix:
+        raise ValueError(
+            f"callback key suffix={suffix} does not match visible schedule "
+            f"suffix={derived_suffix}"
+        )
     if suffix not in SUPPORTED_KERNELS.get(dtype, set()):
         raise ValueError(f"direct kernel was not built for {dtype}/suffix={suffix}")
 
-    # An original-source anchor is copied byte-for-byte.  This preserves every
-    # TCubeTiling field that is not represented in the generic model IR; the
-    # checks below prevent a raw blob from being paired with different visible
-    # parameters, shape, graph, or block count.
-    if source_hex:
+    # Callback output and original-source anchors are copied byte-for-byte.
+    # The callback path is mandatory for the source-frontier campaign: Python
+    # may propose parameters, but it cannot synthesize the buffer sent to the
+    # device.  The checks below prevent raw bytes from being paired with a
+    # different visible schedule, shape, key, or block count.
+    if raw_hex:
         try:
-            blob = bytes.fromhex(source_hex)
+            blob = bytes.fromhex(raw_hex)
         except ValueError as error:
-            raise ValueError(f"invalid source raw tiling hex: {error}") from error
+            raise ValueError(f"invalid raw tiling hex: {error}") from error
         if len(blob) != ABI_BYTES:
             raise ValueError(
-                f"source raw tiling has {len(blob)} bytes; expected {ABI_BYTES}"
+                f"raw tiling has {len(blob)} bytes; expected {ABI_BYTES}"
             )
         words = struct.unpack("<68I", blob)
         expected = {
@@ -385,16 +416,34 @@ def materialize(row: dict[str, str], *, l2_bytes: int, aic_cores: int) -> Materi
         ]
         if mismatches:
             raise ValueError(
-                "source raw tiling/visible parameter mismatch: " + ";".join(mismatches)
+                "raw tiling/visible parameter mismatch: " + ";".join(mismatches)
             )
-        if int(row.get("source_tiling_key") or 0) != 10_000_000_000_000_000_000 + suffix:
-            raise ValueError("source raw tiling key does not match the selected kernel suffix")
-        if int(row.get("used_core_num") or 0) != int(row.get("source_block_dim") or 0):
-            raise ValueError("source raw tiling usedCoreNum does not match source blockDim")
-        workspace = int(row.get("source_workspace_bytes") or 0)
+        expected_key = int(
+            (row.get("callback_tiling_key") if callback_hex
+             else row.get("source_tiling_key"))
+            or 0
+        )
+        if expected_key != 10_000_000_000_000_000_000 + suffix:
+            raise ValueError("raw tiling key does not match the selected kernel suffix")
+        expected_block_dim = int(
+            (row.get("callback_block_dim") if callback_hex
+             else row.get("source_block_dim"))
+            or 0
+        )
+        if int(row.get("used_core_num") or 0) != expected_block_dim:
+            raise ValueError("raw tiling usedCoreNum does not match callback blockDim")
+        workspace = int(
+            (row.get("callback_workspace_bytes") if callback_hex
+             else row.get("source_workspace_bytes"))
+            or 0
+        )
         if workspace <= 0:
-            raise ValueError("source raw tiling lacks a positive source workspace size")
+            raise ValueError("raw tiling lacks a positive workspace size")
         digest = hashlib.sha256(blob).hexdigest()
+        if callback_hex and digest != row.get("callback_tiling_sha256"):
+            raise ValueError("callback raw bytes do not match callback SHA-256")
+        if callback_hex and digest != row.get("model_schedule_sha256"):
+            raise ValueError("callback raw bytes do not match schedule SHA-256")
         fnv = 0xCBF29CE484222325
         for value in blob:
             fnv = ((fnv ^ value) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
@@ -479,6 +528,7 @@ def write_manifest(
     l2_bytes: int,
     aic_cores: int,
     include_reserves: bool = False,
+    require_official_callback: bool = False,
 ) -> int:
     with candidates.open(newline="", encoding="utf-8") as stream:
         rows = list(csv.DictReader(stream))
@@ -497,7 +547,12 @@ def write_manifest(
             continue
         if not include_reserves and truthy(row.get("is_reserve")):
             continue
-        tiling = materialize(row, l2_bytes=l2_bytes, aic_cores=aic_cores)
+        tiling = materialize(
+            row,
+            l2_bytes=l2_bytes,
+            aic_cores=aic_cores,
+            require_official_callback=require_official_callback,
+        )
         filename = (
             f"{safe_name(row['workload_id'])}__r{int(row['rank']):04d}__"
             f"{row['model_schedule_sha256'][:16]}.bin"
@@ -540,11 +595,13 @@ def main() -> int:
     parser.add_argument("--l2-bytes", type=int, required=True)
     parser.add_argument("--aic-cores", type=int, required=True)
     parser.add_argument("--include-reserves", action="store_true")
+    parser.add_argument("--require-official-callback", action="store_true")
     args = parser.parse_args()
     count = write_manifest(
         args.candidates, args.output_dir, args.manifest,
         l2_bytes=args.l2_bytes, aic_cores=args.aic_cores,
         include_reserves=args.include_reserves,
+        require_official_callback=args.require_official_callback,
     )
     print(json.dumps({
         "status": "passed", "candidates": count,

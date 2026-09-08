@@ -79,11 +79,11 @@ if [[ "${PLATFORM_AIC_CORES}" -le 0 ]]; then
     exit 1
 fi
 
-if [[ "${SEARCH_SCOPE}" == "matmul_source_frontier_v1" ]]; then
+if [[ "${SEARCH_SCOPE}" == "matmul_callback_frontier_v2" ]]; then
     if [[ "${REUSE_SOURCE_FRONTIER_CANDIDATES:-0}" == "1" && \
           -s "${SEARCH_OUTPUT}" && -s "${SEARCH_ALL_OUTPUT}" && \
           -s "${FRONTIER_WORKLOADS_OUTPUT:?}" ]]; then
-        echo "MATMUL_SOURCE_FRONTIER_CANDIDATES cached=${SEARCH_OUTPUT}"
+        echo "MATMUL_CALLBACK_FRONTIER_CANDIDATES cached=${SEARCH_OUTPUT}"
     else
         python3 tools/generate_matmul_source_frontier_candidates.py \
             --raw-candidates "${RAW_ALL_OUTPUT}" \

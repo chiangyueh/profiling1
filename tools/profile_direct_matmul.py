@@ -33,7 +33,7 @@ PROFILE_COLUMNS = [
     "actual_kernel_suffix", "actual_block_dim",
 ]
 SAMPLE_COLUMNS = ["workload_id", "rank", "candidate_role", "sample", "latency_ms"]
-SCHEMA = "matmul_direct_candidate_measurement_v1"
+SCHEMA = "matmul_direct_candidate_measurement_v2"
 
 
 def truthy(value: object) -> bool:
@@ -222,9 +222,9 @@ def api_baseline(row: dict[str, str]) -> dict[str, str]:
     output = {field: "" for field in PROFILE_COLUMNS}
     output.update({field: row.get(field, "") for field in PROFILE_COLUMNS})
     output.update({
-        "rank": "0", "source": "official_default",
-        "candidate_role": "api_auto_baseline",
-        "measurement_source": "separate_installed_aclnn_baseline",
+        "rank": "0", "source": "installed_public_operator_reference",
+        "candidate_role": "api_auto_reference",
+        "measurement_source": "separate_installed_aclnn_reference_unknown_tiling",
     })
     return output
 
@@ -235,8 +235,8 @@ def validate_official(rows: list[dict[str, str]], workloads: list[dict[str, str]
     return (
         actual == expected and len(rows) == len(expected)
         and all(
-            row.get("source") == "installed_aclnn_matmul"
-            and row.get("candidate_role") == "official_operator_baseline"
+            row.get("source") == "installed_aclnn_matmul_public_api"
+            and row.get("candidate_role") == "installed_operator_reference"
             and truthy(row.get("success")) and truthy(row.get("preflight_passed"))
             and row.get("preflight_mode") == "numeric_signed_axes_full_v3"
             and float(row.get("median_ms") or 0) > 0
@@ -293,6 +293,7 @@ def main() -> int:
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--progress-every", type=int, default=20)
+    parser.add_argument("--require-official-callback", action="store_true")
     args = parser.parse_args()
 
     workloads = read_rows(args.workloads)
@@ -342,6 +343,7 @@ def main() -> int:
         args.candidates, args.tiling_directory, args.manifest,
         l2_bytes=args.l2_bytes, aic_cores=args.aic_cores,
         include_reserves=True,
+        require_official_callback=args.require_official_callback,
     )
     if materialized != len(all_candidates):
         raise RuntimeError("not every candidate/reserve produced one exact tiling buffer")
@@ -358,7 +360,8 @@ def main() -> int:
         "shapes": shape_count,
         "required_successful_candidates": formal_target,
         "available_reserves": reserve_target,
-        "official_baselines": shape_count,
+        "installed_operator_references": shape_count,
+        "installed_public_operator_tiling_captured": False,
         "measurement": "one warmup plus three device-event samples",
         "candidate_execution": "compile_one_variant_then_measure_immediately",
     })
@@ -385,7 +388,7 @@ def main() -> int:
         for name in tuple(environment):
             if "RUNTIME_KB" in name or "TUNING_BANK" in name:
                 environment.pop(name, None)
-        print(f"OFFICIAL_BASELINE_BEGIN shapes={shape_count}", flush=True)
+        print(f"INSTALLED_PUBLIC_REFERENCE_BEGIN shapes={shape_count}", flush=True)
         official_process = subprocess.Popen(
             command, env=environment, text=True, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, bufsize=1,
@@ -396,14 +399,14 @@ def main() -> int:
         for line in official_process.stdout:
             line = line.rstrip("\n")
             tail_lines.append(line)
-            if line.startswith("official_done "):
+            if line.startswith("installed_reference_done "):
                 official_done += 1
                 if official_done == 1 or official_done % 20 == 0 or official_done == shape_count:
-                    print(f"OFFICIAL_BASELINE_PROGRESS {official_done}/{shape_count}", flush=True)
+                    print(f"INSTALLED_PUBLIC_REFERENCE_PROGRESS {official_done}/{shape_count}", flush=True)
         official_return_code = official_process.wait()
         if official_return_code:
             raise RuntimeError(
-                f"official baseline failed rc={official_return_code}: "
+                f"installed public reference failed rc={official_return_code}: "
                 + "\n".join(tail_lines)
             )
         official_rows = read_rows(args.official_output)
@@ -412,14 +415,14 @@ def main() -> int:
             official_sample_rows, workloads, args.samples
         )
         if not validate_official(official_rows, workloads) or official_sample_map is None:
-            raise RuntimeError("official baseline output contract failed")
-        print(f"OFFICIAL_BASELINE_DONE shapes={shape_count}", flush=True)
+            raise RuntimeError("installed public reference output contract failed")
+        print(f"INSTALLED_PUBLIC_REFERENCE_DONE shapes={shape_count}", flush=True)
     else:
-        print(f"OFFICIAL_BASELINE_RESUME shapes={shape_count}", flush=True)
+        print(f"INSTALLED_PUBLIC_REFERENCE_RESUME shapes={shape_count}", flush=True)
     for official in official_rows:
         log.append_once(
-            f"official:{official['workload_id']}",
-            {"schema": SCHEMA, "record_type": "official_baseline",
+            f"installed-reference:{official['workload_id']}",
+            {"schema": SCHEMA, "record_type": "installed_operator_reference",
              "measurement": official,
              "samples_ms": official_sample_map[official["workload_id"]]},
         )
@@ -700,12 +703,12 @@ def main() -> int:
     log.append_once("campaign:complete", {
         "schema": SCHEMA, "record_type": "campaign_complete",
         "status": "complete", "candidate_records": formal_target,
-        "official_baselines": shape_count, "records": record_target,
+        "installed_operator_references": shape_count, "records": record_target,
     })
     log.close()
     print(
         f"DIRECT_MEASUREMENT_COMPLETE candidates={formal_target} "
-        f"baselines={shape_count} records={record_target}",
+        f"installed_operator_references={shape_count} records={record_target}",
         flush=True,
     )
     return 0

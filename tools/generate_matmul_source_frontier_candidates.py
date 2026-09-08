@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Create a source-anchored, model-independent MatMul hardware frontier.
+"""Create a callback-validated, model-independent MatMul hardware frontier.
 
 Every applicable original CANN route/core cap is retained before a bounded
-hardware-factor neighborhood is expanded around those observed basins.  The
-cost simulator is invoked only after the measured set has been frozen, so its
-score cannot influence which tilings are sent to the NPU.
+hardware-factor and execution-family space is expanded.  Every final 272-byte
+buffer comes from the installed MatMulV3 callback.  The cost simulator is
+invoked only after the measured set has been frozen, so its score cannot
+influence which tilings are sent to the NPU.
 """
 
 from __future__ import annotations
@@ -58,6 +59,13 @@ CUSTOM_COLUMNS = (
     "source_tiling_key", "source_block_dim", "source_workspace_bytes",
     "source_raw_tiling_hex", "source_route_provenance",
     "source_validator_violations",
+    "callback_raw_tiling_hex", "callback_tiling_sha256",
+    "callback_tiling_key", "callback_block_dim",
+    "callback_workspace_bytes", "callback_kernel_suffix",
+    "callback_kernel_family", "official_callback_fixed_point",
+    "official_default_callback", "source_callback_bytes_equal",
+    "tiling_parameter_origin", "tiling_provenance",
+    "callback_validation_ms", "callback_rejected_count",
 )
 MANDATORY_COLUMNS = (
     "workload_id", "m", "n", "k", "dtype", "trans_a", "trans_b",
@@ -474,6 +482,226 @@ def source_frontier_candidates(
     return proposed, legality_ns
 
 
+def all_family_frontier_candidates(
+    workload: old.Workload,
+    source_anchors: list[dict],
+    platform: old.Hardware,
+    hardware,
+    seed: old.Seed,
+    raw_rows: list[dict[str, str]],
+) -> tuple[list[dict], int]:
+    """Merge source-local and cross-family proposals before model scoring.
+
+    The old source-frontier path expanded only BASE anchors.  Keep that local
+    neighborhood, but also admit the BASE, split-K, and full-load proposal
+    builders.  The installed MatMulV3 callback, not these Python predicates,
+    is the final authority on whether a proposed schedule is executable.
+    """
+
+    source_local, source_legality_ns = source_frontier_candidates(
+        workload, source_anchors, platform, hardware
+    )
+    broad, _, broad_legality_ns = proposed_candidates(
+        workload, platform, hardware
+    )
+    template_spaces = old.all_template_candidate_spaces(
+        workload,
+        seed,
+        raw_rows,
+        platform,
+        max(256, len(source_anchors) * 16),
+        "all_templates_validation",
+    )
+
+    merged: list[dict] = []
+    seen_signatures: set[tuple[int, ...]] = set()
+    for item in source_anchors:
+        key = signature(item["knowledge"])
+        if key not in seen_signatures:
+            merged.append(item)
+            seen_signatures.add(key)
+    for item in (*source_local, *broad):
+        key = signature(item["knowledge"])
+        if key not in seen_signatures:
+            merged.append(item)
+            seen_signatures.add(key)
+    for family, candidates in sorted(template_spaces.items()):
+        for index, knowledge in enumerate(candidates):
+            key = signature(knowledge)
+            if key in seen_signatures or not legal(
+                workload, knowledge, platform, hardware
+            ):
+                continue
+            merged.append({
+                "knowledge": dict(knowledge),
+                "design_role": "cross_family_frontier",
+                "controlled_factor": "kernel_family",
+                "pair_id": f"family_{family.lower()}_{index:04d}",
+                "factor_signature": f"family={family}",
+                "hardware_stratum": hardware_stratum(
+                    workload, knowledge, hardware
+                ),
+            })
+            seen_signatures.add(key)
+    return merged, source_legality_ns + broad_legality_ns
+
+
+def ordered_callback_design(
+    proposed: list[dict],
+    source_anchors: list[dict],
+) -> list[dict]:
+    """Order a score-independent design with every family represented early."""
+
+    anchor_signatures = {signature(item["knowledge"]) for item in source_anchors}
+    result = list(source_anchors)
+    remaining = [
+        item for item in proposed
+        if signature(item["knowledge"]) not in anchor_signatures
+    ]
+    family_queues: dict[str, deque[dict]] = {}
+    for family in sorted({
+        execution_mode_name(item["knowledge"]) for item in remaining
+    }):
+        family_items = [
+            item for item in remaining
+            if execution_mode_name(item["knowledge"]) == family
+        ]
+        family_queues[family] = deque(round_robin_strata(
+            family_items,
+            len(family_items),
+            lambda item: (
+                item["controlled_factor"],
+                item["factor_signature"],
+                item["hardware_stratum"],
+            ),
+        ))
+    while any(family_queues.values()):
+        for family in sorted(family_queues):
+            if family_queues[family]:
+                result.append(family_queues[family].popleft())
+    return result
+
+
+def attach_official_callback(
+    workload: old.Workload,
+    item: dict,
+    default_callback: old.CallbackTiling,
+) -> dict:
+    """Return an item whose exact bytes were serialized by installed CANN."""
+
+    knowledge = item["knowledge"]
+    if signature(knowledge) == signature(default_callback.knowledge):
+        callback = default_callback
+    else:
+        callback = old.invoke_official_callback(workload, knowledge)
+    mismatches = [
+        f"{field}={callback.knowledge[field]} expected={knowledge[field]}"
+        for field in old.KNOWLEDGE_FIELDS
+        if callback.knowledge[field] != knowledge[field]
+    ]
+    if mismatches:
+        raise old.SearchError(
+            "installed callback changed candidate: " + "; ".join(mismatches)
+        )
+    if len(callback.blob) != 272:
+        raise old.SearchError(
+            f"installed callback returned {len(callback.blob)} tiling bytes"
+        )
+    suffix = source_suffix(callback.key)
+    if suffix not in DIRECT_KERNEL_SUFFIXES.get(workload.dtype, set()):
+        raise old.SearchError(
+            f"direct kernel is unavailable for {workload.dtype}/suffix={suffix}"
+        )
+    if callback.block_dim != knowledge["usedCoreNum"]:
+        raise old.SearchError(
+            "installed callback blockDim does not match usedCoreNum: "
+            f"{callback.block_dim}!={knowledge['usedCoreNum']}"
+        )
+    workspace = sum(callback.workspaces)
+    if workspace <= 0:
+        raise old.SearchError("installed callback returned no user workspace")
+
+    result = dict(item)
+    source_hex = str(item.get("source_raw_tiling_hex", ""))
+    if item.get("source_anchor") or source_hex:
+        parameter_origin = "original_source_route"
+    elif callback.sha256 == default_callback.sha256:
+        parameter_origin = "installed_default_callback"
+    else:
+        parameter_origin = "hardware_frontier_proposal"
+    result.update({
+        "callback": callback,
+        "callback_raw_tiling_hex": callback.blob.hex(),
+        "callback_tiling_sha256": callback.sha256,
+        "callback_tiling_key": callback.key,
+        "callback_block_dim": callback.block_dim,
+        "callback_workspace_bytes": workspace,
+        "callback_kernel_suffix": suffix,
+        "callback_kernel_family": old.kernel_family(callback.key),
+        "official_callback_fixed_point": "1",
+        "official_default_callback": str(int(
+            callback.sha256 == default_callback.sha256
+        )),
+        "source_callback_bytes_equal": (
+            str(int(bytes.fromhex(source_hex) == callback.blob))
+            if source_hex else ""
+        ),
+        "tiling_parameter_origin": parameter_origin,
+        "tiling_provenance": "installed_cann81_matmulv3_callback_bytes",
+    })
+    return result
+
+
+def callback_validated_design(
+    workload: old.Workload,
+    proposed: list[dict],
+    source_anchors: list[dict],
+    default_callback: old.CallbackTiling,
+    required: int,
+) -> tuple[list[dict], list[dict], int, str]:
+    """Freeze a family-balanced design using callback acceptance only."""
+
+    target = required + RESERVES_PER_SHAPE
+    accepted: list[dict] = []
+    seen_callback_hashes: set[str] = set()
+    rejected = 0
+    first_rejection = ""
+    source_signatures = {signature(item["knowledge"]) for item in source_anchors}
+    for item in ordered_callback_design(proposed, source_anchors):
+        try:
+            validated = attach_official_callback(
+                workload, item, default_callback
+            )
+        except Exception as error:
+            rejected += 1
+            if not first_rejection:
+                first_rejection = str(error).replace("\n", " ")[:240]
+            if signature(item["knowledge"]) in source_signatures:
+                raise old.SearchError(
+                    "original source anchor is not an installed-callback fixed "
+                    f"point: {first_rejection}"
+                ) from error
+            continue
+        callback_hash = validated["callback_tiling_sha256"]
+        if callback_hash in seen_callback_hashes:
+            continue
+        seen_callback_hashes.add(callback_hash)
+        accepted.append(validated)
+        if len(accepted) == target:
+            break
+    if len(accepted) != target:
+        raise old.SearchError(
+            f"installed callback accepted only {len(accepted)} distinct tilings; "
+            f"required {target}; rejected={rejected}"
+        )
+    return (
+        accepted[:required],
+        accepted[required:],
+        rejected,
+        first_rejection,
+    )
+
+
 def legal(
     workload: old.Workload, knowledge: dict[str, int],
     platform: old.Hardware, hardware,
@@ -882,10 +1110,22 @@ def main() -> int:
         args.hbm_bytes_per_cycle_per_core,
     )
     hardware = generic_hardware(platform)
-    raw_fields, _ = read_rows(args.raw_candidates)
+    from tbe.common.platform import set_current_compile_soc_info
+    from tbe.common.utils import op_tiling
+
+    set_current_compile_soc_info(args.soc)
+    op_tiling._RT_BANK_CACHE = {}
+
+    raw_fields, raw_rows = read_rows(args.raw_candidates)
     fields = ["rank", *(field for field in raw_fields if field != "rank" and field not in OBSOLETE_EXECUTION_COLUMNS)]
-    for field in (*MANDATORY_COLUMNS, *old.EXTRA_COLUMNS, *CUSTOM_COLUMNS):
+    for field in (*MANDATORY_COLUMNS, *old.EXTRA_COLUMNS):
         if field not in fields and field not in OBSOLETE_EXECUTION_COLUMNS:
+            fields.append(field)
+    # Reintroduce only the callback columns owned by this campaign.  Several
+    # have the same names as legacy callback diagnostics, which are otherwise
+    # intentionally removed above.
+    for field in CUSTOM_COLUMNS:
+        if field not in fields:
             fields.append(field)
     catalog_fields, catalog = read_rows(args.catalog)
     selected_rows: list[dict[str, str]] = []
@@ -905,11 +1145,22 @@ def main() -> int:
         anchors = read_source_anchors(
             args.source_audit, workload, platform, hardware
         )
-        proposed, legality_ns = source_frontier_candidates(
-            workload, anchors, platform, hardware
+        seed = old.parse_seed(workload)
+        proposed, legality_ns = all_family_frontier_candidates(
+            workload, anchors, platform, hardware, seed, raw_rows
         )
         generation_ns = time.perf_counter_ns() - generation_started
-        formal, reserves = select_fixed_design(proposed, anchors, required)
+        callback_started = time.perf_counter_ns()
+        formal, reserves, callback_rejected, first_rejection = (
+            callback_validated_design(
+                workload,
+                proposed,
+                anchors,
+                seed.default,
+                required,
+            )
+        )
+        callback_ns = time.perf_counter_ns() - callback_started
         frozen = [*formal, *reserves]
         scoring_ns = score_frozen_design(workload, frozen, hardware)
         chosen = [
@@ -921,21 +1172,21 @@ def main() -> int:
             knowledge = item["knowledge"]
             simulation = item["simulation"]
             family = execution_mode_name(knowledge)
-            schedule_sha, suffix = execution_identity(workload, knowledge)
-            if item.get("source_raw_tiling_hex"):
-                schedule_sha = hashlib.sha256(
-                    bytes.fromhex(item["source_raw_tiling_hex"])
-                ).hexdigest()
-                suffix = source_suffix(int(item["source_tiling_key"]))
+            callback = item["callback"]
+            schedule_sha = item["callback_tiling_sha256"]
+            suffix = item["callback_kernel_suffix"]
             row = old.row_from_state(
                 fields, None, workload, knowledge,
-                "official_source_route_frontier_v1", family.upper(),
+                "installed_callback_frontier_v2", family.upper(),
                 simulation.total_cycles,
                 simulation.gm_read_bytes + simulation.gm_write_bytes,
-                simulation.l2_bytes, 10_000_000_000_000_000_000 + suffix,
+                simulation.l2_bytes, callback.key,
                 guidance=item["controlled_factor"],
                 bottleneck=simulation.bottleneck,
-                rationale="original source route anchor or hardware-local expansion; model scored only after freeze",
+                rationale=(
+                    "parameters frozen without model or latency ranking; exact "
+                    "tiling bytes returned by installed MatMulV3 callback"
+                ),
                 resume_policy="allow_new",
             )
             row.update({
@@ -950,13 +1201,13 @@ def main() -> int:
                 "model_kernel_suffix": str(suffix),
                 "model_kernel_variant": family.upper(),
                 "model_kernel_family": family.upper(),
-                "model_input_source": "source_route_or_parameters_after_preregistered_candidate_freeze",
+                "model_input_source": "installed_callback_bytes_after_preregistered_parameter_freeze",
                 "controlled_factor": item["controlled_factor"],
                 "factor_signature": item["factor_signature"],
                 "pair_id": item["pair_id"],
                 "design_role": item["design_role"],
                 "hardware_stratum": item["hardware_stratum"],
-                "selection_basis": "official_source_routes_and_hardware_local_strata_no_latency_no_cost_score",
+                "selection_basis": "all_callback_accepted_families_and_hardware_strata_no_latency_no_cost_score",
                 "candidate_set_frozen_before_model_scoring": "1",
                 "is_reserve": str(int(reserve)),
                 "coverage_intent": metadata["coverage_intent"],
@@ -968,8 +1219,10 @@ def main() -> int:
                 "static_legality_ms": f"{legality_ns / 1e6:.9g}",
                 "simulator_scoring_ms": f"{scoring_ns / 1e6:.9g}",
                 "tiling_solver_select_ms": f"{scoring_ns / 1e6:.9g}",
-                "tiling_solver_extra_ms": f"{generation_ns / 1e6:.9g}",
+                "tiling_solver_extra_ms": f"{(generation_ns + callback_ns) / 1e6:.9g}",
                 "tiling_solver_total_ms": f"{(time.perf_counter_ns() - shape_started) / 1e6:.9g}",
+                "callback_validation_ms": f"{callback_ns / 1e6:.9g}",
+                "callback_rejected_count": str(callback_rejected),
                 "source_anchor": str(int(bool(item.get("source_raw_tiling_hex")))),
                 "source_route": item.get("source_route", ""),
                 "source_core_cap": item.get("source_core_cap", ""),
@@ -979,6 +1232,18 @@ def main() -> int:
                 "source_raw_tiling_hex": item.get("source_raw_tiling_hex", ""),
                 "source_route_provenance": item.get("source_route_provenance", ""),
                 "source_validator_violations": item.get("source_validator_violations", ""),
+                "callback_raw_tiling_hex": item["callback_raw_tiling_hex"],
+                "callback_tiling_sha256": item["callback_tiling_sha256"],
+                "callback_tiling_key": str(item["callback_tiling_key"]),
+                "callback_block_dim": str(item["callback_block_dim"]),
+                "callback_workspace_bytes": str(item["callback_workspace_bytes"]),
+                "callback_kernel_suffix": str(item["callback_kernel_suffix"]),
+                "callback_kernel_family": item["callback_kernel_family"],
+                "official_callback_fixed_point": item["official_callback_fixed_point"],
+                "official_default_callback": item["official_default_callback"],
+                "source_callback_bytes_equal": item["source_callback_bytes_equal"],
+                "tiling_parameter_origin": item["tiling_parameter_origin"],
+                "tiling_provenance": item["tiling_provenance"],
             })
             shape_rows.append(row)
             if not reserve:
@@ -987,11 +1252,13 @@ def main() -> int:
         all_rows.extend(shape_rows)
         selected_workloads.append(metadata)
         print(
-            f"SOURCE_FRONTIER_CANDIDATES [{workload_index}/{len(catalog)}] "
+            f"CALLBACK_FRONTIER_CANDIDATES [{workload_index}/{len(catalog)}] "
             f"{workload.workload_id} formal={len(formal)} reserves={len(reserves)} "
-            f"source_anchors={len(anchors)} legal_pool={len(proposed)} families="
+            f"source_anchors={len(anchors)} legal_pool={len(proposed)} "
+            f"callback_rejected={callback_rejected} families="
             f"{','.join(sorted({execution_mode_name(item['knowledge']) for item in formal}))} "
-            f"host_ms={(time.perf_counter_ns() - shape_started) / 1e6:.3f}",
+            f"host_ms={(time.perf_counter_ns() - shape_started) / 1e6:.3f}"
+            f"{f' first_rejection={first_rejection}' if first_rejection else ''}",
             flush=True,
         )
 
@@ -1008,9 +1275,10 @@ def main() -> int:
             writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
             writer.writeheader(); writer.writerows(rows)
     print(
-        "MATMUL_SOURCE_FRONTIER_CANDIDATES "
+        "MATMUL_CALLBACK_FRONTIER_CANDIDATES "
         f"shapes=3 scheduled={len(selected_rows)} formal=2160 reserves=96 "
-        f"baselines=3 records=2163 source_anchored=1 by_family={dict(family_counts)}",
+        f"installed_operator_references=3 records=2163 "
+        f"callback_bytes_required=1 by_family={dict(family_counts)}",
         flush=True,
     )
     return 0

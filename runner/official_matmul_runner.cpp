@@ -894,7 +894,7 @@ ProfileSummary ProfileOfficial(
                     static_cast<double>(batchMs) / std::max(1, options.repeat);
                 summary.valuesMs.push_back(latencyMs);
                 samplesOutput << EscapeCsv(workload.id)
-                              << ",-1,official_operator_baseline," << sample << ','
+                              << ",-1,installed_operator_reference," << sample << ','
                               << std::setprecision(12) << latencyMs << '\n';
                 samplesOutput.flush();
             }
@@ -936,15 +936,15 @@ void WriteProfileRow(
     WriteCsvRecord(output, {
         workload.id,
         "-1",
-        "installed_aclnn_matmul",
-        "official_operator_baseline",
+        "installed_aclnn_matmul_public_api",
+        "installed_operator_reference",
         ToText(workload.m),
         ToText(workload.n),
         ToText(workload.k),
         workload.dtype,
         ToText(workload.transA),
         ToText(workload.transB),
-        "official_matmul_v3",
+        "opaque_public_dispatch",
         "0",
         "0", "0", "0",
         "0", "0", "0",
@@ -965,7 +965,7 @@ void WriteProfileRow(
         ToText(options.warmup),
         ToText(options.repeat),
         ToText(options.samples),
-        "installed_cann_aclnn_matmul",
+        "public_executor_tiling_not_captured",
         "",
         ToText(summary.devicePrepareMs),
         ToText(summary.executorSetupMs),
@@ -1134,13 +1134,13 @@ int main(int argc, char **argv)
 
             for (size_t index = 0; index < workloads.size(); ++index) {
                 const Workload &workload = workloads[index];
-                std::cout << "official_progress: [" << index + 1 << '/' << workloads.size()
+                std::cout << "installed_reference_progress: [" << index + 1 << '/' << workloads.size()
                           << "] " << workload.id << " M=" << workload.m << " N=" << workload.n
                           << " K=" << workload.k << " dtype=" << workload.dtype << std::endl;
                 const ProfileSummary summary =
                     ProfileOfficial(workload, stream, options, samplesOutput);
                 WriteProfileRow(output, workload, summary, options);
-                std::cout << "official_done " << workload.id
+                std::cout << "installed_reference_done " << workload.id
                           << " supported=" << summary.supported
                           << " success=" << summary.success;
                 if (options.preflightOnly) {

@@ -22,25 +22,31 @@ def is_success(row: dict[str, str]) -> bool:
     return row.get("success") in SUCCESS_VALUES
 
 
-def is_api_auto_baseline(row: dict[str, str]) -> bool:
+def is_api_auto_reference(row: dict[str, str]) -> bool:
     return (
-        row.get("candidate_role") == "api_auto_baseline"
-        or row.get("source") == "official_default"
+        row.get("candidate_role") in {"api_auto_reference", "api_auto_baseline"}
+        or row.get("source") in {
+            "installed_public_operator_reference", "official_default"
+        }
     )
 
 
 def is_searched(row: dict[str, str]) -> bool:
-    return row.get("candidate_role") == "searched" and not is_api_auto_baseline(row)
+    return row.get("candidate_role") == "searched" and not is_api_auto_reference(row)
 
 
 def is_bank_seed_control(row: dict[str, str]) -> bool:
     return row.get("candidate_role") == "bank_seed_control"
 
 
-def is_official_operator_baseline(row: dict[str, str]) -> bool:
+def is_installed_operator_reference(row: dict[str, str]) -> bool:
     return (
-        row.get("candidate_role") == "official_operator_baseline"
-        and row.get("source") == "installed_aclnn_matmul"
+        row.get("candidate_role") in {
+            "installed_operator_reference", "official_operator_baseline"
+        }
+        and row.get("source") in {
+            "installed_aclnn_matmul_public_api", "installed_aclnn_matmul"
+        }
     )
 
 
@@ -184,7 +190,7 @@ def main() -> None:
     parser.add_argument(
         "--official-only-comparison",
         action="store_true",
-        help="rank searched tilings only against the installed official baseline",
+        help="rank searched tilings only against the installed public operator reference",
     )
     args = parser.parse_args()
 
@@ -209,16 +215,17 @@ def main() -> None:
     official_grouped: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in custom_rows:
         if row.get("candidate_role") not in {
-            "api_auto_baseline", "bank_seed_control", "searched",
+            "api_auto_reference", "api_auto_baseline",
+            "bank_seed_control", "searched",
         }:
             raise ValueError(
                 f"{args.input}: unsupported candidate_role={row.get('candidate_role')!r}"
             )
         custom_grouped[row["workload_id"]].append(row)
     for row in official_rows:
-        if not is_official_operator_baseline(row):
+        if not is_installed_operator_reference(row):
             raise ValueError(
-                f"{args.official_input}: official baseline identity contract failed"
+                f"{args.official_input}: installed reference identity contract failed"
             )
         official_grouped[row["workload_id"]].append(row)
 
@@ -233,9 +240,9 @@ def main() -> None:
         }
         if len(custom_shapes) != 1 or official_shapes != custom_shapes:
             raise ValueError(
-                f"{workload_id}: custom/official workload shape mismatch "
+                f"{workload_id}: custom/reference workload shape mismatch "
                 f"(custom={sorted(custom_shapes)!r}, "
-                f"official={sorted(official_shapes)!r})"
+                f"reference={sorted(official_shapes)!r})"
             )
 
     successful_custom = [row for row in custom_rows if is_success(row)]
@@ -252,7 +259,7 @@ def main() -> None:
             (row for row in custom_all if is_success(row)),
             key=lambda row: as_float(row, "median_ms"),
         )
-        api_all = [row for row in custom_all if is_api_auto_baseline(row)]
+        api_all = [row for row in custom_all if is_api_auto_reference(row)]
         api_rows = [row for row in api_all if is_success(row)]
         api_auto = (
             min(api_rows, key=lambda row: as_float(row, "median_ms"))
@@ -287,9 +294,9 @@ def main() -> None:
             first_ranked: dict[str, str] | None = None
             official_status = reference_failure_status(
                 official_all,
-                "official_operator_not_measured",
-                "official_operator_failed",
-                "official_operator_unsupported",
+                "installed_public_reference_not_measured",
+                "installed_public_reference_failed",
+                "installed_public_reference_unsupported",
             )
             for rank_value, row in enumerate(custom_success, 1):
                 enriched = dict(row)
@@ -304,13 +311,13 @@ def main() -> None:
                     api_auto,
                     "api_auto",
                     "api_auto_failed" if api_all else "api_auto_unavailable",
-                    "api_auto_baseline",
+                    "api_auto_reference",
                 )
                 fill_ranked_reference(
                     enriched,
                     row,
                     official_operator,
-                    "official_operator",
+                    "installed_public_reference",
                     official_status,
                 )
                 fill_ranked_reference(
@@ -410,38 +417,38 @@ def main() -> None:
                 if bank_control is None
                 else "no_searched_candidate"
             ),
-            "official_operator_source": (
+            "installed_public_reference_source": (
                 official_operator.get("source", "")
                 if official_operator
                 else official_all[0].get("source", "")
                 if official_all
                 else ""
             ),
-            "official_operator_success": "1" if official_operator else "0",
-            "official_operator_error": (
+            "installed_public_reference_success": "1" if official_operator else "0",
+            "installed_public_reference_error": (
                 ""
                 if official_operator
                 else official_all[0].get("error", "")
                 if official_all
                 else ""
             ),
-            "official_operator_median_ms": (
+            "installed_public_reference_median_ms": (
                 official_operator.get("median_ms", "") if official_operator else ""
             ),
-            "official_operator_stddev_ms": (
+            "installed_public_reference_stddev_ms": (
                 official_operator.get("stddev_ms", "") if official_operator else ""
             ),
-            "official_operator_tflops": (
+            "installed_public_reference_tflops": (
                 official_operator.get("tflops", "") if official_operator else ""
             ),
-            "speedup_vs_official_operator": "",
-            "latency_change_pct_vs_official_operator": "",
-            "official_operator_noise_threshold_pct": "",
-            "official_operator_verdict": reference_failure_status(
+            "speedup_vs_installed_public_reference": "",
+            "latency_change_pct_vs_installed_public_reference": "",
+            "installed_public_reference_noise_threshold_pct": "",
+            "installed_public_reference_verdict": reference_failure_status(
                 official_all,
-                "official_operator_not_measured",
-                "official_operator_failed",
-                "official_operator_unsupported",
+                "installed_public_reference_not_measured",
+                "installed_public_reference_failed",
+                "installed_public_reference_unsupported",
             )
             if official_operator is None
             else "no_searched_candidate",
@@ -489,11 +496,11 @@ def main() -> None:
             )
             comparison.update(
                 {
-                    "speedup_vs_official_operator": f"{speedup:.12g}",
-                    "latency_change_pct_vs_official_operator": f"{change:.12g}",
-                    "official_operator_noise_threshold_pct": f"{threshold:.12g}",
-                    "official_operator_verdict": verdict,
-                    "primary_reference": "official_operator",
+                    "speedup_vs_installed_public_reference": f"{speedup:.12g}",
+                    "latency_change_pct_vs_installed_public_reference": f"{change:.12g}",
+                    "installed_public_reference_noise_threshold_pct": f"{threshold:.12g}",
+                    "installed_public_reference_verdict": verdict,
+                    "primary_reference": "installed_public_operator",
                     "primary_verdict": verdict,
                 }
             )
@@ -509,11 +516,11 @@ def main() -> None:
                     optimization_result = (
                         "improved" if official_verdict == "improved" else "not_improved"
                     )
-                    selection_reason = "official_only_solver_comparison"
+                    selection_reason = "installed_public_reference_comparison"
                     combined_verdict = official_verdict
                 else:
                     optimization_result = "baseline_unavailable"
-                    selection_reason = "official_operator_baseline_not_available"
+                    selection_reason = "installed_public_reference_not_available"
                     combined_verdict = official_verdict
             else:
                 (
@@ -526,7 +533,7 @@ def main() -> None:
                 and not args.official_only_comparison
             ):
                 comparison["primary_reference"] = (
-                    "official_operator+bank_seed_control"
+                    "installed_public_operator+bank_seed_control"
                 )
                 comparison["primary_verdict"] = combined_verdict
             comparison.update(
@@ -563,11 +570,11 @@ def main() -> None:
         "latency_change_pct_vs_api_auto",
         "api_auto_noise_threshold_pct",
         "api_auto_verdict",
-        "official_operator_median_ms",
-        "speedup_vs_official_operator",
-        "latency_change_pct_vs_official_operator",
-        "official_operator_noise_threshold_pct",
-        "official_operator_verdict",
+        "installed_public_reference_median_ms",
+        "speedup_vs_installed_public_reference",
+        "latency_change_pct_vs_installed_public_reference",
+        "installed_public_reference_noise_threshold_pct",
+        "installed_public_reference_verdict",
         "bank_seed_median_ms",
         "speedup_vs_bank_seed",
         "latency_change_pct_vs_bank_seed",

@@ -9,9 +9,10 @@ usage() {
     cat <<'USAGE'
 Usage: profiling/run_npu.sh --mode full [-d PHYSICAL_NPU_ID]
 
-MatMulV3 original-source-route frontier mapping for three preregistered
-shapes.  The formal output contains 2,160 validated candidate
-latencies plus three separate official baselines.
+MatMulV3 installed-callback frontier mapping for three preregistered shapes.
+Every direct tiling buffer is serialized by the installed CANN callback and
+the formal output contains 2,160 candidate latencies plus three separate
+installed public-operator references.
 USAGE
 }
 
@@ -95,7 +96,7 @@ CAMPAIGN_ID="$({
     find src/matmul/mat_mul_v3 cmake -type f -print0 | sort -z | xargs -0 sha256sum
     find "${MATMUL_V3_SOURCE_DIR}" -type f -print0 | sort -z | xargs -0 sha256sum
 } | sha256sum | cut -c1-20)"
-CAMPAIGN_DIR="${ROOT}/results/matmul_source_route_frontier_direct_v1/${CAMPAIGN_ID}"
+CAMPAIGN_DIR="${ROOT}/results/matmul_callback_frontier_direct_v2/${CAMPAIGN_ID}"
 CATALOG="${CAMPAIGN_DIR}/catalog.csv"
 WORKLOADS="${CAMPAIGN_DIR}/workloads.csv"
 CANDIDATES="${CAMPAIGN_DIR}/candidates.csv"
@@ -111,15 +112,16 @@ cp "${CATALOG_TMP}" "${CATALOG}"
 
 if [[ -s "${ANALYSIS}" ]] && \
    grep -q '"status": "complete"' "${ANALYSIS}"; then
-    echo "MATMUL_SOURCE_FRONTIER_COMPLETE shapes=3 records=2163"
+    echo "MATMUL_CALLBACK_FRONTIER_COMPLETE shapes=3 records=2163"
     echo "analysis=${ANALYSIS} logs=${LOG_DIR} measurement_log=${CAMPAIGN_DIR}/measurement_progress.log"
     exit 0
 fi
 
-echo "CAMPAIGN_READY operator=matmul shapes=3 candidate_records=2160 official_baselines=3 records=2163 device=${PHYSICAL_DEVICE}"
+echo "CAMPAIGN_READY operator=matmul shapes=3 candidate_records=2160 installed_operator_references=3 records=2163 device=${PHYSICAL_DEVICE}"
 echo "measurement=1_warmup+3_device_event_samples+validate_last_timed_output"
-echo "design=every_applicable_original_source_route_and_core_cap_plus_hardware_local_frontier"
-echo "candidate_selection=source_routes_no_runtimekb_no_latency_no_cost_score"
+echo "design=all_installed_callback_accepted_families_plus_source_routes_and_hardware_frontier"
+echo "candidate_selection=callback_fixed_points_no_latency_no_cost_score"
+echo "tiling_bytes=installed_cann81_matmulv3_callback_output_only"
 echo "logs=${LOG_DIR}"
 echo "CAMPAIGN_STAGE_TIMING stage=workload_catalog wall_ms=${catalog_wall_ms}"
 
@@ -238,7 +240,7 @@ source_route_wall_ms=$(( ($(date +%s%N) - source_route_started_ns) / 1000000 ))
 echo "CAMPAIGN_STAGE_TIMING stage=source_route_discovery wall_ms=${source_route_wall_ms}"
 
 export DISABLE_MEASUREMENT_HISTORY=1
-export SEARCH_SCOPE=matmul_source_frontier_v1
+export SEARCH_SCOPE=matmul_callback_frontier_v2
 export SEARCH_OUTPUT="${CANDIDATES}"
 export SEARCH_ALL_OUTPUT="${ALL_CANDIDATES}"
 export SEARCH_TILING_DIR="${TILING_DIR}"
@@ -272,6 +274,8 @@ searched = Counter(
 hashes = {}
 source_all = set()
 production_all = set()
+default_callbacks = set()
+families = {}
 for row in candidates:
     hashes.setdefault(row["workload_id"], set()).add(
         row.get("model_schedule_sha256", "")
@@ -284,6 +288,10 @@ for row in candidates:
         and len(row.get("source_raw_tiling_hex", "")) == 544
     ):
         source_all.add(row["workload_id"])
+    if row.get("candidate_role") == "searched" and row.get("is_reserve") != "1":
+        families.setdefault(row["workload_id"], set()).add(
+            row.get("model_kernel_family", "")
+        )
     try:
         provenance = json.loads(row.get("source_route_provenance") or "[]")
     except (json.JSONDecodeError, TypeError):
@@ -295,6 +303,12 @@ for row in candidates:
         for item in provenance if isinstance(item, dict)
     ):
         production_all.add(row["workload_id"])
+    if (
+        row.get("candidate_role") == "searched"
+        and row.get("is_reserve") != "1"
+        and row.get("official_default_callback") == "1"
+    ):
+        default_callbacks.add(row["workload_id"])
 if (
     len(workloads) != 3
     or len(set(workload_ids)) != 3
@@ -303,7 +317,7 @@ if (
          row["trans_a"], row["trans_b"])
         for row in workloads
     }) != 3
-    or {row.get("search_family") for row in workloads} != {"source_route_frontier"}
+    or {row.get("search_family") for row in workloads} != {"installed_callback_frontier"}
     or any("target_kernel_family" in row for row in workloads)
     or len(candidates) != 2256
     or set(candidate_ids) != set(workload_ids)
@@ -317,10 +331,28 @@ if (
     or any(len(hashes[row["workload_id"]]) != searched[row["workload_id"]] for row in workloads)
     or source_all != set(workload_ids)
     or production_all != set(workload_ids)
+    or default_callbacks != set(workload_ids)
+    or set(families) != set(workload_ids)
+    or any(
+        values != {"BASE", "SINGLE_CORE_SPLIT_K", "DETERMINISTIC_SPLIT_K"}
+        for values in families.values()
+    )
     or not all_candidates
     or not all(row.get("global_model_rank", "").isdigit() for row in candidates)
     or not all(row.get("controlled_factor", "") for row in candidates)
     or not all(row.get("candidate_set_frozen_before_model_scoring") == "1" for row in candidates)
+    or not all(row.get("official_callback_fixed_point") == "1" for row in candidates)
+    or not all(len(row.get("callback_raw_tiling_hex", "")) == 544 for row in candidates)
+    or not all(len(row.get("callback_tiling_sha256", "")) == 64 for row in candidates)
+    or not all(
+        row.get("model_schedule_sha256") == row.get("callback_tiling_sha256")
+        for row in candidates
+    )
+    or not all(
+        row.get("tiling_provenance")
+        == "installed_cann81_matmulv3_callback_bytes"
+        for row in candidates
+    )
 ):
     raise SystemExit(1)
 PY
@@ -335,11 +367,11 @@ search_started_ns="$(date +%s%N)"
 set +e
 "${ROOT}/scripts/run_search.sh" "${CATALOG}" 2>&1 | \
     tee "${SEARCH_LOG}" | awk '
-        /SOURCE_FRONTIER_CANDIDATES \[/ {
+        /CALLBACK_FRONTIER_CANDIDATES \[/ {
             split(substr($2,2,length($2)-2), a, "/");
             if (a[1] == 1 || a[1] == a[2] || a[1] % 20 == 0) print;
         }
-        /MATMUL_SOURCE_FRONTIER_CANDIDATES|fatal:/ {print}
+        /MATMUL_CALLBACK_FRONTIER_CANDIDATES|fatal:/ {print}
     '
 search_pipeline_status=("${PIPESTATUS[@]}")
 search_rc="${search_pipeline_status[0]}"
@@ -394,11 +426,12 @@ python3 tools/direct_matmul_tiling.py \
     --manifest "${DETAILS_DIR}/direct_manifest.csv" \
     --l2-bytes "${PLATFORM_L2_BYTES}" \
     --aic-cores "${PLATFORM_AIC_CORES}" \
-    --include-reserves >/dev/null
+    --include-reserves \
+    --require-official-callback >/dev/null
 direct_preflight_wall_ms=$(( ($(date +%s%N) - direct_preflight_started_ns) / 1000000 ))
 echo "DIRECT_TILING_PREFLIGHT passed candidates=2256 wall_ms=${direct_preflight_wall_ms}"
 
-echo "NPU_MEASUREMENT_BEGIN shapes=3 candidate_records=2160 official_baselines=3 records=2163"
+echo "NPU_MEASUREMENT_BEGIN shapes=3 candidate_records=2160 installed_operator_references=3 records=2163"
 export KEEP_DETAILS=1
 export WARMUP=1
 export REPEAT=1
@@ -411,7 +444,7 @@ set +e
 "${ROOT}/scripts/profile_npu.sh" \
     "${CANDIDATES}" "${OUT_STEM}" "${WORKLOADS}" \
     2>&1 | awk '
-        /OFFICIAL_BASELINE_|DIRECT_VARIANT_|DIRECT_MEASUREMENT_|NPU_RESULTS_READY|fatal:|Traceback/ {
+        /INSTALLED_PUBLIC_REFERENCE_|DIRECT_VARIANT_|DIRECT_MEASUREMENT_|NPU_RESULTS_READY|fatal:|Traceback/ {
             print; fflush();
         }
     ' | tee "${PROFILE_LOG}"
