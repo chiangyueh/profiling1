@@ -4,15 +4,19 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE=""
 PHYSICAL_DEVICE="${PHYSICAL_NPU_ID:-2}"
+SHAPE_COUNT=14
+MODEL_RECORDS=14
+TOTAL_RECORDS=28
 
 usage() {
     cat <<'USAGE'
 Usage: profiling/run_npu.sh --mode full [-d PHYSICAL_NPU_ID]
 
-MatMulV3 installed-callback frontier mapping for three preregistered shapes.
-Every direct tiling buffer is serialized by the installed CANN callback and
-the formal output contains 2,160 candidate latencies plus three separate
-installed public-operator references.
+Deployment-style MatMul comparison.  For each of 14 FP16/NN shapes, a
+bounded shape+hardware cost model freezes exactly one direct tiling before a
+separate installed aclnnMatmul reference is run.  The NPU measures only those
+two executions per shape; model selection never consumes reference tilings,
+callbacks, RuntimeKb records, or measured latency.
 USAGE
 }
 
@@ -50,7 +54,7 @@ done < <(env)
 source "${ROOT}/scripts/env.sh" >/dev/null
 
 CANN_VERSION_FILE="${CANN_ROOT}/version.cfg"
-MATMUL_V3_SOURCE_DIR="${CANN_ROOT}/opp/built-in/op_impl/ai_core/tbe/impl/ascendc/mat_mul_v3"
+MATMUL_V3_SOURCE="${CANN_ROOT}/opp/built-in/op_impl/ai_core/tbe/impl/ascendc/mat_mul_v3/mat_mul_v3.cpp"
 [[ -f "${CANN_VERSION_FILE}" ]] || {
     echo "fatal: CANN version.cfg is missing: ${CANN_VERSION_FILE}" >&2
     exit 2
@@ -59,31 +63,31 @@ grep -Eq '^toolkit_running_version=.*:8\.1' "${CANN_VERSION_FILE}" || {
     echo "fatal: this direct campaign requires installed CANN 8.1" >&2
     exit 2
 }
-[[ -f "${MATMUL_V3_SOURCE_DIR}/mat_mul_v3.cpp" ]] || {
+[[ -f "${MATMUL_V3_SOURCE}" ]] || {
     echo "fatal: installed CANN 8.1 MatMulV3 source is missing" >&2
     exit 2
 }
 
 catalog_started_ns="$(date +%s%N)"
-CATALOG_TMP="$(mktemp "${TMPDIR:-/tmp}/matmul-source-frontier.XXXXXX.csv")"
+CATALOG_TMP="$(mktemp "${TMPDIR:-/tmp}/matmul-deployment.XXXXXX.csv")"
 cleanup() {
     [[ -f "${CATALOG_TMP:-}" ]] && rm -f -- "${CATALOG_TMP}"
 }
 trap cleanup EXIT
-
-python3 tools/generate_matmul_source_frontier_workloads.py \
+python3 tools/generate_matmul_deployment_workloads.py \
     --output "${CATALOG_TMP}" >/dev/null
 catalog_wall_ms=$(( ($(date +%s%N) - catalog_started_ns) / 1000000 ))
+CATALOG_SHA256="$(sha256sum "${CATALOG_TMP}" | cut -d' ' -f1)"
+
 CAMPAIGN_ID="$({
+    printf 'catalog_sha256=%s\n' "${CATALOG_SHA256}"
     sha256sum \
-        "${CATALOG_TMP}" \
-        tools/generate_matmul_source_frontier_workloads.py \
-        tools/generate_matmul_source_frontier_candidates.py \
-        tools/collect_matmul_source_routes.py \
-        tools/analyze_matmul_hardware_calibration.py \
+        tools/generate_matmul_deployment_workloads.py \
+        tools/select_matmul_deployment_tilings.py \
+        tools/analyze_matmul_deployment_comparison.py \
         tools/direct_matmul_tiling.py \
         tools/profile_direct_matmul.py \
-        tools/refine_matmul_v3_candidates.py \
+        tools/rank_npu_results.py \
         run_npu.sh \
         scripts/run_search.sh \
         scripts/profile_npu.sh \
@@ -93,35 +97,33 @@ CAMPAIGN_ID="$({
         direct_matmul/runner.cpp \
         npu_cost_model/*.py \
         "${CANN_VERSION_FILE}"
-    find src/matmul/mat_mul_v3 cmake -type f -print0 | sort -z | xargs -0 sha256sum
-    find "${MATMUL_V3_SOURCE_DIR}" -type f -print0 | sort -z | xargs -0 sha256sum
+    find cmake_npu -type f -print0 | sort -z | xargs -0 sha256sum
 } | sha256sum | cut -c1-20)"
-CAMPAIGN_DIR="${ROOT}/results/matmul_callback_frontier_direct_v2/${CAMPAIGN_ID}"
-CATALOG="${CAMPAIGN_DIR}/catalog.csv"
-WORKLOADS="${CAMPAIGN_DIR}/workloads.csv"
-CANDIDATES="${CAMPAIGN_DIR}/candidates.csv"
-ALL_CANDIDATES="${CAMPAIGN_DIR}/fixed_design_scored.csv"
+CAMPAIGN_DIR="${ROOT}/results/matmul_deployment_compare_v1/${CAMPAIGN_ID}"
+CATALOG="${CAMPAIGN_DIR}/workloads.csv"
+CANDIDATES="${CAMPAIGN_DIR}/model_top1.csv"
+SCORED_POOL="${CAMPAIGN_DIR}/model_scored_pool.csv"
+SELECTION_AUDIT="${CAMPAIGN_DIR}/model_selection.jsonl"
 TILING_DIR="${CAMPAIGN_DIR}/tilings"
 OUT_STEM="${CAMPAIGN_DIR}/measurement"
 DETAILS_DIR="${OUT_STEM}_details"
 LOG_DIR="${CAMPAIGN_DIR}/logs"
-ANALYSIS="${CAMPAIGN_DIR}/analysis.json"
-SOURCE_ROUTE_AUDIT="${CAMPAIGN_DIR}/source_routes.jsonl"
+ANALYSIS="${CAMPAIGN_DIR}/comparison.json"
+FREEZE_RECORD="${CAMPAIGN_DIR}/candidate_freeze.json"
 mkdir -p "${CAMPAIGN_DIR}" "${TILING_DIR}" "${LOG_DIR}"
 cp "${CATALOG_TMP}" "${CATALOG}"
 
-if [[ -s "${ANALYSIS}" ]] && \
-   grep -q '"status": "complete"' "${ANALYSIS}"; then
-    echo "MATMUL_CALLBACK_FRONTIER_COMPLETE shapes=3 records=2163"
-    echo "analysis=${ANALYSIS} logs=${LOG_DIR} measurement_log=${CAMPAIGN_DIR}/measurement_progress.log"
+if [[ -s "${ANALYSIS}" ]] && grep -q '"status":"complete"' "${ANALYSIS}"; then
+    echo "MATMUL_DEPLOYMENT_COMPARISON_COMPLETE shapes=${SHAPE_COUNT} records=${TOTAL_RECORDS}"
+    echo "comparison=${ANALYSIS} selection=${SELECTION_AUDIT} logs=${LOG_DIR}"
     exit 0
 fi
 
-echo "CAMPAIGN_READY operator=matmul shapes=3 candidate_records=2160 installed_operator_references=3 records=2163 device=${PHYSICAL_DEVICE}"
+echo "CAMPAIGN_READY operator=matmul shapes=${SHAPE_COUNT} model_candidates=${MODEL_RECORDS} installed_references=${SHAPE_COUNT} records=${TOTAL_RECORDS} device=${PHYSICAL_DEVICE}"
 echo "measurement=1_warmup+3_device_event_samples+validate_last_timed_output"
-echo "design=all_installed_callback_accepted_families_plus_source_routes_and_hardware_frontier"
-echo "candidate_selection=callback_fixed_points_no_latency_no_cost_score"
-echo "tiling_bytes=installed_cann81_matmulv3_callback_output_only"
+echo "design=one_independent_model_top1_plus_one_separate_installed_matmul_reference_per_shape"
+echo "candidate_selection=bounded_shape_hardware_cost_model_max_32_internal_scores_per_shape"
+echo "independence=no_reference_seed_no_callback_bytes_no_runtimekb_no_latency_history"
 echo "logs=${LOG_DIR}"
 echo "CAMPAIGN_STAGE_TIMING stage=workload_catalog wall_ms=${catalog_wall_ms}"
 
@@ -175,203 +177,26 @@ fi
 runner_build_wall_ms=$(( ($(date +%s%N) - runner_build_started_ns) / 1000000 ))
 echo "CAMPAIGN_STAGE_TIMING stage=official_runner_build wall_ms=${runner_build_wall_ms} cached=${runner_build_cached}"
 
-SOURCE_HOST_HASH="$({
-    find src/matmul/mat_mul_v3 cmake -type f -print0 | sort -z | xargs -0 sha256sum
-    sha256sum CMakeLists.txt "${CANN_VERSION_FILE}"
-} | sha256sum | cut -c1-20)"
-SOURCE_STATE="${ROOT}/.benchmark_state/matmul_source_route_host/${SOURCE_HOST_HASH}"
-SOURCE_BUILD="${SOURCE_STATE}/build"
-SOURCE_INSTALL="${SOURCE_STATE}/install"
-SOURCE_PACKAGE_ROOT="${SOURCE_INSTALL}/packages/vendors/matmul_source_routes"
-SOURCE_OPAPI="${SOURCE_PACKAGE_ROOT}/op_api/lib/libcust_opapi.so"
-SOURCE_TILING_LIB_GLOB="${SOURCE_PACKAGE_ROOT}/op_impl/ai_core/tbe/op_tiling/lib/linux"/*/libcust_opmaster_rt2.0.so
-source_host_started_ns="$(date +%s%N)"
-if [[ ! -f "${SOURCE_OPAPI}" ]] || ! compgen -G "${SOURCE_TILING_LIB_GLOB}" >/dev/null; then
-    mkdir -p "${SOURCE_BUILD}" "${SOURCE_INSTALL}"
-    echo "SOURCE_HOST_PACKAGE_BUILD begin jobs=1"
-    SOURCE_BUILD_LOG="${SOURCE_STATE}/build.log"
-    if ! cmake -S "${ROOT}" -B "${SOURCE_BUILD}" -G "Unix Makefiles" \
-        -DBUILD_OPEN_PROJECT=ON \
-        -DASCEND_COMPUTE_UNIT=ascend910b \
-        -DASCEND_OP_NAME=mat_mul_v3 \
-        -DVENDOR_NAME=matmul_source_routes \
-        -DCUSTOM_ASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}" \
-        -DASCEND_THIRD_LIB_PATH="${ROOT}/third_party" \
-        -DENABLE_OPS_KERNEL=OFF \
-        -DENABLE_TEST=OFF \
-        -DENABLE_EXAMPLE=OFF \
-        -DENABLE_CCACHE=OFF \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX="${SOURCE_INSTALL}" \
-        >"${SOURCE_BUILD_LOG}" 2>&1 || \
-       ! cmake --build "${SOURCE_BUILD}" --target package -- -j1 \
-        >>"${SOURCE_BUILD_LOG}" 2>&1 || \
-       ! cmake --install "${SOURCE_BUILD}" >>"${SOURCE_BUILD_LOG}" 2>&1; then
-        echo "SOURCE_HOST_PACKAGE_BUILD failed log=${SOURCE_BUILD_LOG}"
-        tail -20 "${SOURCE_BUILD_LOG}"
-        exit 1
-    fi
-    echo "SOURCE_HOST_PACKAGE_BUILD passed"
-    source_host_cached=0
-else
-    echo "SOURCE_HOST_PACKAGE_BUILD cached"
-    source_host_cached=1
-fi
-if [[ ! -f "${SOURCE_OPAPI}" ]] || ! compgen -G "${SOURCE_TILING_LIB_GLOB}" >/dev/null; then
-    echo "fatal: private MatMul source host package is incomplete" >&2
-    exit 1
-fi
-SOURCE_TILING_LIBRARY="$(compgen -G "${SOURCE_TILING_LIB_GLOB}" | head -1)"
-source_host_wall_ms=$(( ($(date +%s%N) - source_host_started_ns) / 1000000 ))
-echo "CAMPAIGN_STAGE_TIMING stage=source_host_package wall_ms=${source_host_wall_ms} cached=${source_host_cached}"
-
-source_route_started_ns="$(date +%s%N)"
-python3 tools/collect_matmul_source_routes.py \
-    --runner "${ROOT}/build/official_matmul_runner" \
-    --workloads "${CATALOG}" \
-    --audit "${SOURCE_ROUTE_AUDIT}" \
-    --state-dir "${CAMPAIGN_DIR}/source_route_state" \
-    --package-root "${SOURCE_PACKAGE_ROOT}" \
-    --opapi "${SOURCE_OPAPI}" \
-    --tiling-library "${SOURCE_TILING_LIBRARY}" \
-    --device 0 \
-    --max-cores 20
-source_route_wall_ms=$(( ($(date +%s%N) - source_route_started_ns) / 1000000 ))
-echo "CAMPAIGN_STAGE_TIMING stage=source_route_discovery wall_ms=${source_route_wall_ms}"
-
 export DISABLE_MEASUREMENT_HISTORY=1
-export SEARCH_SCOPE=matmul_callback_frontier_v2
+export SEARCH_SCOPE=matmul_deployment_top1_v1
 export SEARCH_OUTPUT="${CANDIDATES}"
-export SEARCH_ALL_OUTPUT="${ALL_CANDIDATES}"
+export SEARCH_ALL_OUTPUT="${SCORED_POOL}"
 export SEARCH_TILING_DIR="${TILING_DIR}"
-export FRONTIER_WORKLOADS_OUTPUT="${WORKLOADS}"
+export DEPLOYMENT_SELECTION_AUDIT="${SELECTION_AUDIT}"
 export MEASUREMENT_JSONL_LOG_DIRECTORY="${LOG_DIR}"
 export MEASUREMENT_JSONL_LOG_MAX_BYTES=52428800
-export SOURCE_ROUTE_AUDIT
-
-candidate_contract() {
-python3 - "${WORKLOADS}" "${CANDIDATES}" "${ALL_CANDIDATES}" "${SOURCE_ROUTE_AUDIT}" <<'PY'
-import csv
-import json
-import sys
-from collections import Counter
-from pathlib import Path
-
-if not all(Path(value).is_file() for value in sys.argv[1:]):
-    raise SystemExit(1)
-workloads = list(csv.DictReader(open(sys.argv[1], newline="", encoding="utf-8")))
-candidates = list(csv.DictReader(open(sys.argv[2], newline="", encoding="utf-8")))
-all_candidates = list(csv.DictReader(open(sys.argv[3], newline="", encoding="utf-8")))
-workload_ids = [row["workload_id"] for row in workloads]
-candidate_ids = [
-    row["workload_id"] for row in candidates
-    if row.get("candidate_role") == "searched"
-]
-searched = Counter(
-    row["workload_id"] for row in candidates
-    if row.get("candidate_role") == "searched"
-)
-hashes = {}
-source_all = set()
-production_all = set()
-default_callbacks = set()
-families = {}
-for row in candidates:
-    hashes.setdefault(row["workload_id"], set()).add(
-        row.get("model_schedule_sha256", "")
-    )
-    if (
-        row.get("candidate_role") == "searched"
-        and row.get("source_anchor") == "1"
-        and "ALL" in row.get("source_route", "").split("+")
-        and "20" in row.get("source_core_cap", "").split(",")
-        and len(row.get("source_raw_tiling_hex", "")) == 544
-    ):
-        source_all.add(row["workload_id"])
-    if row.get("candidate_role") == "searched" and row.get("is_reserve") != "1":
-        families.setdefault(row["workload_id"], set()).add(
-            row.get("model_kernel_family", "")
-        )
-    try:
-        provenance = json.loads(row.get("source_route_provenance") or "[]")
-    except (json.JSONDecodeError, TypeError):
-        provenance = []
-    if row.get("source_anchor") == "1" and any(
-        item.get("source") == "production_dispatcher"
-        and item.get("route") == "ALL"
-        and int(item.get("core_cap", 0)) == 20
-        for item in provenance if isinstance(item, dict)
-    ):
-        production_all.add(row["workload_id"])
-    if (
-        row.get("candidate_role") == "searched"
-        and row.get("is_reserve") != "1"
-        and row.get("official_default_callback") == "1"
-    ):
-        default_callbacks.add(row["workload_id"])
-if (
-    len(workloads) != 3
-    or len(set(workload_ids)) != 3
-    or len({
-        (row["m"], row["n"], row["k"], row["dtype"],
-         row["trans_a"], row["trans_b"])
-        for row in workloads
-    }) != 3
-    or {row.get("search_family") for row in workloads} != {"installed_callback_frontier"}
-    or any("target_kernel_family" in row for row in workloads)
-    or len(candidates) != 2256
-    or set(candidate_ids) != set(workload_ids)
-    or len(searched) != 3
-    or any(
-        searched[row["workload_id"]]
-        != int(row["required_successful_tilings"]) + 32
-        for row in workloads
-    )
-    or len(hashes) != 3
-    or any(len(hashes[row["workload_id"]]) != searched[row["workload_id"]] for row in workloads)
-    or source_all != set(workload_ids)
-    or production_all != set(workload_ids)
-    or default_callbacks != set(workload_ids)
-    or set(families) != set(workload_ids)
-    or any(
-        values != {"BASE", "SINGLE_CORE_SPLIT_K", "DETERMINISTIC_SPLIT_K"}
-        for values in families.values()
-    )
-    or not all_candidates
-    or not all(row.get("global_model_rank", "").isdigit() for row in candidates)
-    or not all(row.get("controlled_factor", "") for row in candidates)
-    or not all(row.get("candidate_set_frozen_before_model_scoring") == "1" for row in candidates)
-    or not all(row.get("official_callback_fixed_point") == "1" for row in candidates)
-    or not all(len(row.get("callback_raw_tiling_hex", "")) == 544 for row in candidates)
-    or not all(len(row.get("callback_tiling_sha256", "")) == 64 for row in candidates)
-    or not all(
-        row.get("model_schedule_sha256") == row.get("callback_tiling_sha256")
-        for row in candidates
-    )
-    or not all(
-        row.get("tiling_provenance")
-        == "installed_cann81_matmulv3_callback_bytes"
-        for row in candidates
-    )
-):
-    raise SystemExit(1)
-PY
-}
-if candidate_contract >/dev/null 2>&1
-then
-    export REUSE_SOURCE_FRONTIER_CANDIDATES=1
+if [[ -s "${CANDIDATES}" && -s "${SCORED_POOL}" && -s "${SELECTION_AUDIT}" ]]; then
+    export REUSE_DEPLOYMENT_SELECTION=1
 fi
 
-SEARCH_LOG="${CAMPAIGN_DIR}/candidate_generation.log"
+SEARCH_LOG="${CAMPAIGN_DIR}/model_selection.log"
 search_started_ns="$(date +%s%N)"
 set +e
 "${ROOT}/scripts/run_search.sh" "${CATALOG}" 2>&1 | \
     tee "${SEARCH_LOG}" | awk '
-        /CALLBACK_FRONTIER_CANDIDATES \[/ {
-            split(substr($2,2,length($2)-2), a, "/");
-            if (a[1] == 1 || a[1] == a[2] || a[1] % 20 == 0) print;
+        /MODEL_TOP1 \[/ || /MATMUL_DEPLOYMENT_SELECTION/ || /fatal:/ || /^CANN platform=/ {
+            print; fflush();
         }
-        /MATMUL_CALLBACK_FRONTIER_CANDIDATES|fatal:/ {print}
     '
 search_pipeline_status=("${PIPESTATUS[@]}")
 search_rc="${search_pipeline_status[0]}"
@@ -381,9 +206,9 @@ if [[ "${search_rc}" -eq 0 && \
 fi
 set -e
 search_wall_ms=$(( ($(date +%s%N) - search_started_ns) / 1000000 ))
-echo "CAMPAIGN_STAGE_TIMING stage=tiling_selection wall_ms=${search_wall_ms}" | tee -a "${SEARCH_LOG}"
+echo "CAMPAIGN_STAGE_TIMING stage=model_tiling_selection wall_ms=${search_wall_ms}" | tee -a "${SEARCH_LOG}"
 if [[ "${search_rc}" -ne 0 ]]; then
-    echo "CANDIDATE_GENERATION_FAILED log=${SEARCH_LOG}"
+    echo "MODEL_SELECTION_FAILED log=${SEARCH_LOG}"
     exit "${search_rc}"
 fi
 
@@ -405,19 +230,129 @@ for value in \
     "${PLATFORM_L0B_BYTES}" "${PLATFORM_L0C_BYTES}" \
     "${PLATFORM_L1_BYTES}" "${PLATFORM_L2_BYTES}" \
     "${PLATFORM_L2_BPC}" "${PLATFORM_HBM_BPC}"; do
-    if [[ -z "${value}" ]]; then
-        echo "CANDIDATE_GENERATION_FAILED invalid_platform_log=${SEARCH_LOG}"
+    [[ -n "${value}" ]] || {
+        echo "MODEL_SELECTION_FAILED invalid_platform_log=${SEARCH_LOG}"
         exit 1
-    fi
+    }
 done
 export PLATFORM_AIC_CORES PLATFORM_L0A_BYTES PLATFORM_L0B_BYTES
 export PLATFORM_L0C_BYTES PLATFORM_L1_BYTES PLATFORM_L2_BYTES
 export PLATFORM_L2_BPC PLATFORM_HBM_BPC
 
-if ! candidate_contract >/dev/null 2>&1; then
-    echo "CANDIDATE_CONTRACT_FAILED log=${SEARCH_LOG}"
-    exit 1
-fi
+python3 - "${CATALOG}" "${CANDIDATES}" "${SCORED_POOL}" "${SELECTION_AUDIT}" \
+    tools/select_matmul_deployment_tilings.py <<'PY'
+import ast
+import csv
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+catalog_path, candidate_path, pool_path, audit_path, selector_path = map(Path, sys.argv[1:])
+catalog = list(csv.DictReader(catalog_path.open(newline="", encoding="utf-8")))
+candidates = list(csv.DictReader(candidate_path.open(newline="", encoding="utf-8")))
+pool = list(csv.DictReader(pool_path.open(newline="", encoding="utf-8")))
+audits = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines() if line]
+ids = [row["workload_id"] for row in catalog]
+candidate_ids = [row["workload_id"] for row in candidates]
+pool_counts = Counter(row["workload_id"] for row in pool)
+audit_ids = [row["workload_id"] for row in audits]
+forbidden_columns = {
+    column for column in (candidates[0] if candidates else {})
+    if any(token in column.lower() for token in (
+        "callback", "source_route", "runtime_kb", "measurement_history",
+    ))
+}
+tree = ast.parse(selector_path.read_text(encoding="utf-8"), filename=str(selector_path))
+banned_imports = {
+    "tbe", "te", "refine_matmul_v3_candidates",
+    "generate_matmul_source_frontier_candidates",
+}
+imports = []
+for node in ast.walk(tree):
+    if isinstance(node, ast.Import):
+        imports.extend(alias.name for alias in node.names)
+    elif isinstance(node, ast.ImportFrom) and node.module:
+        imports.append(node.module)
+bad_imports = [name for name in imports if name.split(".")[0] in banned_imports]
+source_text = selector_path.read_text(encoding="utf-8").lower()
+bad_tokens = [token for token in (
+    "op_tiling", "invoke_official", "parse_seed", "callback_raw_tiling_hex",
+    "source_raw_tiling_hex", "runtime_kb", "measurement_history",
+) if token in source_text]
+candidate_by_id = {row["workload_id"]: row for row in candidates}
+pool_top = {row["workload_id"]: row for row in pool if row.get("new_model_rank") == "1"}
+audit_by_id = {row["workload_id"]: row for row in audits}
+valid = (
+    len(catalog) == 14
+    and len(ids) == len(set(ids))
+    and all(row.get("required_successful_tilings") == "1" for row in catalog)
+    and len(candidates) == 14
+    and candidate_ids == ids
+    and len(set(candidate_ids)) == 14
+    and audit_ids == ids
+    and not forbidden_columns
+    and not bad_imports
+    and not bad_tokens
+    and set(pool_counts) == set(ids)
+    and set(pool_top) == set(ids)
+    and all(0 < count <= 32 for count in pool_counts.values())
+    and all(
+        row.get("rank") == "1"
+        and row.get("new_model_rank") == "1"
+        and row.get("candidate_role") == "searched"
+        and row.get("source") == "independent_hardware_cost_model"
+        and row.get("model_input_source") == "shape_hardware_and_cost_model_only"
+        and row.get("tiling_parameter_origin") == "independent_model_generation"
+        and row.get("is_reserve") == "0"
+        and row.get("required_successful_tilings") == "1"
+        and int(row.get("candidate_budget") or 0) == 32
+        and 0 < int(row.get("generated_candidate_count") or 0) <= 32
+        and int(row.get("legal_candidate_count") or 0) == pool_counts[row["workload_id"]]
+        and len(row.get("model_schedule_sha256", "")) == 64
+        and pool_top[row["workload_id"]].get("model_schedule_sha256")
+            == row.get("model_schedule_sha256")
+        for row in candidates
+    )
+    and all(
+        audit_by_id[workload_id].get("record_type") == "model_top1_frozen"
+        and audit_by_id[workload_id].get("baseline_data_consumed") is False
+        and audit_by_id[workload_id].get("measured_latency_consumed") is False
+        and audit_by_id[workload_id].get("selected", {}).get("model_schedule_sha256")
+            == candidate_by_id[workload_id].get("model_schedule_sha256")
+        for workload_id in ids
+    )
+)
+if not valid:
+    raise SystemExit(
+        "independent model candidate contract failed: "
+        f"catalog={len(catalog)} candidates={len(candidates)} "
+        f"pool={len(pool)} audits={len(audits)} "
+        f"forbidden_columns={sorted(forbidden_columns)} "
+        f"bad_imports={bad_imports} bad_tokens={bad_tokens}"
+    )
+PY
+echo "MODEL_INDEPENDENCE_AUDIT passed shapes=${SHAPE_COUNT} selected=${MODEL_RECORDS} max_internal_per_shape=32"
+
+CANDIDATE_SHA256="$(sha256sum "${CANDIDATES}" | cut -d' ' -f1)"
+python3 - "${FREEZE_RECORD}" "${CANDIDATE_SHA256}" "${search_wall_ms}" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+temporary = path.with_name(path.name + f".tmp.{os.getpid()}")
+temporary.write_text(json.dumps({
+    "schema": "matmul_deployment_candidate_freeze_v1",
+    "candidate_sha256": sys.argv[2],
+    "model_selection_wall_ms": int(sys.argv[3]),
+    "shape_count": 14,
+    "selected_candidates": 14,
+    "frozen_before_baseline_execution": True,
+}, separators=(",", ":"), sort_keys=True) + "\n", encoding="utf-8")
+temporary.replace(path)
+PY
+echo "MODEL_CANDIDATES_FROZEN sha256=${CANDIDATE_SHA256} file=${CANDIDATES}"
 
 direct_preflight_started_ns="$(date +%s%N)"
 python3 tools/direct_matmul_tiling.py \
@@ -425,24 +360,22 @@ python3 tools/direct_matmul_tiling.py \
     --output-dir "${DETAILS_DIR}/direct_tilings" \
     --manifest "${DETAILS_DIR}/direct_manifest.csv" \
     --l2-bytes "${PLATFORM_L2_BYTES}" \
-    --aic-cores "${PLATFORM_AIC_CORES}" \
-    --include-reserves \
-    --require-official-callback >/dev/null
+    --aic-cores "${PLATFORM_AIC_CORES}" >/dev/null
 direct_preflight_wall_ms=$(( ($(date +%s%N) - direct_preflight_started_ns) / 1000000 ))
-echo "DIRECT_TILING_PREFLIGHT passed candidates=2256 wall_ms=${direct_preflight_wall_ms}"
+echo "DIRECT_TILING_PREFLIGHT passed candidates=${MODEL_RECORDS} wall_ms=${direct_preflight_wall_ms}"
 
-echo "NPU_MEASUREMENT_BEGIN shapes=3 candidate_records=2160 installed_operator_references=3 records=2163"
+echo "NPU_MEASUREMENT_BEGIN shapes=${SHAPE_COUNT} model_candidates=${MODEL_RECORDS} installed_references=${SHAPE_COUNT} records=${TOTAL_RECORDS}"
 export KEEP_DETAILS=1
 export WARMUP=1
 export REPEAT=1
 export SAMPLES=3
-export PROFILE_PROGRESS_EVERY=20
+export PROFILE_PROGRESS_EVERY=1
 
 PROFILE_LOG="${CAMPAIGN_DIR}/measurement_progress.log"
 profile_started_ns="$(date +%s%N)"
 set +e
 "${ROOT}/scripts/profile_npu.sh" \
-    "${CANDIDATES}" "${OUT_STEM}" "${WORKLOADS}" \
+    "${CANDIDATES}" "${OUT_STEM}" "${CATALOG}" \
     2>&1 | awk '
         /INSTALLED_PUBLIC_REFERENCE_|DIRECT_VARIANT_|DIRECT_MEASUREMENT_|NPU_RESULTS_READY|fatal:|Traceback/ {
             print; fflush();
@@ -462,6 +395,13 @@ if [[ "${profile_rc}" -ne 0 ]]; then
     exit "${profile_rc}"
 fi
 
+POST_MEASUREMENT_SHA256="$(sha256sum "${CANDIDATES}" | cut -d' ' -f1)"
+[[ "${POST_MEASUREMENT_SHA256}" == "${CANDIDATE_SHA256}" ]] || {
+    echo "fatal: model candidates changed after baseline execution" >&2
+    exit 1
+}
+echo "MODEL_CANDIDATE_FREEZE_VERIFIED sha256=${POST_MEASUREMENT_SHA256}"
+
 for required in \
     "${DETAILS_DIR}/profile.csv" \
     "${DETAILS_DIR}/official_profile.csv"; do
@@ -472,15 +412,14 @@ for required in \
 done
 
 analysis_started_ns="$(date +%s%N)"
-python3 tools/analyze_matmul_hardware_calibration.py \
-    --workloads "${WORKLOADS}" \
+python3 tools/analyze_matmul_deployment_comparison.py \
+    --workloads "${CATALOG}" \
     --candidates "${CANDIDATES}" \
     --profile "${DETAILS_DIR}/profile.csv" \
     --official-profile "${DETAILS_DIR}/official_profile.csv" \
-    --output "${ANALYSIS}" \
-    --log-directory "${LOG_DIR}" \
-    --expected-shapes 3 \
-    --require-direct-tiling-applied
+    --selection-audit "${SELECTION_AUDIT}" \
+    --candidate-sha256 "${CANDIDATE_SHA256}" \
+    --output "${ANALYSIS}"
 analysis_wall_ms=$(( ($(date +%s%N) - analysis_started_ns) / 1000000 ))
 echo "CAMPAIGN_STAGE_TIMING stage=analysis wall_ms=${analysis_wall_ms}"
-echo "analysis=${ANALYSIS} logs=${LOG_DIR} measurement_log=${PROFILE_LOG}"
+echo "comparison=${ANALYSIS} model_tilings=${CANDIDATES} selection=${SELECTION_AUDIT} logs=${LOG_DIR} measurement_log=${PROFILE_LOG}"

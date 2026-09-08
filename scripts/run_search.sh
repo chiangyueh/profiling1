@@ -79,7 +79,62 @@ if [[ "${PLATFORM_AIC_CORES}" -le 0 ]]; then
     exit 1
 fi
 
-if [[ "${SEARCH_SCOPE}" == "matmul_callback_frontier_v2" ]]; then
+if [[ "${SEARCH_SCOPE}" == "matmul_deployment_top1_v1" ]]; then
+    deployment_cache_valid=0
+    if [[ "${REUSE_DEPLOYMENT_SELECTION:-0}" == "1" && \
+          -s "${SEARCH_OUTPUT}" && -s "${SEARCH_ALL_OUTPUT}" && \
+          -s "${DEPLOYMENT_SELECTION_AUDIT:?}" ]]; then
+        if python3 - "${DEPLOYMENT_SELECTION_AUDIT}" \
+            "${PLATFORM_AIC_CORES}" "${PLATFORM_L0A_BYTES}" \
+            "${PLATFORM_L0B_BYTES}" "${PLATFORM_L0C_BYTES}" \
+            "${PLATFORM_L1_BYTES}" "${PLATFORM_L2_BYTES}" \
+            "${PLATFORM_L2_BPC}" "${PLATFORM_HBM_BPC}" <<'PY'
+import json
+import sys
+
+records = [
+    json.loads(line) for line in open(sys.argv[1], encoding="utf-8")
+    if line.strip()
+]
+expected = {
+    "aic_cores": int(sys.argv[2]),
+    "l0a_bytes": int(sys.argv[3]),
+    "l0b_bytes": int(sys.argv[4]),
+    "l0c_bytes": int(sys.argv[5]),
+    "l1_bytes": int(sys.argv[6]),
+    "l2_bytes": int(sys.argv[7]),
+    "l2_bytes_per_cycle_per_core": float(sys.argv[8]),
+    "hbm_bytes_per_cycle_per_core": float(sys.argv[9]),
+}
+if not records or any(
+    record.get("model_inputs", {}).get("hardware", {}).get(key) != value
+    for record in records for key, value in expected.items()
+):
+    raise SystemExit(1)
+PY
+        then
+            deployment_cache_valid=1
+        fi
+    fi
+    if [[ "${deployment_cache_valid}" == "1" ]]; then
+        echo "MATMUL_DEPLOYMENT_SELECTION cached=${SEARCH_OUTPUT}"
+    else
+        python3 tools/select_matmul_deployment_tilings.py \
+            --workloads "${WORKLOADS}" \
+            --output "${SEARCH_OUTPUT}" \
+            --all-output "${SEARCH_ALL_OUTPUT}" \
+            --audit "${DEPLOYMENT_SELECTION_AUDIT:?}" \
+            --soc "${ASCENDC_SOC_VERSION:-${SOC_VERSION:-Ascend910B}}" \
+            --aic-cores "${PLATFORM_AIC_CORES}" \
+            --l0a-bytes "${PLATFORM_L0A_BYTES}" \
+            --l0b-bytes "${PLATFORM_L0B_BYTES}" \
+            --l0c-bytes "${PLATFORM_L0C_BYTES}" \
+            --l1-bytes "${PLATFORM_L1_BYTES}" \
+            --l2-bytes "${PLATFORM_L2_BYTES}" \
+            --l2-bytes-per-cycle-per-core "${PLATFORM_L2_BPC}" \
+            --hbm-bytes-per-cycle-per-core "${PLATFORM_HBM_BPC}"
+    fi
+elif [[ "${SEARCH_SCOPE}" == "matmul_callback_frontier_v2" ]]; then
     if [[ "${REUSE_SOURCE_FRONTIER_CANDIDATES:-0}" == "1" && \
           -s "${SEARCH_OUTPUT}" && -s "${SEARCH_ALL_OUTPUT}" && \
           -s "${FRONTIER_WORKLOADS_OUTPUT:?}" ]]; then

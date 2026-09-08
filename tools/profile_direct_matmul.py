@@ -329,10 +329,8 @@ def main() -> int:
     for workload_id, rows in grouped_candidates.items():
         required_count = workload_contract[workload_id]
         roles = [truthy(row.get("is_reserve")) for row in rows]
-        reserve_count = roles.count(True)
         if (
             roles.count(False) != required_count
-            or reserve_count <= 0
             or roles != sorted(roles)
             or [int(row["rank"]) for row in rows] != list(range(1, len(rows) + 1))
         ):
