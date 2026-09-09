@@ -38,7 +38,7 @@ done
 }
 
 cd "${ROOT}"
-export CANN_ROOT=/usr/local/Ascend/ascend-toolkit/8.1.RC1
+export CANN_ROOT=/usr/local/Ascend/ascend-toolkit/8.1
 export ASCEND_MATMUL_MANUAL_ENV=1
 export ASCENDC_SOC_VERSION="${ASCENDC_SOC_VERSION:-Ascend910B3}"
 export SOC_VERSION="${SOC_VERSION:-${ASCENDC_SOC_VERSION}}"
