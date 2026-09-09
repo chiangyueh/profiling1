@@ -61,6 +61,7 @@ SUPPORTED_KERNELS = {
     "bf16": {0, 1, 20, 21, 30, 31, 201, 10201},
     "fp32": {1, 21, 31, 101, 201, 10201, 20201},
 }
+EXECUTABLE_CANDIDATE_ROLES = {"searched", "direct_measurement"}
 
 
 def truthy(value: object) -> bool:
@@ -543,7 +544,7 @@ def write_manifest(
     manifest.parent.mkdir(parents=True, exist_ok=True)
     manifest_rows: list[dict[str, str]] = []
     for row in rows:
-        if row.get("candidate_role") != "searched":
+        if row.get("candidate_role") not in EXECUTABLE_CANDIDATE_ROLES:
             continue
         if not include_reserves and truthy(row.get("is_reserve")):
             continue
@@ -563,7 +564,7 @@ def write_manifest(
         manifest_rows.append({
             "workload_id": row["workload_id"],
             "rank": row["rank"],
-            "candidate_role": "searched",
+            "candidate_role": row["candidate_role"],
             "m": row["m"], "n": row["n"], "k": row["k"],
             "dtype": row["dtype"],
             "trans_a": row["trans_a"], "trans_b": row["trans_b"],

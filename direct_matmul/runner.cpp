@@ -232,7 +232,8 @@ std::vector<Candidate> LoadManifest(const std::string &path)
         row.reserve = Truthy(Field(fields, columns, "is_reserve"));
         row.requiredSuccessfulTilings = static_cast<uint32_t>(
             std::stoul(Field(fields, columns, "required_successful_tilings")));
-        if (row.workloadId.empty() || row.rank.empty() || row.role != "searched" ||
+        if (row.workloadId.empty() || row.rank.empty() ||
+            (row.role != "searched" && row.role != "direct_measurement") ||
             row.m <= 0 || row.n <= 0 || row.k <= 0 || row.usedCores == 0 ||
             row.workspaceBytes < 20U * 1024U * 1024U ||
             row.requiredSuccessfulTilings == 0) {
@@ -529,7 +530,7 @@ void EmitFailure(const Candidate &candidate, const std::string &error)
         << "DIRECT_MATMUL_RESULT {\"status\":\"failed\","
         << "\"workload_id\":\"" << JsonEscape(candidate.workloadId) << "\","
         << "\"rank\":\"" << JsonEscape(candidate.rank) << "\","
-        << "\"candidate_role\":\"searched\","
+        << "\"candidate_role\":\"" << JsonEscape(candidate.role) << "\","
         << "\"model_schedule_sha256\":\"" << candidate.scheduleSha256 << "\","
         << "\"tiling_sha256\":\"" << candidate.tilingSha256 << "\","
         << "\"error\":\"" << JsonEscape(error) << "\"}" << std::endl;
@@ -553,7 +554,7 @@ void EmitSuccess(
         << "\"tiling_applied\":1,\"full_output_validated\":1,"
         << "\"workload_id\":\"" << JsonEscape(candidate.workloadId) << "\","
         << "\"rank\":\"" << JsonEscape(candidate.rank) << "\","
-        << "\"candidate_role\":\"searched\","
+        << "\"candidate_role\":\"" << JsonEscape(candidate.role) << "\","
         << "\"model_schedule_sha256\":\"" << candidate.scheduleSha256 << "\","
         << "\"actual_tiling_sha256\":\"" << candidate.tilingSha256 << "\","
         << "\"actual_tiling_fnv1a64\":\"" << candidate.tilingFnv1a64 << "\","

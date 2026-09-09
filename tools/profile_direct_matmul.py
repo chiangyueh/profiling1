@@ -18,6 +18,10 @@ from direct_matmul_tiling import write_manifest
 
 PROFILE_COLUMNS = [
     "workload_id", "rank", "source", "candidate_role",
+    "comparison_role", "decision_provenance", "performance_credit_eligible",
+    "original_selector_executed", "experimental_rule_applied",
+    "modified_fields", "unchanged_fields", "measurement_block",
+    "kernel_path_status", "kernel_path_performance_credit_eligible",
     "m", "n", "k", "dtype", "trans_a", "trans_b", "execution_mode",
     "used_core_num", "hint_single_core_m", "hint_single_core_n",
     "hint_single_core_k", "hint_base_m", "hint_base_n", "hint_base_k",
@@ -32,8 +36,12 @@ PROFILE_COLUMNS = [
     "full_output_validated", "actual_tiling_sha256", "actual_tiling_fnv1a64",
     "actual_kernel_suffix", "actual_block_dim",
 ]
-SAMPLE_COLUMNS = ["workload_id", "rank", "candidate_role", "sample", "latency_ms"]
+SAMPLE_COLUMNS = [
+    "workload_id", "rank", "candidate_role", "comparison_role",
+    "performance_credit_eligible", "measurement_block", "sample", "latency_ms",
+]
 SCHEMA = "matmul_direct_candidate_measurement_v2"
+EXECUTABLE_CANDIDATE_ROLES = {"searched", "direct_measurement"}
 
 
 def truthy(value: object) -> bool:
@@ -185,8 +193,22 @@ def candidate_profile(
     row = {field: "" for field in PROFILE_COLUMNS}
     row.update({
         "workload_id": candidate["workload_id"], "rank": candidate["rank"],
-        "source": "hardware_cost_model_direct_cann81",
-        "candidate_role": "searched",
+        "source": candidate.get("source", "direct_cann81"),
+        "candidate_role": candidate.get("candidate_role", "searched"),
+        "comparison_role": candidate.get("comparison_role", ""),
+        "decision_provenance": candidate.get("decision_provenance", ""),
+        "performance_credit_eligible":
+            candidate.get("performance_credit_eligible", ""),
+        "original_selector_executed":
+            candidate.get("original_selector_executed", ""),
+        "experimental_rule_applied":
+            candidate.get("experimental_rule_applied", ""),
+        "modified_fields": candidate.get("modified_fields", ""),
+        "unchanged_fields": candidate.get("unchanged_fields", ""),
+        "measurement_block": candidate.get("measurement_block", ""),
+        "kernel_path_status": candidate.get("kernel_path_status", ""),
+        "kernel_path_performance_credit_eligible":
+            candidate.get("kernel_path_performance_credit_eligible", ""),
         "m": candidate["m"], "n": candidate["n"], "k": candidate["k"],
         "dtype": candidate["dtype"], "trans_a": candidate["trans_a"],
         "trans_b": candidate["trans_b"],
@@ -294,12 +316,13 @@ def main() -> int:
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--progress-every", type=int, default=20)
     parser.add_argument("--require-official-callback", action="store_true")
+    parser.add_argument("--require-fresh-direct-sequence", action="store_true")
     args = parser.parse_args()
 
     workloads = read_rows(args.workloads)
     all_candidates = [
         row for row in read_rows(args.candidates)
-        if row.get("candidate_role") == "searched"
+        if row.get("candidate_role") in EXECUTABLE_CANDIDATE_ROLES
     ]
     candidates = [row for row in all_candidates if not truthy(row.get("is_reserve"))]
     reserves = [row for row in all_candidates if truthy(row.get("is_reserve"))]
@@ -360,7 +383,10 @@ def main() -> int:
         "available_reserves": reserve_target,
         "installed_operator_references": shape_count,
         "installed_public_operator_tiling_captured": False,
-        "measurement": "one warmup plus three device-event samples",
+        "measurement": (
+            f"{args.warmup}_warmup+{args.samples}_device_event_samples"
+            f"+repeat_{args.repeat}"
+        ),
         "candidate_execution": "compile_one_variant_then_measure_immediately",
     })
 
@@ -426,6 +452,15 @@ def main() -> int:
         )
 
     completed, sample_map, attempted = load_completed(args.log_directory, manifest)
+    if (
+        args.require_fresh_direct_sequence
+        and attempted
+        and len(completed) != formal_target
+    ):
+        raise RuntimeError(
+            "partial direct results cannot be resumed because that would break "
+            "the required within-workload execution sequence"
+        )
     required = {
         row["workload_id"]: int(row["required_successful_tilings"])
         for row in workloads
@@ -556,6 +591,9 @@ def main() -> int:
             expected_manifest = manifest.get(key)
             if candidate is None or expected_manifest is None:
                 direct_failure = f"direct runner returned an unknown identity: {key}"
+                continue
+            if result.get("candidate_role") != candidate.get("candidate_role"):
+                direct_failure = f"direct runner returned the wrong candidate role: {key}"
                 continue
             if result.get("status") != "success":
                 log.append_once(f"failure:{key[0]}:{key[1]}", {
@@ -693,7 +731,12 @@ def main() -> int:
             continue
         for index, latency in enumerate(sample_map[key]):
             sample_rows.append({
-                "workload_id": key[0], "rank": key[1], "candidate_role": "searched",
+                "workload_id": key[0], "rank": key[1],
+                "candidate_role": row.get("candidate_role", ""),
+                "comparison_role": row.get("comparison_role", ""),
+                "performance_credit_eligible":
+                    row.get("performance_credit_eligible", ""),
+                "measurement_block": row.get("measurement_block", ""),
                 "sample": str(index), "latency_ms": f"{latency:.12g}",
             })
     write_rows(args.profile_output, custom_rows, PROFILE_COLUMNS)
