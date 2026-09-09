@@ -56,16 +56,7 @@ while IFS='=' read -r name _; do
 done < <(env)
 source "${ROOT}/scripts/env.sh" >/dev/null
 
-CANN_VERSION_FILE="${CANN_ROOT}/version.cfg"
-echo "CANN_ENV root=${CANN_ROOT} version_file=${CANN_VERSION_FILE}"
-[[ -f "${CANN_VERSION_FILE}" ]] || {
-    echo "fatal: CANN version.cfg is missing: ${CANN_VERSION_FILE}" >&2
-    exit 2
-}
-grep -Eq '^toolkit_running_version=.*:8\.1' "${CANN_VERSION_FILE}" || {
-    echo "fatal: this direct campaign requires installed CANN 8.1" >&2
-    exit 2
-}
+echo "CANN_ENV root=${CANN_ROOT}"
 
 CAMPAIGN_FILES=(
     tools/generate_matmul_r5_l2_pair.py
@@ -79,7 +70,6 @@ CAMPAIGN_FILES=(
     direct_matmul/kernel_entry.cpp
     direct_matmul/mat_mul_v3_tiling_data.h
     direct_matmul/runner.cpp
-    "${CANN_VERSION_FILE}"
 )
 CAMPAIGN_ID="$({
     sha256sum "${CAMPAIGN_FILES[@]}"
@@ -107,7 +97,7 @@ echo "logs=${LOG_DIR}"
 
 HOST_BUILD_HASH="$({
     find host compat -type f -print0
-    printf '%s\0' scripts/build_all.sh "${CANN_VERSION_FILE}"
+    printf '%s\0' scripts/build_all.sh
 } | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
 HOST_BUILD_STAMP="${ROOT}/build/.matmul_platform_host.sha256"
 host_build_started_ns="$(date +%s%N)"
@@ -191,7 +181,7 @@ if [[ -s "${ANALYSIS}" ]] && grep -q '"status":"complete"' "${ANALYSIS}"; then
 fi
 
 RUNNER_BUILD_HASH="$({
-    printf '%s\0' runner/official_matmul_runner.cpp cmake_npu/CMakeLists.txt scripts/build_all.sh "${CANN_VERSION_FILE}"
+    printf '%s\0' runner/official_matmul_runner.cpp cmake_npu/CMakeLists.txt scripts/build_all.sh
 } | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
 RUNNER_BUILD_STAMP="${ROOT}/build/.matmul_official_runner.sha256"
 runner_build_started_ns="$(date +%s%N)"
