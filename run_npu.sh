@@ -38,7 +38,42 @@ done
 }
 
 cd "${ROOT}"
-export CANN_ROOT="${CANN_ROOT:-/usr/local/Ascend/ascend-toolkit/latest}"
+
+select_campaign_cann_root() {
+    local requested="${CANN_ROOT:-}"
+    local arch
+    local candidate
+    local -a candidates=()
+    local -A seen=()
+    arch="$(uname -m)"
+    [[ -n "${requested}" ]] && candidates+=("${requested}")
+    candidates+=(
+        /usr/local/Ascend/ascend-toolkit/latest
+        /usr/local/Ascend/ascend-toolkit/8.1
+        /usr/local/Ascend/ascend-toolkit/8.1.RC1
+    )
+    shopt -s nullglob
+    candidates+=(/usr/local/Ascend/ascend-toolkit/8.1*)
+    shopt -u nullglob
+    for candidate in "${candidates[@]}"; do
+        [[ -n "${candidate}" && -z "${seen["${candidate}"]:-}" ]] || continue
+        seen["${candidate}"]=1
+        [[ -f "${candidate}/version.cfg" ]] || continue
+        [[ -d "${candidate}/${arch}-linux" && -d "${candidate}/opp" ]] || continue
+        grep -Eq '^toolkit_running_version=.*[:=]8\.1([^0-9]|$)' "${candidate}/version.cfg" || continue
+        readlink -f "${candidate}" 2>/dev/null || printf '%s\n' "${candidate}"
+        return 0
+    done
+    return 1
+}
+
+if ! SELECTED_CANN_ROOT="$(select_campaign_cann_root)"; then
+    echo "fatal: run_npu.sh could not find a complete CANN 8.1 toolkit under /usr/local/Ascend/ascend-toolkit" >&2
+    find /usr/local/Ascend -maxdepth 5 -type f -name version.cfg -print 2>/dev/null >&2 || true
+    exit 2
+fi
+export CANN_ROOT="${SELECTED_CANN_ROOT}"
+unset SELECTED_CANN_ROOT
 export CANN_REQUIRED_TOOLKIT_SERIES=8.1
 export ASCENDC_SOC_VERSION="${ASCENDC_SOC_VERSION:-Ascend910B3}"
 export SOC_VERSION="${SOC_VERSION:-${ASCENDC_SOC_VERSION}}"
