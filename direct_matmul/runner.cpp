@@ -631,12 +631,15 @@ void RunCandidate(
             reset();
             Check(aclrtSynchronizeStream(stream), "pre-measurement reset synchronize");
             Check(aclrtRecordEvent(begin, stream), "record begin event");
-            launch();
+            for (int repeat = 0; repeat < options.repeat; ++repeat) {
+                launch();
+            }
             Check(aclrtRecordEvent(end, stream), "record end event");
             Check(aclrtSynchronizeEvent(end), "synchronize end event");
             float elapsed = 0;
             Check(aclrtEventElapsedTime(&elapsed, begin, end), "event elapsed time");
-            samples.push_back(elapsed);
+            samples.push_back(
+                static_cast<double>(elapsed) / options.repeat);
         }
         (void)aclrtDestroyEvent(end);
         (void)aclrtDestroyEvent(begin);
@@ -717,7 +720,7 @@ int main(int argc, char **argv)
         options.samples = std::stoi(Get(args, "--samples", "3"));
         options.allowPartial = args.count("--allow-partial") != 0;
         if (options.manifest.empty() || options.warmup < 0 ||
-            options.repeat != 1 || options.samples <= 0) {
+            options.repeat <= 0 || options.samples <= 0) {
             throw std::runtime_error("invalid direct runner options");
         }
         const auto candidates = LoadManifest(options.manifest);

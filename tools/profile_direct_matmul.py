@@ -759,6 +759,24 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as error:
+        try:
+            log_directory_index = sys.argv.index("--log-directory") + 1
+            log_directory = Path(sys.argv[log_directory_index])
+            max_bytes = 50 * 1024 * 1024
+            if "--log-max-bytes" in sys.argv:
+                max_bytes_index = sys.argv.index("--log-max-bytes") + 1
+                max_bytes = int(sys.argv[max_bytes_index])
+            fatal_log = JsonlLog(log_directory, max_bytes)
+            fatal_log.append({
+                "record_key": "campaign:fatal",
+                "schema": SCHEMA,
+                "record_type": "campaign_fatal",
+                "status": "failed",
+                "error": str(error),
+            })
+            fatal_log.close()
+        except Exception:
+            pass
         print(
             "DIRECT_MEASUREMENT_FATAL "
             + json.dumps({"error": str(error)}, separators=(",", ":")),
