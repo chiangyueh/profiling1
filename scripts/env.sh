@@ -7,9 +7,93 @@
 
 set -euo pipefail
 
-export CANN_ROOT="${CANN_ROOT:-/usr/local/Ascend/ascend-toolkit/latest}"
 export SOC_VERSION="${SOC_VERSION:-Ascend910B}"
 export CANN_ARCH="${CANN_ARCH:-$(uname -m)}"
+
+cann_root_layout_valid() {
+    local root="$1"
+    [[ -n "${root}" && -f "${root}/version.cfg" &&
+       -d "${root}/${CANN_ARCH}-linux" && -d "${root}/opp" ]]
+}
+
+cann_root_version_matches() {
+    local root="$1"
+    local required="${CANN_REQUIRED_TOOLKIT_SERIES:-}"
+    local required_regex
+    cann_root_layout_valid "${root}" || return 1
+    [[ -z "${required}" ]] && return 0
+    required_regex="${required//./\\.}"
+    grep -Eq "^toolkit_running_version=.*[:=]${required_regex}([^0-9]|$)" "${root}/version.cfg"
+}
+
+cann_root_canonical() {
+    readlink -f "$1" 2>/dev/null || printf '%s\n' "$1"
+}
+
+resolve_cann_root() {
+    local requested="${CANN_ROOT:-}"
+    local default_root="/usr/local/Ascend/ascend-toolkit/latest"
+    local candidate canonical normalized_requested
+    local -a candidates=()
+    local -A seen=()
+
+    if [[ -n "${requested}" ]]; then
+        candidates+=(
+            "${requested}"
+            "${requested}/ascend-toolkit/latest"
+            "${requested}/latest"
+        )
+        if [[ "${requested}" == *usr/local/Ascend/* ]]; then
+            normalized_requested="/usr/local/Ascend/${requested#*usr/local/Ascend/}"
+            candidates+=(
+                "${normalized_requested}"
+                "${normalized_requested}/ascend-toolkit/latest"
+                "${normalized_requested}/latest"
+            )
+        fi
+    fi
+    candidates+=("${default_root}")
+    shopt -s nullglob
+    candidates+=(
+        /usr/local/Ascend/ascend-toolkit/8.1*
+        /usr/local/Ascend/cann-*/ascend-toolkit/latest
+        /usr/local/Ascend/cann-*/ascend-toolkit/8.1*
+        /usr/local/Ascend/cann-*/latest
+        /usr/local/Ascend/cann-*
+    )
+    shopt -u nullglob
+
+    for candidate in "${candidates[@]}"; do
+        [[ -n "${candidate}" && -z "${seen["${candidate}"]:-}" ]] || continue
+        seen["${candidate}"]=1
+        if cann_root_version_matches "${candidate}"; then
+            canonical="$(cann_root_canonical "${candidate}")"
+            export CANN_ROOT="${canonical}"
+            if [[ -n "${requested}" && "${canonical}" != "$(cann_root_canonical "${requested}")" ]]; then
+                echo "CANN_ROOT_RESOLVED requested=${requested} selected=${canonical}" >&2
+            fi
+            return 0
+        fi
+    done
+
+    echo "fatal: no compatible CANN toolkit root was found" >&2
+    echo "requested_CANN_ROOT=${requested:-<unset>}" >&2
+    echo "required_toolkit_series=${CANN_REQUIRED_TOOLKIT_SERIES:-<any>}" >&2
+    seen=()
+    for candidate in "${candidates[@]}"; do
+        [[ -n "${candidate}" && -z "${seen["${candidate}"]:-}" ]] || continue
+        seen["${candidate}"]=1
+        [[ -n "${candidate}" && -f "${candidate}/version.cfg" ]] || continue
+        printf 'detected_CANN_root=%s ' "${candidate}" >&2
+        sed -n '/^toolkit_running_version=/{p;q;}' "${candidate}/version.cfg" >&2
+    done
+    return 1
+}
+
+if ! resolve_cann_root; then
+    return 1 2>/dev/null || exit 1
+fi
+_RESOLVED_CANN_ROOT="${CANN_ROOT}"
 
 filter_ascend_path() {
     local value="${1:-}"
@@ -20,6 +104,7 @@ import sys
 raw = sys.argv[1] if len(sys.argv) > 1 else ""
 drop_tokens = (
     "/usr/local/Ascend/ascend-toolkit",
+    "/usr/local/Ascend/cann-",
     "/usr/local/Ascend/driver",
     "/usr/local/Ascend/nnrt",
 )
@@ -101,7 +186,16 @@ if [[ "${ASCEND_MATMUL_MANUAL_ENV:-0}" != "1" ]]; then
         # shellcheck disable=SC1090
         source "${SET_ENV_SH}"
         set -u
-        export CANN_ROOT="${ASCEND_TOOLKIT_HOME:-${CANN_ROOT}}"
+        _SET_ENV_CANN_ROOT="${ASCEND_TOOLKIT_HOME:-}"
+        if cann_root_version_matches "${_SET_ENV_CANN_ROOT}"; then
+            export CANN_ROOT="$(cann_root_canonical "${_SET_ENV_CANN_ROOT}")"
+        else
+            if [[ -n "${_SET_ENV_CANN_ROOT}" ]]; then
+                echo "CANN_SET_ENV_ROOT_IGNORED value=${_SET_ENV_CANN_ROOT} selected=${_RESOLVED_CANN_ROOT}" >&2
+            fi
+            export CANN_ROOT="${_RESOLVED_CANN_ROOT}"
+        fi
+        unset _SET_ENV_CANN_ROOT
         USED_OFFICIAL_SET_ENV=1
     fi
     unset SET_ENV_SH
@@ -146,10 +240,10 @@ unset _runtime_ld_paths
 append_path_unique LD_LIBRARY_PATH "${CANN_PLATFORM_ROOT}/devlib"
 
 if [[ "${USED_OFFICIAL_SET_ENV}" == "1" ]]; then
-    unset USED_OFFICIAL_SET_ENV
+    unset USED_OFFICIAL_SET_ENV _RESOLVED_CANN_ROOT
     return 0 2>/dev/null || exit 0
 fi
-unset USED_OFFICIAL_SET_ENV
+unset USED_OFFICIAL_SET_ENV _RESOLVED_CANN_ROOT
 
 _cann_ld_paths=()
 [[ -d "${CANN_PLATFORM_ROOT}/lib64" ]] && _cann_ld_paths+=("${CANN_PLATFORM_ROOT}/lib64")

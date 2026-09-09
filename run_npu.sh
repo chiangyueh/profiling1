@@ -39,6 +39,7 @@ done
 
 cd "${ROOT}"
 export CANN_ROOT="${CANN_ROOT:-/usr/local/Ascend/ascend-toolkit/latest}"
+export CANN_REQUIRED_TOOLKIT_SERIES=8.1
 export ASCENDC_SOC_VERSION="${ASCENDC_SOC_VERSION:-Ascend910B3}"
 export SOC_VERSION="${SOC_VERSION:-${ASCENDC_SOC_VERSION}}"
 export ASCEND_RT_VISIBLE_DEVICES="${PHYSICAL_DEVICE}"
@@ -56,6 +57,7 @@ done < <(env)
 source "${ROOT}/scripts/env.sh" >/dev/null
 
 CANN_VERSION_FILE="${CANN_ROOT}/version.cfg"
+echo "CANN_ENV root=${CANN_ROOT} required_toolkit_series=${CANN_REQUIRED_TOOLKIT_SERIES} version_file=${CANN_VERSION_FILE}"
 [[ -f "${CANN_VERSION_FILE}" ]] || {
     echo "fatal: CANN version.cfg is missing: ${CANN_VERSION_FILE}" >&2
     exit 2
