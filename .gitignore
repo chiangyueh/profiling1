@@ -1,5 +1,6 @@
 /.benchmark_state/
 /results/
+/run.log
 __pycache__/
 *.pyc
 *.[mM][dD]
