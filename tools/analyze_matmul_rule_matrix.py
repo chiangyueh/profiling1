@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare current improved packets with exact prior public MatMul measurements."""
+"""Evaluate AL1 and FixPipe-vector rules against audited public measurements."""
 
 import argparse
 import csv
@@ -10,7 +10,7 @@ from collections import defaultdict
 from pathlib import Path
 
 
-EXPECTED_SHAPES = 5
+EXPECTED_SHAPES = 8
 EXPECTED_SAMPLES = 7
 EXPECTED_WARMUP = 2
 EXPECTED_REPEAT = 20
@@ -147,13 +147,46 @@ def main():
         }
         output_rows.append(row)
         print(
-            f"DISCRIMINATIVE_RESULT id={workload_id} axis={row['selection_axis']} "
+            f"GENERALIZATION_RESULT id={workload_id} axis={row['selection_axis']} "
             f"official_ms={reference_median:.9g} improved_ms={improved_median:.9g} "
             f"delta_pct={delta_pct:+.3f} separation={separation}"
         )
 
+    rule_aggregates = {}
+    for axis in sorted({row["selection_axis"] for row in output_rows}):
+        rows = [row for row in output_rows if row["selection_axis"] == axis]
+        clear_improvements = sum(
+            row["sample_separation"] == "CLEAR_IMPROVED" for row in rows
+        )
+        clear_regressions = sum(
+            row["sample_separation"] == "CLEAR_REGRESSION" for row in rows
+        )
+        overlaps = len(rows) - clear_improvements - clear_regressions
+        geomean_speedup = math.exp(statistics.fmean(
+            math.log(row["speedup"]) for row in rows
+        ))
+        rule_aggregates[axis] = {
+            "shapes": len(rows),
+            "median_wins": sum(row["median_winner"] == "improved" for row in rows),
+            "clear_improvements": clear_improvements,
+            "clear_regressions": clear_regressions,
+            "overlapping_samples": overlaps,
+            "geomean_speedup": geomean_speedup,
+            "worst_delta_pct": max(row["delta_pct"] for row in rows),
+            "status": "PASS_NO_CLEAR_REGRESSION" if clear_regressions == 0
+                      else "FAIL_CLEAR_REGRESSION",
+        }
+        print(
+            f"GENERALIZATION_RULE axis={axis} shapes={len(rows)} "
+            f"clear_improvements={clear_improvements} "
+            f"clear_regressions={clear_regressions} overlap={overlaps} "
+            f"geomean_speedup={geomean_speedup:.6g} "
+            f"worst_delta_pct={rule_aggregates[axis]['worst_delta_pct']:+.3f} "
+            f"status={rule_aggregates[axis]['status']}"
+        )
+
     result = {
-        "schema": "matmul_rule_discriminative_v3",
+        "schema": "matmul_rule_generalization_v1",
         "status": "complete",
         "comparison_basis": "audited_historical_cann81_reference_vs_current_improved",
         "reference_remeasured": False,
@@ -179,6 +212,7 @@ def main():
             ),
             "all_current_outputs_validated": True,
         },
+        "rule_aggregates": rule_aggregates,
         "shapes": output_rows,
     }
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
@@ -192,7 +226,7 @@ def main():
         writer.writeheader()
         writer.writerows(output_rows)
     print(
-        f"DISCRIMINATIVE_COMPLETE shapes={len(output_rows)} "
+        f"GENERALIZATION_COMPLETE shapes={len(output_rows)} "
         f"clear_improvements={result['aggregate']['clear_improvements']} "
         f"clear_regressions={result['aggregate']['clear_regressions']} "
         f"overlap={result['aggregate']['overlapping_samples']}"

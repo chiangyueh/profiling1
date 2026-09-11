@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Freeze a small discriminative improved set with audited historical references."""
+"""Generate two focused rule-generalization batches with audited references."""
 
 import argparse
 import csv
@@ -35,6 +35,12 @@ REFERENCE_FIELDS = (
     "source_sha256", "selection_axis",
 )
 SAMPLE_FIELDS = ("workload_id", "sample", "latency_ms")
+EXPECTED_SHAPES = 8
+EXPECTED_VARIANTS = {("fp32", "101"), ("fp32", "20201")}
+EXPECTED_AXIS_COUNTS = {
+    "al1_residency_generalization": 4,
+    "fixpipe_vector_generalization": 4,
+}
 
 
 def fnv1a64(blob):
@@ -71,8 +77,16 @@ def main():
     contract = json.loads(
         (SELECTOR_ROOT / "validation_contract.json").read_text(encoding="utf-8")
     )
-    if len(contract) != 5 or len({row["workload_id"] for row in contract}) != 5:
-        raise RuntimeError("validation contract must contain five unique shapes")
+    if (len(contract) != EXPECTED_SHAPES or
+            len({row["workload_id"] for row in contract}) != EXPECTED_SHAPES):
+        raise RuntimeError(
+            f"validation contract must contain {EXPECTED_SHAPES} unique shapes"
+        )
+    axis_counts = defaultdict(int)
+    for row in contract:
+        axis_counts[row["selection_axis"]] += 1
+    if dict(axis_counts) != EXPECTED_AXIS_COUNTS:
+        raise RuntimeError(f"unexpected rule-axis coverage: {dict(axis_counts)}")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     args.variant_dir.mkdir(parents=True, exist_ok=True)
@@ -185,19 +199,18 @@ def main():
     variants = defaultdict(list)
     for manifest_row in manifest_rows:
         variants[(manifest_row["dtype"], manifest_row["kernel_suffix"])].append(manifest_row)
-    for (dtype, suffix), rows in variants.items():
+    if set(variants) != EXPECTED_VARIANTS:
+        raise RuntimeError(f"unexpected compiled variants: {sorted(variants)}")
+    for index, ((dtype, suffix), rows) in enumerate(sorted(variants.items())):
         write_csv(args.variant_dir / f"{dtype}_k{suffix}.csv", MANIFEST_FIELDS, rows)
-    for index, manifest_row in enumerate(manifest_rows):
         write_csv(
-            args.sequence_dir / f"{index:02d}__{manifest_row['dtype']}_k{manifest_row['kernel_suffix']}.csv",
-            MANIFEST_FIELDS, [manifest_row],
+            args.sequence_dir / f"{index:02d}__{dtype}_k{suffix}.csv",
+            MANIFEST_FIELDS, rows,
         )
-    if len(variants) != len(contract):
-        raise RuntimeError("discriminative shapes must exercise distinct compiled variants")
     print(
-        f"DISCRIMINATIVE_SET_GENERATED shapes={len(contract)} "
+        f"RULE_GENERALIZATION_SET_GENERATED shapes={len(contract)} "
         f"improved_packets={len(manifest_rows)} reused_official_references={len(reference_rows)} "
-        f"variants={len(variants)}"
+        f"variants={len(variants)} measurement_batches={len(variants)}"
     )
 
 
