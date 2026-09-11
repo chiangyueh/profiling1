@@ -28,7 +28,9 @@
 #include "aclrtlaunch_direct_matmul_fp16_k21.h"
 #include "aclrtlaunch_direct_matmul_fp16_k30.h"
 #include "aclrtlaunch_direct_matmul_fp16_k31.h"
+#include "aclrtlaunch_direct_matmul_fp16_k200.h"
 #include "aclrtlaunch_direct_matmul_fp16_k201.h"
+#include "aclrtlaunch_direct_matmul_fp16_k10200.h"
 #include "aclrtlaunch_direct_matmul_fp16_k10201.h"
 #include "aclrtlaunch_direct_matmul_bf16_k1.h"
 #include "aclrtlaunch_direct_matmul_bf16_k0.h"
@@ -36,13 +38,20 @@
 #include "aclrtlaunch_direct_matmul_bf16_k21.h"
 #include "aclrtlaunch_direct_matmul_bf16_k30.h"
 #include "aclrtlaunch_direct_matmul_bf16_k31.h"
+#include "aclrtlaunch_direct_matmul_bf16_k200.h"
 #include "aclrtlaunch_direct_matmul_bf16_k201.h"
+#include "aclrtlaunch_direct_matmul_bf16_k10200.h"
 #include "aclrtlaunch_direct_matmul_bf16_k10201.h"
+#include "aclrtlaunch_direct_matmul_fp32_k0.h"
 #include "aclrtlaunch_direct_matmul_fp32_k1.h"
+#include "aclrtlaunch_direct_matmul_fp32_k20.h"
 #include "aclrtlaunch_direct_matmul_fp32_k21.h"
+#include "aclrtlaunch_direct_matmul_fp32_k30.h"
 #include "aclrtlaunch_direct_matmul_fp32_k31.h"
 #include "aclrtlaunch_direct_matmul_fp32_k101.h"
+#include "aclrtlaunch_direct_matmul_fp32_k200.h"
 #include "aclrtlaunch_direct_matmul_fp32_k201.h"
+#include "aclrtlaunch_direct_matmul_fp32_k10200.h"
 #include "aclrtlaunch_direct_matmul_fp32_k10201.h"
 #include "aclrtlaunch_direct_matmul_fp32_k20201.h"
 #endif
@@ -233,7 +242,8 @@ std::vector<Candidate> LoadManifest(const std::string &path)
         row.requiredSuccessfulTilings = static_cast<uint32_t>(
             std::stoul(Field(fields, columns, "required_successful_tilings")));
         if (row.workloadId.empty() || row.rank.empty() ||
-            (row.role != "searched" && row.role != "direct_measurement") ||
+            (row.role != "searched" && row.role != "direct_measurement" &&
+             row.role != "independent_improved") ||
             row.m <= 0 || row.n <= 0 || row.k <= 0 || row.usedCores == 0 ||
             row.workspaceBytes < 20U * 1024U * 1024U ||
             row.requiredSuccessfulTilings == 0) {
@@ -464,7 +474,9 @@ aclError Launch(
             case 21: DIRECT_LAUNCH(fp16, 21);
             case 30: DIRECT_LAUNCH(fp16, 30);
             case 31: DIRECT_LAUNCH(fp16, 31);
+            case 200: DIRECT_LAUNCH(fp16, 200);
             case 201: DIRECT_LAUNCH(fp16, 201);
+            case 10200: DIRECT_LAUNCH(fp16, 10200);
             case 10201: DIRECT_LAUNCH(fp16, 10201);
         }
     } else if (candidate.dtype == "bf16") {
@@ -475,16 +487,23 @@ aclError Launch(
             case 21: DIRECT_LAUNCH(bf16, 21);
             case 30: DIRECT_LAUNCH(bf16, 30);
             case 31: DIRECT_LAUNCH(bf16, 31);
+            case 200: DIRECT_LAUNCH(bf16, 200);
             case 201: DIRECT_LAUNCH(bf16, 201);
+            case 10200: DIRECT_LAUNCH(bf16, 10200);
             case 10201: DIRECT_LAUNCH(bf16, 10201);
         }
     } else if (candidate.dtype == "fp32") {
         switch (candidate.suffix) {
+            case 0: DIRECT_LAUNCH(fp32, 0);
             case 1: DIRECT_LAUNCH(fp32, 1);
+            case 20: DIRECT_LAUNCH(fp32, 20);
             case 21: DIRECT_LAUNCH(fp32, 21);
+            case 30: DIRECT_LAUNCH(fp32, 30);
             case 31: DIRECT_LAUNCH(fp32, 31);
             case 101: DIRECT_LAUNCH(fp32, 101);
+            case 200: DIRECT_LAUNCH(fp32, 200);
             case 201: DIRECT_LAUNCH(fp32, 201);
+            case 10200: DIRECT_LAUNCH(fp32, 10200);
             case 10201: DIRECT_LAUNCH(fp32, 10201);
             case 20201: DIRECT_LAUNCH(fp32, 20201);
         }

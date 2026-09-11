@@ -57,11 +57,13 @@ ABI_BYTES = 272
 UB_BYTES = 196_352
 RPC_WORKSPACE_BYTES = 20 * 1024 * 1024
 SUPPORTED_KERNELS = {
-    "fp16": {0, 1, 20, 21, 30, 31, 201, 10201},
-    "bf16": {0, 1, 20, 21, 30, 31, 201, 10201},
-    "fp32": {1, 21, 31, 101, 201, 10201, 20201},
+    "fp16": {0, 1, 20, 21, 30, 31, 200, 201, 10200, 10201},
+    "bf16": {0, 1, 20, 21, 30, 31, 200, 201, 10200, 10201},
+    "fp32": {0, 1, 20, 21, 30, 31, 101, 200, 201, 10200, 10201, 20201},
 }
-EXECUTABLE_CANDIDATE_ROLES = {"searched", "direct_measurement"}
+EXECUTABLE_CANDIDATE_ROLES = {
+    "searched", "direct_measurement", "independent_improved"
+}
 
 
 def truthy(value: object) -> bool:

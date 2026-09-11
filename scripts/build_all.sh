@@ -161,17 +161,24 @@ DIRECT_KERNEL_TARGETS=(
     direct_matmul_kernel_fp16_0 direct_matmul_kernel_fp16_1
     direct_matmul_kernel_fp16_20 direct_matmul_kernel_fp16_21
     direct_matmul_kernel_fp16_30 direct_matmul_kernel_fp16_31
+    direct_matmul_kernel_fp16_200
     direct_matmul_kernel_fp16_201
+    direct_matmul_kernel_fp16_10200
     direct_matmul_kernel_fp16_10201
     direct_matmul_kernel_bf16_0 direct_matmul_kernel_bf16_1
     direct_matmul_kernel_bf16_20 direct_matmul_kernel_bf16_21
     direct_matmul_kernel_bf16_30 direct_matmul_kernel_bf16_31
+    direct_matmul_kernel_bf16_200
     direct_matmul_kernel_bf16_201
+    direct_matmul_kernel_bf16_10200
     direct_matmul_kernel_bf16_10201
-    direct_matmul_kernel_fp32_1 direct_matmul_kernel_fp32_21
-    direct_matmul_kernel_fp32_31
-    direct_matmul_kernel_fp32_101 direct_matmul_kernel_fp32_201
-    direct_matmul_kernel_fp32_10201 direct_matmul_kernel_fp32_20201
+    direct_matmul_kernel_fp32_0 direct_matmul_kernel_fp32_1
+    direct_matmul_kernel_fp32_20 direct_matmul_kernel_fp32_21
+    direct_matmul_kernel_fp32_30 direct_matmul_kernel_fp32_31
+    direct_matmul_kernel_fp32_101
+    direct_matmul_kernel_fp32_200 direct_matmul_kernel_fp32_201
+    direct_matmul_kernel_fp32_10200 direct_matmul_kernel_fp32_10201
+    direct_matmul_kernel_fp32_20201
 )
 MATMUL_V3_KERNEL_DIR="${CANN_ROOT}/opp/built-in/op_impl/ai_core/tbe/impl/ascendc/mat_mul_v3"
 DIRECT_KERNEL_BUILD_SIGNATURE="$({
