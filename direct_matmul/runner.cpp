@@ -559,6 +559,7 @@ void EmitSuccess(
     const Candidate &candidate,
     const std::vector<double> &samples,
     const Stats &stats,
+    const Options &options,
     double devicePrepareMs,
     double warmupWallMs,
     double measurementWallMs,
@@ -581,6 +582,9 @@ void EmitSuccess(
         << "\"actual_block_dim\":" << candidate.usedCores << ','
         << "\"workspace_bytes\":" << candidate.workspaceBytes << ','
         << "\"is_reserve\":" << (candidate.reserve ? 1 : 0) << ','
+        << "\"warmup\":" << options.warmup << ','
+        << "\"repeat\":" << options.repeat << ','
+        << "\"samples\":" << options.samples << ','
         << "\"min_ms\":" << stats.minimum << ','
         << "\"mean_ms\":" << stats.mean << ','
         << "\"median_ms\":" << stats.median << ','
@@ -689,7 +693,7 @@ void RunCandidate(
     const double validationMs = ElapsedMs(validationStarted);
     const Stats stats = ComputeStats(samples);
     EmitSuccess(
-        candidate, samples, stats, devicePrepareMs, warmupWallMs,
+        candidate, samples, stats, options, devicePrepareMs, warmupWallMs,
         measurementWallMs, validationMs, ElapsedMs(totalStarted));
 }
 
