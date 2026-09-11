@@ -170,7 +170,7 @@ if [[ -s "${ANALYSIS}" ]] && grep -q '"status": "complete"' "${ANALYSIS}"; then
 fi
 
 device_preflight_started_ns="$(date +%s%N)"
-python3 - "${DEVICE_ID}" <<'PY'
+if python3 - "${DEVICE_ID}" <<'PY'
 import ctypes
 import os
 import sys
@@ -187,6 +187,21 @@ acl.aclrtSetDevice.argtypes = [ctypes.c_int32]
 acl.aclrtSetDevice.restype = ctypes.c_int
 acl.aclrtResetDevice.argtypes = [ctypes.c_int32]
 acl.aclrtResetDevice.restype = ctypes.c_int
+
+loaded_paths = []
+try:
+    with open("/proc/self/maps", encoding="utf-8") as stream:
+        loaded_paths = sorted({
+            line.split()[-1]
+            for line in stream
+            if "libascendcl.so" in line and line.split()[-1].startswith("/")
+        })
+except OSError:
+    pass
+print(
+    "DEVICE_PREFLIGHT_LIBRARY "
+    f"ascendcl={','.join(loaded_paths) if loaded_paths else 'unresolved'}"
+)
 
 initialized = False
 device_set = False
@@ -222,7 +237,46 @@ finally:
     if initialized:
         acl.aclFinalize()
 PY
+then
+    device_preflight_rc=0
+else
+    device_preflight_rc=$?
+fi
 device_preflight_wall_ms=$(( ($(date +%s%N) - device_preflight_started_ns) / 1000000 ))
+if [[ "${device_preflight_rc}" -ne 0 ]]; then
+    printf '%s\n' 'DEVICE_DIAGNOSTICS_BEGIN'
+    printf 'uid='; id
+    printf 'kernel='; uname -a
+    printf 'cann_root=%s\n' "${CANN_ROOT}"
+    printf 'visible_devices=%s runtime_user_device=%s physical_device=%s\n' \
+        "${ASCEND_RT_VISIBLE_DEVICES}" "${DEVICE_ID}" "${PHYSICAL_DEVICE}"
+    for version_path in \
+        /usr/local/Ascend/driver/version.info \
+        /usr/local/Ascend/driver/version.cfg \
+        /etc/ascend_install.info; do
+        if [[ -r "${version_path}" ]]; then
+            printf 'VERSION_FILE path=%s\n' "${version_path}"
+            sed -n '1,80p' "${version_path}"
+        fi
+    done
+    ls -l \
+        /dev/davinci_manager \
+        "/dev/davinci${PHYSICAL_DEVICE}" \
+        /dev/devmm_svm \
+        /dev/hisi_hdc 2>&1 || true
+    npu_smi="$(command -v npu-smi || true)"
+    if [[ -z "${npu_smi}" && -x /usr/local/Ascend/driver/tools/npu-smi ]]; then
+        npu_smi=/usr/local/Ascend/driver/tools/npu-smi
+    fi
+    if [[ -n "${npu_smi}" ]]; then
+        printf 'NPU_SMI path=%s\n' "${npu_smi}"
+        "${npu_smi}" info 2>&1 || true
+    else
+        printf '%s\n' 'NPU_SMI unavailable'
+    fi
+    printf '%s\n' 'DEVICE_DIAGNOSTICS_END'
+    fail "device preflight failed rc=${device_preflight_rc}; no build or measurement was started"
+fi
 announce "DEVICE_PREFLIGHT passed physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID} wall_ms=${device_preflight_wall_ms}"
 
 coverage_started_ns="$(date +%s%N)"
