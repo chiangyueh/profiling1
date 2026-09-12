@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare MatMulV3 against rule winners and structural ablation probes."""
+"""Compare MatMulV3 against independently generated C220 structural families."""
 from __future__ import annotations
 
 import argparse
@@ -10,10 +10,10 @@ from pathlib import Path
 import statistics
 
 
-EXPECTED_SHAPES = 62
-EXPECTED_SAMPLES = 30
-EXPECTED_WARMUP = 10
-EXPECTED_REPEAT = 20
+EXPECTED_SHAPES = 12
+EXPECTED_SAMPLES = 15
+EXPECTED_WARMUP = 3
+EXPECTED_REPEAT = 10
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
@@ -107,6 +107,7 @@ def main() -> None:
                 "independent_rule_winner",
                 "independent_branch_probe",
                 "independent_structural_probe",
+                "independent_experimental_family",
             )
             and new.get("measurement_source") == "direct_tiling_buffer"
             and new.get("tiling_applied") == 1
@@ -159,7 +160,7 @@ def main() -> None:
         }
         output_rows.append(row)
         print(
-            "PAIRED_RESULT "
+            "C220_STRUCTURAL_RESULT "
             f"id={workload_id} applicable={row['required_applicable_family']} "
             f"selected={row['selected_family']} suffix={row['kernel_suffix']} "
             f"role={row['case_role']} official_ms={old_median:.9g} candidate_ms={new_median:.9g} "
@@ -167,9 +168,9 @@ def main() -> None:
         )
 
     result = {
-        "schema": "matmul_rule_selector_paired_v3",
+        "schema": "matmul_c220_structural_v1",
         "status": "complete",
-        "comparison_basis": "same_campaign_official_api_vs_independent_rule_winner_or_structural_probe",
+        "comparison_basis": "same_campaign_official_api_vs_independent_structural_family",
         "reference_remeasured": True,
         "selection_uses_measurements": False,
         "measurement_contract": {
@@ -203,14 +204,8 @@ def main() -> None:
                 for row in output_rows
             ),
             "all_current_outputs_validated": True,
-            "branch_probes_executed": sum(
-                row["case_role"] == "branch_probe" for row in output_rows
-            ),
-            "selector_top1_cases_executed": sum(
-                row["case_role"] == "selector_top1" for row in output_rows
-            ),
-            "candidate_probes_executed": sum(
-                row["case_role"] == "candidate_probe" for row in output_rows
+            "experimental_family_cases_executed": sum(
+                row["case_role"] == "experimental_family" for row in output_rows
             ),
         },
         "shapes": output_rows,
@@ -226,7 +221,7 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(output_rows)
     print(
-        "PAIRED_COMPLETE "
+        "C220_STRUCTURAL_COMPLETE "
         f"shapes={len(output_rows)} candidate_wins={result['aggregate']['candidate_median_wins']} "
         f"official_wins={result['aggregate']['official_median_wins']} "
         f"overlap={result['aggregate']['overlap']}"

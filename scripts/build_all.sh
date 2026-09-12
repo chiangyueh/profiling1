@@ -179,16 +179,27 @@ DIRECT_KERNEL_TARGETS=(
     direct_matmul_kernel_fp32_200 direct_matmul_kernel_fp32_201
     direct_matmul_kernel_fp32_10200 direct_matmul_kernel_fp32_10201
     direct_matmul_kernel_fp32_20201
+    direct_matmul_kernel_fp16_60 direct_matmul_kernel_fp16_61
+    direct_matmul_kernel_fp16_121
+    direct_matmul_kernel_bf16_60 direct_matmul_kernel_bf16_61
+    direct_matmul_kernel_bf16_121
+    direct_matmul_kernel_fp32_41 direct_matmul_kernel_fp32_51
 )
 MATMUL_V3_KERNEL_DIR="${CANN_ROOT}/opp/built-in/op_impl/ai_core/tbe/impl/ascendc/mat_mul_v3"
+MATMUL_V3_C220_KERNEL_DIR="${ROOT}/colleague_matmul_v3/op_kernel"
 DIRECT_KERNEL_BUILD_SIGNATURE="$({
     sha256sum \
         "${ROOT}/direct_matmul/kernel_entry.cpp" \
-        "${ROOT}/direct_matmul/mat_mul_v3_tiling_data.h"
+        "${ROOT}/direct_matmul/kernel_entry_c220.cpp" \
+        "${ROOT}/direct_matmul/c220_gm_to_l1_kernel.h" \
+        "${ROOT}/direct_matmul/mat_mul_v3_tiling_data.h" \
+        "${ROOT}/direct_matmul/mat_mul_v3_tiling_data_280.h"
     find "${MATMUL_V3_KERNEL_DIR}" -type f -print0 | \
         sort -z | xargs -0 sha256sum
+    find "${MATMUL_V3_C220_KERNEL_DIR}" -type f -print0 | \
+        sort -z | xargs -0 sha256sum
     printf '%s\n' \
-        "cann81-direct-kernel-v2:${ASCENDC_SOC_VERSION}:${DIRECT_KERNEL_TARGETS[*]}"
+        "dual-abi-direct-kernel-v3:${ASCENDC_SOC_VERSION}:${DIRECT_KERNEL_TARGETS[*]}"
 } | sha256sum | cut -d' ' -f1)"
 kernel_count="${#DIRECT_KERNEL_TARGETS[@]}"
 
@@ -220,7 +231,7 @@ recover_kernel_archive() {
         "${NPU_BUILD}/CMakeFiles/${recover_target}_host_stub_obj.dir" \
         -type f -name 'host_stub.cpp.o' -print -quit 2>/dev/null || true)"
     recover_host="$(find "${NPU_BUILD}/${recover_target}_host_dir" \
-        -type f -name 'kernel_entry.cpp.o' -print -quit 2>/dev/null || true)"
+        -type f -name 'kernel_entry*.cpp.o' -print -quit 2>/dev/null || true)"
     [[ -n "${recover_stub}" && -n "${recover_host}" && \
        -f "${NPU_BUILD}/elf_tool.c.o" && \
        -f "${NPU_BUILD}/ascendc_runtime.cpp.o" ]] || return 1
@@ -276,6 +287,23 @@ target_suffix="${target_identity#*_}"
 target_symbol="aclrtlaunch_direct_matmul_${target_dtype}_k${target_suffix}"
 target_include="${NPU_BUILD}/include/${target}"
 target_header="${target_include}/${target_symbol}.h"
+target_is_c220=0
+case "_${target_dtype}_${target_suffix}_" in
+    _fp16_60_|_fp16_61_|_fp16_121_|_bf16_60_|_bf16_61_|_bf16_121_|_fp32_41_|_fp32_51_)
+        target_is_c220=1
+        ;;
+esac
+if [[ "${target_is_c220}" -eq 1 ]]; then
+    target_entry="${ROOT}/direct_matmul/kernel_entry_c220.cpp"
+    target_packet_header="${ROOT}/direct_matmul/mat_mul_v3_tiling_data_280.h"
+    target_kernel_source_dir="${MATMUL_V3_C220_KERNEL_DIR}"
+    runner_packet_definition='-DDIRECT_MATMUL_PACKET_HEADER="mat_mul_v3_tiling_data_280.h"'
+else
+    target_entry="${ROOT}/direct_matmul/kernel_entry.cpp"
+    target_packet_header="${ROOT}/direct_matmul/mat_mul_v3_tiling_data.h"
+    target_kernel_source_dir="${MATMUL_V3_KERNEL_DIR}"
+    runner_packet_definition=''
+fi
 
 if ! kernel_archive_valid "${target}"; then
     recover_kernel_archive "${target}" || true
@@ -286,9 +314,9 @@ if kernel_archive_valid "${target}"; then
     if [[ "$(cat "${target_stamp}" 2>/dev/null || true)" == \
           "${DIRECT_KERNEL_BUILD_SIGNATURE}" ]]; then
         kernel_cache_valid=1
-    elif [[ ! "${ROOT}/direct_matmul/kernel_entry.cpp" -nt "${target_library}" && \
-            ! "${ROOT}/direct_matmul/mat_mul_v3_tiling_data.h" -nt "${target_library}" ]] && \
-         [[ -z "$(find "${MATMUL_V3_KERNEL_DIR}" -type f \
+    elif [[ ! "${target_entry}" -nt "${target_library}" && \
+            ! "${target_packet_header}" -nt "${target_library}" ]] && \
+         [[ -z "$(find "${target_kernel_source_dir}" -type f \
              -newer "${target_library}" -print -quit)" ]]; then
         printf '%s\n' "${DIRECT_KERNEL_BUILD_SIGNATURE}" >"${target_stamp}"
         kernel_cache_valid=1
@@ -315,9 +343,9 @@ runner_stamp="${runner_path}.sha256"
 mkdir -p "${runner_directory}"
 runner_signature="$({
     sha256sum "${ROOT}/direct_matmul/runner.cpp" \
-        "${ROOT}/direct_matmul/mat_mul_v3_tiling_data.h" \
+        "${target_packet_header}" \
         "${target_library}" "${target_header}"
-    printf '%s\n' "single-variant-runner-v1:${target_dtype}:${target_suffix}:${ASCENDC_SOC_VERSION}"
+    printf '%s\n' "single-variant-runner-v2:${target_dtype}:${target_suffix}:${ASCENDC_SOC_VERSION}"
 } | sha256sum | cut -d' ' -f1)"
 if [[ -x "${runner_path}" && \
       "$(cat "${runner_stamp}" 2>/dev/null || true)" == "${runner_signature}" ]]; then
@@ -327,6 +355,7 @@ else
     run_logged "$BUILD/kernel_build.log" "link runner ${target_identity}" \
         g++ -std=c++17 -O3 -DNDEBUG \
         -DDIRECT_MATMUL_SINGLE_VARIANT=1 \
+        ${runner_packet_definition} \
         "-DDIRECT_MATMUL_LAUNCH_HEADER=\"${target_symbol}.h\"" \
         "-DDIRECT_MATMUL_DTYPE_NAME=\"${target_dtype}\"" \
         "-DDIRECT_MATMUL_SUFFIX_VALUE=${target_suffix}U" \

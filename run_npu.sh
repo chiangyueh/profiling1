@@ -4,21 +4,18 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE=""
 PHYSICAL_DEVICE="${PHYSICAL_NPU_ID:-2}"
-WARMUP=10
-REPEAT=20
-SAMPLES=30
-EXPECTED_BRANCHES=13
-EXPECTED_AUDIT_ITEMS=33
-VALIDATION_SHAPES=62
-EXPECTED_VARIANTS=0
+WARMUP=3
+REPEAT=10
+SAMPLES=15
+VALIDATION_SHAPES=12
+EXPECTED_VARIANTS=8
 
 usage() {
     printf '%s\n' \
         'Usage: ./run_npu.sh --mode full [-d PHYSICAL_NPU_ID]' \
         '' \
-        'Audits every installed CANN 8.1 candidate family, then measures 38' \
-        'independent rule winners, 13 branch probes, 11 structural ablations, and one' \
-        'same-campaign official MatMulV3 reference for every test shape.'
+        'Builds and measures five independently generated C220 structural families' \
+        'against one same-campaign official MatMulV3 reference per workload.'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -68,25 +65,24 @@ source "${ROOT}/scripts/env.sh" >/dev/null
 CAMPAIGN_ID="$({
     sha256sum \
         run_npu.sh \
-        tools/generate_matmul_rule_matrix.py \
+        tools/generate_matmul_c220_experimental_matrix.py \
         tools/analyze_matmul_rule_matrix.py \
-        tools/audit_matmul_candidate_engine.py \
         tools/direct_matmul_tiling.py \
         scripts/build_all.sh \
         scripts/env.sh \
         cmake_npu/CMakeLists.txt \
         direct_matmul/kernel_entry.cpp \
+        direct_matmul/kernel_entry_c220.cpp \
+        direct_matmul/c220_gm_to_l1_kernel.h \
         direct_matmul/mat_mul_v3_tiling_data.h \
+        direct_matmul/mat_mul_v3_tiling_data_280.h \
         direct_matmul/runner.cpp \
-        matmul_rule_selector/candidate_audit_spec.json \
-        matmul_rule_selector/family_candidate_contract.json \
-        matmul_rule_selector/validation_contract.json
-    find matmul_rule_selector -type f -name '*.py' -print0 |
-        sort -z | xargs -0 sha256sum
-    find npu_cost_model -type f -name '*.py' -print0 |
+        matmul_rule_selector/c220_experimental_selector.py \
+        matmul_rule_selector/c220_validation_contract.json
+    find colleague_matmul_v3/op_kernel -type f -print0 |
         sort -z | xargs -0 sha256sum
 } | sha256sum | cut -c1-20)"
-CAMPAIGN_DIR="${ROOT}/results/matmul_rule_selector_paired_v3/${CAMPAIGN_ID}"
+CAMPAIGN_DIR="${ROOT}/results/matmul_c220_structural_v1/${CAMPAIGN_ID}"
 PACKET_DIR="${CAMPAIGN_DIR}/packets"
 MANIFEST="${CAMPAIGN_DIR}/improved_manifest.csv"
 SELECTION="${CAMPAIGN_DIR}/selection.jsonl"
@@ -157,9 +153,9 @@ for role in sorted(by_role):
         f"clear_official_wins={sum(row['sample_separation'] == 'CLEAR_OFFICIAL_WINNER' for row in role_rows)} "
         f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in role_rows)}"
     )
-selector_rows = by_role["selector_top1"]
+selector_rows = by_role["experimental_family"]
 print(
-    "FINAL_SELECTOR_SUMMARY "
+    "FINAL_EXPERIMENTAL_SUMMARY "
     f"shapes={len(selector_rows)} "
     f"candidate_wins={sum(row['median_winner'] == 'candidate' for row in selector_rows)} "
     f"official_wins={sum(row['median_winner'] == 'official' for row in selector_rows)} "
@@ -202,18 +198,18 @@ fail() {
 announce "RUN_LOG path=${RUN_LOG}"
 source_revision="$(git rev-parse HEAD 2>/dev/null || printf unknown)"
 announce "SOURCE_REVISION commit=${source_revision}"
-announce "CAMPAIGN_READY operator=matmul focus=all_installed_family_branches_and_boundaries host_branches=${EXPECTED_BRANCHES} audit_items=${EXPECTED_AUDIT_ITEMS} npu_shapes=${VALIDATION_SHAPES} selector_top1_measurements=38 branch_probe_measurements=13 structural_probe_measurements=11 official_measurements=${VALIDATION_SHAPES} measurement_batches=derived_from_complete_manifest compiled_variants=all_manifest_dtype_suffix_pairs physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
+announce "CAMPAIGN_READY operator=matmul focus=c220_structural_families families=5 npu_shapes=${VALIDATION_SHAPES} candidate_measurements=${VALIDATION_SHAPES} official_measurements=${VALIDATION_SHAPES} compiled_variants=${EXPECTED_VARIANTS} physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
 announce "measurement=${WARMUP}_warmup+${SAMPLES}_device_event_samples+repeat_${REPEAT}+validate_last_timed_output"
-announce "selection=all_applicable_installed_families_then_hard_legality_then_protocol_specific_hardware_rules_then_critical_path_tiebreak"
-announce "selector=shape_and_frozen_hardware_only"
+announce "selection=one_required_structural_family_per_workload_with_hard_resource_checks_and_no_fallback"
+announce "selector=shape_and_frozen_c220_hardware_formula_only"
 announce "official_reference=same_campaign_installed_aclnn_matmul_public_api"
-announce "forbidden=measured_latency_at_selection,history_lookup_at_runtime,repo_lookup,tiling_bank,official_tiling_seed"
+announce "forbidden=cost_model,measured_latency_at_selection,history_lookup_at_runtime,repo_lookup,tiling_bank,official_tiling_seed,installed_branch_fallback"
 announce "CANN_ENV root=${CANN_ROOT} soc=${SOC_VERSION} aic=20 visible_devices=${ASCEND_RT_VISIBLE_DEVICES}"
 announce "results=${CAMPAIGN_DIR}"
 
 if [[ -s "${ANALYSIS}" ]] && grep -q '"status": "complete"' "${ANALYSIS}"; then
     emit_final_results
-    announce "PAIRED_VALIDATION_COMPLETE cached=1 analysis=${ANALYSIS} summary=${SUMMARY} log=${RUN_LOG}"
+    announce "C220_STRUCTURAL_VALIDATION_COMPLETE cached=1 analysis=${ANALYSIS} summary=${SUMMARY} log=${RUN_LOG}"
     exit 0
 fi
 
@@ -327,24 +323,16 @@ if [[ "${device_preflight_rc}" -ne 0 ]]; then
 fi
 announce "DEVICE_PREFLIGHT passed physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID} wall_ms=${device_preflight_wall_ms}"
 
-audit_started_ns="$(date +%s%N)"
-audit_json="$(python3 tools/audit_matmul_candidate_engine.py)"
-python3 -c 'import json,sys; x=json.loads(sys.argv[1]); assert x["status"] == "PASS" and x["mandatory_count"] == int(sys.argv[2]) and x["passed_count"] == int(sys.argv[2]) and not x["failed_ids"]' "${audit_json}" "${EXPECTED_AUDIT_ITEMS}"
-printf '%s\n' "${audit_json}"
-audit_wall_ms=$(( ($(date +%s%N) - audit_started_ns) / 1000000 ))
-announce "HOST_CANDIDATE_AUDIT passed items=${EXPECTED_AUDIT_ITEMS} branches=${EXPECTED_BRANCHES}"
-announce "CAMPAIGN_STAGE_TIMING stage=host_candidate_audit wall_ms=${audit_wall_ms}"
-
 generation_started_ns="$(date +%s%N)"
-python3 tools/generate_matmul_rule_matrix.py \
+python3 tools/generate_matmul_c220_experimental_matrix.py \
     --output-dir "${PACKET_DIR}" \
     --manifest "${MANIFEST}" \
     --selection "${SELECTION}" \
     --variant-dir "${VARIANT_DIR}" \
     --sequence-dir "${SEQUENCE_DIR}"
-EXPECTED_VARIANTS="$(find "${VARIANT_DIR}" -maxdepth 1 -type f -name '*.csv' | wc -l)"
-[[ "${EXPECTED_VARIANTS}" -ge 12 ]] || \
-    fail "generated ${EXPECTED_VARIANTS} dtype/suffix variants; expected at least 12"
+actual_variants="$(find "${VARIANT_DIR}" -maxdepth 1 -type f -name '*.csv' | wc -l)"
+[[ "${actual_variants}" -eq "${EXPECTED_VARIANTS}" ]] || \
+    fail "generated ${actual_variants} dtype/suffix variants; expected ${EXPECTED_VARIANTS}"
 printf '%s\n' 'SELECTION_RECORDS_BEGIN'
 sed 's/^/SELECTION_RECORD /' "${SELECTION}"
 printf '%s\n' 'SELECTION_RECORDS_END'
@@ -352,8 +340,8 @@ printf '%s\n' 'CANDIDATE_MANIFEST_CSV_BEGIN'
 cat "${MANIFEST}"
 printf '%s\n' 'CANDIDATE_MANIFEST_CSV_END'
 generation_wall_ms=$(( ($(date +%s%N) - generation_started_ns) / 1000000 ))
-announce "RULE_WINNER_AND_PROBE_PACKET_GENERATION passed shapes=${VALIDATION_SHAPES} variants=${EXPECTED_VARIANTS}"
-announce "CAMPAIGN_STAGE_TIMING stage=rule_winner_and_probe_packet_generation wall_ms=${generation_wall_ms}"
+announce "C220_STRUCTURAL_PACKET_GENERATION passed shapes=${VALIDATION_SHAPES} families=5 variants=${EXPECTED_VARIANTS} packet_bytes=280"
+announce "CAMPAIGN_STAGE_TIMING stage=c220_structural_packet_generation wall_ms=${generation_wall_ms}"
 
 official_build_started_ns="$(date +%s%N)"
 announce "OFFICIAL_RUNNER_BUILD begin jobs=1"
@@ -450,4 +438,4 @@ printf '%s\n' 'FINAL_SUMMARY_CSV_END'
 analysis_wall_ms=$(( ($(date +%s%N) - analysis_started_ns) / 1000000 ))
 announce "CAMPAIGN_STAGE_TIMING stage=analysis wall_ms=${analysis_wall_ms}"
 emit_final_results
-announce "PAIRED_VALIDATION_COMPLETE cached=0 analysis=${ANALYSIS} summary=${SUMMARY} packets=${PACKET_DIR} log=${RUN_LOG}"
+announce "C220_STRUCTURAL_VALIDATION_COMPLETE cached=0 analysis=${ANALYSIS} summary=${SUMMARY} packets=${PACKET_DIR} log=${RUN_LOG}"

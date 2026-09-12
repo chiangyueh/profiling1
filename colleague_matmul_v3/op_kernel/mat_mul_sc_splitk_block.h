@@ -16,6 +16,7 @@
 #define __OP_KERNEL_MATMUL_V3_SC_SPLITK_BLOCK_H__
 
 #include "mat_mul_v3_common.h"
+#include "mat_mul_base_block.h"
 #include "kernel_operator.h"
 
 using namespace AscendC;

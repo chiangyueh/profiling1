@@ -55,7 +55,11 @@
 #include "aclrtlaunch_direct_matmul_fp32_k10201.h"
 #include "aclrtlaunch_direct_matmul_fp32_k20201.h"
 #endif
+#ifdef DIRECT_MATMUL_PACKET_HEADER
+#include DIRECT_MATMUL_PACKET_HEADER
+#else
 #include "mat_mul_v3_tiling_data.h"
+#endif
 
 namespace {
 
@@ -245,7 +249,8 @@ std::vector<Candidate> LoadManifest(const std::string &path)
             (row.role != "searched" && row.role != "direct_measurement" &&
              row.role != "independent_improved" &&
              row.role != "independent_global_winner" &&
-             row.role != "independent_branch_probe") ||
+             row.role != "independent_branch_probe" &&
+             row.role != "independent_experimental_family") ||
             row.m <= 0 || row.n <= 0 || row.k <= 0 || row.usedCores == 0 ||
             row.workspaceBytes < 20U * 1024U * 1024U ||
             row.requiredSuccessfulTilings == 0) {
@@ -634,7 +639,7 @@ void RunCandidate(
     auto launch = [&]() {
         Check(Launch(
             candidate, stream, a.ptr, b.ptr, c.ptr, workspace.ptr, tiling.ptr),
-            "direct CANN 8.1 MatMulV3 kernel launch");
+            "direct MatMulV3 family kernel launch");
     };
 
     const auto warmupStarted = Clock::now();
