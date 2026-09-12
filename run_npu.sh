@@ -9,6 +9,7 @@ REPEAT=10
 SAMPLES=15
 VALIDATION_SHAPES=12
 EXPECTED_VARIANTS=8
+NUMERIC_PREFLIGHT_MAX_MIB=320
 
 usage() {
     printf '%s\n' \
@@ -200,6 +201,7 @@ source_revision="$(git rev-parse HEAD 2>/dev/null || printf unknown)"
 announce "SOURCE_REVISION commit=${source_revision}"
 announce "CAMPAIGN_READY operator=matmul focus=c220_structural_families families=5 npu_shapes=${VALIDATION_SHAPES} candidate_measurements=${VALIDATION_SHAPES} official_measurements=${VALIDATION_SHAPES} compiled_variants=${EXPECTED_VARIANTS} physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
 announce "measurement=${WARMUP}_warmup+${SAMPLES}_device_event_samples+repeat_${REPEAT}+validate_last_timed_output"
+announce "numeric_preflight_limit_mib=${NUMERIC_PREFLIGHT_MAX_MIB} largest_input_pair_mib=258"
 announce "selection=one_required_structural_family_per_workload_with_hard_resource_checks_and_no_fallback"
 announce "selector=shape_and_frozen_c220_hardware_formula_only"
 announce "official_reference=same_campaign_installed_aclnn_matmul_public_api"
@@ -388,7 +390,7 @@ announce "OFFICIAL_MEASUREMENT begin shapes=${VALIDATION_SHAPES}"
     --warmup "${WARMUP}" \
     --repeat "${REPEAT}" \
     --samples "${SAMPLES}" \
-    --numeric-preflight-max-mib 256 \
+    --numeric-preflight-max-mib "${NUMERIC_PREFLIGHT_MAX_MIB}" \
     --structured-full-preflight \
     --validate-after-measurement
 announce "OFFICIAL_MEASUREMENT passed shapes=${VALIDATION_SHAPES}"
