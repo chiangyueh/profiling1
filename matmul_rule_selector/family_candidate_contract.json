@@ -1,0 +1,288 @@
+{
+  "contract_version": "cann81_c220_candidate_contract_v1",
+  "target": {
+    "soc": "Ascend910B3",
+    "arch": 220,
+    "aic": 20,
+    "aiv": 40,
+    "cann": "8.1",
+    "packet_bytes": 272,
+    "scope": "ND dense MatMulV3 with matching FP16, BF16 or FP32 inputs and output"
+  },
+  "selection_semantics": {
+    "official_order_is_not_used_to_choose_the_improved_winner": true,
+    "all_applicable_installed_families_are_scored": true,
+    "official_tiling_seed": false,
+    "history_or_runtime_kb_lookup": false,
+    "measured_latency_at_selection_time": false,
+    "winner": "minimum simulated critical-path cycles after exact CANN lowering and validation",
+    "tie_break": "family name then complete packet fields; deterministic and independent of official output"
+  },
+  "families": [
+    {
+      "name": "BASE",
+      "status": "INSTALLED_81_EXECUTABLE",
+      "suffixes": [0, 1],
+      "source_anchors": [
+        "mat_mul_v3_base_tiling.cpp:918-924",
+        "mat_mul_v3_base_tiling.cpp:1014-1140",
+        "mat_mul_v3_base_tiling.cpp:1601-1641",
+        "mat_mul_base_block.h"
+      ],
+      "applicability": "Every input in the target scope has a direct BASE candidate.",
+      "candidate_axes": [
+        "baseM and baseN are positive 16-element multiples projected from Cube issue, output-wave and L0 capacity boundaries",
+        "baseK is a positive K0 multiple projected from K extent and L0A/L0B capacity boundaries",
+        "stepKa, stepKb, depthA1 and depthB1 are derived together from the exact L1 packet-capacity and 256/512-byte DMA rules",
+        "usedCoreNum is chosen only from useful MN task counts up to 20",
+        "traversal is each legal permutation of M and N",
+        "L2 windows are task-aligned reuse regions and may exceed L2 only as a cache miss, never as a scratchpad allocation"
+      ],
+      "hard_constraints": [
+        "singleCoreM and singleCoreN cover exactly one BASE task and are not smaller than the inner tile",
+        "singleCoreK covers K because BASE has no split reduction",
+        "L0A, L0B, L0C, L1 and bias reservations fit",
+        "L2 counts and blocks cover every MN task without gaps",
+        "suffix 0 is used exactly when an input needs ND-to-NZ workspace; suffix 1 otherwise"
+      ],
+      "cost_components": [
+        "per-core MN wave and tail imbalance",
+        "padded Cube commands",
+        "GM/L2-to-L1 traffic after traversal and L2-window reuse",
+        "L1-to-L0A/L0B traffic",
+        "FixPipe result traffic",
+        "ND-to-NZ conversion traffic and Vector work",
+        "pipeline fill and drain"
+      ]
+    },
+    {
+      "name": "AL1",
+      "status": "INSTALLED_81_EXECUTABLE",
+      "suffixes": [101],
+      "source_anchors": [
+        "mat_mul_v3_base_tiling.cpp:1468-1504",
+        "mat_mul_l1_full_load.h:CopyInA1",
+        "mat_mul_l1_full_load.h:MatmulBaseKernelAL1FullLoad"
+      ],
+      "applicability": "FP32, not transA, transB, M<=16, 16<N<=320, K>=4096, K divisible by 128, and the complete aligned A plus B/bias buffers fit L1.",
+      "candidate_axes": [
+        "baseK from full-K divisors at L0A/L0B and remaining-L1 transition points, including non-power-of-two values such as 448",
+        "stepKb and depthB1 from legal divisor-aligned B packet and single/double-buffer transitions",
+        "usedCoreNum from useful N-task wave counts up to the hardware AIC count",
+        "task traversal, L2 task grouping and legal local buffer depths while complete A remains resident"
+      ],
+      "hard_constraints": [
+        "baseM=16, baseN=16, baseK divides K and singleCoreN=16 for the installed source-backed packet family",
+        "singleCoreM=M, singleCoreK covers K, stepKa=K/baseK, depthA1=stepKa",
+        "the complete aligned MxK A allocation fits one AIC L1",
+        "no ND-to-NZ workspace suffix is dispatched"
+      ],
+      "cost_components": [
+        "one complete A load per active AIC",
+        "B streaming and B pipeline",
+        "N-task wave and tail imbalance",
+        "Cube and FixPipe work",
+        "local-memory pipeline fill"
+      ]
+    },
+    {
+      "name": "BL1",
+      "status": "INSTALLED_81_EXECUTABLE",
+      "suffixes": [200, 201],
+      "source_anchors": [
+        "mat_mul_v3_base_tiling.cpp:1506-1557",
+        "mat_mul_l1_full_load.h:CopyBL1",
+        "mat_mul_l1_full_load.h:MatmulBaseKernelBL1FullLoad"
+      ],
+      "applicability": "M>16*max(K,N), K<=256, and B is available through the source on-the-way path or the documented FP32 narrow-A VNCHW path with resident B fitting L1.",
+      "candidate_axes": [
+        "baseN aligned to the B layout and bounded by N",
+        "baseK on K0 and L0A/L0B boundaries",
+        "baseM on L0A/L0C/L1 capacity boundaries",
+        "usedCoreNum from useful M-task counts",
+        "M/N traversal and legal L2 groups"
+      ],
+      "hard_constraints": [
+        "singleCoreN covers N, stepN=ceil(N/baseN)",
+        "stepKa=stepKb=ceil(K/baseK), depthB1=stepN*stepKb",
+        "singleCoreM=2*baseM and depthA1=2*stepKa for the installed source-backed packet family",
+        "the full B resident set plus streamed A packets fits L1"
+      ],
+      "cost_components": [
+        "one resident B-panel load per active AIC",
+        "number of M tasks amortizing that load",
+        "A streaming traffic",
+        "M-tail imbalance",
+        "Cube, FixPipe and optional A conversion work"
+      ]
+    },
+    {
+      "name": "FIXPIPE_BL1",
+      "status": "INSTALLED_81_EXECUTABLE",
+      "suffixes": [10200, 10201, 20201],
+      "source_anchors": [
+        "mat_mul_v3_base_tiling.cpp:1424-1465",
+        "mat_mul_v3_base_tiling.cpp:1560-1599",
+        "mat_mul_optimized_fixpipe_algorithm.h"
+      ],
+      "applicability": "N<256, K<=256, N is neither an output-alignment multiple nor a divisor of it, M>=20*512, and the scalar-bound exclusion holds. FP16/BF16 additionally require not transA and either K is 256-byte aligned or K is below one 256-byte quantum. FP32 does not impose that transA restriction.",
+      "candidate_axes": [
+        "usedCoreNum from useful M tasks",
+        "legal local buffer counts",
+        "resident-B A-pipeline packet depth when it preserves the complete K iteration",
+        "FixPipe versus FP32 Vector NZ-to-ND when the latter's exact predicate holds"
+      ],
+      "hard_constraints": [
+        "baseN=align16(N), baseM is a positive 128-row multiple fitting L0C and UB",
+        "baseK is a positive 16-element multiple fitting double-buffered L0A/L0B",
+        "singleCoreM=baseM, singleCoreN=baseN, singleCoreK covers K",
+        "B is complete in L1; disabled and task-block L2 scheduler packets are independently legal and both remain candidates",
+        "suffix 20201 requires FP32, no A conversion, K divisible by 8 and N<=192"
+      ],
+      "cost_components": [
+        "resident B load",
+        "A streaming and A-pipeline depth",
+        "aligned temporary-output padding",
+        "per-core ping-pong GM workspace traffic",
+        "AIC/AIV flags and synchronization",
+        "Vector gather or NZ-to-ND work",
+        "saved direct FixPipe padding"
+      ]
+    },
+    {
+      "name": "SINGLE_CORE_SPLIT_K",
+      "status": "INSTALLED_81_EXECUTABLE",
+      "suffixes": [20, 21],
+      "source_anchors": [
+        "mat_mul_v3_base_tiling.cpp:1808-1894",
+        "mat_mul_v3_base_tiling.cpp:1896-1917",
+        "mat_mul_sc_splitk_block.h",
+        "mat_mul_sc_splitk_kernel.h"
+      ],
+      "applicability": "The source single-core Split-K support predicate holds and the candidate has singleCoreN>=512, average MN occupancy>=0.70, plus the documented 896<=N<=2048 stronger occupancy rule.",
+      "candidate_axes": [
+        "legal MN core grids and aligned parent tasks",
+        "baseM/baseN/baseK on scratchpad boundaries",
+        "serial K chunk size and packet depth",
+        "M-first or N-first traversal",
+        "L2 long-axis grouping"
+      ],
+      "hard_constraints": [
+        "each AIC owns complete MN output tasks; K is not distributed between AICs",
+        "singleCoreK=stepKa*baseK, stepKa=stepKb and at least two K chunks execute",
+        "later K chunks use the kernel's atomic accumulation path",
+        "usedCoreNum does not exceed MN task count",
+        "all local memories and L2 task coverage validate"
+      ],
+      "cost_components": [
+        "MN task-wave and tail imbalance",
+        "serial K chunk count",
+        "repeated result write or atomic accumulation",
+        "A/B transfer reuse under traversal",
+        "conversion workspace and Vector work",
+        "pipeline fill for each parent task"
+      ]
+    },
+    {
+      "name": "DETERMINISTIC_SPLIT_K",
+      "status": "INSTALLED_81_EXECUTABLE",
+      "suffixes": [30, 31],
+      "source_anchors": [
+        "mat_mul_v3_base_tiling.cpp:1919-2013",
+        "mat_mul_v3_base_tiling.cpp:2015-2110",
+        "mat_mul_deterministic_splitk_kernel.h"
+      ],
+      "applicability": "The source SupportMultiSplitK predicate holds: low MN occupancy with K>=20*384, the small TA/NT special domain, or the documented K>=27392 domain after its FixPipe-bound rejection.",
+      "candidate_axes": [
+        "MK or NK 3x3 traversal",
+        "K partition count derived from executable K chunks up to 20",
+        "L2-bounded opposite-axis panel size"
+      ],
+      "hard_constraints": [
+        "installed 3x3 packet uses baseM=baseN=128 and baseK=256/input_bytes",
+        "singleCoreK=3*baseK with the matching 3x1 or 1x3 step/depth profile",
+        "at least two AIC K partitions execute",
+        "each AIC writes an FP32 partial and AIV reduces in fixed order",
+        "the 256-byte FP32 N-tail reducer stride cannot exceed the allocated singleCoreN slot"
+      ],
+      "cost_components": [
+        "K-owner imbalance",
+        "partial FP32 workspace write/read",
+        "P-1 Vector additions per output element",
+        "AIC/AIV barriers",
+        "MK/NK operand traffic and L2 panel reuse",
+        "final cast and output"
+      ]
+    },
+    {
+      "name": "INCREMENTAL_PATTERN",
+      "status": "INSTALLED_81_EXECUTABLE",
+      "suffixes": [1],
+      "source_anchors": [
+        "mat_mul_v3_base_tiling.cpp:1717-1777",
+        "mat_mul_v3_base_tiling.cpp:DoIncreTiling",
+        "cache_tiling.cc:TilingPatternProcess/FastFindParams"
+      ],
+      "applicability": "M<=128, matching FP16/BF16 input and output, ND, not transA, transB, no bias and no ND-to-NZ head conversion.",
+      "candidate_axes": [
+        "the complete finite PATTERN_AL1_FULL, PATTERN_BL1_FULL and PATTERN_NOT_FULL source loops",
+        "M/N core dimensions",
+        "L1/L0 M/N/K factors",
+        "single/double buffer selection"
+      ],
+      "hard_constraints": [
+        "every source loop candidate is preserved before hardware simulation",
+        "converted CANN fields pass the same packet and memory validator as other BASE-key candidates",
+        "the source cycle winner is not used as an official tiling seed; every converted candidate is independently rescored"
+      ],
+      "cost_components": [
+        "the lowered BASE execution graph costs",
+        "per-core MN tail",
+        "resident/full-load traffic implied by the pattern fields",
+        "Cube, MTE and FixPipe pipeline work"
+      ]
+    }
+  ],
+  "non_installed_families": [
+    {
+      "name": "NONDETERMINISTIC_MULTI_CORE_SPLIT_K",
+      "status": "REQUIRES_NEW_KERNEL",
+      "reason": "CANN 8.1 DAV-C220 dispatch has no mode-4 suffix."
+    },
+    {
+      "name": "SINGLE_CORE_SPLIT_K_NKM",
+      "status": "REQUIRES_NEW_KERNEL",
+      "reason": "CANN 8.1 dispatch has no mode-5 NKM kernel."
+    },
+    {
+      "name": "SINGLE_CORE_SPLIT_K_GM_TO_L1",
+      "status": "REQUIRES_NEW_KERNEL",
+      "reason": "CANN 8.1 dispatch has no mode-6 manual GM-to-L1 kernel."
+    },
+    {
+      "name": "SINGLE_CORE_SPLIT_K_AL1",
+      "status": "REQUIRES_NEW_KERNEL",
+      "reason": "The installed source and key set do not dispatch the newer combined kernel."
+    },
+    {
+      "name": "STREAM_K_AND_DP_STREAM_K",
+      "status": "REQUIRES_NEW_KERNEL",
+      "reason": "Tail-only cross-core K ownership and partial reduction require the arch35 scheduler/kernel."
+    },
+    {
+      "name": "ASW_AND_ASWT",
+      "status": "REQUIRES_NEW_KERNEL",
+      "reason": "Tail sub-block ownership and dynamic window scheduling are not expressible by the installed 8.1 packet."
+    }
+  ],
+  "pareto_objectives": [
+    "critical_core_cycles",
+    "critical_to_average_core_ratio",
+    "padded_cube_resource_cycles",
+    "gm_read_plus_write_bytes",
+    "l2_bytes",
+    "reduction_cycles",
+    "workspace_bytes",
+    "peak_L1_plus_L0_plus_UB_bytes"
+  ]
+}

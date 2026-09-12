@@ -217,6 +217,10 @@ class Access:
     pattern: AccessPattern = AccessPattern.CONTIGUOUS
     contiguous_axes: tuple[str, ...] = ()
     transaction_bytes: int = 32
+    # Per-command padding that is stronger than the logical tensor extent.
+    # This models row-stride contracts such as FixPipe's 512-byte temporary
+    # output without changing the useful tensor shape.
+    padded_axis_alignments: tuple[tuple[str, int], ...] = ()
     coalesced_elements: int = 1
     # Axes whose successive tiles are separated by a producer/consumer
     # dependency.  Their transfer latency cannot be collapsed into one
@@ -245,6 +249,13 @@ class Access:
             raise ValueError("an access path needs at least two memory spaces")
         if self.transaction_bytes <= 0:
             raise ValueError("transaction_bytes must be positive")
+        padded_names = [name for name, _ in self.padded_axis_alignments]
+        if len(padded_names) != len(set(padded_names)):
+            raise ValueError("padded_axis_alignments contains duplicate axes")
+        if not set(padded_names) <= set(self.axes):
+            raise ValueError("padded_axis_alignments refers to an unaccessed axis")
+        if any(value <= 0 for _, value in self.padded_axis_alignments):
+            raise ValueError("padded axis alignment must be positive")
         if self.coalesced_elements <= 0:
             raise ValueError("coalesced_elements must be positive")
         if len(self.dependency_axes) != len(set(self.dependency_axes)):
@@ -317,6 +328,10 @@ class Stage:
     accesses: tuple[Access, ...] = ()
     primitives: tuple[Primitive, ...] = ()
     scope: StageScope = StageScope.TASK
+    # Some kernels execute a core-local prologue before checking whether the
+    # launched block owns an output task.  Such work must be charged to all
+    # launched cores, including blocks with no productive task.
+    runs_on_all_launched_cores: bool = False
     # Work items inside a stage may be submitted concurrently.  They still
     # compete for a shared resource, which the simulator accounts for.
     concurrent: bool = False
@@ -332,6 +347,10 @@ class Stage:
             raise ValueError(f"stage {self.name} has no work")
         if len(self.invocation_axes) != len(set(self.invocation_axes)):
             raise ValueError("stage invocation_axes must be unique")
+        if self.runs_on_all_launched_cores and self.scope != StageScope.CORE:
+            raise ValueError(
+                "runs_on_all_launched_cores is valid only for CORE stages"
+            )
 
 
 @dataclass(frozen=True)

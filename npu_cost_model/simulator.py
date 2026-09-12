@@ -88,6 +88,7 @@ class SimulationResult:
     hbm_cycles: float
     l2_cycles: float
     shared_resource_cycles: float
+    pipeline_fill_cycles: float
     bottleneck: str
     launch_cycles: float
     reduction_cycles: float
@@ -110,6 +111,7 @@ def _invalid(error: str) -> SimulationResult:
         hbm_cycles=inf,
         l2_cycles=inf,
         shared_resource_cycles=inf,
+        pipeline_fill_cycles=inf,
         bottleneck="invalid",
         launch_cycles=0.0,
         reduction_cycles=0.0,
@@ -153,8 +155,14 @@ def _traffic_bytes(
 ) -> tuple[int, int, int]:
     """Return service bytes, useful bytes and issued copy requests."""
 
-    elements = _points(extents, access.axes)
-    useful = elements * element_bytes
+    useful_elements = _points(extents, access.axes)
+    useful = useful_elements * element_bytes
+    padded = dict(access.padded_axis_alignments)
+    traffic_extents = {
+        name: align_up(value, padded[name]) if name in padded else value
+        for name, value in extents.items()
+    }
+    elements = _points(traffic_extents, access.axes)
     if access.pattern == AccessPattern.INDIRECT:
         requests = ceil_div(elements, access.coalesced_elements)
         return requests * access.transaction_bytes, useful, requests
@@ -295,7 +303,14 @@ def _access_cost(
                     dtype_bytes(access.local_dtype) + element_bytes
                 )
             port_bytes = align_up(
-                _points(extents, access.axes)
+                _points(
+                    {
+                        name: align_up(value, dict(access.padded_axis_alignments)[name])
+                        if name in dict(access.padded_axis_alignments) else value
+                        for name, value in extents.items()
+                    },
+                    access.axes,
+                )
                 * service_bytes_per_element,
                 access.transaction_bytes,
             )
@@ -332,7 +347,12 @@ def _access_cost(
         # latency is paid only while filling/draining the pipeline.  Charging
         # the full route latency once per K packet double-counts that same
         # dependency and systematically favors tiny tasks with more cores.
-        if waves > 1.0 and plan.buffer_counts.get(destination, 1) == 2:
+        if waves > 1.0 and (
+            plan.buffer_counts.get(destination, 1) == 2
+            or plan.transfer_buffer_count(
+                access.tensor, source, destination
+            ) == 2
+        ):
             waves = 1.0
         if access.pattern == AccessPattern.INDIRECT and MemorySpace.GM in (
             source, destination
@@ -790,8 +810,10 @@ def _core_stage_cost(
     hardware: Hardware,
     reduction_partitions: int,
     cache_group_resident: bool,
+    *,
+    all_launched: bool = False,
 ) -> WorkCost:
-    """Cost of setup/resident loads performed once by every active core."""
+    """Cost of one productive-only or all-launched core prologue."""
 
     extents = {
         axis.name: min(axis.extent, plan.tasks[axis.name])
@@ -799,7 +821,10 @@ def _core_stage_cost(
     }
     total = WorkCost()
     for stage in algorithm.stages:
-        if stage.scope != StageScope.CORE:
+        if (
+            stage.scope != StageScope.CORE
+            or stage.runs_on_all_launched_cores != all_launched
+        ):
             continue
         total.add(
             _stage_cost(
@@ -850,9 +875,24 @@ def _task_pipeline_cost(
         (space,) for space in algorithm.buffered_spaces
     )
     for boundary in boundaries:
-        if not all(
+        globally_buffered = all(
             plan.buffer_counts.get(space, 1) == 2 for space in boundary
-        ):
+        )
+        transfer_buffered = False
+        if boundary == (MemorySpace.L1,):
+            relevant = []
+            for stage_index, _ in stage_costs:
+                for access in algorithm.stages[stage_index].accesses:
+                    if (
+                        access.mode == AccessMode.READ
+                        and (MemorySpace.GM, MemorySpace.L1)
+                        in tuple(zip(access.path, access.path[1:]))
+                    ):
+                        relevant.append(plan.transfer_buffer_count(
+                            access.tensor, MemorySpace.GM, MemorySpace.L1
+                        ))
+            transfer_buffered = bool(relevant) and min(relevant) == 2
+        if not globally_buffered and not transfer_buffered:
             continue
         boundary_spaces = set(boundary)
         for stage_index, _ in stage_costs:
@@ -1002,16 +1042,17 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
 
     classes = _task_classes(operator, algorithm, plan)
     total_tasks = sum(count for _, count in classes)
-    active_cores = min(plan.used_cores, total_tasks)
-    if active_cores <= 0:
+    launched_cores = plan.used_cores
+    productive_cores = min(launched_cores, total_tasks)
+    if productive_cores <= 0:
         return _invalid("schedule has no executable task")
 
-    core_serial = [0.0] * active_cores
-    core_resources: list[dict[Resource, float]] = [dict() for _ in range(active_cores)]
-    core_fill = [0.0] * active_cores
-    core_gm_read = [0.0] * active_cores
-    core_gm_write = [0.0] * active_cores
-    core_l2 = [0.0] * active_cores
+    core_serial = [0.0] * launched_cores
+    core_resources: list[dict[Resource, float]] = [dict() for _ in range(launched_cores)]
+    core_fill = [0.0] * launched_cores
+    core_gm_read = [0.0] * launched_cores
+    core_gm_write = [0.0] * launched_cores
+    core_l2 = [0.0] * launched_cores
     offset = 0
     task_cache: dict[tuple[tuple[str, int], ...], tuple[WorkCost, float]] = {}
     for extents, multiplicity in classes:
@@ -1042,10 +1083,10 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
         task, task_fill = cached_task
         if not task.valid:
             return _invalid(task.error)
-        base = multiplicity // active_cores
-        extra = multiplicity % active_cores
-        for core in range(active_cores):
-            count = base + (1 if (core - offset) % active_cores < extra else 0)
+        base = multiplicity // productive_cores
+        extra = multiplicity % productive_cores
+        for core in range(productive_cores):
+            count = base + (1 if (core - offset) % productive_cores < extra else 0)
             if count <= 0:
                 continue
             core_serial[core] += task.elapsed_cycles * count
@@ -1057,20 +1098,20 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
                 core_resources[core][resource] = (
                     core_resources[core].get(resource, 0.0) + cycles * count
                 )
-        offset = (offset + extra) % active_cores
+        offset = (offset + extra) % productive_cores
 
     kernel_stage = _kernel_stage_cost(
         operator,
         algorithm,
         plan,
         hardware,
-        active_cores,
+        productive_cores,
         total_reduction_partitions,
         cache_group_resident,
     )
     if not kernel_stage.valid:
         return _invalid(kernel_stage.error)
-    core_stage = _core_stage_cost(
+    productive_core_stage = _core_stage_cost(
         operator,
         algorithm,
         plan,
@@ -1078,25 +1119,41 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
         total_reduction_partitions,
         cache_group_resident,
     )
-    if not core_stage.valid:
-        return _invalid(core_stage.error)
+    launched_core_stage = _core_stage_cost(
+        operator,
+        algorithm,
+        plan,
+        hardware,
+        total_reduction_partitions,
+        cache_group_resident,
+        all_launched=True,
+    )
+    if not productive_core_stage.valid or not launched_core_stage.valid:
+        return _invalid(
+            productive_core_stage.error or launched_core_stage.error
+        )
 
     core_cycles: list[float] = []
     aggregate_resources: dict[Resource, float] = {}
     gm_read = gm_write = l2_bytes = 0.0
-    for core in range(active_cores):
-        for resource, cycles in core_stage.resource_cycles.items():
-            core_resources[core][resource] = (
-                core_resources[core].get(resource, 0.0) + cycles
-            )
+    for core in range(launched_cores):
+        stage_costs = [launched_core_stage]
+        if core < productive_cores:
+            stage_costs.append(productive_core_stage)
+        for core_stage in stage_costs:
+            for resource, cycles in core_stage.resource_cycles.items():
+                core_resources[core][resource] = (
+                    core_resources[core].get(resource, 0.0) + cycles
+                )
+            core_serial[core] += core_stage.elapsed_cycles
+            core_gm_read[core] += core_stage.gm_read_bytes
+            core_gm_write[core] += core_stage.gm_write_bytes
+            core_l2[core] += core_stage.l2_bytes
         for resource, cycles in kernel_stage.resource_cycles.items():
             core_resources[core][resource] = (
                 core_resources[core].get(resource, 0.0) + cycles
             )
-        core_serial[core] += core_stage.elapsed_cycles + kernel_stage.elapsed_cycles
-        core_gm_read[core] += core_stage.gm_read_bytes
-        core_gm_write[core] += core_stage.gm_write_bytes
-        core_l2[core] += core_stage.l2_bytes
+        core_serial[core] += kernel_stage.elapsed_cycles
         core_gm_read[core] += kernel_stage.gm_read_bytes
         core_gm_write[core] += kernel_stage.gm_write_bytes
         core_l2[core] += kernel_stage.l2_bytes
@@ -1112,7 +1169,7 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
 
     protocol = algorithm.effective_reduction_protocol
     if (
-        total_reduction_partitions > active_cores
+        total_reduction_partitions > productive_cores
         and protocol == ReductionProtocol.PARALLEL_WORKSPACE
     ):
         # Each producer core owns one workspace partial.  If there are more
@@ -1121,7 +1178,7 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
         # cross-core reduction.  They are not independent plain stores.
         # Evaluate the exact result access for every output-tail class so the
         # correction remains an IR rule, independent of the operator name.
-        repeated_chunks_per_output = total_reduction_partitions - active_cores
+        repeated_chunks_per_output = total_reduction_partitions - productive_cores
         direct_resource_delta: dict[Resource, float] = {}
         atomic_resource_delta: dict[Resource, float] = {}
         elapsed_delta = 0.0
@@ -1197,9 +1254,9 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
                     )
         if elapsed_delta > 0.0:
             critical_index = max(
-                range(active_cores), key=core_cycles.__getitem__
+                range(productive_cores), key=core_cycles.__getitem__
             )
-            core_cycles[critical_index] += elapsed_delta / active_cores
+            core_cycles[critical_index] += elapsed_delta / productive_cores
         gm_read += read_delta
         gm_write += write_delta
         l2_bytes += l2_delta
@@ -1217,15 +1274,15 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
         algorithm,
         plan,
         hardware,
-        active_cores,
+        productive_cores,
         total_reduction_partitions,
     )
     if workspace_traffic.elapsed_cycles:
         # Declared per-core payload already includes every core.  Convert its
         # aggregate service to the critical per-core path while retaining the
         # aggregate resource and bandwidth totals for shared roofs.
-        core_cycles[max(range(active_cores), key=core_cycles.__getitem__)] += (
-            workspace_traffic.elapsed_cycles / active_cores
+        core_cycles[max(range(productive_cores), key=core_cycles.__getitem__)] += (
+            workspace_traffic.elapsed_cycles / productive_cores
         )
         gm_read += workspace_traffic.gm_read_bytes
         gm_write += workspace_traffic.gm_write_bytes
@@ -1254,7 +1311,7 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
         # It is a general parallel-reduction rule and follows directly from
         # the per-active-core WorkspaceBuffer allocation.
         reduction_producers = (
-            min(total_reduction_partitions, active_cores)
+            min(total_reduction_partitions, productive_cores)
             if protocol == ReductionProtocol.PARALLEL_WORKSPACE
             else 1
         )
@@ -1286,12 +1343,12 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
             1.0, operation_rate * reduction_cores
         )
         sync_rate = hardware.rate(Resource.SYNC).operations_per_cycle
-        sync_cycles = (active_cores + reduction_cores) / max(1.0e-12, sync_rate)
+        sync_cycles = (productive_cores + reduction_cores) / max(1.0e-12, sync_rate)
         # CANN's mixed AIC/AIV kernels finalize the workspace inside the same
         # launch.  Charge the synchronization and vector work, not a second
         # host kernel launch.
         reduction_cycles = vector_cycles + sync_cycles
-        critical_index = max(range(active_cores), key=core_cycles.__getitem__)
+        critical_index = max(range(productive_cores), key=core_cycles.__getitem__)
         core_cycles[critical_index] += reduction_cycles
         gm_read += reduction_read
         gm_write += reduction_write
@@ -1305,7 +1362,7 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
         )
 
     critical = max(core_cycles)
-    average = sum(core_cycles) / active_cores
+    average = sum(core_cycles) / launched_cores
     l2_capacity = hardware.capacities.get(MemorySpace.L2, 0)
     cache_pressure = (
         max(1.0, peak.get(MemorySpace.L2, 0) / l2_capacity)
@@ -1333,7 +1390,7 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
             shared_cycles = max(shared_cycles, cycles / units)
     launch = (
         hardware.kernel_launch_cycles
-        + hardware.active_core_launch_cycles * active_cores
+        + hardware.active_core_launch_cycles * launched_cores
     )
     roofs = {
         "critical_core": critical,
@@ -1352,10 +1409,11 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
         hbm_cycles=hbm_cycles,
         l2_cycles=l2_cycles,
         shared_resource_cycles=shared_cycles,
+        pipeline_fill_cycles=max(core_fill, default=0.0),
         bottleneck=bottleneck,
         launch_cycles=launch,
         reduction_cycles=reduction_cycles,
-        active_cores=active_cores,
+        active_cores=launched_cores,
         workspace_bytes=workspace_bytes,
         gm_read_bytes=gm_read,
         gm_write_bytes=gm_write,

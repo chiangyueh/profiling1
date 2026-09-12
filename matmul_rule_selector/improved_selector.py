@@ -20,9 +20,8 @@ from matmul_reconstruction._core.initializer import (  # noqa: E402
     CUBE_FIELDS,
     initialize_cube,
 )
-from matmul_reconstruction.api import select as baseline_select  # noqa: E402
 
-from formula_rules import CompileInfo, Hardware, Shape, TilingRuleError, solve  # noqa: E402
+from formula_rules import CompileInfo, Hardware, Shape, solve  # noqa: E402
 
 
 HARDWARE = {
@@ -62,6 +61,7 @@ FAMILY_NAME = {
     "BL1": "BL1_FULL_LOAD",
     "SINGLE_CORE_SPLIT_K": "SINGLE_CORE_SPLIT_K",
     "DETERMINISTIC_SPLIT_K": "DETERMINISTIC_SPLIT_K",
+    "INCREMENTAL_PATTERN": "INCREMENTAL_PATTERN",
 }
 
 FAMILY_KEY_PARTS = {
@@ -70,6 +70,7 @@ FAMILY_KEY_PARTS = {
     "BL1": (2, 0, 0),
     "SINGLE_CORE_SPLIT_K": (0, 2, 0),
     "DETERMINISTIC_SPLIT_K": (0, 3, 0),
+    "INCREMENTAL_PATTERN": (0, 0, 0),
 }
 
 # These are the branches actually dispatched by the installed CANN 8.1
@@ -114,36 +115,6 @@ def make_request(m, k, n, dtype, trans_a, trans_b):
         "bias": False,
         "hf32": False,
         "forceGrpAccForFp32": False,
-    }
-
-
-def no_candidate_result(request, baseline, reason, formula=None):
-    baseline_output = {
-        "selected_family": baseline["selected_family"],
-        "tiling_key": baseline["tiling_key"],
-        "block_dim": baseline["blockDim"],
-        "workspace_bytes": baseline["workspace_bytes"],
-        "tiling_data_bytes": baseline["raw_buffer_bytes"],
-        "tiling_data_hex": baseline["raw_buffer_hex"],
-        "tiling_data_sha256": baseline["raw_buffer_sha256"],
-    }
-    return {
-        "status": "NO_DISTINCT_IMPROVEMENT",
-        "request": request,
-        "baseline": baseline_output,
-        "improved": None,
-        "baseline_equivalent": formula is not None,
-        "changed_rules": [],
-        "changed_fields": {},
-        "skip_reason": reason,
-        "formula_family": None if formula is None else formula.get("family"),
-        "npu_eligible": False,
-        "validation": {
-            "host_packet": "NO_IMPROVED_PACKET",
-            "kernel_key_domain": "NO_IMPROVED_PACKET",
-            "local_capacity": "NO_IMPROVED_PACKET",
-            "npu_performance": "NOT_MEASURED",
-        },
     }
 
 
@@ -221,36 +192,6 @@ def nd2nz_geometry(width, n_value, d_value, used_cores):
     return best_n, best_d
 
 
-def workspace_for(family, fields, shape, conversion_a, conversion_b, fix_mode):
-    rpc = 20 * 1024 * 1024
-    if family == "SINGLE_CORE_SPLIT_K":
-        width = 4 if shape.dtype == "fp32" else 2
-        total = rpc + shape.m * align_up(shape.n, 256 // width) * 4
-    elif family == "DETERMINISTIC_SPLIT_K":
-        total = rpc + fields["usedCoreNum"] * fields["singleCoreM"] * fields["singleCoreN"] * 8
-    else:
-        total = rpc
-    width = shape.d
-    if fix_mode == 1:
-        total += (align_up(shape.n, 512 // width) * fields["baseM"] *
-                  fields["usedCoreNum"] * 2 * width)
-    elif fix_mode == 2:
-        total += (align_up(shape.n, 16) * fields["baseM"] *
-                  fields["usedCoreNum"] * 2 * width)
-    c0 = 32 // width
-    if conversion_a:
-        if shape.trans_a:
-            total += align_up(shape.m, c0) * align_up(shape.k, 16) * width
-        else:
-            total += align_up(shape.m, 16) * align_up(shape.k, c0) * width
-    if conversion_b:
-        if shape.trans_b:
-            total += align_up(shape.n, 16) * align_up(shape.k, c0) * width
-        else:
-            total += align_up(shape.n, c0) * align_up(shape.k, 16) * width
-    return total
-
-
 def validate_complete_candidate(payload, raw, suffix, fields, shape):
     """Reject an internally inconsistent host packet before it reaches an NPU run."""
     if len(raw) != 272:
@@ -272,8 +213,8 @@ def validate_complete_candidate(payload, raw, suffix, fields, shape):
         raise ValueError("dbL0C is outside the installed kernel domain")
 
     dtype_bytes = shape.d
-    l0a = 2 * fields["baseM"] * fields["baseK"] * dtype_bytes
-    l0b = 2 * fields["baseN"] * fields["baseK"] * dtype_bytes
+    l0a = fields["dbL0A"] * fields["baseM"] * fields["baseK"] * dtype_bytes
+    l0b = fields["dbL0B"] * fields["baseN"] * fields["baseK"] * dtype_bytes
     l0c = fields["dbL0C"] * fields["baseM"] * fields["baseN"] * 4
     l1 = (
         fields["depthA1"] * fields["baseM"]
@@ -287,37 +228,10 @@ def validate_complete_candidate(payload, raw, suffix, fields, shape):
         raise ValueError("candidate exceeds usable L1 capacity")
 
 
-def changed_rules(family, cube_changes, l2_changes, metadata_changes):
-    changed = set(cube_changes)
-    rules = []
-    if family == "BASE" and changed & {"baseM", "baseN"}:
-        rules.append("R01_GEOMETRIC_BASE_MN")
-    if family == "BASE" and changed & {"baseM", "baseN", "singleCoreM", "singleCoreN", "usedCoreNum"}:
-        rules.append("R02_WAVE_TAIL_REDISTRIBUTION")
-    if family == "BASE" and "baseK" in changed:
-        rules.append("R03_BASE_K_AFTER_MN")
-    if family == "BASE" and changed & {"stepKa", "stepKb", "depthA1", "depthB1"}:
-        rules.append("R04_JOINT_L1_STEP_DEPTH")
-    family_rule = {
-        "AL1": "R05_AL1_RESIDENCY",
-        "BL1": "R06_BL1_RESIDENCY",
-        "SINGLE_CORE_SPLIT_K": "R07_SINGLE_CORE_SPLIT_K_GRID",
-        "DETERMINISTIC_SPLIT_K": "R08_DETERMINISTIC_SPLIT_K",
-    }.get(family)
-    if family_rule and (changed or l2_changes or metadata_changes):
-        rules.append(family_rule)
-    if family in ("SINGLE_CORE_SPLIT_K", "DETERMINISTIC_SPLIT_K") and changed & {"singleCoreM", "singleCoreN"}:
-        rules.append("R09_SPLIT_K_L2_LONG_AXIS")
-    if family == "BASE" and l2_changes:
-        rules.append("R10_BASE_L2_MACRO")
-    if family == "FIXPIPE_BL1" and (changed or metadata_changes):
-        rules.extend(("R12_FIXPIPE_RESIDENT_B", "R13_FIXPIPE_BALANCED_A_PIPELINE"))
-    if "iterateOrder" in changed or "calOrder" in l2_changes:
-        rules.append("R11_TRAVERSAL_ORDER")
-    return rules
-
-
-def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
+def generate(
+    m, k, n, dtype="fp16", trans_a=False, trans_b=False,
+    *, required_suffix=None, required_family=None,
+):
     request = make_request(m, k, n, dtype, trans_a, trans_b)
     shape = Shape(
         m=m,
@@ -340,13 +254,80 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
         format_y="ND",
         total_ub_size=196352,
     )
-    try:
-        formula = solve(shape, FORMULA_HARDWARE, compile_info)
-    except (TilingRuleError, ValueError, ZeroDivisionError) as exc:
-        baseline = baseline_select(
-            request, HARDWARE, source_profile="installed_81", trace=False
+    # A generation or legality failure is fatal.  Falling back to the
+    # official selector here would turn an absent improved result into an
+    # apparently valid baseline packet and violate decision independence.
+    formula = solve(shape, FORMULA_HARDWARE, compile_info)
+    selection_basis = "INDEPENDENT_GLOBAL_HARDWARE_COST_MINIMUM"
+    if required_suffix is not None or required_family is not None:
+        required_suffix = (
+            None if required_suffix is None else int(required_suffix)
         )
-        return no_candidate_result(request, baseline, f"FORMULA_DOMAIN: {exc}")
+        matching = [
+            candidate
+            for candidate in formula["candidate_audit"].get(
+                "all_candidates", ()
+            )
+            if (
+                (required_suffix is None or int(candidate["kernel_suffix"]) == required_suffix)
+                and (required_family is None or candidate["family"] == required_family)
+            )
+        ]
+        if not matching:
+            # solve omits bulky records for the deployment path.  Re-run the
+            # same independent engine with records only for explicit branch
+            # execution coverage; this still uses no official packet/data.
+            from candidate_engine import generate_and_select
+            audited = generate_and_select(
+                shape, FORMULA_HARDWARE, compile_info,
+                include_audit_records=True,
+            )
+            matching = [
+                candidate
+                for candidate in audited["candidate_audit"]["all_candidates"]
+                if (
+                    (required_suffix is None or int(candidate["kernel_suffix"]) == required_suffix)
+                    and (required_family is None or candidate["family"] == required_family)
+                )
+            ]
+            formula = audited
+        if not matching:
+            raise ValueError(
+                "no legal independent candidate for requested branch "
+                f"suffix={required_suffix} family={required_family}"
+            )
+        selected = min(
+            matching,
+            key=lambda candidate: (
+                candidate["cost"]["total_cycles"],
+                candidate["family"],
+                tuple(sorted(candidate["knowledge"].items())),
+            ),
+        )
+        emitted_is_global_winner = (
+            selected["family"] == formula["family"]
+            and selected["knowledge"] == formula["knowledge"]
+        )
+        formula = dict(formula)
+        formula["candidate_audit"] = dict(formula["candidate_audit"])
+        formula["candidate_audit"].update({
+            "emitted_candidate_role": "branch_probe",
+            "emitted_candidate_is_global_minimum": emitted_is_global_winner,
+            "required_branch_suffix": required_suffix,
+            "required_branch_family": required_family,
+        })
+        formula.update({
+            "family": selected["family"],
+            "fields": selected["fields"],
+            "l2": selected["l2"],
+            "conversion_a": selected["conversion_a"],
+            "conversion_b": selected["conversion_b"],
+            "fix_mode": selected["fix_mode"],
+            "resource_bytes": selected["resource_bytes"],
+            "workspace_bytes": selected["workspace_bytes"],
+            "cost": selected["cost"],
+        })
+        selection_basis = "INDEPENDENT_BRANCH_COVERAGE_MINIMUM"
 
     fields = formula["fields"]
     initializer = initialize_cube(request, HARDWARE, trace=False)
@@ -364,8 +345,8 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
     # Every analytic rule in this selector explicitly budgets double-buffered
     # L0 A/B footprints.  These flags therefore follow the new fields rather
     # than being copied from the official selector output.
-    cube["dbL0A"] = 2
-    cube["dbL0B"] = 2
+    cube["dbL0A"] = int(fields["dbL0A"])
+    cube["dbL0B"] = int(fields["dbL0B"])
     cube["dbL0C"] = int(fields["dbL0C"])
 
     l2_formula = formula["l2"]
@@ -411,7 +392,7 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
         "matmulRunInfo": run,
         # The installed 8.1 host writes this storage word before it computes
         # its advisory flag.  Zero is the actual packet contract, not a value
-        # borrowed from the baseline candidate.
+        # fixed by the installed packet ABI, not borrowed from another tiling.
         "l2CacheFlag": 0,
         "vector": vector,
         "padding_hex": {"220": "00000000", "244": "00000000", "252": "00000000"},
@@ -428,9 +409,7 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
     suffix = fix_mode * 10000 + load_mode * 100 + split_mode * 10 + mix_mode
     validate_complete_candidate(payload, raw, suffix, fields, shape)
     key = 10**19 + suffix
-    workspace = workspace_for(
-        formula["family"], fields, shape, conversion_a, conversion_b, fix_mode
-    )
+    workspace = int(formula["workspace_bytes"])
     improved = {
         "selected_family": (
             "BL1_FULL_LOAD_VEC_NZ2ND"
@@ -444,83 +423,20 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
         "tiling_data_hex": raw.hex(),
         "tiling_data_sha256": hashlib.sha256(raw).hexdigest(),
     }
-    # The official MatMulV3 result is produced only after the improved packet
-    # is complete.  It is comparison data and cannot influence any field,
-    # family, key, workspace, or eligibility decision above.
-    baseline = baseline_select(
-        request,
-        HARDWARE,
-        source_profile="installed_81",
-        trace=False,
-    )
-    baseline_output = {
-        "selected_family": baseline["selected_family"],
-        "tiling_key": baseline["tiling_key"],
-        "block_dim": baseline["blockDim"],
-        "workspace_bytes": baseline["workspace_bytes"],
-        "tiling_data_bytes": baseline["raw_buffer_bytes"],
-        "tiling_data_hex": baseline["raw_buffer_hex"],
-        "tiling_data_sha256": baseline["raw_buffer_sha256"],
-    }
-
-    baseline_cube = baseline["tilingData"]["matmulTiling"]
-    cube_changes = {
-        name: {"baseline": int(baseline_cube[name]), "improved": int(cube[name])}
-        for name in CUBE_FIELDS
-        if int(baseline_cube[name]) != int(cube[name])
-    }
-    baseline_l2 = baseline["tilingData"]["tileL2cacheTiling"]
-    l2_changes = {
-        name: {"baseline": int(baseline_l2[name]), "improved": int(l2[name])}
-        for name in l2
-        if int(baseline_l2[name]) != int(l2[name])
-    }
-    metadata_changes = {
-        name: {"baseline": baseline_output[name], "improved": improved[name]}
-        for name in ("selected_family", "tiling_key", "block_dim", "workspace_bytes")
-        if baseline_output[name] != improved[name]
-    }
-    all_changes = dict(cube_changes)
-    all_changes.update({f"l2.{name}": value for name, value in l2_changes.items()})
-    all_changes.update(metadata_changes)
-    effective_cube_changes = dict(cube_changes)
-    effective_l2_changes = dict(l2_changes)
-    if l2_formula.get("ignored_by_this_family"):
-        effective_l2_changes.clear()
-    effective_run_or_vector_change = any(
-        int(baseline["tilingData"]["matmulRunInfo"][name]) != int(run[name])
-        for name in run
-    ) or any(
-        int(baseline["tilingData"][name]) != int(vector[name])
-        for name in VECTOR_NAMES
-    )
-    if (not effective_cube_changes and not effective_l2_changes and
-            not metadata_changes and not effective_run_or_vector_change):
-        return no_candidate_result(
-            request, baseline, "FORMULAS_PRODUCED_BASELINE_VALUES", formula=formula
-        )
-
-    active_rules = changed_rules(
-        formula["family"], cube_changes, l2_changes, metadata_changes
-    )
-    if "two_wave_L2_residency_guard" in formula:
-        active_rules.append("R14_TWO_WAVE_L2_RESIDENCY")
-
     return {
         "status": "MODIFIED_TILING",
         "request": request,
-        "baseline": baseline_output,
         "improved": improved,
-        "baseline_equivalent": False,
-        "changed_rules": active_rules,
-        "changed_fields": all_changes,
+        "selection_basis": selection_basis,
         "formula_family": formula["family"],
         "kernel_suffix": suffix,
         "resource_bytes": formula["resource_bytes"],
+        "cost": formula["cost"],
+        "candidate_audit": formula["candidate_audit"],
         "npu_eligible": True,
         "path_coverage": {
-            "initializer": "RETAINED_AND_MARKED; evaluated independently before baseline",
-            "family_selection": "MODIFIED",
+            "initializer": "ABI_DEFAULTS_ONLY; NO_FAMILY_OR_TILE_SELECTION",
+            "family_selection": "ALL_APPLICABLE_FAMILIES_SCORED_BY_EXACT_LOWERED_CRITICAL_PATH",
             "base_and_parent_geometry": "MODIFIED",
             "k_l1_pipeline": "MODIFIED",
             "l2_partition": (
@@ -532,6 +448,13 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
             "kernel_implementation": "RETAINED_CANN_81_BRANCH_AND_MARKED",
             "abi_layout": "RETAINED_272_BYTE_ABI_AND_MARKED",
             "official_selector_as_seed": "FORBIDDEN_AND_NOT_USED",
+            "history_or_runtime_kb": "FORBIDDEN_AND_NOT_USED",
+            "pareto_pruning": "COMPLETE_WITHIN_FAMILY_NO_FIXED_TOPN",
+            "emitted_candidate_role": (
+                "BRANCH_PROBE_NOT_CLAIMED_AS_GLOBAL_WINNER"
+                if required_suffix is not None or required_family is not None
+                else "INDEPENDENT_GLOBAL_WINNER"
+            ),
         },
         "validation": {
             "host_packet": "PASS_272_BYTE_ABI_ROUNDTRIP",

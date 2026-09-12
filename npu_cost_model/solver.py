@@ -2106,7 +2106,14 @@ def derive_ideal_region(
         # traversal frontiers.  Retaining every intermediate direct
         # projection as another expansion seed is redundant and turns the
         # finite ideal region into a large Cartesian-like audit pool.
-        unique_algorithm_anchors = unique_primary_anchors
+        # ``direct`` has already passed the complete rate-independent
+        # hardware Pareto test.  Preserve every feasible member here; using
+        # only the lowest simulated-cycle member as the returned anchor set
+        # would be a hidden top-1 preselection before CANN lowering.  Only
+        # the best member of each reduction topology needs the more expensive
+        # adjacent/capacity expansion, but all direct Pareto members remain
+        # candidates for the final exact-lowered Pareto test.
+        unique_algorithm_anchors = tuple(dict.fromkeys(feasible_direct))
         anchors.extend(unique_algorithm_anchors)
         primary_anchors.update(unique_primary_anchors)
         algorithm_anchor_counts[algorithm_index] = len(unique_algorithm_anchors)
@@ -2126,8 +2133,9 @@ def derive_ideal_region(
             )
             if is_primary else ()
         )
-        # Direct projections are all retained, but only the best feasible
-        # anchor in each numeric reduction topology is expanded.  A capacity
+        # Every rate-independent direct Pareto projection is retained, but
+        # only the best feasible anchor in each numeric reduction topology is
+        # expanded.  A capacity
         # frontier is a neighbourhood of an optimum, not a Cartesian
         # multiplier for every alternate buffer/traversal projection.  This
         # preserves every hardware-derived direction while bounding solve

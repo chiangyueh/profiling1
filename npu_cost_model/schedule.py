@@ -34,6 +34,12 @@ class TilingPlan:
     transfer_tiles: tuple[
         tuple[str, MemorySpace, MemorySpace, str, int], ...
     ] = ()
+    # Ping/pong depth may differ for A and B even though both occupy L1.
+    # Keep it on the declared transfer instead of collapsing it to one
+    # MemorySpace-wide flag.
+    transfer_buffers: tuple[
+        tuple[str, MemorySpace, MemorySpace, int], ...
+    ] = ()
     cache_tiles: tuple[tuple[str, int], ...] = ()
     reduction_parts: tuple[tuple[str, int], ...] = ()
     buffers: tuple[tuple[MemorySpace, int], ...] = ()
@@ -44,6 +50,7 @@ class TilingPlan:
         task_tile_names = [name for name, _ in self.task_tiles]
         invocation_tile_names = [name for name, _ in self.invocation_tiles]
         transfer_tile_keys = [item[:4] for item in self.transfer_tiles]
+        transfer_buffer_keys = [item[:3] for item in self.transfer_buffers]
         cache_tile_names = [name for name, _ in self.cache_tiles]
         reduction_names = [name for name, _ in self.reduction_parts]
         buffer_names = [space for space, _ in self.buffers]
@@ -59,6 +66,8 @@ class TilingPlan:
             raise ValueError("invocation_tiles contains duplicate axes")
         if len(transfer_tile_keys) != len(set(transfer_tile_keys)):
             raise ValueError("transfer_tiles contains duplicate route/axis keys")
+        if len(transfer_buffer_keys) != len(set(transfer_buffer_keys)):
+            raise ValueError("transfer_buffers contains duplicate route keys")
         if len(cache_tile_names) != len(set(cache_tile_names)):
             raise ValueError("cache_tiles contains duplicate axes")
         if len(reduction_names) != len(set(reduction_names)):
@@ -73,6 +82,8 @@ class TilingPlan:
             raise ValueError("invocation tile sizes must be positive")
         if any(value <= 0 for *_, value in self.transfer_tiles):
             raise ValueError("transfer tile sizes must be positive")
+        if any(value not in (1, 2) for *_, value in self.transfer_buffers):
+            raise ValueError("transfer buffer counts must be one or two")
         if any(value <= 0 for _, value in self.cache_tiles):
             raise ValueError("cache tile sizes must be positive")
         if any(value <= 0 for _, value in self.reduction_parts):
@@ -121,6 +132,18 @@ class TilingPlan:
             )
         }
 
+    def transfer_buffer_count(
+        self,
+        tensor: str,
+        source: MemorySpace,
+        destination: MemorySpace,
+    ) -> int:
+        return dict(
+            ((item_tensor, item_source, item_destination), count)
+            for item_tensor, item_source, item_destination, count
+            in self.transfer_buffers
+        ).get((tensor, source, destination), 1)
+
     def as_dict(self) -> dict[str, object]:
         return {
             "algorithm": self.algorithm,
@@ -137,6 +160,16 @@ class TilingPlan:
                 }
                 for tensor, source, destination, axis, value
                 in self.transfer_tiles
+            ],
+            "transfer_buffers": [
+                {
+                    "tensor": tensor,
+                    "source": source.value,
+                    "destination": destination.value,
+                    "count": count,
+                }
+                for tensor, source, destination, count
+                in self.transfer_buffers
             ],
             "cache_tiles": self.caches,
             "used_cores": self.used_cores,

@@ -288,6 +288,7 @@ def validate_cann_tiling(
     output_dtype: str | None = None,
     has_bias: bool = False,
     aoe_injection: bool = False,
+    incremental_pattern: bool = False,
 ) -> tuple[str, ...]:
     """Return structural CANN/kernel violations without running a callback.
 
@@ -429,7 +430,7 @@ def validate_cann_tiling(
     if split == SplitCoreMode.BASE:
         if single_k < k:
             reasons.append("NON_SPLIT_GRAPH_DOES_NOT_COVER_K")
-        if full == FullLoadMode.BASE and (
+        if full == FullLoadMode.BASE and not incremental_pattern and (
             single_m > base_m
             or single_n > base_n
             or base_m > align_up(single_m, 16)
@@ -439,6 +440,19 @@ def validate_cann_tiling(
             or step_n != 1
         ):
             reasons.append("BASE_TASK_AND_INNER_GEOMETRY_INCONSISTENT")
+        if incremental_pattern and not (
+            dtype in ("fp16", "bf16")
+            and not trans_a
+            and trans_b
+            and m <= 128
+            and not has_bias
+            and full == FullLoadMode.BASE
+            and fix == FixOptMode.BASE
+            and single_m == base_m
+            and single_n == base_n
+            and single_k >= k
+        ):
+            reasons.append("INCREMENTAL_PATTERN_CONTRACT")
         if used > output_tasks:
             reasons.append("USED_CORES_EXCEED_OUTPUT_TASKS")
     elif split == SplitCoreMode.SINGLE_CORE_SPLIT_K:
@@ -502,17 +516,22 @@ def validate_cann_tiling(
             and k % (512 // in_bytes) == 0
         ):
             reasons.append("AL1_FULL_LOAD_WORKLOAD_CONTRACT")
+        # The installed AL1 kernel consumes a complete resident A but does
+        # not require the tiler's historical baseK=256 choice.  Direct NPU
+        # runs validate divisor-aligned 448/512 packets; legality follows the
+        # Matmul API capacities and packet relations, not one old selector
+        # constant.
         if not (
             base_m == 16
             and base_n == 16
-            and base_k == 256
+            and k % base_k == 0
             and m <= single_m <= 16
             and single_n == 16
             and single_k >= k
-            and step_m == step_n == step_kb == 1
-            and step_ka == ceil_div(k, base_k)
+            and step_m == step_n == 1
+            and step_ka == k // base_k
             and depth_a == step_ka
-            and depth_b == 2
+            and depth_b in (step_kb, 2 * step_kb)
         ):
             reasons.append("AL1_FULL_LOAD_GEOMETRY_CONTRACT")
 
@@ -553,7 +572,7 @@ def validate_cann_tiling(
                 and k <= 256
                 and n % align_elements != 0
                 and align_elements % n != 0
-                and m >= hardware.core_count(Resource.CUBE) * 128
+                and m >= hardware.core_count(Resource.CUBE) * 512
                 and not (n < c0 and k < c0)
             )
             if dtype in ("fp16", "bf16"):
@@ -582,12 +601,6 @@ def validate_cann_tiling(
         or int(knowledge["l2NTileBlock"]) <= 0
     ):
         reasons.append("SPLIT_K_REQUIRES_L2_TILE_BLOCKS")
-    if fix != FixOptMode.BASE and (
-        int(knowledge["l2MTileBlock"]) != 0
-        or int(knowledge["l2NTileBlock"]) != 0
-    ):
-        reasons.append("BL1_FIXPIPE_REQUIRES_DISABLED_L2_TILING")
-
     reasons.extend(_l2_schedule_reasons(m, n, knowledge))
     return tuple(dict.fromkeys(reasons))
 
@@ -779,6 +792,14 @@ def lower_plan_to_cann(
     base_m = align_up(min(max(16, plan.tiles["m"]), max(16, m)), 16)
     base_n = align_up(min(max(16, plan.tiles["n"]), max(16, n)), 16)
     base_k = align_up(min(max(k0, plan.tiles["k"]), max(k0, k)), k0)
+    # The installed BASE/BL1 source derives baseK only from its declared
+    # 64/128/256/512-byte template and capacity boundaries.  A generic plan
+    # with single buffering can otherwise lower to a much larger K tile that
+    # no CANN 8.1 source path emits and whose Matmul API configuration has not
+    # been qualified by this kernel.  AL1 and FixPipe have their own explicit
+    # geometry below.
+    if graph_name in ("base", "bl1_full_load"):
+        base_k = min(base_k, 512 // input_bytes)
     # A plan already passed generic local-memory validation, but padding a
     # tail at the ABI boundary can cross a capacity edge.  Shrink only by a
     # hardware alignment quantum until all three Cube memories fit.
@@ -836,14 +857,34 @@ def lower_plan_to_cann(
         ):
             raise ValueError("AL1 full-load is outside the CANN 8.1 source contract")
         base_m = base_n = 16
-        base_k = 256
+        # Keep the full resident A unpadded.  Enumerated generic K tiles are
+        # projected to the largest legal divisor at or below their L0 bound.
+        base_k_limit = min(
+            max(k0, base_k),
+            hardware.capacities[MemorySpace.L0A]
+            // (2 * base_m * input_bytes),
+            hardware.capacities[MemorySpace.L0B]
+            // (2 * base_n * input_bytes),
+        )
+        base_k = max(
+            candidate
+            for candidate in range(k0, base_k_limit + 1, k0)
+            if k % candidate == 0
+        )
         single_m = m
         single_n = 16
         step_m = step_n = 1
-        step_ka = ceil_div(k, base_k)
-        step_kb = 1
+        step_ka = k // base_k
+        b_step_capacity = (
+            l1_capacity - align_up(m, 16) * k * input_bytes
+        ) // (2 * base_n * base_k * input_bytes)
+        step_kb = max(
+            candidate
+            for candidate in range(1, min(step_ka, b_step_capacity) + 1)
+            if step_ka % candidate == 0
+        )
         depth_a = step_ka
-        depth_b = 2
+        depth_b = 2 * step_kb
         single_k = k
     elif full == FullLoadMode.BL1_FULL_LOAD:
         if k > 256:
@@ -887,7 +928,7 @@ def lower_plan_to_cann(
                 n < 256
                 and n % align_elements != 0
                 and align_elements % n != 0
-                and m >= hardware.core_count(Resource.CUBE) * 128
+                and m >= hardware.core_count(Resource.CUBE) * 512
                 and not (n < c0 and k < c0)
             )
             if dtype in ("fp16", "bf16"):
@@ -927,21 +968,35 @@ def lower_plan_to_cann(
             depth_b = ceil_div(k, base_k)
             step_kb = depth_b
             remaining = l1_capacity // input_bytes - depth_b * base_n * base_k
-            depth_a = max(0, remaining // (base_m * base_k))
-            depth_a = min(depth_a, depth_b)
-            if depth_a >= 8:
-                step_ka, depth_a = 4, 8
+            a_depth_capacity = max(0, remaining // (base_m * base_k))
+            if a_depth_capacity >= 2:
+                step_ka = max(
+                    1, min(depth_b, a_depth_capacity // 2)
+                )
+                depth_a = 2 * step_ka
             else:
-                step_ka = depth_a
-            if depth_a <= 0:
+                step_ka = depth_a = 1
+            if a_depth_capacity <= 0:
                 raise ValueError("BL1 FixPipe has no legal AL1 packet")
             step_m = step_n = 1
             single_m = base_m
             single_n = base_n
             single_k = k
     elif split == SplitCoreMode.SINGLE_CORE_SPLIT_K:
+        # DoSingleCoreSplitKTiling starts from the installed 3x3/2x4 profile.
+        # Its search changes the parent MN grid and K packet length, not the
+        # Cube primitive's 128x128x256-byte base block.
+        base_m = base_n = 128
+        base_k = 256 // input_bytes
         step_m = max(1, min(3, ceil_div(single_m, base_m)))
         step_n = max(1, min(3, ceil_div(single_n, base_n)))
+        # The source kernel's IterateAll region is stepM*baseM by
+        # stepN*baseN.  Generic task breakpoints can lie below that region
+        # after the C220 primitive is forced to 128x128; enlarge the parent
+        # task to the actual executable invocation instead of emitting a
+        # packet whose inner loop extends beyond its ownership rectangle.
+        single_m = max(single_m, min(m, step_m * base_m))
+        single_n = max(single_n, min(n, step_n * base_n))
         target_parts = max(2, plan.reductions.get("k", 2))
         target_k = align_up(ceil_div(k, target_parts), base_k)
         max_step = max(1, (k - 1) // base_k)
@@ -987,7 +1042,7 @@ def lower_plan_to_cann(
     if graph_name == "deterministic_split_k":
         used_cores = min(k_chunks, hardware.core_count(Resource.CUBE))
 
-    disabled_l2 = full == FullLoadMode.BL1_FULL_LOAD and fix != FixOptMode.BASE
+    disabled_l2 = False
     aligned_mix = source_layout_conversion(
         m, n, k, dtype, trans_a, trans_b,
         a_layout=a_layout,
@@ -1121,6 +1176,10 @@ def plan_from_cann(
         task_tiles=(("m", single_m), ("n", single_n), ("k", single_k)),
         invocation_tiles=invocation_tiles,
         transfer_tiles=transfer_tiles,
+        transfer_buffers=(
+            ("A", MemorySpace.GM, MemorySpace.L1, min(2, a_packets)),
+            ("B", MemorySpace.GM, MemorySpace.L1, min(2, b_packets)),
+        ),
         cache_tiles=(
             ("m", max(min(single_m, m), min(max(single_m, l2_m), m))),
             ("n", max(min(single_n, n), min(max(single_n, l2_n), n))),
@@ -1133,6 +1192,8 @@ def plan_from_cann(
             (MemorySpace.L0A, _integer(knowledge, "dbL0A")),
             (MemorySpace.L0B, _integer(knowledge, "dbL0B")),
             (MemorySpace.L0C, _integer(knowledge, "dbL0C")),
+            *((((MemorySpace.UB, 2),)
+               if graph.fix != FixOptMode.BASE else ())),
         ),
         traversal=traversal,
     )

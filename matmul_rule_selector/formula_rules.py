@@ -408,7 +408,9 @@ def tile_l2(s: Shape, h: Hardware, bm: int, bn: int, gm: int, gn: int) -> dict:
                 full_k_rect_fits=f(x, y) <= h.l2)
 
 
-def solve(s: Shape, h: Hardware = Hardware(), ci: Optional[CompileInfo] = None) -> dict:
+def _obsolete_single_formula(
+    s: Shape, h: Hardware = Hardware(), ci: Optional[CompileInfo] = None
+) -> dict:
     validate_input_domain(s, h, ci)
     bias_macro_matches = ci.orig_dtype_bias == ci.orig_dtype_x1
     d = s.d
@@ -722,6 +724,21 @@ def solve(s: Shape, h: Hardware = Hardware(), ci: Optional[CompileInfo] = None) 
                  core_grid_semantics='K ownership; MN are serial panels' if family == 'DETERMINISTIC_SPLIT_K' else 'MN work items')
     state['legality'] = validate_generated_rules(s, h, ci, state)
     return state
+
+
+def solve(
+    s: Shape, h: Hardware = Hardware(), ci: Optional[CompileInfo] = None
+) -> dict:
+    """Return the global minimum of the audited finite family frontiers.
+
+    The prior one-formula selector remains above only for source-history
+    review.  It is deliberately unreachable from this public entry point.
+    """
+
+    validate_input_domain(s, h, ci)
+    from candidate_engine import generate_and_select
+
+    return generate_and_select(s, h, ci)
 
 
 def examples() -> List[Tuple[str, Shape, Hardware]]:

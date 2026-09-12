@@ -4,21 +4,21 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE=""
 PHYSICAL_DEVICE="${PHYSICAL_NPU_ID:-2}"
-WARMUP=2
+WARMUP=10
 REPEAT=20
-SAMPLES=7
-EXPECTED_BRANCHES=12
-EXPECTED_RULE_GROUPS=14
-VALIDATION_SHAPES=8
-EXPECTED_VARIANTS=2
+SAMPLES=30
+EXPECTED_BRANCHES=13
+EXPECTED_AUDIT_ITEMS=30
+VALIDATION_SHAPES=31
+EXPECTED_VARIANTS=0
 
 usage() {
     printf '%s\n' \
         'Usage: ./run_npu.sh --mode full [-d PHYSICAL_NPU_ID]' \
         '' \
-        'Checks all CANN 8.1 rule branches on the host, then measures four AL1' \
-        'and four FixPipe-vector improved packets in two compiled batches. Their' \
-        'audited public MatMulV3 measurements are reused; baselines are not rerun.'
+        'Audits every installed CANN 8.1 candidate family, then measures 18' \
+        'independent selector winners, 13 explicit branch probes, and one' \
+        'same-campaign official MatMulV3 reference for every test shape.'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -70,7 +70,7 @@ CAMPAIGN_ID="$({
         run_npu.sh \
         tools/generate_matmul_rule_matrix.py \
         tools/analyze_matmul_rule_matrix.py \
-        tools/check_matmul_rule_coverage.py \
+        tools/audit_matmul_candidate_engine.py \
         tools/direct_matmul_tiling.py \
         scripts/build_all.sh \
         scripts/env.sh \
@@ -78,20 +78,23 @@ CAMPAIGN_ID="$({
         direct_matmul/kernel_entry.cpp \
         direct_matmul/mat_mul_v3_tiling_data.h \
         direct_matmul/runner.cpp \
-        matmul_rule_selector/branch_contract.json \
+        matmul_rule_selector/candidate_audit_spec.json \
+        matmul_rule_selector/family_candidate_contract.json \
         matmul_rule_selector/validation_contract.json
     find matmul_rule_selector -type f -name '*.py' -print0 |
         sort -z | xargs -0 sha256sum
+    find npu_cost_model -type f -name '*.py' -print0 |
+        sort -z | xargs -0 sha256sum
 } | sha256sum | cut -c1-20)"
-CAMPAIGN_DIR="${ROOT}/results/matmul_rule_generalization_v1/${CAMPAIGN_ID}"
+CAMPAIGN_DIR="${ROOT}/results/matmul_global_selector_paired_v2/${CAMPAIGN_ID}"
 PACKET_DIR="${CAMPAIGN_DIR}/packets"
 MANIFEST="${CAMPAIGN_DIR}/improved_manifest.csv"
 SELECTION="${CAMPAIGN_DIR}/selection.jsonl"
 VARIANT_DIR="${CAMPAIGN_DIR}/variants"
 SEQUENCE_DIR="${CAMPAIGN_DIR}/sequence"
 RUNNER_LOG="${RUN_LOG}"
-REFERENCE_PROFILE="${CAMPAIGN_DIR}/historical_official_profile.csv"
-REFERENCE_SAMPLES="${CAMPAIGN_DIR}/historical_official_samples.csv"
+OFFICIAL_PROFILE="${CAMPAIGN_DIR}/official_profile.csv"
+OFFICIAL_SAMPLES="${CAMPAIGN_DIR}/official_samples.csv"
 ANALYSIS="${CAMPAIGN_DIR}/analysis.json"
 SUMMARY="${CAMPAIGN_DIR}/summary.csv"
 mkdir -p "${CAMPAIGN_DIR}"
@@ -120,8 +123,11 @@ for row in rows:
         "FINAL_RESULT "
         f"id={row['workload_id']} "
         f"axis={row['selection_axis']} "
-        f"official_ms={float(row['historical_official_median_ms']):.9g} "
-        f"improved_ms={float(row['current_improved_median_ms']):.9g} "
+        f"role={row['case_role']} "
+        f"applicable={row['required_applicable_family']} "
+        f"selected={row['selected_family']} "
+        f"official_ms={float(row['official_median_ms']):.9g} "
+        f"candidate_ms={float(row['candidate_median_ms']):.9g} "
         f"delta_pct={float(row['delta_pct']):+.3f} "
         f"winner={row['median_winner']} "
         f"separation={row['sample_separation']}"
@@ -132,18 +138,18 @@ for axis in sorted(by_axis):
         "FINAL_RULE_RESULT "
         f"axis={axis} "
         f"shapes={len(axis_rows)} "
-        f"improved_wins={sum(row['median_winner'] == 'improved' for row in axis_rows)} "
-        f"clear_improvements={sum(row['sample_separation'] == 'CLEAR_IMPROVED' for row in axis_rows)} "
-        f"clear_regressions={sum(row['sample_separation'] == 'CLEAR_REGRESSION' for row in axis_rows)} "
+        f"candidate_wins={sum(row['median_winner'] == 'candidate' for row in axis_rows)} "
+        f"clear_candidate_wins={sum(row['sample_separation'] == 'CLEAR_CANDIDATE_WINNER' for row in axis_rows)} "
+        f"clear_official_wins={sum(row['sample_separation'] == 'CLEAR_OFFICIAL_WINNER' for row in axis_rows)} "
         f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in axis_rows)}"
     )
 print(
     "FINAL_RESULT_SUMMARY "
     f"shapes={len(rows)} "
-    f"improved_wins={sum(row['median_winner'] == 'improved' for row in rows)} "
+    f"candidate_wins={sum(row['median_winner'] == 'candidate' for row in rows)} "
     f"official_wins={sum(row['median_winner'] == 'official' for row in rows)} "
-    f"clear_improvements={sum(row['sample_separation'] == 'CLEAR_IMPROVED' for row in rows)} "
-    f"clear_regressions={sum(row['sample_separation'] == 'CLEAR_REGRESSION' for row in rows)} "
+    f"clear_candidate_wins={sum(row['sample_separation'] == 'CLEAR_CANDIDATE_WINNER' for row in rows)} "
+    f"clear_official_wins={sum(row['sample_separation'] == 'CLEAR_OFFICIAL_WINNER' for row in rows)} "
     f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in rows)}"
 )
 print("FINAL_RESULTS_END")
@@ -172,18 +178,18 @@ fail() {
 announce "RUN_LOG path=${RUN_LOG}"
 source_revision="$(git rev-parse HEAD 2>/dev/null || printf unknown)"
 announce "SOURCE_REVISION commit=${source_revision}"
-announce "CAMPAIGN_READY operator=matmul focus=al1_and_fixpipe_vector host_branches=${EXPECTED_BRANCHES} rule_groups=${EXPECTED_RULE_GROUPS} npu_shapes=${VALIDATION_SHAPES} improved_measurements=${VALIDATION_SHAPES} measurement_batches=${EXPECTED_VARIANTS} compiled_variants=${EXPECTED_VARIANTS} reused_official_references=${VALIDATION_SHAPES} physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
+announce "CAMPAIGN_READY operator=matmul focus=all_installed_family_branches_and_boundaries host_branches=${EXPECTED_BRANCHES} audit_items=${EXPECTED_AUDIT_ITEMS} npu_shapes=${VALIDATION_SHAPES} selector_top1_measurements=18 branch_probe_measurements=13 official_measurements=${VALIDATION_SHAPES} measurement_batches=derived_from_complete_manifest compiled_variants=all_manifest_dtype_suffix_pairs physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
 announce "measurement=${WARMUP}_warmup+${SAMPLES}_device_event_samples+repeat_${REPEAT}+validate_last_timed_output"
-announce "selection=predeclared_structural_decision_boundaries_not_latency_ranked"
-announce "selector=shape_and_hardware_formula_only"
-announce "official_reference=audited_existing_cann81_measurements_not_rerun"
-announce "forbidden=cost_model,history_lookup_at_runtime,repo_lookup,tiling_bank,candidate_search,official_tiling_seed"
+announce "selection=all_applicable_installed_families_then_hard_legality_then_rate_independent_pareto_then_global_critical_path_minimum"
+announce "selector=shape_and_frozen_hardware_only"
+announce "official_reference=same_campaign_installed_aclnn_matmul_public_api"
+announce "forbidden=measured_latency_at_selection,history_lookup_at_runtime,repo_lookup,tiling_bank,official_tiling_seed"
 announce "CANN_ENV root=${CANN_ROOT} soc=${SOC_VERSION} aic=20 visible_devices=${ASCEND_RT_VISIBLE_DEVICES}"
 announce "results=${CAMPAIGN_DIR}"
 
 if [[ -s "${ANALYSIS}" ]] && grep -q '"status": "complete"' "${ANALYSIS}"; then
     emit_final_results
-    announce "GENERALIZATION_COMPLETE cached=1 analysis=${ANALYSIS} summary=${SUMMARY} log=${RUN_LOG}"
+    announce "PAIRED_VALIDATION_COMPLETE cached=1 analysis=${ANALYSIS} summary=${SUMMARY} log=${RUN_LOG}"
     exit 0
 fi
 
@@ -297,13 +303,13 @@ if [[ "${device_preflight_rc}" -ne 0 ]]; then
 fi
 announce "DEVICE_PREFLIGHT passed physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID} wall_ms=${device_preflight_wall_ms}"
 
-coverage_started_ns="$(date +%s%N)"
-coverage_json="$(python3 tools/check_matmul_rule_coverage.py)"
-python3 -c 'import json,sys; x=json.loads(sys.argv[1]); assert x["installed_cann81_dispatch_branches"] == 12 and x["modified_rule_groups"] == 14 and x["modified_branch_witnesses"] == 12 and x["status"] == "PASS"' "${coverage_json}"
-printf '%s\n' "${coverage_json}"
-coverage_wall_ms=$(( ($(date +%s%N) - coverage_started_ns) / 1000000 ))
-announce "HOST_RULE_COVERAGE passed branches=${EXPECTED_BRANCHES} rule_groups=${EXPECTED_RULE_GROUPS}"
-announce "CAMPAIGN_STAGE_TIMING stage=host_rule_coverage wall_ms=${coverage_wall_ms}"
+audit_started_ns="$(date +%s%N)"
+audit_json="$(python3 tools/audit_matmul_candidate_engine.py)"
+python3 -c 'import json,sys; x=json.loads(sys.argv[1]); assert x["status"] == "PASS" and x["mandatory_count"] == int(sys.argv[2]) and x["passed_count"] == int(sys.argv[2]) and not x["failed_ids"]' "${audit_json}" "${EXPECTED_AUDIT_ITEMS}"
+printf '%s\n' "${audit_json}"
+audit_wall_ms=$(( ($(date +%s%N) - audit_started_ns) / 1000000 ))
+announce "HOST_CANDIDATE_AUDIT passed items=${EXPECTED_AUDIT_ITEMS} branches=${EXPECTED_BRANCHES}"
+announce "CAMPAIGN_STAGE_TIMING stage=host_candidate_audit wall_ms=${audit_wall_ms}"
 
 generation_started_ns="$(date +%s%N)"
 python3 tools/generate_matmul_rule_matrix.py \
@@ -311,24 +317,31 @@ python3 tools/generate_matmul_rule_matrix.py \
     --manifest "${MANIFEST}" \
     --selection "${SELECTION}" \
     --variant-dir "${VARIANT_DIR}" \
-    --sequence-dir "${SEQUENCE_DIR}" \
-    --historical-profile "${REFERENCE_PROFILE}" \
-    --historical-samples "${REFERENCE_SAMPLES}"
+    --sequence-dir "${SEQUENCE_DIR}"
+EXPECTED_VARIANTS="$(find "${VARIANT_DIR}" -maxdepth 1 -type f -name '*.csv' | wc -l)"
+[[ "${EXPECTED_VARIANTS}" -ge 12 ]] || \
+    fail "generated ${EXPECTED_VARIANTS} dtype/suffix variants; expected at least 12"
 printf '%s\n' 'SELECTION_RECORDS_BEGIN'
 sed 's/^/SELECTION_RECORD /' "${SELECTION}"
 printf '%s\n' 'SELECTION_RECORDS_END'
-printf '%s\n' 'IMPROVED_MANIFEST_CSV_BEGIN'
+printf '%s\n' 'CANDIDATE_MANIFEST_CSV_BEGIN'
 cat "${MANIFEST}"
-printf '%s\n' 'IMPROVED_MANIFEST_CSV_END'
-printf '%s\n' 'HISTORICAL_OFFICIAL_PROFILE_CSV_BEGIN'
-cat "${REFERENCE_PROFILE}"
-printf '%s\n' 'HISTORICAL_OFFICIAL_PROFILE_CSV_END'
-printf '%s\n' 'HISTORICAL_OFFICIAL_SAMPLES_CSV_BEGIN'
-cat "${REFERENCE_SAMPLES}"
-printf '%s\n' 'HISTORICAL_OFFICIAL_SAMPLES_CSV_END'
+printf '%s\n' 'CANDIDATE_MANIFEST_CSV_END'
 generation_wall_ms=$(( ($(date +%s%N) - generation_started_ns) / 1000000 ))
-announce "RULE_GENERALIZATION_PACKET_GENERATION passed shapes=${VALIDATION_SHAPES} variants=${EXPECTED_VARIANTS}"
-announce "CAMPAIGN_STAGE_TIMING stage=discriminative_packet_generation wall_ms=${generation_wall_ms}"
+announce "GLOBAL_WINNER_AND_BRANCH_PACKET_GENERATION passed shapes=${VALIDATION_SHAPES} variants=${EXPECTED_VARIANTS}"
+announce "CAMPAIGN_STAGE_TIMING stage=global_winner_packet_generation wall_ms=${generation_wall_ms}"
+
+official_build_started_ns="$(date +%s%N)"
+announce "OFFICIAL_RUNNER_BUILD begin jobs=1"
+if ! BUILD_COMPONENTS=official BUILD_JOBS=1 scripts/build_all.sh; then
+    fail "official runner build failed"
+fi
+official_runner="${ROOT}/build/official_matmul_runner"
+[[ -x "${official_runner}" ]] || fail "official runner missing after build: ${official_runner}"
+"${official_runner}" --candidates "${MANIFEST}" --validate-input >/dev/null
+official_build_wall_ms=$(( ($(date +%s%N) - official_build_started_ns) / 1000000 ))
+announce "OFFICIAL_RUNNER_BUILD passed"
+announce "CAMPAIGN_STAGE_TIMING stage=official_runner_build wall_ms=${official_build_wall_ms}"
 
 build_started_ns="$(date +%s%N)"
 variant_count=0
@@ -354,6 +367,26 @@ build_wall_ms=$(( ($(date +%s%N) - build_started_ns) / 1000000 ))
 announce "CAMPAIGN_STAGE_TIMING stage=selected_variant_build wall_ms=${build_wall_ms}"
 
 measurement_started_ns="$(date +%s%N)"
+announce "OFFICIAL_MEASUREMENT begin shapes=${VALIDATION_SHAPES}"
+"${official_runner}" \
+    --candidates "${MANIFEST}" \
+    --output "${OFFICIAL_PROFILE}" \
+    --samples-output "${OFFICIAL_SAMPLES}" \
+    --device "${DEVICE_ID}" \
+    --warmup "${WARMUP}" \
+    --repeat "${REPEAT}" \
+    --samples "${SAMPLES}" \
+    --numeric-preflight-max-mib 256 \
+    --structured-full-preflight \
+    --validate-after-measurement
+announce "OFFICIAL_MEASUREMENT passed shapes=${VALIDATION_SHAPES}"
+printf '%s\n' 'OFFICIAL_PROFILE_CSV_BEGIN'
+cat "${OFFICIAL_PROFILE}"
+printf '%s\n' 'OFFICIAL_PROFILE_CSV_END'
+printf '%s\n' 'OFFICIAL_SAMPLES_CSV_BEGIN'
+cat "${OFFICIAL_SAMPLES}"
+printf '%s\n' 'OFFICIAL_SAMPLES_CSV_END'
+
 batch_index=0
 for packet_manifest in "${SEQUENCE_DIR}"/*.csv; do
     filename="$(basename "${packet_manifest}" .csv)"
@@ -361,26 +394,26 @@ for packet_manifest in "${SEQUENCE_DIR}"/*.csv; do
     runner="${ROOT}/build/direct_runners/direct_matmul_${variant}"
     batch_index=$((batch_index + 1))
     batch_shapes=$(( $(wc -l <"${packet_manifest}") - 1 ))
-    announce "IMPROVED_MEASUREMENT_BATCH ${batch_index}/${EXPECTED_VARIANTS} begin variant=${variant} shapes=${batch_shapes} manifest=$(basename "${packet_manifest}")"
+    announce "CANDIDATE_MEASUREMENT_BATCH ${batch_index}/${EXPECTED_VARIANTS} begin variant=${variant} shapes=${batch_shapes} manifest=$(basename "${packet_manifest}")"
     "${runner}" \
         --manifest "${packet_manifest}" \
         --device "${DEVICE_ID}" \
         --warmup "${WARMUP}" \
         --repeat "${REPEAT}" \
         --samples "${SAMPLES}"
-    announce "IMPROVED_MEASUREMENT_BATCH ${batch_index}/${EXPECTED_VARIANTS} passed variant=${variant} shapes=${batch_shapes}"
+    announce "CANDIDATE_MEASUREMENT_BATCH ${batch_index}/${EXPECTED_VARIANTS} passed variant=${variant} shapes=${batch_shapes}"
 done
 [[ "${batch_index}" -eq "${EXPECTED_VARIANTS}" ]] || \
     fail "measured ${batch_index} batches, expected ${EXPECTED_VARIANTS}"
 measurement_wall_ms=$(( ($(date +%s%N) - measurement_started_ns) / 1000000 ))
-announce "CAMPAIGN_STAGE_TIMING stage=improved_measurement wall_ms=${measurement_wall_ms}"
+announce "CAMPAIGN_STAGE_TIMING stage=paired_npu_measurement wall_ms=${measurement_wall_ms}"
 
 analysis_started_ns="$(date +%s%N)"
 python3 tools/analyze_matmul_rule_matrix.py \
     --manifest "${MANIFEST}" \
     --runner-log "${RUNNER_LOG}" \
-    --reference-profile "${REFERENCE_PROFILE}" \
-    --reference-samples "${REFERENCE_SAMPLES}" \
+    --official-profile "${OFFICIAL_PROFILE}" \
+    --official-samples "${OFFICIAL_SAMPLES}" \
     --selection "${SELECTION}" \
     --output-json "${ANALYSIS}" \
     --output-csv "${SUMMARY}"
@@ -393,4 +426,4 @@ printf '%s\n' 'FINAL_SUMMARY_CSV_END'
 analysis_wall_ms=$(( ($(date +%s%N) - analysis_started_ns) / 1000000 ))
 announce "CAMPAIGN_STAGE_TIMING stage=analysis wall_ms=${analysis_wall_ms}"
 emit_final_results
-announce "RULE_GENERALIZATION_OUTPUT analysis=${ANALYSIS} summary=${SUMMARY} packets=${PACKET_DIR} log=${RUN_LOG}"
+announce "PAIRED_VALIDATION_COMPLETE cached=0 analysis=${ANALYSIS} summary=${SUMMARY} packets=${PACKET_DIR} log=${RUN_LOG}"

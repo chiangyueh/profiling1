@@ -243,7 +243,9 @@ std::vector<Candidate> LoadManifest(const std::string &path)
             std::stoul(Field(fields, columns, "required_successful_tilings")));
         if (row.workloadId.empty() || row.rank.empty() ||
             (row.role != "searched" && row.role != "direct_measurement" &&
-             row.role != "independent_improved") ||
+             row.role != "independent_improved" &&
+             row.role != "independent_global_winner" &&
+             row.role != "independent_branch_probe") ||
             row.m <= 0 || row.n <= 0 || row.k <= 0 || row.usedCores == 0 ||
             row.workspaceBytes < 20U * 1024U * 1024U ||
             row.requiredSuccessfulTilings == 0) {

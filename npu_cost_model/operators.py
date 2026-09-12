@@ -222,6 +222,7 @@ def matmul(
                         transaction_bytes=(
                             workspace_alignment * dtype_bytes(out_dtype)
                         ),
+                        padded_axis_alignments=(("n", workspace_alignment),),
                         local_dtype="fp32",
                         service_bytes_per_element=4 + dtype_bytes(out_dtype),
                     ),),
@@ -236,6 +237,7 @@ def matmul(
                             transaction_bytes=(
                                 workspace_alignment * dtype_bytes(out_dtype)
                             ),
+                            padded_axis_alignments=(("n", workspace_alignment),),
                         ),
                         Access(
                             "C", ("m", "n"), AccessMode.WRITE,
@@ -252,6 +254,21 @@ def matmul(
                     ),),
                     invocation_axes=invocation_axes,
                 ),
+                # The installed C220 FixPipe/Vector kernels exchange a
+                # producer-ready and consumer-ready flag for each ping/pong
+                # output task.  Four flag operations are the irreducible
+                # AIC/AIV handshake.  Model them explicitly instead of
+                # allowing a vector-output candidate to receive free
+                # synchronization merely because its data bytes are small.
+                Stage(
+                    "aic_aiv_output_synchronization",
+                    primitives=(Primitive(
+                        Resource.SYNC,
+                        (),
+                        operations_per_point=4.0,
+                    ),),
+                    invocation_axes=invocation_axes,
+                ),
             )
         return (Stage(
             "write_result",
@@ -261,8 +278,16 @@ def matmul(
                 if atomic or repeated_atomic_axis is not None
                 else AccessMode.WRITE,
                 (MemorySpace.L0C, MemorySpace.GM),
+                pattern=AccessPattern.STRIDED,
+                contiguous_axes=("n",),
                 local_dtype="fp32",
                 service_bytes_per_element=4 + dtype_bytes(out_dtype),
+                # C220 FixPipe stores complete 256-byte output rows.  An
+                # unaligned logical N therefore consumes padded service even
+                # though only logical elements are committed to C.
+                padded_axis_alignments=((
+                    "n", 256 // dtype_bytes(out_dtype)
+                ),),
                 is_result=True,
                 first_iteration_mode=(
                     AccessMode.WRITE
@@ -312,6 +337,8 @@ def matmul(
                     residency=((MemorySpace.L1, TileLevel.TASK),),
                 ),),
                 scope=StageScope.CORE,
+                # AL1 Process performs CopyInA1 before its task-valid guard.
+                runs_on_all_launched_cores=True,
             ))
         if resident_b:
             stages.append(Stage(
@@ -390,6 +417,9 @@ def matmul(
             pipeline_boundaries=(
                 (MemorySpace.L1,),
                 (MemorySpace.L0A, MemorySpace.L0B),
+                (MemorySpace.L0C,),
+                *(((MemorySpace.UB,),)
+                  if MemorySpace.UB in buffered else ()),
             ),
             workspace_buffers=workspace_buffers,
             coupled_task_axes=coupled_task_axes,

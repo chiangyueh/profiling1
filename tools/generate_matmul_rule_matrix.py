@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Generate two focused rule-generalization batches with audited references."""
+"""Materialize independent selector winners and explicit branch probes."""
+from __future__ import annotations
 
 import argparse
 import csv
+from collections import defaultdict
 import hashlib
 import json
-import math
-import statistics
+from pathlib import Path
 import struct
 import sys
-from collections import defaultdict
-from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,112 +26,131 @@ MANIFEST_FIELDS = (
     "model_schedule_sha256", "is_reserve", "l2_cache_flag", "nd2nz_a",
     "nd2nz_b", "required_successful_tilings",
 )
-REFERENCE_FIELDS = (
-    "workload_id", "source", "candidate_role", "execution_mode", "success",
-    "preflight_passed", "preflight_mode", "error", "min_ms", "mean_ms",
-    "median_ms", "stddev_ms", "p95_ms", "max_ms", "warmup", "repeat",
-    "samples", "device", "toolkit", "measurement_method", "record_uid",
-    "source_sha256", "selection_axis",
-)
-SAMPLE_FIELDS = ("workload_id", "sample", "latency_ms")
-EXPECTED_SHAPES = 8
-EXPECTED_VARIANTS = {("fp32", "101"), ("fp32", "20201")}
-EXPECTED_AXIS_COUNTS = {
-    "al1_residency_generalization": 4,
-    "fixpipe_vector_generalization": 4,
+EXPECTED_FAMILIES = {
+    "BASE", "AL1", "BL1", "FIXPIPE_BL1", "SINGLE_CORE_SPLIT_K",
+    "DETERMINISTIC_SPLIT_K", "INCREMENTAL_PATTERN",
 }
+EXPECTED_SUFFIXES = {0, 1, 20, 21, 30, 31, 101, 200, 201, 10200, 10201, 20201}
+EXPECTED_VALIDATION_ROWS = 31
+EXPECTED_BRANCH_PROBES = 13
 
 
-def fnv1a64(blob):
+def fnv1a64(blob: bytes) -> str:
     value = 0xCBF29CE484222325
     for byte in blob:
         value = ((value ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     return f"{value:016x}"
 
 
-def write_csv(path, fields, rows):
+def write_csv(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
+        writer = csv.DictWriter(
+            stream, fieldnames=MANIFEST_FIELDS, lineterminator="\n"
+        )
         writer.writeheader()
         writer.writerows(rows)
 
 
-def percentile_95(values):
-    ordered = sorted(values)
-    return ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
+def clear_files(directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    for path in directory.iterdir():
+        if path.is_file():
+            path.unlink()
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--selection", type=Path, required=True)
     parser.add_argument("--variant-dir", type=Path, required=True)
     parser.add_argument("--sequence-dir", type=Path, required=True)
-    parser.add_argument("--historical-profile", type=Path, required=True)
-    parser.add_argument("--historical-samples", type=Path, required=True)
     args = parser.parse_args()
 
     contract = json.loads(
         (SELECTOR_ROOT / "validation_contract.json").read_text(encoding="utf-8")
     )
-    if (len(contract) != EXPECTED_SHAPES or
-            len({row["workload_id"] for row in contract}) != EXPECTED_SHAPES):
+    identities = {row["workload_id"] for row in contract}
+    declared_families = {row["required_applicable_family"] for row in contract}
+    if len(contract) != EXPECTED_VALIDATION_ROWS or len(identities) != len(contract):
         raise RuntimeError(
-            f"validation contract must contain {EXPECTED_SHAPES} unique shapes"
+            f"validation contract must contain exactly {EXPECTED_VALIDATION_ROWS} unique witnesses"
         )
-    axis_counts = defaultdict(int)
-    for row in contract:
-        axis_counts[row["selection_axis"]] += 1
-    if dict(axis_counts) != EXPECTED_AXIS_COUNTS:
-        raise RuntimeError(f"unexpected rule-axis coverage: {dict(axis_counts)}")
+    if declared_families != EXPECTED_FAMILIES:
+        raise RuntimeError(
+            "validation contract does not cover every installed candidate family"
+        )
+    branch_rows = [row for row in contract if row.get("case_role") == "branch_probe"]
+    selector_rows = [row for row in contract if row.get("case_role") == "selector_top1"]
+    if len(branch_rows) != EXPECTED_BRANCH_PROBES or len(selector_rows) != 18:
+        raise RuntimeError("validation contract branch/selector row count was reduced")
+    if {int(row["required_suffix"]) for row in branch_rows} != EXPECTED_SUFFIXES:
+        raise RuntimeError("branch probes do not cover exactly all 12 installed suffixes")
+    if not any(
+        row.get("required_family") == "INCREMENTAL_PATTERN"
+        for row in branch_rows
+    ):
+        raise RuntimeError("incremental candidate branch probe is missing")
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    args.variant_dir.mkdir(parents=True, exist_ok=True)
-    args.sequence_dir.mkdir(parents=True, exist_ok=True)
     for directory in (args.output_dir, args.variant_dir, args.sequence_dir):
-        for stale in directory.iterdir():
-            if stale.is_file():
-                stale.unlink()
+        clear_files(directory)
 
-    manifest_rows = []
-    reference_rows = []
-    reference_sample_rows = []
-    selections = []
+    manifest_rows: list[dict[str, str]] = []
+    selections: list[dict] = []
     for row in contract:
         workload_id = str(row["workload_id"])
+        case_role = str(row["case_role"])
+        if case_role not in ("branch_probe", "selector_top1"):
+            raise RuntimeError(f"{workload_id}: invalid case_role={case_role}")
         result = generate(
             int(row["m"]), int(row["k"]), int(row["n"]), str(row["dtype"]),
             bool(row["trans_a"]), bool(row["trans_b"]),
+            required_suffix=row.get("required_suffix"),
+            required_family=row.get("required_family"),
         )
         if result["status"] != "MODIFIED_TILING" or not result["npu_eligible"]:
+            raise RuntimeError(f"{workload_id}: selector did not emit an NPU packet")
+        applicable_family = str(row["required_applicable_family"])
+        audit = result["candidate_audit"]
+        if not audit["applicability"].get(applicable_family, False):
             raise RuntimeError(
-                f"{workload_id}: improved tiling is not executable: "
-                f"{result.get('skip_reason', result['status'])}"
+                f"{workload_id}: required family {applicable_family} is not applicable"
             )
-        if result["baseline"]["selected_family"] != row["expected_baseline_family"]:
-            raise RuntimeError(f"{workload_id}: reconstructed baseline family drift")
-        if result["formula_family"] != row["expected_improved_family"]:
-            raise RuntimeError(f"{workload_id}: improved family drift")
-        if int(result["kernel_suffix"]) != int(row["expected_suffix"]):
-            raise RuntimeError(f"{workload_id}: improved suffix drift")
-        missing = set(row["required_rules"]) - set(result["changed_rules"])
-        if missing or result["baseline_equivalent"]:
-            raise RuntimeError(f"{workload_id}: inactive discriminative rules {sorted(missing)}")
+        if audit["unique_counts"].get(applicable_family, 0) <= 0:
+            raise RuntimeError(
+                f"{workload_id}: applicable family {applicable_family} emitted no candidate"
+            )
+        if case_role == "branch_probe":
+            if result["formula_family"] != row["required_family"]:
+                raise RuntimeError(f"{workload_id}: branch family drift")
+            if int(result["kernel_suffix"]) != int(row["required_suffix"]):
+                raise RuntimeError(f"{workload_id}: branch suffix drift")
+            if result["selection_basis"] != "INDEPENDENT_BRANCH_COVERAGE_MINIMUM":
+                raise RuntimeError(f"{workload_id}: branch selection attestation failed")
+        elif result["selection_basis"] != "INDEPENDENT_GLOBAL_HARDWARE_COST_MINIMUM":
+            raise RuntimeError(f"{workload_id}: global selection attestation failed")
+        if audit["official_selector_called"] or audit["history_lookup"]:
+            raise RuntimeError(f"{workload_id}: candidate decision is not independent")
+        if case_role == "selector_top1" and not audit["winner_is_global_minimum"]:
+            raise RuntimeError(f"{workload_id}: selected candidate is not global minimum")
 
         packet = result["improved"]
         blob = bytes.fromhex(packet["tiling_data_hex"])
         digest = hashlib.sha256(blob).hexdigest()
         if len(blob) != 272 or digest != packet["tiling_data_sha256"]:
-            raise RuntimeError(f"{workload_id}: invalid improved ABI packet")
+            raise RuntimeError(f"{workload_id}: invalid improved packet")
         packet_path = args.output_dir / f"{workload_id}.bin"
         packet_path.write_bytes(blob)
         words = struct.unpack("<68I", blob)
         manifest_rows.append({
             "workload_id": workload_id,
             "rank": "0",
-            "candidate_role": "independent_improved",
+            "candidate_role": (
+                "independent_branch_probe"
+                if case_role == "branch_probe"
+                else "independent_global_winner"
+            ),
             "m": str(row["m"]), "n": str(row["n"]), "k": str(row["k"]),
             "dtype": str(row["dtype"]),
             "trans_a": str(int(row["trans_a"])),
@@ -144,73 +162,49 @@ def main():
             "tiling_sha256": digest,
             "tiling_fnv1a64": fnv1a64(blob),
             "model_schedule_sha256": hashlib.sha256(
-                (workload_id + ":improved:" + digest).encode("ascii")
+                json.dumps(
+                    {
+                        "workload_id": workload_id,
+                        "family": result["formula_family"],
+                        "suffix": result["kernel_suffix"],
+                        "packet": digest,
+                        "cost": result["cost"],
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
             ).hexdigest(),
-            "is_reserve": "0", "l2_cache_flag": str(words[62]),
-            "nd2nz_a": str(words[58]), "nd2nz_b": str(words[59]),
+            "is_reserve": "0",
+            "l2_cache_flag": str(words[62]),
+            "nd2nz_a": str(words[58]),
+            "nd2nz_b": str(words[59]),
             "required_successful_tilings": "1",
         })
-
-        reference = row["reference"]
-        samples = [float(value) for value in reference["samples_ms"]]
-        if (len(samples) != 7 or any(not math.isfinite(value) or value <= 0 for value in samples) or
-                reference["device"] != "Ascend910B3" or
-                reference["toolkit"] != "CANN 8.1" or
-                reference["source"] != "installed_aclnn_matmul" or
-                reference["measurement_method"] != "device_event_latency" or
-                reference["preflight_mode"] != "numeric_signed_axes_full_v3" or
-                int(reference["warmup"]) != 2 or int(reference["repeat"]) != 20):
-            raise RuntimeError(f"{workload_id}: historical reference contract is invalid")
-        reference_rows.append({
-            "workload_id": workload_id,
-            "source": "historical_installed_aclnn_matmul_device_event",
-            "candidate_role": "installed_operator_reference",
-            "execution_mode": "official_matmul_v3",
-            "success": "1", "preflight_passed": "1",
-            "preflight_mode": reference["preflight_mode"], "error": "",
-            "min_ms": min(samples), "mean_ms": statistics.fmean(samples),
-            "median_ms": statistics.median(samples),
-            "stddev_ms": statistics.pstdev(samples),
-            "p95_ms": percentile_95(samples), "max_ms": max(samples),
-            "warmup": str(reference["warmup"]),
-            "repeat": str(reference["repeat"]), "samples": str(len(samples)),
-            "device": reference["device"], "toolkit": reference["toolkit"],
-            "measurement_method": reference["measurement_method"],
-            "record_uid": reference["record_uid"],
-            "source_sha256": reference["source_sha256"],
-            "selection_axis": row["selection_axis"],
-        })
-        reference_sample_rows.extend({
-            "workload_id": workload_id, "sample": str(index), "latency_ms": value,
-        } for index, value in enumerate(samples))
         result["workload_id"] = workload_id
         result["selection_axis"] = row["selection_axis"]
-        result["historical_reference_record_uid"] = reference["record_uid"]
+        result["required_applicable_family"] = applicable_family
+        result["case_role"] = case_role
         selections.append(result)
 
-    write_csv(args.manifest, MANIFEST_FIELDS, manifest_rows)
-    write_csv(args.historical_profile, REFERENCE_FIELDS, reference_rows)
-    write_csv(args.historical_samples, SAMPLE_FIELDS, reference_sample_rows)
+    write_csv(args.manifest, manifest_rows)
+    variants: dict[tuple[str, str], list[dict[str, str]]] = defaultdict(list)
+    for row in manifest_rows:
+        variants[(row["dtype"], row["kernel_suffix"])].append(row)
+    for index, ((dtype, suffix), rows) in enumerate(sorted(variants.items())):
+        name = f"{dtype}_k{suffix}"
+        write_csv(args.variant_dir / f"{name}.csv", rows)
+        write_csv(args.sequence_dir / f"{index:02d}__{name}.csv", rows)
+
     args.selection.parent.mkdir(parents=True, exist_ok=True)
     with args.selection.open("w", encoding="utf-8") as stream:
         for result in selections:
             stream.write(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n")
-
-    variants = defaultdict(list)
-    for manifest_row in manifest_rows:
-        variants[(manifest_row["dtype"], manifest_row["kernel_suffix"])].append(manifest_row)
-    if set(variants) != EXPECTED_VARIANTS:
-        raise RuntimeError(f"unexpected compiled variants: {sorted(variants)}")
-    for index, ((dtype, suffix), rows) in enumerate(sorted(variants.items())):
-        write_csv(args.variant_dir / f"{dtype}_k{suffix}.csv", MANIFEST_FIELDS, rows)
-        write_csv(
-            args.sequence_dir / f"{index:02d}__{dtype}_k{suffix}.csv",
-            MANIFEST_FIELDS, rows,
-        )
     print(
-        f"RULE_GENERALIZATION_SET_GENERATED shapes={len(contract)} "
-        f"improved_packets={len(manifest_rows)} reused_official_references={len(reference_rows)} "
-        f"variants={len(variants)} measurement_batches={len(variants)}"
+        "RULE_MATRIX_GENERATED "
+        f"shapes={len(manifest_rows)} "
+        f"selector_top1={sum(row['candidate_role'] == 'independent_global_winner' for row in manifest_rows)} "
+        f"branch_probes={sum(row['candidate_role'] == 'independent_branch_probe' for row in manifest_rows)} "
+        f"applicable_families={len(declared_families)} variants={len(variants)}"
     )
 
 
