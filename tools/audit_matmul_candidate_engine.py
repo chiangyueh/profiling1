@@ -336,8 +336,12 @@ def check_indep_02(ctx: AuditContext) -> dict[str, Any]:
     assert "baseline" not in result and "baseline_equivalent" not in result
     assert result["selection_basis"] == "INDEPENDENT_HARDWARE_RULE_MINIMUM"
     harness = (ROOT / "run_npu.sh").read_text(encoding="utf-8")
-    generation_position = harness.index(
-        "\npython3 tools/generate_matmul_rule_matrix.py"
+    generator_markers = (
+        "\npython3 tools/generate_matmul_rule_matrix.py",
+        "\npython3 tools/generate_matmul_c220_experimental_matrix.py",
+    )
+    generation_position = min(
+        harness.index(marker) for marker in generator_markers if marker in harness
     )
     measurement_position = harness.index('announce "OFFICIAL_MEASUREMENT begin')
     assert generation_position < measurement_position

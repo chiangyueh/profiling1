@@ -102,7 +102,9 @@ __aicore__ inline void RunGmToL1(
         const uint32_t mUse = tiling.singleCoreM < mRemain ? tiling.singleCoreM : mRemain;
         const uint32_t nUse = tiling.singleCoreN < nRemain ? tiling.singleCoreN : nRemain;
         const uint32_t maxK = tiling.singleCoreK;
-        const uint32_t aRowsAligned = MMV3CeilAlign(static_cast<uint64_t>(mUse), ALIGNED_H);
+        const uint32_t maxTileM = tiling.baseM < mUse ? tiling.baseM : mUse;
+        const uint32_t maxTileN = tiling.baseN < nUse ? tiling.baseN : nUse;
+        const uint32_t aRowsAligned = MMV3CeilAlign(static_cast<uint64_t>(maxTileM), ALIGNED_H);
         const uint32_t bKAligned = MMV3CeilAlign(static_cast<uint64_t>(maxK), ALIGNED_H);
 
         GlobalTensor<T> inputA;
@@ -122,7 +124,7 @@ __aicore__ inline void RunGmToL1(
         TQue<QuePosition::B1, 1> queueB;
         pipe.InitBuffer(queueA, 1, static_cast<uint64_t>(aRowsAligned) * maxK * sizeof(T));
         pipe.InitBuffer(queueB, 1, static_cast<uint64_t>(bKAligned) *
-                                      MMV3CeilAlign(static_cast<uint64_t>(nUse), ALIGNED_H) * sizeof(T));
+                                      MMV3CeilAlign(static_cast<uint64_t>(maxTileN), ALIGNED_H) * sizeof(T));
 
         using aL1Type = MatmulType<TPosition::TSCM, CubeFormat::NZ, T, false>;
         using bL1Type = MatmulType<TPosition::TSCM, CubeFormat::NZ, T, false>;
@@ -131,31 +133,48 @@ __aicore__ inline void RunGmToL1(
         MatmulImpl<aL1Type, bL1Type, cGmType, biasType, MM_CFG_NO_PRELOAD> mm;
         mm.SetSubBlockIdx(0);
         mm.Init(&tiling, &pipe);
-        const uint64_t outputOffset = static_cast<uint64_t>(mStart) * tiling.N + nStart;
-        for (uint32_t kStart = 0, kIndex = 0; kStart < tiling.Ka;
-             kStart += maxK, ++kIndex) {
-            const uint32_t kRemain = static_cast<uint32_t>(tiling.Ka - kStart);
-            const uint32_t kUse = maxK < kRemain ? maxK : kRemain;
-            LocalTensor<T> localA = queueA.AllocTensor<T>();
-            LocalTensor<T> localB = queueB.AllocTensor<T>();
-            CopyAFromGmToL1(localA, inputA,
-                            static_cast<uint64_t>(mStart) * tiling.Ka + kStart,
-                            mUse, kUse, tiling.Ka);
-            CopyBFromGmToL1(localB, inputB,
-                            static_cast<uint64_t>(kStart) * tiling.N + nStart,
-                            kUse, nUse, tiling.N);
-            queueA.EnQue(localA);
-            queueB.EnQue(localB);
-            localA = queueA.DeQue<T>();
-            localB = queueB.DeQue<T>();
-            mm.SetOrgShape(mUse, nUse, kUse, kUse, tiling.N);
-            mm.SetSingleShape(mUse, nUse, kUse);
-            mm.SetTensorA(localA, false);
-            mm.SetTensorB(localB, false);
-            mm.Iterate();
-            mm.GetTensorC(accumulated[outputOffset], kIndex == 0 ? 0 : 1);
-            queueA.FreeTensor(localA);
-            queueB.FreeTensor(localB);
+        // A TSCM/B TSCM tensor contains one base tile.  Passing a wider
+        // singleCoreN directly makes the matmul engine advance as if a second
+        // baseN tile were present in the local tensor.  Materialize and launch
+        // every baseM/baseN tile explicitly so local NZ strides and GM output
+        // offsets remain identical at each boundary.
+        for (uint32_t mLocal = 0; mLocal < mUse; mLocal += tiling.baseM) {
+            const uint32_t tileMRemain = mUse - mLocal;
+            const uint32_t tileM = tiling.baseM < tileMRemain ? tiling.baseM : tileMRemain;
+            for (uint32_t kStart = 0, kIndex = 0; kStart < tiling.Ka;
+                 kStart += maxK, ++kIndex) {
+                const uint32_t kRemain = static_cast<uint32_t>(tiling.Ka - kStart);
+                const uint32_t kUse = maxK < kRemain ? maxK : kRemain;
+                LocalTensor<T> localA = queueA.AllocTensor<T>();
+                CopyAFromGmToL1(
+                    localA, inputA,
+                    static_cast<uint64_t>(mStart + mLocal) * tiling.Ka + kStart,
+                    tileM, kUse, tiling.Ka);
+                queueA.EnQue(localA);
+                localA = queueA.DeQue<T>();
+                // Keep one A base tile resident while all N base tiles use it.
+                for (uint32_t nLocal = 0; nLocal < nUse; nLocal += tiling.baseN) {
+                    const uint32_t tileNRemain = nUse - nLocal;
+                    const uint32_t tileN = tiling.baseN < tileNRemain ? tiling.baseN : tileNRemain;
+                    const uint64_t outputOffset =
+                        static_cast<uint64_t>(mStart + mLocal) * tiling.N + nStart + nLocal;
+                    LocalTensor<T> localB = queueB.AllocTensor<T>();
+                    CopyBFromGmToL1(
+                        localB, inputB,
+                        static_cast<uint64_t>(kStart) * tiling.N + nStart + nLocal,
+                        kUse, tileN, tiling.N);
+                    queueB.EnQue(localB);
+                    localB = queueB.DeQue<T>();
+                    mm.SetOrgShape(tileM, tileN, kUse, kUse, tiling.N);
+                    mm.SetSingleShape(tileM, tileN, kUse);
+                    mm.SetTensorA(localA, false);
+                    mm.SetTensorB(localB, false);
+                    mm.Iterate();
+                    mm.GetTensorC(accumulated[outputOffset], kIndex == 0 ? 0 : 1);
+                    queueB.FreeTensor(localB);
+                }
+                queueA.FreeTensor(localA);
+            }
         }
         mm.End();
         SetAtomicNone();

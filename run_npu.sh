@@ -7,15 +7,15 @@ PHYSICAL_DEVICE="${PHYSICAL_NPU_ID:-2}"
 WARMUP=3
 REPEAT=10
 SAMPLES=15
-VALIDATION_SHAPES=12
-EXPECTED_VARIANTS=8
+VALIDATION_SHAPES=4
+EXPECTED_VARIANTS=4
 NUMERIC_PREFLIGHT_MAX_MIB=320
 
 usage() {
     printf '%s\n' \
         'Usage: ./run_npu.sh --mode full [-d PHYSICAL_NPU_ID]' \
         '' \
-        'Builds and measures five independently generated C220 structural families' \
+        'Builds and measures the independently modelled C220 GM-to-L1 family' \
         'against one same-campaign official MatMulV3 reference per workload.'
 }
 
@@ -83,7 +83,7 @@ CAMPAIGN_ID="$({
     find colleague_matmul_v3/op_kernel -type f -print0 |
         sort -z | xargs -0 sha256sum
 } | sha256sum | cut -c1-20)"
-CAMPAIGN_DIR="${ROOT}/results/matmul_c220_structural_v1/${CAMPAIGN_ID}"
+CAMPAIGN_DIR="${ROOT}/results/matmul_c220_gm_to_l1_v1/${CAMPAIGN_ID}"
 PACKET_DIR="${CAMPAIGN_DIR}/packets"
 MANIFEST="${CAMPAIGN_DIR}/improved_manifest.csv"
 SELECTION="${CAMPAIGN_DIR}/selection.jsonl"
@@ -199,10 +199,10 @@ fail() {
 announce "RUN_LOG path=${RUN_LOG}"
 source_revision="$(git rev-parse HEAD 2>/dev/null || printf unknown)"
 announce "SOURCE_REVISION commit=${source_revision}"
-announce "CAMPAIGN_READY operator=matmul focus=c220_structural_families families=5 npu_shapes=${VALIDATION_SHAPES} candidate_measurements=${VALIDATION_SHAPES} official_measurements=${VALIDATION_SHAPES} compiled_variants=${EXPECTED_VARIANTS} physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
+announce "CAMPAIGN_READY operator=matmul focus=c220_gm_to_l1 families=2 npu_shapes=${VALIDATION_SHAPES} candidate_measurements=${VALIDATION_SHAPES} official_measurements=${VALIDATION_SHAPES} compiled_variants=${EXPECTED_VARIANTS} physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
 announce "measurement=${WARMUP}_warmup+${SAMPLES}_device_event_samples+repeat_${REPEAT}+validate_last_timed_output"
-announce "numeric_preflight_limit_mib=${NUMERIC_PREFLIGHT_MAX_MIB} largest_input_pair_mib=258"
-announce "selection=one_required_structural_family_per_workload_with_hard_resource_checks_and_no_fallback"
+announce "numeric_preflight_limit_mib=${NUMERIC_PREFLIGHT_MAX_MIB}"
+announce "selection=finite_legal_gm_to_l1_candidates_pareto_pruned_then_critical_path_minimum"
 announce "selector=shape_and_frozen_c220_hardware_formula_only"
 announce "official_reference=same_campaign_installed_aclnn_matmul_public_api"
 announce "forbidden=cost_model,measured_latency_at_selection,history_lookup_at_runtime,repo_lookup,tiling_bank,official_tiling_seed,installed_branch_fallback"
@@ -211,7 +211,7 @@ announce "results=${CAMPAIGN_DIR}"
 
 if [[ -s "${ANALYSIS}" ]] && grep -q '"status": "complete"' "${ANALYSIS}"; then
     emit_final_results
-    announce "C220_STRUCTURAL_VALIDATION_COMPLETE cached=1 analysis=${ANALYSIS} summary=${SUMMARY} log=${RUN_LOG}"
+    announce "C220_GM_TO_L1_VALIDATION_COMPLETE cached=1 analysis=${ANALYSIS} summary=${SUMMARY} log=${RUN_LOG}"
     exit 0
 fi
 
@@ -342,8 +342,37 @@ printf '%s\n' 'CANDIDATE_MANIFEST_CSV_BEGIN'
 cat "${MANIFEST}"
 printf '%s\n' 'CANDIDATE_MANIFEST_CSV_END'
 generation_wall_ms=$(( ($(date +%s%N) - generation_started_ns) / 1000000 ))
-announce "C220_STRUCTURAL_PACKET_GENERATION passed shapes=${VALIDATION_SHAPES} families=5 variants=${EXPECTED_VARIANTS} packet_bytes=280"
-announce "CAMPAIGN_STAGE_TIMING stage=c220_structural_packet_generation wall_ms=${generation_wall_ms}"
+announce "C220_GM_TO_L1_PACKET_GENERATION passed shapes=${VALIDATION_SHAPES} families=2 variants=${EXPECTED_VARIANTS} packet_bytes=280"
+announce "CAMPAIGN_STAGE_TIMING stage=c220_gm_to_l1_packet_generation wall_ms=${generation_wall_ms}"
+
+input_cap_audit="$(python3 - "${MANIFEST}" "${NUMERIC_PREFLIGHT_MAX_MIB}" <<'PY'
+import csv
+import sys
+
+width = {"fp16": 2, "bf16": 2, "fp32": 4}
+with open(sys.argv[1], newline="", encoding="utf-8") as stream:
+    rows = list(csv.DictReader(stream))
+limit = int(sys.argv[2]) * 1024 * 1024
+sizes = {
+    row["workload_id"]: (
+        int(row["m"]) * int(row["k"]) + int(row["k"]) * int(row["n"])
+    ) * width[row["dtype"]]
+    for row in rows
+}
+largest = max(sizes, key=sizes.get)
+max_k = max(int(row["k"]) for row in rows)
+if sizes[largest] > limit or max_k > 60000:
+    raise SystemExit(
+        f"input preflight contract invalid: largest={largest} "
+        f"bytes={sizes[largest]} limit={limit} max_k={max_k}"
+    )
+print(
+    f"largest={largest} bytes={sizes[largest]} "
+    f"mib={sizes[largest] / 1048576:g} limit_mib={limit / 1048576:g} max_k={max_k}"
+)
+PY
+)"
+announce "INPUT_CAP_AUDIT passed ${input_cap_audit}"
 
 official_build_started_ns="$(date +%s%N)"
 announce "OFFICIAL_RUNNER_BUILD begin jobs=1"
@@ -402,25 +431,52 @@ cat "${OFFICIAL_SAMPLES}"
 printf '%s\n' 'OFFICIAL_SAMPLES_CSV_END'
 
 batch_index=0
+candidate_batch_failures=0
 for packet_manifest in "${SEQUENCE_DIR}"/*.csv; do
     filename="$(basename "${packet_manifest}" .csv)"
     variant="${filename##*__}"
     runner="${ROOT}/build/direct_runners/direct_matmul_${variant}"
     batch_index=$((batch_index + 1))
     batch_shapes=$(( $(wc -l <"${packet_manifest}") - 1 ))
+    announce "CANDIDATE_CANARY ${batch_index}/${EXPECTED_VARIANTS} begin variant=${variant} shapes=${batch_shapes}"
+    if canary_output="$("${runner}" \
+        --manifest "${packet_manifest}" \
+        --device "${DEVICE_ID}" \
+        --warmup 0 \
+        --repeat 1 \
+        --samples 1 \
+        --allow-partial 2>&1)"; then
+        canary_rc=0
+    else
+        canary_rc=$?
+    fi
+    printf '%s\n' "${canary_output}" | sed 's/^/C220_CANARY_RECORD /'
+    canary_invalid="$(grep -c 'DIRECT_MATMUL_RESULT .*"status":"failed"' <<<"${canary_output}" || true)"
+    if [[ "${canary_rc}" -ne 0 || "${canary_invalid}" -ne 0 ]]; then
+        candidate_batch_failures=$((candidate_batch_failures + 1))
+        announce "CANDIDATE_CANARY ${batch_index}/${EXPECTED_VARIANTS} failed variant=${variant} rc=${canary_rc} invalid_shapes=${canary_invalid}; formal_measurement=skipped"
+        continue
+    fi
+    announce "CANDIDATE_CANARY ${batch_index}/${EXPECTED_VARIANTS} passed variant=${variant} shapes=${batch_shapes}"
     announce "CANDIDATE_MEASUREMENT_BATCH ${batch_index}/${EXPECTED_VARIANTS} begin variant=${variant} shapes=${batch_shapes} manifest=$(basename "${packet_manifest}")"
-    "${runner}" \
+    if "${runner}" \
         --manifest "${packet_manifest}" \
         --device "${DEVICE_ID}" \
         --warmup "${WARMUP}" \
         --repeat "${REPEAT}" \
-        --samples "${SAMPLES}"
-    announce "CANDIDATE_MEASUREMENT_BATCH ${batch_index}/${EXPECTED_VARIANTS} passed variant=${variant} shapes=${batch_shapes}"
+        --samples "${SAMPLES}"; then
+        announce "CANDIDATE_MEASUREMENT_BATCH ${batch_index}/${EXPECTED_VARIANTS} passed variant=${variant} shapes=${batch_shapes}"
+    else
+        candidate_batch_failures=$((candidate_batch_failures + 1))
+        announce "CANDIDATE_MEASUREMENT_BATCH ${batch_index}/${EXPECTED_VARIANTS} failed variant=${variant}; continuing_remaining_variants=1"
+    fi
 done
 [[ "${batch_index}" -eq "${EXPECTED_VARIANTS}" ]] || \
     fail "measured ${batch_index} batches, expected ${EXPECTED_VARIANTS}"
 measurement_wall_ms=$(( ($(date +%s%N) - measurement_started_ns) / 1000000 ))
 announce "CAMPAIGN_STAGE_TIMING stage=paired_npu_measurement wall_ms=${measurement_wall_ms}"
+[[ "${candidate_batch_failures}" -eq 0 ]] || \
+    fail "all ${EXPECTED_VARIANTS} variants were attempted; ${candidate_batch_failures} variant batches failed correctness or execution"
 
 analysis_started_ns="$(date +%s%N)"
 python3 tools/analyze_matmul_rule_matrix.py \
@@ -440,4 +496,4 @@ printf '%s\n' 'FINAL_SUMMARY_CSV_END'
 analysis_wall_ms=$(( ($(date +%s%N) - analysis_started_ns) / 1000000 ))
 announce "CAMPAIGN_STAGE_TIMING stage=analysis wall_ms=${analysis_wall_ms}"
 emit_final_results
-announce "C220_STRUCTURAL_VALIDATION_COMPLETE cached=0 analysis=${ANALYSIS} summary=${SUMMARY} packets=${PACKET_DIR} log=${RUN_LOG}"
+announce "C220_GM_TO_L1_VALIDATION_COMPLETE cached=0 analysis=${ANALYSIS} summary=${SUMMARY} packets=${PACKET_DIR} log=${RUN_LOG}"

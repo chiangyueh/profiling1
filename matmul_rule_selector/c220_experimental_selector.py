@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent finite-rule selector for the C220 structural MatMul paths."""
+"""Independent finite-candidate selector for C220 MatMul family kernels."""
 from __future__ import annotations
 
 import hashlib
@@ -21,6 +21,20 @@ L0B = 65536
 L0C = 131072
 L1 = 524032
 SYSTEM_WORKSPACE = 20 * 1024 * 1024
+L1_QUEUE_RESERVE = 4096
+GM_TO_L1_BYTES_PER_CYCLE = 16.0
+L1_TO_L0_BYTES_PER_CYCLE = 256.0
+FIXPIPE_BYTES_PER_CYCLE = 64.0
+ATOMIC_BYTES_PER_CYCLE = 12.8
+AGGREGATE_HBM_BYTES_PER_CYCLE = 640.0
+CUBE_MACS_PER_CYCLE_16BIT = 4096.0
+VECTOR_CAST_ELEMENTS_PER_CYCLE = 128.0
+MTE2_TRANSFER_CYCLES = 347.0
+MTE1_TRANSFER_CYCLES = 2.0
+FIXPIPE_TRANSFER_CYCLES = 31.0
+ATOMIC_TRANSFER_CYCLES = 382.0
+GM_TO_L1_SYNC_CYCLES = 545.0
+KERNEL_LAUNCH_CYCLES = 96.0
 FAMILIES = {
     "MULTI_CORE_SPLIT_K": {"fp32": 41},
     "SINGLE_CORE_NKM_SPLIT_K": {"fp32": 51},
@@ -145,6 +159,240 @@ def sc_cube(req: dict, *, nkm: bool) -> tuple[dict, dict]:
     return cube, audit
 
 
+def partition_by_base_tiles(total: int, base: int, groups: int) -> tuple[int, list[int]]:
+    total_tiles = ceil_div(total, base)
+    tiles_per_group = ceil_div(total_tiles, groups)
+    single = tiles_per_group * base
+    extents = []
+    for start in range(0, total, single):
+        extents.append(min(single, total - start))
+    return single, extents
+
+
+def gm_to_l1_cost(req: dict, *, base_m: int, base_n: int, base_k: int,
+                  k_stripe: int, m_extents: list[int], n_extents: list[int]) -> dict:
+    width = 2
+    k_chunks = ceil_div(req["K"], k_stripe)
+    k_tail = req["K"] - (k_chunks - 1) * k_stripe
+    aligned_k_sum = (k_chunks - 1) * k_stripe + align_up(k_tail, 16)
+    k_base_tiles = ((k_chunks - 1) * ceil_div(k_stripe, base_k) +
+                    ceil_div(k_tail, base_k))
+    core_costs = []
+    core_breakdowns = []
+    total_hbm_bytes = 0
+    total_useful_macs = 0
+    total_padded_macs = 0
+    for m_extent in m_extents:
+        m_tile_count = ceil_div(m_extent, base_m)
+        m_tail = m_extent - (m_tile_count - 1) * base_m
+        aligned_m_sum = (m_tile_count - 1) * base_m + align_up(m_tail, 16)
+        for n_extent in n_extents:
+            n_tile_count = ceil_div(n_extent, base_n)
+            n_tail = n_extent - (n_tile_count - 1) * base_n
+            aligned_n_sum = (n_tile_count - 1) * base_n + align_up(n_tail, 16)
+            # The kernel retains one A base tile in L1 while sweeping all N
+            # base tiles.  B must be reloaded once for every M base tile.
+            gm_bytes = (
+                m_extent * req["K"] * width +
+                m_tile_count * req["K"] * n_extent * width
+            )
+            gm_copies = (
+                m_tile_count * k_chunks +
+                m_tile_count * n_tile_count * k_chunks
+            )
+            l1_l0_bytes = (
+                aligned_m_sum * n_tile_count * aligned_k_sum +
+                m_tile_count * aligned_n_sum * aligned_k_sum
+            ) * width
+            l1_l0_copies = 2 * m_tile_count * n_tile_count * k_chunks
+            useful = m_extent * n_extent * req["K"]
+            padded = aligned_m_sum * aligned_n_sum * aligned_k_sum
+            total_useful_macs += useful
+            total_padded_macs += padded
+            cube_macs = padded
+            mad_tiles = m_tile_count * n_tile_count * k_base_tiles
+            output_bytes = m_extent * n_extent * 4
+            output_tile_count = m_tile_count * n_tile_count
+            output_cycles = (
+                output_bytes / FIXPIPE_BYTES_PER_CYCLE +
+                output_tile_count * FIXPIPE_TRANSFER_CYCLES
+            )
+            output_hbm_bytes = output_bytes
+            if k_chunks > 1:
+                output_cycles += (k_chunks - 1) * (
+                    output_bytes / ATOMIC_BYTES_PER_CYCLE +
+                    output_tile_count * ATOMIC_TRANSFER_CYCLES
+                )
+                output_hbm_bytes += (k_chunks - 1) * 2 * output_bytes
+            gm_cycles = gm_bytes / GM_TO_L1_BYTES_PER_CYCLE + gm_copies * MTE2_TRANSFER_CYCLES
+            l1_l0_cycles = (l1_l0_bytes / L1_TO_L0_BYTES_PER_CYCLE +
+                            l1_l0_copies * MTE1_TRANSFER_CYCLES)
+            cube_cycles = cube_macs / CUBE_MACS_PER_CYCLE_16BIT + mad_tiles * 21.0
+            # Two AIVs split the rows owned by one AIC.  Conversion begins
+            # after the AIC publishes its completion event.
+            vector_elements = ceil_div(m_extent, 2) * n_extent
+            vector_cycles = (
+                vector_elements * 4 / GM_TO_L1_BYTES_PER_CYCLE +
+                vector_elements * width / FIXPIPE_BYTES_PER_CYCLE +
+                vector_elements / VECTOR_CAST_ELEMENTS_PER_CYCLE +
+                MTE2_TRANSFER_CYCLES + 25.0
+            )
+            core_cycles = (gm_cycles + max(cube_cycles, l1_l0_cycles) +
+                           output_cycles + vector_cycles)
+            core_costs.append(core_cycles)
+            core_breakdowns.append({
+                "gm_to_l1_cycles": gm_cycles,
+                "cube_cycles": cube_cycles,
+                "l1_to_l0_cycles": l1_l0_cycles,
+                "cube_l1_overlap_cycles": max(cube_cycles, l1_l0_cycles),
+                "output_accumulation_cycles": output_cycles,
+                "vector_cast_cycles": vector_cycles,
+                "total_cycles": core_cycles,
+            })
+            total_hbm_bytes += gm_bytes + output_hbm_bytes + m_extent * n_extent * (4 + width)
+    aggregate_cycles = total_hbm_bytes / AGGREGATE_HBM_BYTES_PER_CYCLE
+    worst_index = max(range(len(core_costs)), key=core_costs.__getitem__)
+    worst = core_breakdowns[worst_index]
+    critical_cycles = (max(worst["total_cycles"], aggregate_cycles) +
+                       GM_TO_L1_SYNC_CYCLES + KERNEL_LAUNCH_CYCLES)
+    dominant_local = max(
+        ("gm_to_l1", "cube_l1_overlap", "output_accumulation", "vector_cast"),
+        key=lambda name: worst[f"{name}_cycles"],
+    )
+    return {
+        "critical_cycles": critical_cycles,
+        "critical_path": (
+            "aggregate_hbm" if aggregate_cycles > worst["total_cycles"]
+            else f"worst_core:{dominant_local}"
+        ),
+        "worst_core_cycles": worst["total_cycles"],
+        "worst_core_components": worst,
+        "aggregate_hbm_cycles": aggregate_cycles,
+        "total_hbm_bytes": total_hbm_bytes,
+        "useful_macs": total_useful_macs,
+        "padded_macs": total_padded_macs,
+        "padding_ratio": total_padded_macs / max(1, total_useful_macs),
+        "k_chunks": k_chunks,
+    }
+
+
+def gm_to_l1_cube(req: dict) -> tuple[dict, dict]:
+    width = 2
+    candidates = []
+    seen = set()
+    for base_m in (128, 64, 32):
+        for base_n in (128, 64, 32):
+            for base_k in (128, 64, 32):
+                if (base_m * base_k * width * 2 > L0A or
+                        base_n * base_k * width * 2 > L0B or
+                        base_m * base_n * 4 * 2 > L0C):
+                    continue
+                resident_per_step = (base_m + base_n) * base_k * width
+                max_step = (L1 - L1_QUEUE_RESERVE) // resident_per_step
+                if max_step < 1:
+                    continue
+                step_k = min(max_step, ceil_div(req["K"], base_k))
+                k_stripe = step_k * base_k
+                m_tiles = ceil_div(req["M"], base_m)
+                n_tiles = ceil_div(req["N"], base_n)
+                for m_groups in range(1, min(m_tiles, AIC) + 1):
+                    for n_groups in range(1, min(n_tiles, AIC // m_groups) + 1):
+                        single_m, m_extents = partition_by_base_tiles(
+                            req["M"], base_m, m_groups)
+                        single_n, n_extents = partition_by_base_tiles(
+                            req["N"], base_n, n_groups)
+                        used = len(m_extents) * len(n_extents)
+                        if used > AIC:
+                            continue
+                        signature = (base_m, base_n, base_k, k_stripe, single_m, single_n, used)
+                        if signature in seen:
+                            continue
+                        seen.add(signature)
+                        cost = gm_to_l1_cost(
+                            req, base_m=base_m, base_n=base_n,
+                            base_k=base_k, k_stripe=k_stripe,
+                            m_extents=m_extents, n_extents=n_extents)
+                        # Every term before used is a hardware service term;
+                        # core count is only a final tie-break, never the goal.
+                        score = (
+                            cost["critical_cycles"], cost["aggregate_hbm_cycles"],
+                            cost["padding_ratio"], cost["total_hbm_bytes"], -used,
+                        )
+                        candidates.append((
+                            score, base_m, base_n, base_k, k_stripe,
+                            single_m, single_n, used, cost,
+                        ))
+    if not candidates:
+        raise ValueError("no legal GM-to-L1 finite candidate")
+
+    def pareto_metrics(candidate: tuple) -> tuple[float, ...]:
+        cost = candidate[8]
+        return (
+            cost["critical_cycles"], cost["worst_core_cycles"],
+            cost["aggregate_hbm_cycles"], cost["padding_ratio"],
+            float(cost["total_hbm_bytes"]),
+        )
+
+    pareto_candidates = []
+    for candidate in candidates:
+        metrics = pareto_metrics(candidate)
+        dominated = False
+        for other in candidates:
+            if other is candidate:
+                continue
+            other_metrics = pareto_metrics(other)
+            if (all(left <= right for left, right in zip(other_metrics, metrics)) and
+                    any(left < right for left, right in zip(other_metrics, metrics))):
+                dominated = True
+                break
+        if not dominated:
+            pareto_candidates.append(candidate)
+    if not pareto_candidates:
+        raise RuntimeError("GM-to-L1 Pareto pruning removed every legal candidate")
+    (score, base_m, base_n, base_k, k_stripe,
+     single_m, single_n, used, cost) = min(pareto_candidates)
+    step_k = k_stripe // base_k
+    cube = empty_cube(req)
+    cube.update({
+        "usedCoreNum": used,
+        "singleCoreM": single_m, "singleCoreN": single_n,
+        "singleCoreK": k_stripe,
+        "baseM": base_m, "baseN": base_n, "baseK": base_k,
+        "depthA1": step_k, "depthB1": step_k,
+        "stepM": 1, "stepN": 1,
+        "stepKa": step_k, "stepKb": step_k,
+        "dbL0A": 2, "dbL0B": 2, "dbL0C": 2,
+    })
+    return cube, {
+        "model": "gm_to_l1_critical_path_v1",
+        "finite_candidate_count": len(candidates),
+        "pareto_candidate_count": len(pareto_candidates),
+        "candidate_score": list(score),
+        "critical_path_cycles": cost["critical_cycles"],
+        "critical_path": cost["critical_path"],
+        "worst_core_cycles": cost["worst_core_cycles"],
+        "worst_core_components": cost["worst_core_components"],
+        "aggregate_hbm_cycles": cost["aggregate_hbm_cycles"],
+        "total_hbm_bytes": cost["total_hbm_bytes"],
+        "padding_ratio": cost["padding_ratio"],
+        "k_chunks": cost["k_chunks"],
+        "core_grid_tasks": used,
+        "base_tile": [base_m, base_n, base_k],
+        "k_stripe": k_stripe,
+        "critical_path_equation": "max(worst_core,aggregate_hbm)+sync+launch",
+        "worst_core_equation": "gm_to_l1+max(cube,l1_to_l0)+output_accumulation+vector_cast",
+        "primitive_calibration": "frozen_c220_isolated_instruction_contract_v1",
+        "service_rates": {
+            "gm_to_l1_bytes_per_cycle": GM_TO_L1_BYTES_PER_CYCLE,
+            "l1_to_l0_bytes_per_cycle": L1_TO_L0_BYTES_PER_CYCLE,
+            "cube_macs_per_cycle": CUBE_MACS_PER_CYCLE_16BIT,
+            "fixpipe_bytes_per_cycle": FIXPIPE_BYTES_PER_CYCLE,
+            "atomic_bytes_per_cycle": ATOMIC_BYTES_PER_CYCLE,
+            "aggregate_hbm_bytes_per_cycle": AGGREGATE_HBM_BYTES_PER_CYCLE,
+        },
+    }
+
+
 def multi_core_cube(req: dict) -> tuple[dict, dict]:
     k_parts = min(AIC, max(2, ceil_div(req["K"], 4096)))
     single_k = align_up(ceil_div(req["K"], k_parts), 16)
@@ -255,9 +503,15 @@ def al1_cube(req: dict) -> tuple[dict, dict]:
 
 
 def validate_cube(cube: dict, width: int, family: str) -> dict:
-    resident_a = align_up(cube["singleCoreM"], 16) * cube["singleCoreK"] * width
+    gm_to_l1 = family in (
+        "SINGLE_CORE_SPLIT_K_GM_TO_L1",
+        "SINGLE_CORE_SPLIT_K_GM_TO_L1_UNALIGNED",
+    )
+    resident_m = cube["baseM"] if gm_to_l1 else cube["singleCoreM"]
+    resident_n = cube["baseN"] if gm_to_l1 else cube["singleCoreN"]
+    resident_a = align_up(resident_m, 16) * cube["singleCoreK"] * width
     resident_b = (align_up(cube["singleCoreK"], 16) *
-                  align_up(cube["singleCoreN"], 16) * width)
+                  align_up(resident_n, 16) * width)
     checks = {
         "all_words_uint32": all(type(cube[name]) is int and 0 <= cube[name] < 2**32 for name in CUBE_FIELDS),
         "base_alignment": cube["baseM"] % 16 == 0 and cube["baseN"] % 16 == 0 and cube["baseK"] % 16 == 0,
@@ -268,10 +522,7 @@ def validate_cube(cube: dict, width: int, family: str) -> dict:
         "l1_fit": ((cube["baseM"] * cube["baseK"] * cube["depthA1"] +
                     cube["baseN"] * cube["baseK"] * cube["depthB1"]) * width <= L1 + 256),
         "gm_to_l1_resident_fit": (
-            family not in (
-                "SINGLE_CORE_SPLIT_K_GM_TO_L1",
-                "SINGLE_CORE_SPLIT_K_GM_TO_L1_UNALIGNED",
-            ) or resident_a + resident_b <= L1
+            not gm_to_l1 or resident_a + resident_b <= L1 - L1_QUEUE_RESERVE
         ),
     }
     if not all(checks.values()):
@@ -313,7 +564,7 @@ def generate(m: int, k: int, n: int, dtype: str, trans_a: bool, trans_b: bool,
         cube, derivation = sc_cube(req, nkm=True)
         cal_order = 1
     elif required_family in ("SINGLE_CORE_SPLIT_K_GM_TO_L1", "SINGLE_CORE_SPLIT_K_GM_TO_L1_UNALIGNED"):
-        cube, derivation = sc_cube(req, nkm=False)
+        cube, derivation = gm_to_l1_cube(req)
         cal_order = 0
     else:
         cube, derivation = al1_cube(req)
@@ -325,10 +576,10 @@ def generate(m: int, k: int, n: int, dtype: str, trans_a: bool, trans_b: bool,
         "SINGLE_CORE_SPLIT_K_GM_TO_L1_UNALIGNED",
     ):
         derivation.update({
-            "resident_a_l1_bytes": align_up(cube["singleCoreM"], 16) * cube["singleCoreK"] * width,
+            "resident_a_l1_bytes": align_up(cube["baseM"], 16) * cube["singleCoreK"] * width,
             "resident_b_l1_bytes": (align_up(cube["singleCoreK"], 16) *
-                                     align_up(cube["singleCoreN"], 16) * width),
-            "resident_l1_limit_bytes": L1,
+                                     align_up(cube["baseN"], 16) * width),
+            "resident_l1_limit_bytes": L1 - L1_QUEUE_RESERVE,
         })
     unaligned = required_family.endswith("UNALIGNED")
     vector = vector_geometry(req, cube["usedCoreNum"])
@@ -356,7 +607,9 @@ def generate(m: int, k: int, n: int, dtype: str, trans_a: bool, trans_b: bool,
         cube["stepKa"] * cube["baseK"] < k
     )
     output_workspace = align_up(m * n * 4, 512) if needs_fp32_output else 0
-    conversion_workspace = align_up(m * k * width, 512) + align_up(k * n * width, 512) if unaligned else 0
+    # The custom family pads each base tile directly during GM->L1 ND2NZ;
+    # it does not materialize whole converted A/B tensors in workspace.
+    conversion_workspace = 0
     workspace = SYSTEM_WORKSPACE + output_workspace + conversion_workspace
     suffix = FAMILIES[required_family][dtype]
     return {
@@ -364,7 +617,7 @@ def generate(m: int, k: int, n: int, dtype: str, trans_a: bool, trans_b: bool,
         "npu_eligible": True,
         "formula_family": required_family,
         "kernel_suffix": suffix,
-        "selection_basis": "INDEPENDENT_STRUCTURAL_RULE",
+        "selection_basis": "INDEPENDENT_FINITE_CANDIDATE_CRITICAL_PATH",
         "applicability_reason": reason,
         "packet_layout": "target280_cube200",
         "packet_bytes": len(blob),

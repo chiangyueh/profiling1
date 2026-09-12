@@ -199,7 +199,7 @@ DIRECT_KERNEL_BUILD_SIGNATURE="$({
     find "${MATMUL_V3_C220_KERNEL_DIR}" -type f -print0 | \
         sort -z | xargs -0 sha256sum
     printf '%s\n' \
-        "dual-abi-direct-kernel-v3:${ASCENDC_SOC_VERSION}:${DIRECT_KERNEL_TARGETS[*]}"
+        "dual-abi-direct-kernel-v4:${ASCENDC_SOC_VERSION}:${DIRECT_KERNEL_TARGETS[*]}"
 } | sha256sum | cut -d' ' -f1)"
 kernel_count="${#DIRECT_KERNEL_TARGETS[@]}"
 
@@ -313,12 +313,6 @@ kernel_cache_valid=0
 if kernel_archive_valid "${target}"; then
     if [[ "$(cat "${target_stamp}" 2>/dev/null || true)" == \
           "${DIRECT_KERNEL_BUILD_SIGNATURE}" ]]; then
-        kernel_cache_valid=1
-    elif [[ ! "${target_entry}" -nt "${target_library}" && \
-            ! "${target_packet_header}" -nt "${target_library}" ]] && \
-         [[ -z "$(find "${target_kernel_source_dir}" -type f \
-             -newer "${target_library}" -print -quit)" ]]; then
-        printf '%s\n' "${DIRECT_KERNEL_BUILD_SIGNATURE}" >"${target_stamp}"
         kernel_cache_valid=1
     fi
 fi
