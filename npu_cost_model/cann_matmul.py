@@ -435,7 +435,6 @@ def validate_cann_tiling(
             or single_n > base_n
             or base_m > align_up(single_m, 16)
             or base_n > align_up(single_n, 16)
-            or base_k > align_up(single_k, k0)
             or step_m != 1
             or step_n != 1
         ):
@@ -495,6 +494,10 @@ def validate_cann_tiling(
             or used > k_chunks
         ):
             reasons.append("DETERMINISTIC_SPLIT_K_3X3_CONTRACT")
+        if (mk33 and int(knowledge["iterateOrder"]) != 1) or (
+            nk33 and int(knowledge["iterateOrder"]) != 0
+        ):
+            reasons.append("DETERMINISTIC_SPLIT_K_ITERATE_GEOMETRY_MISMATCH")
         # Every deterministic partial is allocated with a
         # singleCoreM*singleCoreN stride.  The C220 reducer and MatMul API
         # round the final N block to 256 bytes in FP32 workspace.  If that
@@ -502,8 +505,17 @@ def validate_cann_tiling(
         # slot overwrites the next (the 512x160x49152 BF16 device failure
         # starts exactly at the first affected row).  This is a workspace
         # address bound, not a profitability threshold.
-        n_tail = n - (ceil_div(n, single_n) - 1) * single_n
-        if align_up(n_tail, 256 // dtype_bytes("fp32")) > single_n:
+        n_task_count = ceil_div(n, single_n)
+        n_tail = n - (n_task_count - 1) * single_n
+        # A single N task uses the kernel's complete output/workspace slot;
+        # there is no following N slot for the aligned reducer tail to
+        # overwrite.  The old check rejected the installed MK profile for
+        # every N<64 shape even though that profile is the valid one.  The
+        # stride bound applies only when a subsequent N task exists.
+        if (
+            n_task_count > 1
+            and align_up(n_tail, 256 // dtype_bytes("fp32")) > single_n
+        ):
             reasons.append("DETERMINISTIC_SPLIT_K_N_TAIL_WORKSPACE_OVERFLOW")
 
     if full == FullLoadMode.AL1_FULL_LOAD:
@@ -831,6 +843,7 @@ def lower_plan_to_cann(
     step_ka = step_kb = 1
     single_k = k
     depth_a = depth_b = 1
+    iterate_order = 1 if (plan.traversal or ("m", "n"))[-1] == "m" else 0
 
     if graph_name == "deterministic_split_k":
         # Exact C220 deterministic workspace-reduction packet geometry.
@@ -840,10 +853,12 @@ def lower_plan_to_cann(
             step_m, step_n = 1, 3
             depth_a, depth_b = 6, 9
             single_m, single_n = m, 384
+            iterate_order = 0
         else:
             step_m, step_n = 3, 1
             depth_a, depth_b = 9, 6
             single_m, single_n = 384, n
+            iterate_order = 1
         step_ka = step_kb = 3
         single_k = 3 * base_k
     elif full == FullLoadMode.AL1_FULL_LOAD and split == SplitCoreMode.BASE:
@@ -1061,7 +1076,7 @@ def lower_plan_to_cann(
         "depthB1": depth_b,
         "stepM": step_m,
         "stepN": step_n,
-        "iterateOrder": 1 if (plan.traversal or ("m", "n"))[-1] == "m" else 0,
+        "iterateOrder": iterate_order,
         "stepKa": step_ka,
         "stepKb": step_kb,
         "dbL0A": buffers.get(MemorySpace.L0A, 1),

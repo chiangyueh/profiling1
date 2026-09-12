@@ -8,16 +8,16 @@ WARMUP=10
 REPEAT=20
 SAMPLES=30
 EXPECTED_BRANCHES=13
-EXPECTED_AUDIT_ITEMS=30
-VALIDATION_SHAPES=31
+EXPECTED_AUDIT_ITEMS=33
+VALIDATION_SHAPES=62
 EXPECTED_VARIANTS=0
 
 usage() {
     printf '%s\n' \
         'Usage: ./run_npu.sh --mode full [-d PHYSICAL_NPU_ID]' \
         '' \
-        'Audits every installed CANN 8.1 candidate family, then measures 18' \
-        'independent selector winners, 13 explicit branch probes, and one' \
+        'Audits every installed CANN 8.1 candidate family, then measures 38' \
+        'independent rule winners, 13 branch probes, 11 structural ablations, and one' \
         'same-campaign official MatMulV3 reference for every test shape.'
 }
 
@@ -86,7 +86,7 @@ CAMPAIGN_ID="$({
     find npu_cost_model -type f -name '*.py' -print0 |
         sort -z | xargs -0 sha256sum
 } | sha256sum | cut -c1-20)"
-CAMPAIGN_DIR="${ROOT}/results/matmul_global_selector_paired_v2/${CAMPAIGN_ID}"
+CAMPAIGN_DIR="${ROOT}/results/matmul_rule_selector_paired_v3/${CAMPAIGN_ID}"
 PACKET_DIR="${CAMPAIGN_DIR}/packets"
 MANIFEST="${CAMPAIGN_DIR}/improved_manifest.csv"
 SELECTION="${CAMPAIGN_DIR}/selection.jsonl"
@@ -117,8 +117,10 @@ if len(rows) != expected:
     raise SystemExit(f"expected {expected} final rows, found {len(rows)}")
 print("FINAL_RESULTS_BEGIN")
 by_axis = defaultdict(list)
+by_role = defaultdict(list)
 for row in rows:
     by_axis[row["selection_axis"]].append(row)
+    by_role[row["case_role"]].append(row)
     print(
         "FINAL_RESULT "
         f"id={row['workload_id']} "
@@ -143,6 +145,28 @@ for axis in sorted(by_axis):
         f"clear_official_wins={sum(row['sample_separation'] == 'CLEAR_OFFICIAL_WINNER' for row in axis_rows)} "
         f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in axis_rows)}"
     )
+for role in sorted(by_role):
+    role_rows = by_role[role]
+    print(
+        "FINAL_ROLE_SUMMARY "
+        f"role={role} "
+        f"shapes={len(role_rows)} "
+        f"candidate_wins={sum(row['median_winner'] == 'candidate' for row in role_rows)} "
+        f"official_wins={sum(row['median_winner'] == 'official' for row in role_rows)} "
+        f"clear_candidate_wins={sum(row['sample_separation'] == 'CLEAR_CANDIDATE_WINNER' for row in role_rows)} "
+        f"clear_official_wins={sum(row['sample_separation'] == 'CLEAR_OFFICIAL_WINNER' for row in role_rows)} "
+        f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in role_rows)}"
+    )
+selector_rows = by_role["selector_top1"]
+print(
+    "FINAL_SELECTOR_SUMMARY "
+    f"shapes={len(selector_rows)} "
+    f"candidate_wins={sum(row['median_winner'] == 'candidate' for row in selector_rows)} "
+    f"official_wins={sum(row['median_winner'] == 'official' for row in selector_rows)} "
+    f"clear_candidate_wins={sum(row['sample_separation'] == 'CLEAR_CANDIDATE_WINNER' for row in selector_rows)} "
+    f"clear_official_wins={sum(row['sample_separation'] == 'CLEAR_OFFICIAL_WINNER' for row in selector_rows)} "
+    f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in selector_rows)}"
+)
 print(
     "FINAL_RESULT_SUMMARY "
     f"shapes={len(rows)} "
@@ -178,9 +202,9 @@ fail() {
 announce "RUN_LOG path=${RUN_LOG}"
 source_revision="$(git rev-parse HEAD 2>/dev/null || printf unknown)"
 announce "SOURCE_REVISION commit=${source_revision}"
-announce "CAMPAIGN_READY operator=matmul focus=all_installed_family_branches_and_boundaries host_branches=${EXPECTED_BRANCHES} audit_items=${EXPECTED_AUDIT_ITEMS} npu_shapes=${VALIDATION_SHAPES} selector_top1_measurements=18 branch_probe_measurements=13 official_measurements=${VALIDATION_SHAPES} measurement_batches=derived_from_complete_manifest compiled_variants=all_manifest_dtype_suffix_pairs physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
+announce "CAMPAIGN_READY operator=matmul focus=all_installed_family_branches_and_boundaries host_branches=${EXPECTED_BRANCHES} audit_items=${EXPECTED_AUDIT_ITEMS} npu_shapes=${VALIDATION_SHAPES} selector_top1_measurements=38 branch_probe_measurements=13 structural_probe_measurements=11 official_measurements=${VALIDATION_SHAPES} measurement_batches=derived_from_complete_manifest compiled_variants=all_manifest_dtype_suffix_pairs physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
 announce "measurement=${WARMUP}_warmup+${SAMPLES}_device_event_samples+repeat_${REPEAT}+validate_last_timed_output"
-announce "selection=all_applicable_installed_families_then_hard_legality_then_rate_independent_pareto_then_global_critical_path_minimum"
+announce "selection=all_applicable_installed_families_then_hard_legality_then_protocol_specific_hardware_rules_then_critical_path_tiebreak"
 announce "selector=shape_and_frozen_hardware_only"
 announce "official_reference=same_campaign_installed_aclnn_matmul_public_api"
 announce "forbidden=measured_latency_at_selection,history_lookup_at_runtime,repo_lookup,tiling_bank,official_tiling_seed"
@@ -328,8 +352,8 @@ printf '%s\n' 'CANDIDATE_MANIFEST_CSV_BEGIN'
 cat "${MANIFEST}"
 printf '%s\n' 'CANDIDATE_MANIFEST_CSV_END'
 generation_wall_ms=$(( ($(date +%s%N) - generation_started_ns) / 1000000 ))
-announce "GLOBAL_WINNER_AND_BRANCH_PACKET_GENERATION passed shapes=${VALIDATION_SHAPES} variants=${EXPECTED_VARIANTS}"
-announce "CAMPAIGN_STAGE_TIMING stage=global_winner_packet_generation wall_ms=${generation_wall_ms}"
+announce "RULE_WINNER_AND_PROBE_PACKET_GENERATION passed shapes=${VALIDATION_SHAPES} variants=${EXPECTED_VARIANTS}"
+announce "CAMPAIGN_STAGE_TIMING stage=rule_winner_and_probe_packet_generation wall_ms=${generation_wall_ms}"
 
 official_build_started_ns="$(date +%s%N)"
 announce "OFFICIAL_RUNNER_BUILD begin jobs=1"

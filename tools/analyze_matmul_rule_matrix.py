@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare MatMulV3 against selector winners and explicit branch probes."""
+"""Compare MatMulV3 against rule winners and structural ablation probes."""
 from __future__ import annotations
 
 import argparse
@@ -10,7 +10,7 @@ from pathlib import Path
 import statistics
 
 
-EXPECTED_SHAPES = 31
+EXPECTED_SHAPES = 62
 EXPECTED_SAMPLES = 30
 EXPECTED_WARMUP = 10
 EXPECTED_REPEAT = 20
@@ -104,7 +104,9 @@ def main() -> None:
             and new.get("status") == "success"
             and new.get("candidate_role") == expected["candidate_role"]
             and expected["candidate_role"] in (
-                "independent_global_winner", "independent_branch_probe"
+                "independent_rule_winner",
+                "independent_branch_probe",
+                "independent_structural_probe",
             )
             and new.get("measurement_source") == "direct_tiling_buffer"
             and new.get("tiling_applied") == 1
@@ -165,9 +167,9 @@ def main() -> None:
         )
 
     result = {
-        "schema": "matmul_global_selector_paired_v2",
+        "schema": "matmul_rule_selector_paired_v3",
         "status": "complete",
-        "comparison_basis": "same_campaign_official_api_vs_independent_global_winner_or_branch_probe",
+        "comparison_basis": "same_campaign_official_api_vs_independent_rule_winner_or_structural_probe",
         "reference_remeasured": True,
         "selection_uses_measurements": False,
         "measurement_contract": {
@@ -206,6 +208,9 @@ def main() -> None:
             ),
             "selector_top1_cases_executed": sum(
                 row["case_role"] == "selector_top1" for row in output_rows
+            ),
+            "candidate_probes_executed": sum(
+                row["case_role"] == "candidate_probe" for row in output_rows
             ),
         },
         "shapes": output_rows,

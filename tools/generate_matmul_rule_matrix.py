@@ -31,8 +31,10 @@ EXPECTED_FAMILIES = {
     "DETERMINISTIC_SPLIT_K", "INCREMENTAL_PATTERN",
 }
 EXPECTED_SUFFIXES = {0, 1, 20, 21, 30, 31, 101, 200, 201, 10200, 10201, 20201}
-EXPECTED_VALIDATION_ROWS = 31
+EXPECTED_VALIDATION_ROWS = 62
 EXPECTED_BRANCH_PROBES = 13
+EXPECTED_SELECTOR_ROWS = 38
+EXPECTED_CANDIDATE_PROBES = 11
 
 
 def fnv1a64(blob: bytes) -> str:
@@ -83,7 +85,14 @@ def main() -> None:
         )
     branch_rows = [row for row in contract if row.get("case_role") == "branch_probe"]
     selector_rows = [row for row in contract if row.get("case_role") == "selector_top1"]
-    if len(branch_rows) != EXPECTED_BRANCH_PROBES or len(selector_rows) != 18:
+    candidate_rows = [
+        row for row in contract if row.get("case_role") == "candidate_probe"
+    ]
+    if (
+        len(branch_rows) != EXPECTED_BRANCH_PROBES
+        or len(selector_rows) != EXPECTED_SELECTOR_ROWS
+        or len(candidate_rows) != EXPECTED_CANDIDATE_PROBES
+    ):
         raise RuntimeError("validation contract branch/selector row count was reduced")
     if {int(row["required_suffix"]) for row in branch_rows} != EXPECTED_SUFFIXES:
         raise RuntimeError("branch probes do not cover exactly all 12 installed suffixes")
@@ -101,13 +110,16 @@ def main() -> None:
     for row in contract:
         workload_id = str(row["workload_id"])
         case_role = str(row["case_role"])
-        if case_role not in ("branch_probe", "selector_top1"):
+        if case_role not in (
+            "branch_probe", "selector_top1", "candidate_probe"
+        ):
             raise RuntimeError(f"{workload_id}: invalid case_role={case_role}")
         result = generate(
             int(row["m"]), int(row["k"]), int(row["n"]), str(row["dtype"]),
             bool(row["trans_a"]), bool(row["trans_b"]),
             required_suffix=row.get("required_suffix"),
             required_family=row.get("required_family"),
+            required_fields=row.get("required_fields"),
         )
         if result["status"] != "MODIFIED_TILING" or not result["npu_eligible"]:
             raise RuntimeError(f"{workload_id}: selector did not emit an NPU packet")
@@ -128,12 +140,25 @@ def main() -> None:
                 raise RuntimeError(f"{workload_id}: branch suffix drift")
             if result["selection_basis"] != "INDEPENDENT_BRANCH_COVERAGE_MINIMUM":
                 raise RuntimeError(f"{workload_id}: branch selection attestation failed")
-        elif result["selection_basis"] != "INDEPENDENT_GLOBAL_HARDWARE_COST_MINIMUM":
-            raise RuntimeError(f"{workload_id}: global selection attestation failed")
+        elif case_role == "candidate_probe":
+            if result["formula_family"] != row["required_family"]:
+                raise RuntimeError(f"{workload_id}: candidate family drift")
+            if int(result["kernel_suffix"]) != int(row["required_suffix"]):
+                raise RuntimeError(f"{workload_id}: candidate suffix drift")
+            if result["selection_basis"] != "INDEPENDENT_STRUCTURAL_PROBE_MINIMUM":
+                raise RuntimeError(f"{workload_id}: candidate selection attestation failed")
+            if any(
+                int(result["candidate_audit"]["required_candidate_fields"].get(name, -1))
+                != int(value)
+                for name, value in row["required_fields"].items()
+            ):
+                raise RuntimeError(f"{workload_id}: candidate field attestation failed")
+        elif result["selection_basis"] != "INDEPENDENT_HARDWARE_RULE_MINIMUM":
+            raise RuntimeError(f"{workload_id}: rule selection attestation failed")
         if audit["official_selector_called"] or audit["history_lookup"]:
             raise RuntimeError(f"{workload_id}: candidate decision is not independent")
-        if case_role == "selector_top1" and not audit["winner_is_global_minimum"]:
-            raise RuntimeError(f"{workload_id}: selected candidate is not global minimum")
+        if case_role == "selector_top1" and not audit["winner_is_rule_minimum"]:
+            raise RuntimeError(f"{workload_id}: selected candidate is not rule minimum")
 
         packet = result["improved"]
         blob = bytes.fromhex(packet["tiling_data_hex"])
@@ -149,7 +174,9 @@ def main() -> None:
             "candidate_role": (
                 "independent_branch_probe"
                 if case_role == "branch_probe"
-                else "independent_global_winner"
+                else "independent_structural_probe"
+                if case_role == "candidate_probe"
+                else "independent_rule_winner"
             ),
             "m": str(row["m"]), "n": str(row["n"]), "k": str(row["k"]),
             "dtype": str(row["dtype"]),
@@ -202,8 +229,9 @@ def main() -> None:
     print(
         "RULE_MATRIX_GENERATED "
         f"shapes={len(manifest_rows)} "
-        f"selector_top1={sum(row['candidate_role'] == 'independent_global_winner' for row in manifest_rows)} "
+        f"selector_top1={sum(row['candidate_role'] == 'independent_rule_winner' for row in manifest_rows)} "
         f"branch_probes={sum(row['candidate_role'] == 'independent_branch_probe' for row in manifest_rows)} "
+        f"candidate_probes={sum(row['candidate_role'] == 'independent_structural_probe' for row in manifest_rows)} "
         f"applicable_families={len(declared_families)} variants={len(variants)}"
     )
 

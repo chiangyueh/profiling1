@@ -114,7 +114,13 @@ def ascend_910b3() -> Hardware:
             MemorySpace.L0A: 64 * 1024,
             MemorySpace.L0B: 64 * 1024,
             MemorySpace.L0C: 128 * 1024,
-            MemorySpace.L1: 524032,
+            # The host compile-info reports 524032 usable bytes, while the
+            # C220 MatMulV3 source deliberately restores its 256-byte
+            # bookkeeping reserve before deriving depthA1/depthB1.  The
+            # execution-side physical capacity is therefore the full 512 KiB.
+            # Keeping 524032 here incorrectly rejects the exact boundary
+            # packets (for example 128x256 with depth 16/8).
+            MemorySpace.L1: 512 * 1024,
             MemorySpace.UB: 196352,
             MemorySpace.L2: 192 * 1024 * 1024,
         },

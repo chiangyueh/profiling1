@@ -224,13 +224,16 @@ def validate_complete_candidate(payload, raw, suffix, fields, shape):
         raise ValueError("candidate exceeds L0A/L0B capacity")
     if l0c > FORMULA_HARDWARE.l0c:
         raise ValueError("candidate exceeds L0C capacity")
-    if l1 > FORMULA_HARDWARE.l1_usable:
-        raise ValueError("candidate exceeds usable L1 capacity")
+    # MatMulV3 receives 524032 from compile-info and restores the reserved
+    # 256 bytes before its L1 depth calculation.  Validate against the same
+    # execution-side 512 KiB boundary.
+    if l1 > FORMULA_HARDWARE.l1_usable + 256:
+        raise ValueError("candidate exceeds MatMulV3 physical L1 capacity")
 
 
 def generate(
     m, k, n, dtype="fp16", trans_a=False, trans_b=False,
-    *, required_suffix=None, required_family=None,
+    *, required_suffix=None, required_family=None, required_fields=None,
 ):
     request = make_request(m, k, n, dtype, trans_a, trans_b)
     shape = Shape(
@@ -258,8 +261,16 @@ def generate(
     # official selector here would turn an absent improved result into an
     # apparently valid baseline packet and violate decision independence.
     formula = solve(shape, FORMULA_HARDWARE, compile_info)
-    selection_basis = "INDEPENDENT_GLOBAL_HARDWARE_COST_MINIMUM"
-    if required_suffix is not None or required_family is not None:
+    selection_basis = "INDEPENDENT_HARDWARE_RULE_MINIMUM"
+    required_fields = {
+        str(name): int(value)
+        for name, value in (required_fields or {}).items()
+    }
+    if (
+        required_suffix is not None
+        or required_family is not None
+        or required_fields
+    ):
         required_suffix = (
             None if required_suffix is None else int(required_suffix)
         )
@@ -271,6 +282,10 @@ def generate(
             if (
                 (required_suffix is None or int(candidate["kernel_suffix"]) == required_suffix)
                 and (required_family is None or candidate["family"] == required_family)
+                and all(
+                    int(candidate["knowledge"].get(name, -1)) == value
+                    for name, value in required_fields.items()
+                )
             )
         ]
         if not matching:
@@ -288,33 +303,38 @@ def generate(
                 if (
                     (required_suffix is None or int(candidate["kernel_suffix"]) == required_suffix)
                     and (required_family is None or candidate["family"] == required_family)
+                    and all(
+                        int(candidate["knowledge"].get(name, -1)) == value
+                        for name, value in required_fields.items()
+                    )
                 )
             ]
             formula = audited
         if not matching:
             raise ValueError(
                 "no legal independent candidate for requested branch "
-                f"suffix={required_suffix} family={required_family}"
+                f"suffix={required_suffix} family={required_family} "
+                f"fields={required_fields}"
             )
+        from candidate_engine import candidate_rule_key
         selected = min(
             matching,
-            key=lambda candidate: (
-                candidate["cost"]["total_cycles"],
-                candidate["family"],
-                tuple(sorted(candidate["knowledge"].items())),
-            ),
+            key=candidate_rule_key,
         )
-        emitted_is_global_winner = (
+        emitted_is_rule_winner = (
             selected["family"] == formula["family"]
             and selected["knowledge"] == formula["knowledge"]
         )
         formula = dict(formula)
         formula["candidate_audit"] = dict(formula["candidate_audit"])
         formula["candidate_audit"].update({
-            "emitted_candidate_role": "branch_probe",
-            "emitted_candidate_is_global_minimum": emitted_is_global_winner,
+            "emitted_candidate_role": (
+                "candidate_probe" if required_fields else "branch_probe"
+            ),
+            "emitted_candidate_is_rule_minimum": emitted_is_rule_winner,
             "required_branch_suffix": required_suffix,
             "required_branch_family": required_family,
+            "required_candidate_fields": required_fields,
         })
         formula.update({
             "family": selected["family"],
@@ -327,7 +347,11 @@ def generate(
             "workspace_bytes": selected["workspace_bytes"],
             "cost": selected["cost"],
         })
-        selection_basis = "INDEPENDENT_BRANCH_COVERAGE_MINIMUM"
+        selection_basis = (
+            "INDEPENDENT_STRUCTURAL_PROBE_MINIMUM"
+            if required_fields
+            else "INDEPENDENT_BRANCH_COVERAGE_MINIMUM"
+        )
 
     fields = formula["fields"]
     initializer = initialize_cube(request, HARDWARE, trace=False)
@@ -436,7 +460,7 @@ def generate(
         "npu_eligible": True,
         "path_coverage": {
             "initializer": "ABI_DEFAULTS_ONLY; NO_FAMILY_OR_TILE_SELECTION",
-            "family_selection": "ALL_APPLICABLE_FAMILIES_SCORED_BY_EXACT_LOWERED_CRITICAL_PATH",
+            "family_selection": "ALL_APPLICABLE_FAMILIES_ORDERED_BY_PROTOCOL_RULE_THEN_EXACT_LOWERED_CRITICAL_PATH",
             "base_and_parent_geometry": "MODIFIED",
             "k_l1_pipeline": "MODIFIED",
             "l2_partition": (
@@ -451,9 +475,10 @@ def generate(
             "history_or_runtime_kb": "FORBIDDEN_AND_NOT_USED",
             "pareto_pruning": "COMPLETE_WITHIN_FAMILY_NO_FIXED_TOPN",
             "emitted_candidate_role": (
-                "BRANCH_PROBE_NOT_CLAIMED_AS_GLOBAL_WINNER"
+                "STRUCTURAL_OR_BRANCH_PROBE_NOT_CLAIMED_AS_RULE_WINNER"
                 if required_suffix is not None or required_family is not None
-                else "INDEPENDENT_GLOBAL_WINNER"
+                or required_fields
+                else "INDEPENDENT_RULE_WINNER"
             ),
         },
         "validation": {

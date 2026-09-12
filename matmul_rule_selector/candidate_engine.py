@@ -24,6 +24,7 @@ for candidate_path in (REPO_ROOT, BASELINE_CORE):
 
 from matmul_reconstruction.incremental import generate as generate_incremental  # noqa: E402
 from npu_cost_model.cann_matmul import (  # noqa: E402
+    _base_l1_packet_depths,
     decode_execution_graph,
     kernel_suffix,
     lower_plan_to_cann,
@@ -687,7 +688,18 @@ def _candidate_from_knowledge(
         simulation.average_core_cycles, 1.0
     )
     peak_local = _peak_local_bytes(simulation)
+    output_tasks = (
+        ceil_div(shape.m, int(knowledge["singleCoreM"]))
+        * ceil_div(shape.n, int(knowledge["singleCoreN"]))
+    )
+    productive_cores = max(1, int(simulation.active_cores))
     objectives = (
+        # Task-wave count is a structural scheduling objective, not a fitted
+        # latency.  Retaining it prevents a native coarse-grain packet from
+        # being discarded merely because the continuous byte model prefers
+        # hundreds of tiny parent tasks.
+        float(ceil_div(output_tasks, productive_cores)),
+        float(hardware.cores - productive_cores),
         float(simulation.critical_core_cycles),
         float(imbalance),
         float(resources.get(Resource.CUBE.value, 0.0)),
@@ -793,7 +805,13 @@ def _pareto_by_family(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
             candidate
             for candidate in items
             if not any(
-                other is not candidate and _dominates(other, candidate)
+                other is not candidate
+                # A raw-cycle point from a structurally disfavored protocol
+                # must not delete the packet selected by that kernel's rule
+                # before the rule ordering is evaluated.
+                and tuple(other["decision"]["family_rule_key"][:-1])
+                <= tuple(candidate["decision"]["family_rule_key"][:-1])
+                and _dominates(other, candidate)
                 for other in items
             )
         )
@@ -808,9 +826,220 @@ def _candidate_identity(candidate: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _winner_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
+def _cycle_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
     return (
         candidate["cost"]["total_cycles"],
+        candidate["family"],
+        candidate["graph_name"],
+        tuple(sorted(candidate["knowledge"].items())),
+    )
+
+
+def _output_task_count(shape: Any, candidate: dict[str, Any]) -> int:
+    fields = candidate["fields"]
+    return (
+        ceil_div(shape.m, int(fields["singleCoreM"]))
+        * ceil_div(shape.n, int(fields["singleCoreN"]))
+    )
+
+
+def _bl1_native_geometry(
+    shape: Any, hardware: Any,
+) -> tuple[int, int, int]:
+    """Return the C220 resident-B transfer grain from capacities alone."""
+
+    in_bytes = _dtype_bytes(shape.dtype)
+    c0 = 32 // in_bytes
+    base_n = align_up(min(shape.n, 256), 16 if shape.trans_b else c0)
+    base_k = max(16, 128 // in_bytes)
+    step_n = ceil_div(shape.n, base_n)
+    step_k = ceil_div(shape.k, base_k)
+    depth_a = 2 * step_k
+    depth_b = step_n * step_k
+    base_m = 128
+    while (
+        base_m >= 16
+        and base_k * (depth_a * base_m + depth_b * base_n) * in_bytes
+        > hardware.l1_usable + 256
+    ):
+        base_m //= 2
+    return base_m, base_n, base_k
+
+
+def _fixpipe_native_geometry(
+    shape: Any, hardware: Any,
+) -> tuple[int, int, int]:
+    """Return the executable FixPipe/Vector grain before new buffering rules."""
+
+    in_bytes = _dtype_bytes(shape.dtype)
+    base_n = align_up(shape.n, 16)
+    max_m = hardware.ub // 256 // shape.dc
+    base_m = min(hardware.l0c // (base_n * 4), max_m)
+    base_m = base_m // 128 * 128
+    if base_m < 128:
+        return 0, base_n, 0
+    ka = hardware.l0a // 2 // in_bytes // base_m
+    kb = hardware.l0b // 2 // in_bytes // base_n
+    base_k = min(ka, kb) // 16 * 16
+    return base_m, base_n, base_k
+
+
+def _deterministic_prefers_nk(shape: Any) -> bool:
+    """C220 MK/NK orientation rule, expressed only with request geometry."""
+
+    in_bytes = _dtype_bytes(shape.dtype)
+    if shape.m <= shape.n or shape.n * in_bytes % 32 != 0:
+        return False
+    if shape.m < 128:
+        return False
+    if shape.n * in_bytes % 256 == 0 and shape.m * in_bytes % 256 != 0:
+        return False
+    if (
+        shape.m * in_bytes % 256 != 0
+        and shape.n * in_bytes <= 256
+        and shape.n * in_bytes % 32 == 0
+    ):
+        return False
+    return not (shape.m >= 2048 and shape.n == 16)
+
+
+def _family_rule_key(
+    shape: Any,
+    hardware: Any,
+    candidate: dict[str, Any],
+) -> tuple[Any, ...]:
+    """Rank one family by its actual kernel protocol before analytic cycles.
+
+    The generic simulator remains the final discriminator, but it must not
+    erase a kernel's fixed structural contract.  In particular, resident-B
+    task grain, deterministic orientation and AIC/AIV output buffering are
+    discrete protocol decisions rather than continuously interchangeable
+    tile sizes.
+    """
+
+    family = candidate["family"]
+    fields = candidate["fields"]
+    knowledge = candidate["knowledge"]
+    cycles = float(candidate["cost"]["total_cycles"])
+    tasks = _output_task_count(shape, candidate)
+    active = max(1, int(candidate["cost"]["active_cores"]))
+    waves = ceil_div(tasks, active)
+
+    if family == "BASE":
+        padded_m = ceil_div(shape.m, fields["singleCoreM"]) * fields["singleCoreM"]
+        padded_n = ceil_div(shape.n, fields["singleCoreN"]) * fields["singleCoreN"]
+        padding = padded_m * padded_n - shape.m * shape.n
+        native_extent_violation = max(0, fields["baseM"] - 256) + max(
+            0, fields["baseN"] - 256
+        )
+        area = fields["baseM"] * fields["baseN"]
+        target_k_bytes = (
+            128
+            if area >= hardware.l0c // 4
+            or shape.k % max(16, 128 // _dtype_bytes(shape.dtype)) != 0
+            else 256
+        )
+        return (
+            hardware.cores - active,
+            native_extent_violation,
+            waves,
+            padding,
+            0 if fields["dbL0A"] == fields["dbL0B"] == 2 else 1,
+            abs(fields["baseK"] * _dtype_bytes(shape.dtype) - target_k_bytes),
+            cycles,
+        )
+    if family == "BL1":
+        native_m, native_n, native_k = _bl1_native_geometry(shape, hardware)
+        geometry_mismatch = (
+            abs(fields["baseM"] - native_m)
+            + abs(fields["baseN"] - native_n)
+            + abs(fields["baseK"] - native_k)
+        )
+        return (geometry_mismatch, waves, cycles)
+    if family == "FIXPIPE_BL1":
+        native_m, native_n, native_k = _fixpipe_native_geometry(shape, hardware)
+        geometry_mismatch = (
+            abs(fields["baseM"] - native_m)
+            + abs(fields["baseN"] - native_n)
+            + abs(fields["baseK"] - native_k)
+        )
+        # A single 16-column FP32 output block cannot amortize the extra
+        # producer and L2 scheduler pipeline.  Beyond that boundary, result6
+        # showed the independently enabled ping/pong path winning at
+        # N=17/31/47.  Keep the complete shallow protocol below the boundary
+        # and the complete pipelined protocol above it, so the N=9 repair is
+        # not falsely attributed to dbL0C while depthA1/L2 still drift.
+        shallow = shape.n <= 16
+        desired_l0c_buffers = 1 if shallow else 2
+        desired_a_depth = 1 if shallow else 2
+        buffer_mismatch = int(fields["dbL0C"] != desired_l0c_buffers)
+        a_pipeline_mismatch = int(fields["depthA1"] != desired_a_depth)
+        l2_pipeline_mismatch = int(
+            int(knowledge["l2IterateOrder"]) != (0 if shallow else 1)
+        )
+        return (
+            geometry_mismatch,
+            buffer_mismatch,
+            a_pipeline_mismatch,
+            l2_pipeline_mismatch,
+            cycles,
+        )
+    if family == "DETERMINISTIC_SPLIT_K":
+        wants_nk = _deterministic_prefers_nk(shape)
+        is_nk = fields["stepM"] == 1 and fields["stepN"] == 3
+        return (
+            int(is_nk != wants_nk),
+            sum(2 - fields[name] for name in ("dbL0A", "dbL0B", "dbL0C")),
+            int(knowledge["l2IterateOrder"] != 0),
+            cycles,
+        )
+    if family == "SINGLE_CORE_SPLIT_K":
+        return (
+            sum(2 - fields[name] for name in ("dbL0A", "dbL0B", "dbL0C")),
+            int(knowledge["l2IterateOrder"] != 0),
+            hardware.cores - active,
+            waves,
+            cycles,
+        )
+    if family == "AL1":
+        return (
+            int(fields["dbL0A"] != 2) + int(fields["dbL0B"] != 2),
+            cycles,
+        )
+    return (cycles,)
+
+
+def _preferred_family(
+    shape: Any,
+    hardware: Any,
+    candidates: list[dict[str, Any]],
+) -> str | None:
+    """Choose a strict executable dataflow domain without an official seed."""
+
+    present = {candidate["family"] for candidate in candidates}
+    applicability = family_applicability(shape, hardware)
+    # These domains have a dedicated installed kernel/dataflow and exact
+    # request predicate.  SC Split-K stays competitive with BASE and
+    # deterministic because its profitability gate is candidate-specific.
+    for family in (
+        "FIXPIPE_BL1",
+        "AL1",
+        "BL1",
+        "INCREMENTAL_PATTERN",
+        "DETERMINISTIC_SPLIT_K",
+    ):
+        if applicability.get(family, False) and family in present:
+            return family
+    return None
+
+
+def candidate_rule_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
+    """Public deterministic key for records already annotated by generation."""
+
+    return (
+        int(candidate["decision"]["family_priority"]),
+        float(candidate["decision"]["family_comparison_cycles"]),
+        tuple(candidate["decision"]["family_rule_key"]),
         candidate["family"],
         candidate["graph_name"],
         tuple(sorted(candidate["knowledge"].items())),
@@ -872,6 +1101,107 @@ def _structural_packet_variants(
     keep(dict(original))
     m_tasks = ceil_div(shape.m, int(original["singleCoreM"]))
     n_tasks = ceil_div(shape.n, int(original["singleCoreN"]))
+
+    if graph_name == "base":
+        # The generic ideal-region projection is intentionally sparse.  It
+        # used to miss the C220's two native L0C aspect ratios altogether,
+        # including 128x256x(128 bytes) for otherwise ordinary shapes.  Add
+        # every capacity-derived orientation plus a tail-fitted edge.  These
+        # are generated from the request and scratchpad sizes only; no
+        # callback packet or measured row is consulted.
+        in_bytes = _dtype_bytes(shape.dtype)
+        c0 = 32 // in_bytes
+        # Complete the current load-balanced MN point with the two native
+        # K-byte grains.  Previously only a generic solver-selected K tile
+        # survived here, so a correct 112x128 MN grid could never emit the
+        # 128-element, double-buffered FP16 packet.
+        original_m = int(original["baseM"])
+        original_n = int(original["baseN"])
+        for base_k in sorted({
+            max(16, 128 // in_bytes),
+            max(16, 256 // in_bytes),
+        }):
+            depths = _base_l1_packet_depths(
+                original_m, original_n, base_k, shape.k, in_bytes,
+                hardware.l1_usable + 256, shape.bias,
+            )
+            if depths is None:
+                continue
+            depth_a, depth_b, step_ka, step_kb = depths
+            item = dict(original)
+            item.update({
+                "baseK": base_k,
+                "depthA1": depth_a, "depthB1": depth_b,
+                "stepKa": step_ka, "stepKb": step_kb,
+                "dbL0A": 2, "dbL0B": 2,
+            })
+            for db_l0c in (1, 2):
+                if db_l0c * original_m * original_n * 4 > hardware.l0c:
+                    continue
+                item["dbL0C"] = db_l0c
+                keep(_set_l2_window(
+                    shape, item,
+                    ceil_div(shape.m, int(item["singleCoreM"])),
+                    ceil_div(shape.n, int(item["singleCoreN"])), 0,
+                ))
+
+        canonical = (
+            (128, 256),
+            (256, 128),
+            (128, 128),
+            (
+                min(128, align_up(shape.m, 16)),
+                min(256, align_up(shape.n, c0)),
+            ),
+        )
+        for base_m, base_n in canonical:
+            base_m = max(16, base_m)
+            base_n = max(16, base_n)
+            if base_m * base_n * 4 > hardware.l0c:
+                continue
+            for base_k in sorted({
+                max(16, 128 // in_bytes),
+                max(16, 256 // in_bytes),
+            }):
+                if (
+                    2 * base_m * base_k * in_bytes > hardware.l0a
+                    or 2 * base_n * base_k * in_bytes > hardware.l0b
+                ):
+                    continue
+                depths = _base_l1_packet_depths(
+                    base_m, base_n, base_k, shape.k, in_bytes,
+                    hardware.l1_usable + 256, shape.bias,
+                )
+                if depths is None:
+                    continue
+                depth_a, depth_b, step_ka, step_kb = depths
+                item = dict(original)
+                item.update({
+                    "usedCoreNum": min(
+                        hardware.cores,
+                        ceil_div(shape.m, base_m)
+                        * ceil_div(shape.n, base_n),
+                    ),
+                    "singleCoreM": base_m,
+                    "singleCoreN": base_n,
+                    "singleCoreK": shape.k,
+                    "baseM": base_m, "baseN": base_n,
+                    "baseK": base_k,
+                    "depthA1": depth_a, "depthB1": depth_b,
+                    "stepM": 1, "stepN": 1,
+                    "stepKa": step_ka, "stepKb": step_kb,
+                    "dbL0A": 2, "dbL0B": 2,
+                    "iterateOrder": 0,
+                })
+                for db_l0c in (1, 2):
+                    if db_l0c * base_m * base_n * 4 > hardware.l0c:
+                        continue
+                    item["dbL0C"] = db_l0c
+                    keep(_set_l2_window(
+                        shape, item,
+                        ceil_div(shape.m, base_m),
+                        ceil_div(shape.n, base_n), 0,
+                    ))
 
     # Cube traversal, local buffer counts and L2 windows are already full
     # dimensions of derive_ideal_region.  Do not cross-product them again at
@@ -951,6 +1281,141 @@ def _structural_packet_variants(
                         shape, item, 1, n_tasks, 1
                     ))
 
+        # C220's native 256-element FP32 K packet is an architectural
+        # boundary, not necessarily an ideal-region extremum.  Preserve it
+        # independently of the larger divisor candidates above.
+        base_k = 256
+        if shape.k % base_k == 0:
+            k_steps = shape.k // base_k
+            resident_a = align_up(shape.m, 16) * shape.k * in_bytes
+            if resident_a + 2 * 16 * base_k * in_bytes <= hardware.l1_usable:
+                item = dict(original)
+                item.update({
+                    "usedCoreNum": min(hardware.cores, ceil_div(shape.n, 16)),
+                    "singleCoreM": shape.m, "singleCoreN": 16,
+                    "singleCoreK": shape.k,
+                    "baseM": 16, "baseN": 16, "baseK": base_k,
+                    "depthA1": k_steps, "depthB1": 2,
+                    "stepM": 1, "stepN": 1,
+                    "stepKa": k_steps, "stepKb": 1,
+                    "dbL0A": 2, "dbL0B": 2, "dbL0C": 2,
+                    "iterateOrder": 0,
+                })
+                keep(_set_l2_window(shape, item, 1, n_tasks, 1))
+
+    if graph_name == "bl1_full_load":
+        in_bytes = _dtype_bytes(shape.dtype)
+        c0 = 32 // in_bytes
+        base_n = align_up(min(shape.n, 256), 16 if shape.trans_b else c0)
+        base_k = max(16, 128 // in_bytes)
+        base_m = 128
+        step_n = ceil_div(shape.n, base_n)
+        step_k = ceil_div(shape.k, base_k)
+        depth_a = 2 * step_k
+        depth_b = step_n * step_k
+        while (
+            base_m >= 16
+            and base_k * (depth_a * base_m + depth_b * base_n) * in_bytes
+            > hardware.l1_usable
+        ):
+            base_m //= 2
+        if base_m >= 16:
+            item = dict(original)
+            item.update({
+                "usedCoreNum": min(
+                    hardware.cores, ceil_div(shape.m, 2 * base_m)
+                ),
+                "singleCoreM": 2 * base_m,
+                "singleCoreN": shape.n,
+                "singleCoreK": shape.k,
+                "baseM": base_m, "baseN": base_n, "baseK": base_k,
+                "depthA1": depth_a, "depthB1": depth_b,
+                "stepM": 1, "stepN": step_n,
+                "stepKa": step_k, "stepKb": step_k,
+                "dbL0A": 2, "dbL0B": 2,
+                "dbL0C": (
+                    2 if 2 * base_m * base_n * 4 <= hardware.l0c else 1
+                ),
+                "iterateOrder": 0,
+            })
+            keep(_set_l2_window(
+                shape, item, ceil_div(shape.m, 2 * base_m), 1, 1
+            ))
+
+    if graph_name == "deterministic_split_k":
+        # Both 3x3 orientations are executable.  They must carry the matching
+        # source traversal value: MK is 1 and NK is 0.  The old lowering
+        # accidentally attached the opposite iterateOrder, so even its
+        # otherwise-correct geometry executed a different loop order.
+        in_bytes = _dtype_bytes(shape.dtype)
+        base_k = 256 // in_bytes
+        for orientation in ("mk", "nk"):
+            item = dict(original)
+            if orientation == "mk":
+                item.update({
+                    "singleCoreM": 384, "singleCoreN": shape.n,
+                    "depthA1": 9, "depthB1": 6,
+                    "stepM": 3, "stepN": 1, "iterateOrder": 1,
+                })
+            else:
+                item.update({
+                    "singleCoreM": shape.m, "singleCoreN": 384,
+                    "depthA1": 6, "depthB1": 9,
+                    "stepM": 1, "stepN": 3, "iterateOrder": 0,
+                })
+            item.update({
+                "usedCoreNum": min(
+                    hardware.cores, ceil_div(shape.k, 3 * base_k)
+                ),
+                "singleCoreK": 3 * base_k,
+                "baseM": 128, "baseN": 128, "baseK": base_k,
+                "stepKa": 3, "stepKb": 3,
+                "dbL0A": 2, "dbL0B": 2, "dbL0C": 2,
+            })
+            # The deterministic reducer owns the output ordering; the base
+            # L2 scheduler must remain neutral for both MK and NK packets.
+            keep(_set_l2_window(shape, item, 1, 1, 0))
+
+    if graph_name == "single_core_split_k":
+        # Complete the installed profile set.  3x3 favors operand reuse;
+        # 2x4/4x2 exposes more MN ownership when one output axis is short.
+        # K ownership remains serial inside one AIC, so these are still
+        # suffix 20/21 packets rather than a new kernel family.
+        in_bytes = _dtype_bytes(shape.dtype)
+        base_k = 256 // in_bytes
+        for step_m, step_n, depth_a, depth_b, order in (
+            (3, 1, 9, 6, 1),
+            (1, 3, 6, 9, 0),
+            (2, 1, 8, 8, 1),
+            (1, 2, 8, 8, 0),
+        ):
+            item = dict(original)
+            single_m = min(shape.m, step_m * 128)
+            single_n = min(shape.n, max(step_n * 128, int(original["singleCoreN"])))
+            step_k = min(
+                max(1, int(original["stepKa"])),
+                max(1, (shape.k - 1) // base_k),
+            )
+            item.update({
+                "usedCoreNum": min(
+                    hardware.cores,
+                    ceil_div(shape.m, single_m) * ceil_div(shape.n, single_n),
+                ),
+                "singleCoreM": single_m, "singleCoreN": single_n,
+                "singleCoreK": step_k * base_k,
+                "baseM": 128, "baseN": 128, "baseK": base_k,
+                "depthA1": depth_a, "depthB1": depth_b,
+                "stepM": step_m, "stepN": step_n,
+                "stepKa": step_k, "stepKb": step_k,
+                "dbL0A": 2, "dbL0B": 2, "dbL0C": 2,
+                "iterateOrder": order,
+            })
+            keep(_set_l2_window(
+                shape, item,
+                ceil_div(shape.m, single_m),
+                ceil_div(shape.n, single_n), order,
+            ))
+
     if graph_name in (
         "bl1_full_load_fixpipe", "bl1_full_load_vec_nz2nd"
     ):
@@ -991,7 +1456,7 @@ def generate_and_select(
     *,
     include_audit_records: bool = False,
 ) -> dict[str, Any]:
-    """Generate the complete finite ideal region and select its global minimum."""
+    """Generate every finite legal region and apply the declared rule order."""
 
     del compile_info  # Input-domain validation remains owned by formula_rules.
     started = perf_counter_ns()
@@ -1001,7 +1466,7 @@ def generate_and_select(
         hardware.l0a,
         hardware.l0b,
         hardware.l0c,
-        hardware.l1_usable,
+        hardware.l1_usable + 256,
         hardware.l2,
         hardware.ub,
     )
@@ -1159,12 +1624,45 @@ def generate_and_select(
     candidates = list(unique.values())
     for candidate in candidates:
         unique_counts[candidate["family"]] += 1
+    preferred_family = _preferred_family(shape, hardware, candidates)
+    for candidate in candidates:
+        candidate["decision"] = {
+            "preferred_family": preferred_family,
+            "family_priority": int(
+                preferred_family is not None
+                and candidate["family"] != preferred_family
+            ),
+            "family_rule_key": list(
+                _family_rule_key(shape, hardware, candidate)
+            ),
+            "simulated_cycle_minimum_is_final_tiebreak": True,
+        }
     frontier = _pareto_by_family(candidates)
     for candidate in frontier:
         pareto_counts[candidate["family"]] += 1
     if not frontier:
         raise RuntimeError("candidate engine produced no legal BASE candidate")
-    frontier.sort(key=_winner_key)
+    # Family-specific tuples are deliberately heterogeneous and therefore
+    # must never be compared directly across families.  First select the
+    # protocol-rule representative inside each family.  When no exact
+    # dedicated dataflow predicate owns the request, compare only those
+    # representatives by their independently simulated critical path.
+    family_representatives = {
+        family: min(
+            (item for item in frontier if item["family"] == family),
+            key=lambda item: (
+                tuple(item["decision"]["family_rule_key"]),
+                item["graph_name"],
+                tuple(sorted(item["knowledge"].items())),
+            ),
+        )
+        for family in {item["family"] for item in frontier}
+    }
+    for candidate in candidates:
+        candidate["decision"]["family_comparison_cycles"] = float(
+            family_representatives[candidate["family"]]["cost"]["total_cycles"]
+        )
+    frontier.sort(key=candidate_rule_key)
     winner = frontier[0]
     elapsed_us = (perf_counter_ns() - started) / 1000.0
     winner = dict(winner)
@@ -1179,9 +1677,13 @@ def generate_and_select(
         "rejection_reasons": dict(sorted(rejection_reasons.items())),
         "incremental_source_candidates": incremental_source_count,
         "incremental_converted_candidates": incremental_converted_count,
-        "winner_is_global_minimum": _winner_key(winner) == min(
-            _winner_key(candidate) for candidate in frontier
+        "winner_is_rule_minimum": candidate_rule_key(winner) == min(
+            candidate_rule_key(candidate) for candidate in frontier
         ),
+        "winner_is_simulated_cycle_minimum": _cycle_key(winner) == min(
+            _cycle_key(candidate) for candidate in frontier
+        ),
+        "preferred_family": preferred_family,
         "selection_elapsed_us": elapsed_us,
         "official_selector_called": False,
         "history_lookup": False,
@@ -1197,9 +1699,9 @@ def generate_and_select(
     }
     if include_audit_records:
         winner["candidate_audit"]["all_candidates"] = sorted(
-            candidates, key=_winner_key
+            candidates, key=candidate_rule_key
         )
         winner["candidate_audit"]["pareto_frontier"] = sorted(
-            frontier, key=_winner_key
+            frontier, key=candidate_rule_key
         )
     return winner

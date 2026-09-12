@@ -1,5 +1,5 @@
 {
-  "contract_version": "cann81_c220_candidate_contract_v1",
+  "contract_version": "cann81_c220_candidate_contract_v2",
   "target": {
     "soc": "Ascend910B3",
     "arch": 220,
@@ -10,13 +10,14 @@
     "scope": "ND dense MatMulV3 with matching FP16, BF16 or FP32 inputs and output"
   },
   "selection_semantics": {
-    "official_order_is_not_used_to_choose_the_improved_winner": true,
+    "official_selector_is_never_called": true,
     "all_applicable_installed_families_are_scored": true,
     "official_tiling_seed": false,
     "history_or_runtime_kb_lookup": false,
     "measured_latency_at_selection_time": false,
-    "winner": "minimum simulated critical-path cycles after exact CANN lowering and validation",
-    "tie_break": "family name then complete packet fields; deterministic and independent of official output"
+    "family_dispatch": "exact shape/hardware predicates select dedicated FixPipe, AL1, BL1, incremental or deterministic protocols; SC remains competitive with BASE because its profitability gate is candidate-specific",
+    "winner": "first choose one representative inside each family by that family's declared protocol rule; an exact dedicated dataflow predicate owns its domain, otherwise compare only family representatives by independently simulated critical-path cycles",
+    "tie_break": "complete packet fields; deterministic and independent of official output"
   },
   "families": [
     {
@@ -53,7 +54,8 @@
         "FixPipe result traffic",
         "ND-to-NZ conversion traffic and Vector work",
         "pipeline fill and drain"
-      ]
+      ],
+      "selection_rule": "maximize productive AIC occupancy, reject base extents above the native 256 boundary, minimize parent-task waves and padding, prefer double-buffered A/B and the native 128/256-byte K grain, then minimize critical-path cycles"
     },
     {
       "name": "AL1",
@@ -83,7 +85,8 @@
         "N-task wave and tail imbalance",
         "Cube and FixPipe work",
         "local-memory pipeline fill"
-      ]
+      ],
+      "selection_rule": "inside the exact AL1 domain prefer double-buffered A/B, then minimize critical-path cycles; generated baseK divisors and useful N-task core counts are not fixed to the historical 256/20 values"
     },
     {
       "name": "BL1",
@@ -114,7 +117,8 @@
         "A streaming traffic",
         "M-tail imbalance",
         "Cube, FixPipe and optional A conversion work"
-      ]
+      ],
+      "selection_rule": "match the capacity-derived native resident-B grain before minimizing M-task waves and critical-path cycles; this excludes the proven-bad tiny parent tasks without reading an official packet"
     },
     {
       "name": "FIXPIPE_BL1",
@@ -147,7 +151,8 @@
         "AIC/AIV flags and synchronization",
         "Vector gather or NZ-to-ND work",
         "saved direct FixPipe padding"
-      ]
+      ],
+      "selection_rule": "match the UB/L0-derived native FixPipe grain; for N<=16 keep the shallow one-packet A, one-slot L0C and neutral-L2 protocol, while N>16 uses the independently introduced two-packet A, ping/pong L0C and block-L2 protocol, then minimize critical-path cycles"
     },
     {
       "name": "SINGLE_CORE_SPLIT_K",
@@ -181,7 +186,8 @@
         "A/B transfer reuse under traversal",
         "conversion workspace and Vector work",
         "pipeline fill for each parent task"
-      ]
+      ],
+      "selection_rule": "prefer double-buffered 3x3/2x4 profiles, neutral L2 traversal, productive AIC occupancy and fewer serial parent-task waves before critical-path cycles; this family is not forced over a better BASE or deterministic packet"
     },
     {
       "name": "DETERMINISTIC_SPLIT_K",
@@ -212,7 +218,8 @@
         "AIC/AIV barriers",
         "MK/NK operand traffic and L2 panel reuse",
         "final cast and output"
-      ]
+      ],
+      "selection_rule": "derive MK versus NK from aligned M/N geometry, require the matching iterateOrder, prefer double-buffered L0 and neutral reducer-owned L2 order, then minimize critical-path cycles"
     },
     {
       "name": "INCREMENTAL_PATTERN",
@@ -240,7 +247,8 @@
         "per-core MN tail",
         "resident/full-load traffic implied by the pattern fields",
         "Cube, MTE and FixPipe pipeline work"
-      ]
+      ],
+      "selection_rule": "inside the exact incremental domain rank every generated pattern candidate by its independently reconstructed critical path and dispatch the winning incremental packet rather than a generic BASE approximation"
     }
   ],
   "non_installed_families": [
@@ -276,6 +284,8 @@
     }
   ],
   "pareto_objectives": [
+    "parent_task_waves",
+    "inactive_AIC_count",
     "critical_core_cycles",
     "critical_to_average_core_ratio",
     "padded_cube_resource_cycles",

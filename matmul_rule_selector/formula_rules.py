@@ -729,7 +729,7 @@ def _obsolete_single_formula(
 def solve(
     s: Shape, h: Hardware = Hardware(), ci: Optional[CompileInfo] = None
 ) -> dict:
-    """Return the global minimum of the audited finite family frontiers.
+    """Return the audited rule winner from the finite family frontiers.
 
     The prior one-formula selector remains above only for source-history
     review.  It is deliberately unreachable from this public entry point.

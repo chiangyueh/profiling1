@@ -31,6 +31,7 @@ from candidate_engine import (  # noqa: E402
     _deterministic_split_shape_applicable,
     _dominates,
     _single_core_split_shape_applicable,
+    candidate_rule_key,
     family_applicability,
     generate_and_select,
     non_installed_family_status,
@@ -51,6 +52,7 @@ from npu_cost_model.simulator import align_up, ceil_div, simulate  # noqa: E402
 
 SPEC_PATH = SELECTOR / "candidate_audit_spec.json"
 CONTRACT_PATH = SELECTOR / "family_candidate_contract.json"
+VALIDATION_PATH = SELECTOR / "validation_contract.json"
 
 POSITIVE_WITNESSES = {
     # This BASE witness deliberately requires ND-to-NZ so the Vector and
@@ -168,7 +170,7 @@ class AuditContext:
             assert candidates, (suffix, family, winner["candidate_audit"])
             self._suffix[suffix] = (shape, min(
                 candidates,
-                key=lambda item: item["cost"]["total_cycles"],
+                key=candidate_rule_key,
             ))
         return self._suffix[suffix]
 
@@ -213,7 +215,7 @@ def check_scope_01(ctx: AuditContext) -> dict[str, Any]:
     for item in ctx.contract["families"]:
         for key in (
             "status", "source_anchors", "applicability", "candidate_axes",
-            "hard_constraints", "cost_components",
+            "hard_constraints", "cost_components", "selection_rule",
         ):
             assert item.get(key), (item["name"], key)
     return {
@@ -332,7 +334,7 @@ def check_indep_02(ctx: AuditContext) -> dict[str, Any]:
             assert node.value not in {"baseline", "baseline_equivalent"}
     result = ctx.packet()
     assert "baseline" not in result and "baseline_equivalent" not in result
-    assert result["selection_basis"] == "INDEPENDENT_GLOBAL_HARDWARE_COST_MINIMUM"
+    assert result["selection_basis"] == "INDEPENDENT_HARDWARE_RULE_MINIMUM"
     harness = (ROOT / "run_npu.sh").read_text(encoding="utf-8")
     generation_position = harness.index(
         "\npython3 tools/generate_matmul_rule_matrix.py"
@@ -489,6 +491,35 @@ def check_gen_07(ctx: AuditContext) -> dict[str, Any]:
     }
 
 
+def check_gen_08(ctx: AuditContext) -> dict[str, Any]:
+    del ctx
+    rows = json.loads(VALIDATION_PATH.read_text(encoding="utf-8"))
+    counts = Counter(row["case_role"] for row in rows)
+    assert len(rows) == 62
+    assert counts == {
+        "branch_probe": 13,
+        "selector_top1": 38,
+        "candidate_probe": 11,
+    }
+    assert len({row["workload_id"] for row in rows}) == len(rows)
+    axes = {row["selection_axis"] for row in rows}
+    for required in (
+        "bl1_parent_task_ablation",
+        "det_orientation_ablation",
+        "fixpipe_l0c_ablation_low",
+        "fixpipe_l0c_ablation_high",
+        "al1_k_grain_ablation",
+        "incremental_vs_base_ablation",
+        "base_aspect_ablation",
+        "base_k_grain_ablation",
+        "sc_buffering_ablation",
+        "base_parent_task_ablation",
+        "sc_vs_base_family_ablation",
+    ):
+        assert required in axes
+    return {"rows": len(rows), "roles": dict(sorted(counts.items()))}
+
+
 def check_legal_01(ctx: AuditContext) -> dict[str, Any]:
     validated = Counter()
     for witness, winner in ctx.all_positive().items():
@@ -598,7 +629,7 @@ def check_legal_04(ctx: AuditContext) -> dict[str, Any]:
         assert field["depthB1"] in (
             field["stepKb"], 2 * field["stepKb"]
         )
-        assert item["resource_bytes"]["L1_AB"] <= ctx.hardware.l1_usable
+        assert item["resource_bytes"]["L1_AB"] <= ctx.hardware.l1_usable + 256
     return {
         "candidate_count": len(candidates),
         "geometry": {
@@ -639,7 +670,7 @@ def check_legal_05(ctx: AuditContext) -> dict[str, Any]:
         assert field["singleCoreM"] == 2 * field["baseM"]
         assert field["stepN"] == ceil_div(shape.n, field["baseN"])
         assert field["depthB1"] == field["stepN"] * field["stepKb"]
-        assert item["resource_bytes"]["L1_AB"] <= ctx.hardware.l1_usable
+        assert item["resource_bytes"]["L1_AB"] <= ctx.hardware.l1_usable + 256
     return {"candidate_count": len(candidates), "boundaries": checked_boundaries}
 
 
@@ -786,7 +817,7 @@ def check_legal_08(ctx: AuditContext) -> dict[str, Any]:
         assert candidate["resource_bytes"]["L0A"] <= ctx.hardware.l0a
         assert candidate["resource_bytes"]["L0B"] <= ctx.hardware.l0b
         assert candidate["resource_bytes"]["L0C"] <= ctx.hardware.l0c
-        assert candidate["resource_bytes"]["L1_AB"] <= ctx.hardware.l1_usable
+        assert candidate["resource_bytes"]["L1_AB"] <= ctx.hardware.l1_usable + 256
         m_tasks = ceil_div(shape.m, fields["singleCoreM"])
         n_tasks = ceil_div(shape.n, fields["singleCoreN"])
         mb = int(knowledge["l2MTileBlock"])
@@ -805,6 +836,30 @@ def check_legal_08(ctx: AuditContext) -> dict[str, Any]:
     return {
         "validator": "independent_arithmetic_not_validate_cann_tiling",
         "checked": checked,
+    }
+
+
+def check_legal_09(ctx: AuditContext) -> dict[str, Any]:
+    shape = Shape(2048, 2048, 512, dtype="bf16")
+    records = ctx.select(shape)["candidate_audit"]["all_candidates"]
+    boundary = [
+        item for item in records
+        if item["family"] == "BASE"
+        and item["fields"]["baseM"] == 128
+        and item["fields"]["baseN"] == 256
+        and item["fields"]["baseK"] == 64
+        and item["fields"]["depthA1"] == 16
+        and item["fields"]["depthB1"] == 8
+    ]
+    assert boundary
+    assert boundary[0]["resource_bytes"]["L1_AB"] == 512 * 1024
+    assert ctx.model_hardware.capacities[MemorySpace.L1] == 512 * 1024
+    assert ctx.hardware.l1_usable + 256 == 512 * 1024
+    return {
+        "compile_info_usable_bytes": ctx.hardware.l1_usable,
+        "source_restored_bytes": 256,
+        "physical_capacity_bytes": 512 * 1024,
+        "boundary_packet_count": len(boundary),
     }
 
 
@@ -994,6 +1049,8 @@ def check_pareto_01(ctx: AuditContext) -> dict[str, Any]:
             ]
             assert not any(
                 candidate_id(other) != candidate_id(retained)
+                and tuple(other["decision"]["family_rule_key"][:-1])
+                <= tuple(retained["decision"]["family_rule_key"][:-1])
                 and _dominates(other, retained)
                 for other in same_family
             )
@@ -1015,22 +1072,13 @@ def check_pareto_02(ctx: AuditContext) -> dict[str, Any]:
     }
 
 
-def winner_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
-    return (
-        candidate["cost"]["total_cycles"],
-        candidate["family"],
-        candidate["graph_name"],
-        tuple(sorted(candidate["knowledge"].items())),
-    )
-
-
 def check_select_01(ctx: AuditContext) -> dict[str, Any]:
     evidence = {}
     for name, winner in ctx.all_positive().items():
         frontier = winner["candidate_audit"]["pareto_frontier"]
-        expected = min(frontier, key=winner_key)
+        expected = min(frontier, key=candidate_rule_key)
         assert candidate_id(winner) == candidate_id(expected)
-        assert winner["candidate_audit"]["winner_is_global_minimum"] is True
+        assert winner["candidate_audit"]["winner_is_rule_minimum"] is True
         assert winner["candidate_audit"]["official_selector_called"] is False
         assert winner["candidate_audit"]["history_lookup"] is False
         evidence[name] = {
@@ -1039,6 +1087,50 @@ def check_select_01(ctx: AuditContext) -> dict[str, Any]:
             "frontier_candidates": len(frontier),
         }
     return evidence
+
+
+def check_select_02(ctx: AuditContext) -> dict[str, Any]:
+    cases = {
+        "BL1": Shape(32768, 128, 16),
+        "DET": Shape(16, 17, 7680),
+        "FIX_LOW": Shape(10240, 9, 8, dtype="fp32"),
+        "FIX_HIGH": Shape(12288, 17, 16, dtype="fp32"),
+        "AL1": Shape(12, 160, 7168, dtype="fp32", trans_b=True),
+        "INCREMENTAL": Shape(64, 1024, 4096, trans_b=True),
+        "BASE": Shape(2048, 2048, 512, dtype="bf16"),
+    }
+    winners = {name: ctx.select(shape) for name, shape in cases.items()}
+    assert winners["BL1"]["family"] == "BL1"
+    assert winners["BL1"]["fields"]["baseM"] == 128
+    assert winners["BL1"]["fields"]["singleCoreM"] == 256
+    det = winners["DET"]
+    assert det["family"] == "DETERMINISTIC_SPLIT_K"
+    assert (det["fields"]["stepM"], det["fields"]["stepN"]) == (3, 1)
+    assert det["fields"]["iterateOrder"] == 1
+    assert all(det["fields"][name] == 2 for name in ("dbL0A", "dbL0B", "dbL0C"))
+    assert det["knowledge"]["l2IterateOrder"] == 0
+    fix_low = winners["FIX_LOW"]
+    assert fix_low["fields"]["dbL0C"] == 1
+    assert fix_low["fields"]["depthA1"] == 1
+    assert fix_low["knowledge"]["l2IterateOrder"] == 0
+    fix_high = winners["FIX_HIGH"]
+    assert fix_high["fields"]["dbL0C"] == 2
+    assert fix_high["fields"]["depthA1"] == 2
+    assert fix_high["knowledge"]["l2IterateOrder"] == 1
+    assert winners["AL1"]["family"] == "AL1"
+    assert winners["AL1"]["fields"]["usedCoreNum"] == 10
+    assert winners["AL1"]["fields"]["baseK"] != 256
+    assert winners["INCREMENTAL"]["family"] == "INCREMENTAL_PATTERN"
+    base = winners["BASE"]
+    assert base["family"] == "BASE"
+    assert (base["fields"]["baseM"], base["fields"]["baseN"]) == (128, 256)
+    return {
+        name: {
+            "family": winner["family"],
+            "fields": winner["fields"],
+        }
+        for name, winner in winners.items()
+    }
 
 
 def check_packet_01(ctx: AuditContext) -> dict[str, Any]:
@@ -1085,6 +1177,7 @@ CHECKS: dict[str, Callable[[AuditContext], dict[str, Any]]] = {
     "GEN_05": check_gen_05,
     "GEN_06": check_gen_06,
     "GEN_07": check_gen_07,
+    "GEN_08": check_gen_08,
     "LEGAL_01": check_legal_01,
     "LEGAL_02": check_legal_02,
     "LEGAL_03": check_legal_03,
@@ -1093,6 +1186,7 @@ CHECKS: dict[str, Callable[[AuditContext], dict[str, Any]]] = {
     "LEGAL_06": check_legal_06,
     "LEGAL_07": check_legal_07,
     "LEGAL_08": check_legal_08,
+    "LEGAL_09": check_legal_09,
     "COST_01": check_cost_01,
     "COST_02": check_cost_02,
     "COST_03": check_cost_03,
@@ -1101,6 +1195,7 @@ CHECKS: dict[str, Callable[[AuditContext], dict[str, Any]]] = {
     "PARETO_01": check_pareto_01,
     "PARETO_02": check_pareto_02,
     "SELECT_01": check_select_01,
+    "SELECT_02": check_select_02,
     "PACKET_01": check_packet_01,
     "PACKET_02": check_packet_02,
 }
