@@ -42,6 +42,27 @@ EXPECTED_VARIANTS = {
 }
 
 
+def audit_gm_to_l1_kernel_protocol() -> None:
+    source = (ROOT / "direct_matmul" / "c220_gm_to_l1_kernel.h").read_text(
+        encoding="utf-8"
+    )
+    m_loop = source.find("for (uint32_t mLocal = 0;")
+    n_loop = source.find("for (uint32_t nLocal = 0;")
+    k_loop = source.find("for (uint32_t kStart = 0, kIndex = 0;")
+    partial_sum = source.find("mm.Iterate(kIndex != 0);")
+    output_flush = source.find("mm.GetTensorC(accumulated[outputOffset], 0);")
+    if not (0 <= m_loop < n_loop < k_loop < partial_sum < output_flush):
+        raise RuntimeError(
+            "GM-to-L1 kernel is not M/N-output-tile -> K-partial-sum -> single-flush"
+        )
+    if source.count("mm.Iterate(kIndex != 0);") != 1:
+        raise RuntimeError("GM-to-L1 kernel partial-sum call count drift")
+    if source.count("mm.GetTensorC(accumulated[outputOffset], 0);") != 1:
+        raise RuntimeError("GM-to-L1 kernel output-flush call count drift")
+    if "SetAtomicAdd" in source:
+        raise RuntimeError("GM-to-L1 L0C-resident kernel must not use GM atomic accumulation")
+
+
 def ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
 
@@ -50,11 +71,13 @@ def audit_gm_to_l1_selection(workload: dict, result: dict) -> None:
     cube = result["cube"]
     derivation = result["derivation"]
     workload_id = workload["workload_id"]
-    if derivation.get("model") != "gm_to_l1_critical_path_v1":
+    if derivation.get("model") != "gm_to_l1_l0c_resident_critical_path_v2":
         raise RuntimeError(f"{workload_id}: wrong formula model")
     if derivation.get("primitive_calibration") != "frozen_c220_isolated_instruction_contract_v1":
         raise RuntimeError(f"{workload_id}: missing primitive calibration attestation")
-    if derivation.get("critical_path_equation") != "max(worst_core,aggregate_hbm)+sync+launch":
+    if derivation.get("protocol") != "l0c_resident_k_partial_sum_single_output_flush":
+        raise RuntimeError(f"{workload_id}: wrong execution protocol")
+    if derivation.get("critical_path_equation") != "max(worst_core,aggregate_hbm,aggregate_l2)+sync+launch":
         raise RuntimeError(f"{workload_id}: critical-path equation drift")
     if not (derivation["finite_candidate_count"] > 0 and
             0 < derivation["pareto_candidate_count"] <= derivation["finite_candidate_count"]):
@@ -69,7 +92,7 @@ def audit_gm_to_l1_selection(workload: dict, result: dict) -> None:
         cube["stepM"] == cube["stepN"] == 1 and
         cube["stepKa"] == cube["stepKb"] == step_k and
         cube["depthA1"] == cube["depthB1"] == step_k and
-        cube["dbL0A"] == cube["dbL0B"] == cube["dbL0C"] == 2
+        cube["dbL0A"] == cube["dbL0B"] == 2 and cube["dbL0C"] == 1
     ):
         raise RuntimeError(f"{workload_id}: packet pipeline fields do not match the model")
     if cube["singleCoreM"] % cube["baseM"] or cube["singleCoreN"] % cube["baseN"]:
@@ -80,18 +103,32 @@ def audit_gm_to_l1_selection(workload: dict, result: dict) -> None:
     )
     if expected_cores != cube["usedCoreNum"] or expected_cores != result["block_dim"]:
         raise RuntimeError(f"{workload_id}: core-grid ownership mismatch")
+    max_m_extent = min(int(workload["m"]), cube["singleCoreM"])
+    max_n_extent = min(int(workload["n"]), cube["singleCoreN"])
+    output_tiles = (
+        ceil_div(max_m_extent, cube["baseM"]) *
+        ceil_div(max_n_extent, cube["baseN"])
+    )
+    expected_k_chunks = ceil_div(int(workload["k"]), cube["singleCoreK"])
+    if not (
+        derivation["k_chunks"] == expected_k_chunks and
+        derivation["worst_core_matmul_iterations"] == output_tiles * expected_k_chunks and
+        derivation["worst_core_components"]["output_flushes"] == output_tiles
+    ):
+        raise RuntimeError(f"{workload_id}: K partial-sum/output-flush count mismatch")
     resident = derivation["resident_a_l1_bytes"] + derivation["resident_b_l1_bytes"]
     if resident > derivation["resident_l1_limit_bytes"]:
         raise RuntimeError(f"{workload_id}: GM-to-L1 queues exceed the audited L1 limit")
     components = derivation["worst_core_components"]
     rebuilt_worst = (
-        components["gm_to_l1_cycles"] + components["cube_l1_overlap_cycles"] +
+        components["input_l2_to_l1_cycles"] + components["cube_l1_overlap_cycles"] +
         components["output_accumulation_cycles"] + components["vector_cast_cycles"]
     )
     if not math.isclose(rebuilt_worst, components["total_cycles"], rel_tol=1e-12):
         raise RuntimeError(f"{workload_id}: worst-core equation mismatch")
     rebuilt_critical = max(
-        components["total_cycles"], derivation["aggregate_hbm_cycles"]
+        components["total_cycles"], derivation["aggregate_hbm_cycles"],
+        derivation["aggregate_l2_cycles"]
     ) + GM_TO_L1_SYNC_CYCLES + KERNEL_LAUNCH_CYCLES
     if not math.isclose(rebuilt_critical, derivation["critical_path_cycles"], rel_tol=1e-12):
         raise RuntimeError(f"{workload_id}: critical-path total mismatch")
@@ -129,6 +166,8 @@ def main() -> None:
     parser.add_argument("--variant-dir", type=Path, required=True)
     parser.add_argument("--sequence-dir", type=Path, required=True)
     args = parser.parse_args()
+
+    audit_gm_to_l1_kernel_protocol()
 
     complete_contract = json.loads(
         (SELECTOR_ROOT / "c220_validation_contract.json").read_text(encoding="utf-8")

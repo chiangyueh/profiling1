@@ -168,7 +168,7 @@ def main() -> None:
         )
 
     result = {
-        "schema": "matmul_c220_gm_to_l1_v1",
+        "schema": "matmul_c220_gm_to_l1_l0c_v2",
         "status": "complete",
         "comparison_basis": "same_campaign_official_api_vs_independent_gm_to_l1_family",
         "reference_remeasured": True,

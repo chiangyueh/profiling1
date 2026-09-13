@@ -22,17 +22,16 @@ L0C = 131072
 L1 = 524032
 SYSTEM_WORKSPACE = 20 * 1024 * 1024
 L1_QUEUE_RESERVE = 4096
-GM_TO_L1_BYTES_PER_CYCLE = 16.0
+L2_TO_LOCAL_BYTES_PER_CYCLE = 110.0
 L1_TO_L0_BYTES_PER_CYCLE = 256.0
 FIXPIPE_BYTES_PER_CYCLE = 64.0
-ATOMIC_BYTES_PER_CYCLE = 12.8
 AGGREGATE_HBM_BYTES_PER_CYCLE = 640.0
+AGGREGATE_L2_BYTES_PER_CYCLE = 2200.0
 CUBE_MACS_PER_CYCLE_16BIT = 4096.0
 VECTOR_CAST_ELEMENTS_PER_CYCLE = 128.0
 MTE2_TRANSFER_CYCLES = 347.0
 MTE1_TRANSFER_CYCLES = 2.0
 FIXPIPE_TRANSFER_CYCLES = 31.0
-ATOMIC_TRANSFER_CYCLES = 382.0
 GM_TO_L1_SYNC_CYCLES = 545.0
 KERNEL_LAUNCH_CYCLES = 96.0
 FAMILIES = {
@@ -179,9 +178,14 @@ def gm_to_l1_cost(req: dict, *, base_m: int, base_n: int, base_k: int,
                     ceil_div(k_tail, base_k))
     core_costs = []
     core_breakdowns = []
-    total_hbm_bytes = 0
+    unique_hbm_bytes = (
+        (req["M"] * req["K"] + req["K"] * req["N"]) * width +
+        req["M"] * req["N"] * (4 + 4 + width)
+    )
+    total_l2_bytes = 0
     total_useful_macs = 0
     total_padded_macs = 0
+    total_matmul_iterations = 0
     for m_extent in m_extents:
         m_tile_count = ceil_div(m_extent, base_m)
         m_tail = m_extent - (m_tile_count - 1) * base_m
@@ -190,16 +194,17 @@ def gm_to_l1_cost(req: dict, *, base_m: int, base_n: int, base_k: int,
             n_tile_count = ceil_div(n_extent, base_n)
             n_tail = n_extent - (n_tile_count - 1) * base_n
             aligned_n_sum = (n_tile_count - 1) * base_n + align_up(n_tail, 16)
-            # The kernel retains one A base tile in L1 while sweeping all N
-            # base tiles.  B must be reloaded once for every M base tile.
+            # Each output base tile remains in L0C while all K stripes are
+            # accumulated with Iterate(enPartialSum).  A is therefore loaded
+            # once per N base tile and B once per M base tile; neither operand
+            # is copied from HBM for every use because GlobalTensor keeps the
+            # normal L2 policy.
             gm_bytes = (
-                m_extent * req["K"] * width +
+                n_tile_count * m_extent * req["K"] * width +
                 m_tile_count * req["K"] * n_extent * width
             )
-            gm_copies = (
-                m_tile_count * k_chunks +
-                m_tile_count * n_tile_count * k_chunks
-            )
+            matmul_iterations = m_tile_count * n_tile_count * k_chunks
+            gm_copies = 2 * matmul_iterations
             l1_l0_bytes = (
                 aligned_m_sum * n_tile_count * aligned_k_sum +
                 m_tile_count * aligned_n_sum * aligned_k_sum
@@ -217,14 +222,7 @@ def gm_to_l1_cost(req: dict, *, base_m: int, base_n: int, base_k: int,
                 output_bytes / FIXPIPE_BYTES_PER_CYCLE +
                 output_tile_count * FIXPIPE_TRANSFER_CYCLES
             )
-            output_hbm_bytes = output_bytes
-            if k_chunks > 1:
-                output_cycles += (k_chunks - 1) * (
-                    output_bytes / ATOMIC_BYTES_PER_CYCLE +
-                    output_tile_count * ATOMIC_TRANSFER_CYCLES
-                )
-                output_hbm_bytes += (k_chunks - 1) * 2 * output_bytes
-            gm_cycles = gm_bytes / GM_TO_L1_BYTES_PER_CYCLE + gm_copies * MTE2_TRANSFER_CYCLES
+            input_cycles = gm_bytes / L2_TO_LOCAL_BYTES_PER_CYCLE + gm_copies * MTE2_TRANSFER_CYCLES
             l1_l0_cycles = (l1_l0_bytes / L1_TO_L0_BYTES_PER_CYCLE +
                             l1_l0_copies * MTE1_TRANSFER_CYCLES)
             cube_cycles = cube_macs / CUBE_MACS_PER_CYCLE_16BIT + mad_tiles * 21.0
@@ -232,43 +230,63 @@ def gm_to_l1_cost(req: dict, *, base_m: int, base_n: int, base_k: int,
             # after the AIC publishes its completion event.
             vector_elements = ceil_div(m_extent, 2) * n_extent
             vector_cycles = (
-                vector_elements * 4 / GM_TO_L1_BYTES_PER_CYCLE +
+                vector_elements * 4 / L2_TO_LOCAL_BYTES_PER_CYCLE +
                 vector_elements * width / FIXPIPE_BYTES_PER_CYCLE +
                 vector_elements / VECTOR_CAST_ELEMENTS_PER_CYCLE +
                 MTE2_TRANSFER_CYCLES + 25.0
             )
-            core_cycles = (gm_cycles + max(cube_cycles, l1_l0_cycles) +
+            core_cycles = (input_cycles + max(cube_cycles, l1_l0_cycles) +
                            output_cycles + vector_cycles)
             core_costs.append(core_cycles)
             core_breakdowns.append({
-                "gm_to_l1_cycles": gm_cycles,
+                "input_l2_to_l1_cycles": input_cycles,
                 "cube_cycles": cube_cycles,
                 "l1_to_l0_cycles": l1_l0_cycles,
                 "cube_l1_overlap_cycles": max(cube_cycles, l1_l0_cycles),
                 "output_accumulation_cycles": output_cycles,
                 "vector_cast_cycles": vector_cycles,
+                "matmul_iterations": matmul_iterations,
+                "output_flushes": output_tile_count,
                 "total_cycles": core_cycles,
             })
-            total_hbm_bytes += gm_bytes + output_hbm_bytes + m_extent * n_extent * (4 + width)
-    aggregate_cycles = total_hbm_bytes / AGGREGATE_HBM_BYTES_PER_CYCLE
+            total_l2_bytes += gm_bytes + m_extent * n_extent * (4 + 4 + width)
+            total_matmul_iterations += matmul_iterations
+    active_cores = len(core_costs)
+    effective_hbm_rate = min(AGGREGATE_HBM_BYTES_PER_CYCLE, active_cores * 32.0)
+    effective_l2_rate = min(AGGREGATE_L2_BYTES_PER_CYCLE,
+                            active_cores * L2_TO_LOCAL_BYTES_PER_CYCLE)
+    aggregate_hbm_cycles = unique_hbm_bytes / effective_hbm_rate
+    aggregate_l2_cycles = total_l2_bytes / effective_l2_rate
     worst_index = max(range(len(core_costs)), key=core_costs.__getitem__)
     worst = core_breakdowns[worst_index]
-    critical_cycles = (max(worst["total_cycles"], aggregate_cycles) +
+    critical_cycles = (max(worst["total_cycles"], aggregate_hbm_cycles,
+                           aggregate_l2_cycles) +
                        GM_TO_L1_SYNC_CYCLES + KERNEL_LAUNCH_CYCLES)
     dominant_local = max(
-        ("gm_to_l1", "cube_l1_overlap", "output_accumulation", "vector_cast"),
+        ("input_l2_to_l1", "cube_l1_overlap", "output_accumulation", "vector_cast"),
         key=lambda name: worst[f"{name}_cycles"],
     )
     return {
         "critical_cycles": critical_cycles,
         "critical_path": (
-            "aggregate_hbm" if aggregate_cycles > worst["total_cycles"]
+            "aggregate_hbm" if aggregate_hbm_cycles == max(
+                worst["total_cycles"], aggregate_hbm_cycles, aggregate_l2_cycles)
+            else "aggregate_l2" if aggregate_l2_cycles > worst["total_cycles"]
             else f"worst_core:{dominant_local}"
         ),
         "worst_core_cycles": worst["total_cycles"],
         "worst_core_components": worst,
-        "aggregate_hbm_cycles": aggregate_cycles,
-        "total_hbm_bytes": total_hbm_bytes,
+        "aggregate_hbm_cycles": aggregate_hbm_cycles,
+        "aggregate_l2_cycles": aggregate_l2_cycles,
+        "unique_hbm_bytes": unique_hbm_bytes,
+        "total_l2_bytes": total_l2_bytes,
+        "total_matmul_iterations": total_matmul_iterations,
+        "active_cores": active_cores,
+        "effective_hbm_bytes_per_cycle": effective_hbm_rate,
+        "effective_l2_bytes_per_cycle": effective_l2_rate,
+        "worst_core_matmul_iterations": max(
+            item["matmul_iterations"] for item in core_breakdowns
+        ),
         "useful_macs": total_useful_macs,
         "padded_macs": total_padded_macs,
         "padding_ratio": total_padded_macs / max(1, total_useful_macs),
@@ -280,12 +298,12 @@ def gm_to_l1_cube(req: dict) -> tuple[dict, dict]:
     width = 2
     candidates = []
     seen = set()
-    for base_m in (128, 64, 32):
-        for base_n in (128, 64, 32):
+    for base_m in (256, 128, 64, 32):
+        for base_n in (256, 128, 64, 32):
             for base_k in (128, 64, 32):
                 if (base_m * base_k * width * 2 > L0A or
                         base_n * base_k * width * 2 > L0B or
-                        base_m * base_n * 4 * 2 > L0C):
+                        base_m * base_n * 4 > L0C):
                     continue
                 resident_per_step = (base_m + base_n) * base_k * width
                 max_step = (L1 - L1_QUEUE_RESERVE) // resident_per_step
@@ -315,8 +333,9 @@ def gm_to_l1_cube(req: dict) -> tuple[dict, dict]:
                         # Every term before used is a hardware service term;
                         # core count is only a final tie-break, never the goal.
                         score = (
-                            cost["critical_cycles"], cost["aggregate_hbm_cycles"],
-                            cost["padding_ratio"], cost["total_hbm_bytes"], -used,
+                            cost["critical_cycles"], cost["worst_core_matmul_iterations"],
+                            cost["aggregate_hbm_cycles"], cost["total_l2_bytes"],
+                            cost["aggregate_l2_cycles"], cost["padding_ratio"], -used,
                         )
                         candidates.append((
                             score, base_m, base_n, base_k, k_stripe,
@@ -329,8 +348,9 @@ def gm_to_l1_cube(req: dict) -> tuple[dict, dict]:
         cost = candidate[8]
         return (
             cost["critical_cycles"], cost["worst_core_cycles"],
-            cost["aggregate_hbm_cycles"], cost["padding_ratio"],
-            float(cost["total_hbm_bytes"]),
+            cost["aggregate_hbm_cycles"], cost["aggregate_l2_cycles"],
+            float(cost["worst_core_matmul_iterations"]), cost["padding_ratio"],
+            float(cost["total_l2_bytes"]),
         )
 
     pareto_candidates = []
@@ -361,10 +381,10 @@ def gm_to_l1_cube(req: dict) -> tuple[dict, dict]:
         "depthA1": step_k, "depthB1": step_k,
         "stepM": 1, "stepN": 1,
         "stepKa": step_k, "stepKb": step_k,
-        "dbL0A": 2, "dbL0B": 2, "dbL0C": 2,
+        "dbL0A": 2, "dbL0B": 2, "dbL0C": 1,
     })
     return cube, {
-        "model": "gm_to_l1_critical_path_v1",
+        "model": "gm_to_l1_l0c_resident_critical_path_v2",
         "finite_candidate_count": len(candidates),
         "pareto_candidate_count": len(pareto_candidates),
         "candidate_score": list(score),
@@ -373,22 +393,30 @@ def gm_to_l1_cube(req: dict) -> tuple[dict, dict]:
         "worst_core_cycles": cost["worst_core_cycles"],
         "worst_core_components": cost["worst_core_components"],
         "aggregate_hbm_cycles": cost["aggregate_hbm_cycles"],
-        "total_hbm_bytes": cost["total_hbm_bytes"],
+        "aggregate_l2_cycles": cost["aggregate_l2_cycles"],
+        "unique_hbm_bytes": cost["unique_hbm_bytes"],
+        "total_l2_bytes": cost["total_l2_bytes"],
+        "total_matmul_iterations": cost["total_matmul_iterations"],
+        "active_cores": cost["active_cores"],
+        "effective_hbm_bytes_per_cycle": cost["effective_hbm_bytes_per_cycle"],
+        "effective_l2_bytes_per_cycle": cost["effective_l2_bytes_per_cycle"],
+        "worst_core_matmul_iterations": cost["worst_core_matmul_iterations"],
         "padding_ratio": cost["padding_ratio"],
         "k_chunks": cost["k_chunks"],
         "core_grid_tasks": used,
         "base_tile": [base_m, base_n, base_k],
         "k_stripe": k_stripe,
-        "critical_path_equation": "max(worst_core,aggregate_hbm)+sync+launch",
-        "worst_core_equation": "gm_to_l1+max(cube,l1_to_l0)+output_accumulation+vector_cast",
+        "protocol": "l0c_resident_k_partial_sum_single_output_flush",
+        "critical_path_equation": "max(worst_core,aggregate_hbm,aggregate_l2)+sync+launch",
+        "worst_core_equation": "input_l2_to_l1+max(cube,l1_to_l0)+output_flush+vector_cast",
         "primitive_calibration": "frozen_c220_isolated_instruction_contract_v1",
         "service_rates": {
-            "gm_to_l1_bytes_per_cycle": GM_TO_L1_BYTES_PER_CYCLE,
+            "l2_to_local_bytes_per_cycle": L2_TO_LOCAL_BYTES_PER_CYCLE,
             "l1_to_l0_bytes_per_cycle": L1_TO_L0_BYTES_PER_CYCLE,
             "cube_macs_per_cycle": CUBE_MACS_PER_CYCLE_16BIT,
             "fixpipe_bytes_per_cycle": FIXPIPE_BYTES_PER_CYCLE,
-            "atomic_bytes_per_cycle": ATOMIC_BYTES_PER_CYCLE,
             "aggregate_hbm_bytes_per_cycle": AGGREGATE_HBM_BYTES_PER_CYCLE,
+            "aggregate_l2_bytes_per_cycle": AGGREGATE_L2_BYTES_PER_CYCLE,
         },
     }
 

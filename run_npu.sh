@@ -83,7 +83,7 @@ CAMPAIGN_ID="$({
     find colleague_matmul_v3/op_kernel -type f -print0 |
         sort -z | xargs -0 sha256sum
 } | sha256sum | cut -c1-20)"
-CAMPAIGN_DIR="${ROOT}/results/matmul_c220_gm_to_l1_v1/${CAMPAIGN_ID}"
+CAMPAIGN_DIR="${ROOT}/results/matmul_c220_gm_to_l1_l0c_v2/${CAMPAIGN_ID}"
 PACKET_DIR="${CAMPAIGN_DIR}/packets"
 MANIFEST="${CAMPAIGN_DIR}/improved_manifest.csv"
 SELECTION="${CAMPAIGN_DIR}/selection.jsonl"
@@ -199,10 +199,10 @@ fail() {
 announce "RUN_LOG path=${RUN_LOG}"
 source_revision="$(git rev-parse HEAD 2>/dev/null || printf unknown)"
 announce "SOURCE_REVISION commit=${source_revision}"
-announce "CAMPAIGN_READY operator=matmul focus=c220_gm_to_l1 families=2 npu_shapes=${VALIDATION_SHAPES} candidate_measurements=${VALIDATION_SHAPES} official_measurements=${VALIDATION_SHAPES} compiled_variants=${EXPECTED_VARIANTS} physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
+announce "CAMPAIGN_READY operator=matmul focus=c220_gm_to_l1_l0c_partial_sum families=2 npu_shapes=${VALIDATION_SHAPES} candidate_measurements=${VALIDATION_SHAPES} official_measurements=${VALIDATION_SHAPES} compiled_variants=${EXPECTED_VARIANTS} physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
 announce "measurement=${WARMUP}_warmup+${SAMPLES}_device_event_samples+repeat_${REPEAT}+validate_last_timed_output"
 announce "numeric_preflight_limit_mib=${NUMERIC_PREFLIGHT_MAX_MIB}"
-announce "selection=finite_legal_gm_to_l1_candidates_pareto_pruned_then_critical_path_minimum"
+announce "selection=finite_legal_l0c_resident_candidates_pareto_pruned_then_hbm_l2_per_core_critical_path_minimum"
 announce "selector=shape_and_frozen_c220_hardware_formula_only"
 announce "official_reference=same_campaign_installed_aclnn_matmul_public_api"
 announce "forbidden=cost_model,measured_latency_at_selection,history_lookup_at_runtime,repo_lookup,tiling_bank,official_tiling_seed,installed_branch_fallback"

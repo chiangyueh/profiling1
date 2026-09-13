@@ -133,51 +133,50 @@ __aicore__ inline void RunGmToL1(
         MatmulImpl<aL1Type, bL1Type, cGmType, biasType, MM_CFG_NO_PRELOAD> mm;
         mm.SetSubBlockIdx(0);
         mm.Init(&tiling, &pipe);
-        // A TSCM/B TSCM tensor contains one base tile.  Passing a wider
-        // singleCoreN directly makes the matmul engine advance as if a second
-        // baseN tile were present in the local tensor.  Materialize and launch
-        // every baseM/baseN tile explicitly so local NZ strides and GM output
-        // offsets remain identical at each boundary.
+        SetAtomicNone();
+        // One output base tile stays in L0C across every K stripe.  Iterate's
+        // enPartialSum contract preserves the preceding L0C value, so only the
+        // completed tile is written to GM.  This removes the old per-stripe
+        // GetTensorC/atomic round trip while retaining explicit base-tile NZ
+        // boundaries for aligned and unaligned inputs.
         for (uint32_t mLocal = 0; mLocal < mUse; mLocal += tiling.baseM) {
             const uint32_t tileMRemain = mUse - mLocal;
             const uint32_t tileM = tiling.baseM < tileMRemain ? tiling.baseM : tileMRemain;
-            for (uint32_t kStart = 0, kIndex = 0; kStart < tiling.Ka;
-                 kStart += maxK, ++kIndex) {
-                const uint32_t kRemain = static_cast<uint32_t>(tiling.Ka - kStart);
-                const uint32_t kUse = maxK < kRemain ? maxK : kRemain;
-                LocalTensor<T> localA = queueA.AllocTensor<T>();
-                CopyAFromGmToL1(
-                    localA, inputA,
-                    static_cast<uint64_t>(mStart + mLocal) * tiling.Ka + kStart,
-                    tileM, kUse, tiling.Ka);
-                queueA.EnQue(localA);
-                localA = queueA.DeQue<T>();
-                // Keep one A base tile resident while all N base tiles use it.
-                for (uint32_t nLocal = 0; nLocal < nUse; nLocal += tiling.baseN) {
-                    const uint32_t tileNRemain = nUse - nLocal;
-                    const uint32_t tileN = tiling.baseN < tileNRemain ? tiling.baseN : tileNRemain;
-                    const uint64_t outputOffset =
-                        static_cast<uint64_t>(mStart + mLocal) * tiling.N + nStart + nLocal;
+            for (uint32_t nLocal = 0; nLocal < nUse; nLocal += tiling.baseN) {
+                const uint32_t tileNRemain = nUse - nLocal;
+                const uint32_t tileN = tiling.baseN < tileNRemain ? tiling.baseN : tileNRemain;
+                const uint64_t outputOffset =
+                    static_cast<uint64_t>(mStart + mLocal) * tiling.N + nStart + nLocal;
+                for (uint32_t kStart = 0, kIndex = 0; kStart < tiling.Ka;
+                     kStart += maxK, ++kIndex) {
+                    const uint32_t kRemain = static_cast<uint32_t>(tiling.Ka - kStart);
+                    const uint32_t kUse = maxK < kRemain ? maxK : kRemain;
+                    LocalTensor<T> localA = queueA.AllocTensor<T>();
                     LocalTensor<T> localB = queueB.AllocTensor<T>();
+                    CopyAFromGmToL1(
+                        localA, inputA,
+                        static_cast<uint64_t>(mStart + mLocal) * tiling.Ka + kStart,
+                        tileM, kUse, tiling.Ka);
                     CopyBFromGmToL1(
                         localB, inputB,
                         static_cast<uint64_t>(kStart) * tiling.N + nStart + nLocal,
                         kUse, tileN, tiling.N);
+                    queueA.EnQue(localA);
                     queueB.EnQue(localB);
+                    localA = queueA.DeQue<T>();
                     localB = queueB.DeQue<T>();
                     mm.SetOrgShape(tileM, tileN, kUse, kUse, tiling.N);
                     mm.SetSingleShape(tileM, tileN, kUse);
                     mm.SetTensorA(localA, false);
                     mm.SetTensorB(localB, false);
-                    mm.Iterate();
-                    mm.GetTensorC(accumulated[outputOffset], kIndex == 0 ? 0 : 1);
+                    mm.Iterate(kIndex != 0);
+                    queueA.FreeTensor(localA);
                     queueB.FreeTensor(localB);
                 }
-                queueA.FreeTensor(localA);
+                mm.GetTensorC(accumulated[outputOffset], 0);
             }
         }
         mm.End();
-        SetAtomicNone();
         NotifyEvent<PIPE_FIX>(AIC_SYNC_AIV_FLAG);
     }
 }
