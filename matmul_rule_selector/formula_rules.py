@@ -408,9 +408,16 @@ def tile_l2(s: Shape, h: Hardware, bm: int, bn: int, gm: int, gn: int) -> dict:
                 full_k_rect_fits=f(x, y) <= h.l2)
 
 
-def _obsolete_single_formula(
+def _solve_unique_theoretical(
     s: Shape, h: Hardware = Hardware(), ci: Optional[CompileInfo] = None
 ) -> dict:
+    """Derive one complete tiling by a fixed sequence of integer equations.
+
+    This function does not construct a set of tilings.  Divisor projection,
+    capacity clipping and axis projection each replace one scalar in the same
+    in-progress tiling.  There is therefore exactly one complete result for a
+    supported request and no candidate ranking, Pareto pass or latency score.
+    """
     validate_input_domain(s, h, ci)
     bias_macro_matches = ci.orig_dtype_bias == ci.orig_dtype_x1
     d = s.d
@@ -722,6 +729,15 @@ def _obsolete_single_formula(
                  last_N=s.n - (gn - 1) * single_n,
                  last_K=s.k - (cd(s.k, single_k) - 1) * single_k,
                  core_grid_semantics='K ownership; MN are serial panels' if family == 'DETERMINISTIC_SPLIT_K' else 'MN work items')
+    state['selection_contract'] = dict(
+        complete_tilings_constructed=1,
+        candidate_enumeration=False,
+        pareto_pruning=False,
+        latency_or_cost_score=False,
+        history_lookup=False,
+        runtime_tiling_bank=False,
+        decision='ordered_branch_predicates_then_closed_form_integer_projection',
+    )
     state['legality'] = validate_generated_rules(s, h, ci, state)
     return state
 
@@ -729,16 +745,9 @@ def _obsolete_single_formula(
 def solve(
     s: Shape, h: Hardware = Hardware(), ci: Optional[CompileInfo] = None
 ) -> dict:
-    """Return the audited rule winner from the finite family frontiers.
+    """Public entry point for the single-path theoretical selector."""
 
-    The prior one-formula selector remains above only for source-history
-    review.  It is deliberately unreachable from this public entry point.
-    """
-
-    validate_input_domain(s, h, ci)
-    from candidate_engine import generate_and_select
-
-    return generate_and_select(s, h, ci)
+    return _solve_unique_theoretical(s, h, ci)
 
 
 def examples() -> List[Tuple[str, Shape, Hardware]]:

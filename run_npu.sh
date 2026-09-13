@@ -7,16 +7,16 @@ PHYSICAL_DEVICE="${PHYSICAL_NPU_ID:-2}"
 WARMUP=3
 REPEAT=10
 SAMPLES=15
-VALIDATION_SHAPES=4
-EXPECTED_VARIANTS=4
-NUMERIC_PREFLIGHT_MAX_MIB=320
+VALIDATION_SHAPES=8
+EXPECTED_VARIANTS=2
+NUMERIC_PREFLIGHT_MAX_MIB=64
 
 usage() {
     printf '%s\n' \
         'Usage: ./run_npu.sh --mode full [-d PHYSICAL_NPU_ID]' \
         '' \
-        'Builds and measures the independently modelled C220 GM-to-L1 family' \
-        'against one same-campaign official MatMulV3 reference per workload.'
+        'Audits the complete source family chain, then measures exactly one' \
+        'closed-form improved tiling and one official reference per workload.'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -66,27 +66,27 @@ source "${ROOT}/scripts/env.sh" >/dev/null
 CAMPAIGN_ID="$({
     sha256sum \
         run_npu.sh \
-        tools/generate_matmul_c220_experimental_matrix.py \
+        tools/generate_matmul_unique_formula_matrix.py \
         tools/analyze_matmul_rule_matrix.py \
         tools/direct_matmul_tiling.py \
         scripts/build_all.sh \
         scripts/env.sh \
         cmake_npu/CMakeLists.txt \
         direct_matmul/kernel_entry.cpp \
-        direct_matmul/kernel_entry_c220.cpp \
-        direct_matmul/c220_gm_to_l1_kernel.h \
         direct_matmul/mat_mul_v3_tiling_data.h \
-        direct_matmul/mat_mul_v3_tiling_data_280.h \
         direct_matmul/runner.cpp \
-        matmul_rule_selector/c220_experimental_selector.py \
-        matmul_rule_selector/c220_validation_contract.json
-    find colleague_matmul_v3/op_kernel -type f -print0 |
+        matmul_rule_selector/formula_rules.py \
+        matmul_rule_selector/improved_selector.py \
+        matmul_rule_selector/source_family_audit_contract.json \
+        matmul_rule_selector/unique_formula_validation_contract.json
+    find matmul_rule_selector/baseline_core -type f -name '*.py' -print0 |
         sort -z | xargs -0 sha256sum
 } | sha256sum | cut -c1-20)"
-CAMPAIGN_DIR="${ROOT}/results/matmul_c220_gm_to_l1_l0c_v2/${CAMPAIGN_ID}"
+CAMPAIGN_DIR="${ROOT}/results/matmul_unique_theoretical_selector_v1/${CAMPAIGN_ID}"
 PACKET_DIR="${CAMPAIGN_DIR}/packets"
 MANIFEST="${CAMPAIGN_DIR}/improved_manifest.csv"
 SELECTION="${CAMPAIGN_DIR}/selection.jsonl"
+THEORY_AUDIT="${CAMPAIGN_DIR}/theory_audit.jsonl"
 VARIANT_DIR="${CAMPAIGN_DIR}/variants"
 SEQUENCE_DIR="${CAMPAIGN_DIR}/sequence"
 RUNNER_LOG="${RUN_LOG}"
@@ -154,9 +154,9 @@ for role in sorted(by_role):
         f"clear_official_wins={sum(row['sample_separation'] == 'CLEAR_OFFICIAL_WINNER' for row in role_rows)} "
         f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in role_rows)}"
     )
-selector_rows = by_role["experimental_family"]
+selector_rows = by_role["unique_theoretical_improvement"]
 print(
-    "FINAL_EXPERIMENTAL_SUMMARY "
+    "FINAL_THEORETICAL_SUMMARY "
     f"shapes={len(selector_rows)} "
     f"candidate_wins={sum(row['median_winner'] == 'candidate' for row in selector_rows)} "
     f"official_wins={sum(row['median_winner'] == 'official' for row in selector_rows)} "
@@ -199,21 +199,75 @@ fail() {
 announce "RUN_LOG path=${RUN_LOG}"
 source_revision="$(git rev-parse HEAD 2>/dev/null || printf unknown)"
 announce "SOURCE_REVISION commit=${source_revision}"
-announce "CAMPAIGN_READY operator=matmul focus=c220_gm_to_l1_l0c_partial_sum families=2 npu_shapes=${VALIDATION_SHAPES} candidate_measurements=${VALIDATION_SHAPES} official_measurements=${VALIDATION_SHAPES} compiled_variants=${EXPECTED_VARIANTS} physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
+announce "CAMPAIGN_READY operator=matmul selector=unique_ordered_closed_form source_families=7 source_suffixes=12 npu_shapes=${VALIDATION_SHAPES} candidate_measurements=${VALIDATION_SHAPES} official_measurements=${VALIDATION_SHAPES} compiled_variants=${EXPECTED_VARIANTS} physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
 announce "measurement=${WARMUP}_warmup+${SAMPLES}_device_event_samples+repeat_${REPEAT}+validate_last_timed_output"
 announce "numeric_preflight_limit_mib=${NUMERIC_PREFLIGHT_MAX_MIB}"
-announce "selection=finite_legal_l0c_resident_candidates_pareto_pruned_then_hbm_l2_per_core_critical_path_minimum"
-announce "selector=shape_and_frozen_c220_hardware_formula_only"
+announce "selection=one_source_family_then_one_closed_form_tiling_no_cross_family_ranking"
+announce "selector=shape_and_frozen_910b3_hardware_integer_equations_only"
 announce "official_reference=same_campaign_installed_aclnn_matmul_public_api"
-announce "forbidden=cost_model,measured_latency_at_selection,history_lookup_at_runtime,repo_lookup,tiling_bank,official_tiling_seed,installed_branch_fallback"
+announce "forbidden=cost_model,measured_latency_at_selection,history_lookup_at_runtime,repo_lookup,tiling_bank,candidate_enumeration,pareto,installed_host_tiler"
+announce "unmodified_paths=reported_as_baseline_equivalent_and_excluded_from_improved_measurement"
 announce "CANN_ENV root=${CANN_ROOT} soc=${SOC_VERSION} aic=20 visible_devices=${ASCEND_RT_VISIBLE_DEVICES}"
 announce "results=${CAMPAIGN_DIR}"
 
 if [[ -s "${ANALYSIS}" ]] && grep -q '"status": "complete"' "${ANALYSIS}"; then
     emit_final_results
-    announce "C220_GM_TO_L1_VALIDATION_COMPLETE cached=1 analysis=${ANALYSIS} summary=${SUMMARY} log=${RUN_LOG}"
+    announce "UNIQUE_FORMULA_VALIDATION_COMPLETE cached=1 analysis=${ANALYSIS} summary=${SUMMARY} theory=${THEORY_AUDIT} log=${RUN_LOG}"
     exit 0
 fi
+
+generation_started_ns="$(date +%s%N)"
+python3 tools/generate_matmul_unique_formula_matrix.py \
+    --output-dir "${PACKET_DIR}" \
+    --manifest "${MANIFEST}" \
+    --selection "${SELECTION}" \
+    --theory-audit "${THEORY_AUDIT}" \
+    --variant-dir "${VARIANT_DIR}" \
+    --sequence-dir "${SEQUENCE_DIR}"
+actual_variants="$(find "${VARIANT_DIR}" -maxdepth 1 -type f -name '*.csv' | wc -l)"
+[[ "${actual_variants}" -eq "${EXPECTED_VARIANTS}" ]] || \
+    fail "generated ${actual_variants} dtype/suffix variants; expected ${EXPECTED_VARIANTS}"
+printf '%s\n' 'SELECTION_RECORDS_BEGIN'
+sed 's/^/SELECTION_RECORD /' "${SELECTION}"
+printf '%s\n' 'SELECTION_RECORDS_END'
+printf '%s\n' 'THEORETICAL_RESULTS_BEGIN'
+sed 's/^/THEORETICAL_RESULT /' "${THEORY_AUDIT}"
+printf '%s\n' 'THEORETICAL_RESULTS_END'
+printf '%s\n' 'CANDIDATE_MANIFEST_CSV_BEGIN'
+cat "${MANIFEST}"
+printf '%s\n' 'CANDIDATE_MANIFEST_CSV_END'
+generation_wall_ms=$(( ($(date +%s%N) - generation_started_ns) / 1000000 ))
+announce "UNIQUE_FORMULA_PACKET_GENERATION passed shapes=${VALIDATION_SHAPES} source_families=7 source_suffixes=12 variants=${EXPECTED_VARIANTS} complete_tilings_per_shape=1 packet_bytes=272"
+announce "CAMPAIGN_STAGE_TIMING stage=unique_formula_packet_generation wall_ms=${generation_wall_ms}"
+
+input_cap_audit="$(python3 - "${MANIFEST}" "${NUMERIC_PREFLIGHT_MAX_MIB}" <<'PY'
+import csv
+import sys
+
+width = {"fp16": 2, "bf16": 2, "fp32": 4}
+with open(sys.argv[1], newline="", encoding="utf-8") as stream:
+    rows = list(csv.DictReader(stream))
+limit = int(sys.argv[2]) * 1024 * 1024
+sizes = {
+    row["workload_id"]: (
+        int(row["m"]) * int(row["k"]) + int(row["k"]) * int(row["n"])
+    ) * width[row["dtype"]]
+    for row in rows
+}
+largest = max(sizes, key=sizes.get)
+max_k = max(int(row["k"]) for row in rows)
+if sizes[largest] > limit or max_k > 60000:
+    raise SystemExit(
+        f"input preflight contract invalid: largest={largest} "
+        f"bytes={sizes[largest]} limit={limit} max_k={max_k}"
+    )
+print(
+    f"largest={largest} bytes={sizes[largest]} "
+    f"mib={sizes[largest] / 1048576:g} limit_mib={limit / 1048576:g} max_k={max_k}"
+)
+PY
+)"
+announce "INPUT_CAP_AUDIT passed ${input_cap_audit}"
 
 device_preflight_started_ns="$(date +%s%N)"
 if python3 - "${DEVICE_ID}" <<'PY'
@@ -325,55 +379,6 @@ if [[ "${device_preflight_rc}" -ne 0 ]]; then
 fi
 announce "DEVICE_PREFLIGHT passed physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID} wall_ms=${device_preflight_wall_ms}"
 
-generation_started_ns="$(date +%s%N)"
-python3 tools/generate_matmul_c220_experimental_matrix.py \
-    --output-dir "${PACKET_DIR}" \
-    --manifest "${MANIFEST}" \
-    --selection "${SELECTION}" \
-    --variant-dir "${VARIANT_DIR}" \
-    --sequence-dir "${SEQUENCE_DIR}"
-actual_variants="$(find "${VARIANT_DIR}" -maxdepth 1 -type f -name '*.csv' | wc -l)"
-[[ "${actual_variants}" -eq "${EXPECTED_VARIANTS}" ]] || \
-    fail "generated ${actual_variants} dtype/suffix variants; expected ${EXPECTED_VARIANTS}"
-printf '%s\n' 'SELECTION_RECORDS_BEGIN'
-sed 's/^/SELECTION_RECORD /' "${SELECTION}"
-printf '%s\n' 'SELECTION_RECORDS_END'
-printf '%s\n' 'CANDIDATE_MANIFEST_CSV_BEGIN'
-cat "${MANIFEST}"
-printf '%s\n' 'CANDIDATE_MANIFEST_CSV_END'
-generation_wall_ms=$(( ($(date +%s%N) - generation_started_ns) / 1000000 ))
-announce "C220_GM_TO_L1_PACKET_GENERATION passed shapes=${VALIDATION_SHAPES} families=2 variants=${EXPECTED_VARIANTS} packet_bytes=280"
-announce "CAMPAIGN_STAGE_TIMING stage=c220_gm_to_l1_packet_generation wall_ms=${generation_wall_ms}"
-
-input_cap_audit="$(python3 - "${MANIFEST}" "${NUMERIC_PREFLIGHT_MAX_MIB}" <<'PY'
-import csv
-import sys
-
-width = {"fp16": 2, "bf16": 2, "fp32": 4}
-with open(sys.argv[1], newline="", encoding="utf-8") as stream:
-    rows = list(csv.DictReader(stream))
-limit = int(sys.argv[2]) * 1024 * 1024
-sizes = {
-    row["workload_id"]: (
-        int(row["m"]) * int(row["k"]) + int(row["k"]) * int(row["n"])
-    ) * width[row["dtype"]]
-    for row in rows
-}
-largest = max(sizes, key=sizes.get)
-max_k = max(int(row["k"]) for row in rows)
-if sizes[largest] > limit or max_k > 60000:
-    raise SystemExit(
-        f"input preflight contract invalid: largest={largest} "
-        f"bytes={sizes[largest]} limit={limit} max_k={max_k}"
-    )
-print(
-    f"largest={largest} bytes={sizes[largest]} "
-    f"mib={sizes[largest] / 1048576:g} limit_mib={limit / 1048576:g} max_k={max_k}"
-)
-PY
-)"
-announce "INPUT_CAP_AUDIT passed ${input_cap_audit}"
-
 official_build_started_ns="$(date +%s%N)"
 announce "OFFICIAL_RUNNER_BUILD begin jobs=1"
 if ! BUILD_COMPONENTS=official BUILD_JOBS=1 scripts/build_all.sh; then
@@ -450,7 +455,7 @@ for packet_manifest in "${SEQUENCE_DIR}"/*.csv; do
     else
         canary_rc=$?
     fi
-    printf '%s\n' "${canary_output}" | sed 's/^/C220_CANARY_RECORD /'
+    printf '%s\n' "${canary_output}" | sed 's/^/UNIQUE_FORMULA_CANARY_RECORD /'
     canary_invalid="$(grep -c 'DIRECT_MATMUL_RESULT .*"status":"failed"' <<<"${canary_output}" || true)"
     if [[ "${canary_rc}" -ne 0 || "${canary_invalid}" -ne 0 ]]; then
         candidate_batch_failures=$((candidate_batch_failures + 1))
@@ -496,4 +501,4 @@ printf '%s\n' 'FINAL_SUMMARY_CSV_END'
 analysis_wall_ms=$(( ($(date +%s%N) - analysis_started_ns) / 1000000 ))
 announce "CAMPAIGN_STAGE_TIMING stage=analysis wall_ms=${analysis_wall_ms}"
 emit_final_results
-announce "C220_GM_TO_L1_VALIDATION_COMPLETE cached=0 analysis=${ANALYSIS} summary=${SUMMARY} packets=${PACKET_DIR} log=${RUN_LOG}"
+announce "UNIQUE_FORMULA_VALIDATION_COMPLETE cached=0 analysis=${ANALYSIS} summary=${SUMMARY} theory=${THEORY_AUDIT} packets=${PACKET_DIR} log=${RUN_LOG}"

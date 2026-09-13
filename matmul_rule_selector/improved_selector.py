@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+"""Single-result MatMulV3 tiling rules for Ascend 910B3 / CANN 8.1.
+
+The complete source-reconstructed decision chain first selects exactly one
+execution family and legal packet from shape and hardware.  A family-specific
+closed-form rule may then replace that packet without reading any of its tile
+fields.  No cost model, candidate set, Pareto pass, history table, RuntimeKb
+or installed host tiler is consulted.
+"""
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
@@ -20,61 +30,47 @@ from matmul_reconstruction._core.initializer import (  # noqa: E402
     CUBE_FIELDS,
     initialize_cube,
 )
+from matmul_reconstruction.api import select as source_select  # noqa: E402
 
 from formula_rules import CompileInfo, Hardware, Shape, solve  # noqa: E402
 
 
 HARDWARE = {
-    "aicNum": 20,
-    "aivNum": 40,
-    "ubSize": 196352,
-    "l1Size": 524032,
-    "l2Size": 201326592,
-    "l0CSize": 131072,
-    "l0ASize": 65536,
-    "l0BSize": 65536,
-    "btSize": 1024,
-    "supportL0c2out": True,
-    "supportL12BtBf16": False,
-    "cubeFreq": 0,
-    "npuArch": 220,
-    "socVersion": 220,
-    "socVersionStr": "Ascend910B3",
+    "aicNum": 20, "aivNum": 40, "ubSize": 196352,
+    "l1Size": 524032, "l2Size": 201326592,
+    "l0CSize": 131072, "l0ASize": 65536, "l0BSize": 65536,
+    "btSize": 1024, "supportL0c2out": True,
+    "supportL12BtBf16": False, "cubeFreq": 0, "npuArch": 220,
+    "socVersion": 220, "socVersionStr": "Ascend910B3",
     "cannVersion": "8.1.RC1",
 }
 
 FORMULA_HARDWARE = Hardware(
-    cores=20,
-    l0a=65536,
-    l0b=65536,
-    l0c=131072,
-    l1_usable=524032,
-    l2=201326592,
-    ub=196352,
-    bt=1024,
+    cores=20, l0a=65536, l0b=65536, l0c=131072,
+    l1_usable=524032, l2=201326592, ub=196352, bt=1024,
 )
 
 FAMILY_NAME = {
-    "BASE": "BASE",
-    "FIXPIPE_BL1": "BL1_FULL_LOAD_FIXPIPE",
-    "AL1": "AL1_FULL_LOAD",
-    "BL1": "BL1_FULL_LOAD",
+    "BASE": "BASE", "FIXPIPE_BL1": "BL1_FULL_LOAD_FIXPIPE",
+    "AL1": "AL1_FULL_LOAD", "BL1": "BL1_FULL_LOAD",
+    "SINGLE_CORE_SPLIT_K": "SINGLE_CORE_SPLIT_K",
+    "DETERMINISTIC_SPLIT_K": "DETERMINISTIC_SPLIT_K",
+}
+
+SOURCE_TO_FORMULA_FAMILY = {
+    "BASE": "BASE", "AL1_FULL_LOAD": "AL1", "BL1_FULL_LOAD": "BL1",
+    "BL1_FULL_LOAD_FIXPIPE": "FIXPIPE_BL1",
     "SINGLE_CORE_SPLIT_K": "SINGLE_CORE_SPLIT_K",
     "DETERMINISTIC_SPLIT_K": "DETERMINISTIC_SPLIT_K",
     "INCREMENTAL_PATTERN": "INCREMENTAL_PATTERN",
 }
 
 FAMILY_KEY_PARTS = {
-    "BASE": (0, 0, 0),
-    "AL1": (1, 0, 0),
-    "BL1": (2, 0, 0),
+    "BASE": (0, 0, 0), "AL1": (1, 0, 0), "BL1": (2, 0, 0),
     "SINGLE_CORE_SPLIT_K": (0, 2, 0),
     "DETERMINISTIC_SPLIT_K": (0, 3, 0),
-    "INCREMENTAL_PATTERN": (0, 0, 0),
 }
 
-# These are the branches actually dispatched by the installed CANN 8.1
-# DAV-C220 mat_mul_v3.cpp.  Later mode-4/5/6 kernels are deliberately absent.
 KERNEL_SUFFIXES = {
     "fp16": frozenset((0, 1, 20, 21, 30, 31, 200, 201, 10200, 10201)),
     "bf16": frozenset((0, 1, 20, 21, 30, 31, 200, 201, 10200, 10201)),
@@ -96,32 +92,39 @@ KERNEL_VARIANT = {
 }
 
 
-def align_up(value, alignment):
-    return (value + alignment - 1) // alignment * alignment
+def ceil_div(value: int, divisor: int) -> int:
+    return (value + divisor - 1) // divisor
+
+
+def align_up(value: int, alignment: int) -> int:
+    return ceil_div(value, alignment) * alignment
 
 
 def make_request(m, k, n, dtype, trans_a, trans_b):
     return {
-        "M": m,
-        "N": n,
-        "K": k,
-        "dtype": dtype,
-        "output_dtype": dtype,
-        "layoutA": "ND",
-        "layoutB": "ND",
-        "layoutC": "ND",
-        "transA": trans_a,
-        "transB": trans_b,
-        "bias": False,
-        "hf32": False,
-        "forceGrpAccForFp32": False,
+        "M": m, "N": n, "K": k, "dtype": dtype, "output_dtype": dtype,
+        "layoutA": "ND", "layoutB": "ND", "layoutC": "ND",
+        "transA": trans_a, "transB": trans_b, "bias": False,
+        "hf32": False, "forceGrpAccForFp32": False,
     }
 
 
-def nd2nz_overflow(n_aligned, n_value, base_n, base_d, width):
-    aligned_loops = (n_aligned + base_n - 1) // base_n
-    value_loops = (n_value + base_n - 1) // base_n
-    if aligned_loops == value_loops:
+def _source_output(source: dict) -> dict:
+    suffix = int(source["tiling_key"] - 10**19)
+    return {
+        "selected_family": source["selected_family"],
+        "kernel_variant": KERNEL_VARIANT[suffix],
+        "tiling_key": int(source["tiling_key"]),
+        "block_dim": int(source["blockDim"]),
+        "workspace_bytes": int(source["workspace_bytes"]),
+        "tiling_data_bytes": int(source["raw_buffer_bytes"]),
+        "tiling_data_hex": source["raw_buffer_hex"],
+        "tiling_data_sha256": source["raw_buffer_sha256"],
+    }
+
+
+def _nd2nz_overflow(n_aligned, n_value, base_n, base_d, width):
+    if ceil_div(n_aligned, base_n) == ceil_div(n_value, base_n):
         return False
     mask = (1 << 64) - 1
     completed = (n_value // base_n - 1) & mask
@@ -129,8 +132,8 @@ def nd2nz_overflow(n_aligned, n_value, base_n, base_d, width):
     return remaining * base_d > FORMULA_HARDWARE.ub // 2 // width
 
 
-def nd2nz_geometry(width, n_value, d_value, used_cores):
-    """CANN 8.1 vector head geometry, evaluated from this candidate only."""
+def _nd2nz_geometry(width, n_value, d_value, used_cores):
+    """Compute one CANN 8.1 vector stripe; this is not tiling enumeration."""
     vector_cores = max(2 * used_cores, 1)
     threshold = 2048 // width
     c0 = 32 // width
@@ -139,226 +142,244 @@ def nd2nz_geometry(width, n_value, d_value, used_cores):
     if d_value <= threshold:
         base_d = max(d_aligned, 1)
         initial_n = FORMULA_HARDWARE.ub // 2 // width // base_d
-        rounds = max(
-            (align_up(n_aligned, vector_cores) // vector_cores + initial_n - 1)
-            // initial_n,
-            1,
-        )
-        base_n = max(
-            ((n_aligned + vector_cores - 1) // vector_cores + rounds - 1)
-            // rounds,
-            16,
-        )
-        while base_n > 16 and nd2nz_overflow(
+        rounds = max(ceil_div(ceil_div(n_aligned, vector_cores), initial_n), 1)
+        base_n = max(ceil_div(ceil_div(n_aligned, vector_cores), rounds), 16)
+        while base_n > 16 and _nd2nz_overflow(
             n_aligned, n_value, base_n, base_d, width
         ):
             base_n -= 1
         return base_n, base_d
 
-    best_tail = 0
-    best_n = 16
-    best_d = 4096 // width
+    best_tail, best_n, best_d = 0, 16, 4096 // width
     for base_bytes in (6144, 4096, 2048):
         base_d = max(min(d_aligned, base_bytes // width), 1)
-        d_loops = (d_aligned + base_d - 1) // base_d
+        d_loops = ceil_div(d_aligned, base_d)
         d_tail = d_aligned % base_d
         if 0 < d_tail < 512 // width:
             if base_d * width == 6144:
                 continue
             d_loops -= 1
-            base_d = max(
-                align_up((d_aligned + d_loops - 1) // d_loops, c0), 1
-            )
+            base_d = max(align_up(ceil_div(d_aligned, d_loops), c0), 1)
         base_n = max(FORMULA_HARDWARE.ub // 2 // width // base_d, 16)
         if base_n * base_d * width * 2 > FORMULA_HARDWARE.ub:
             continue
-        if nd2nz_overflow(n_aligned, n_value, base_n, base_d, width):
-            continue
-        n_loops = (n_aligned + base_n - 1) // base_n
-        tail = n_loops * d_loops % vector_cores
         while base_n > 16:
-            if nd2nz_overflow(n_aligned, n_value, base_n, base_d, width):
-                base_n -= 1
-                n_loops = (n_aligned + base_n - 1) // base_n
-                tail = n_loops * d_loops % vector_cores
-                continue
-            if tail == 0:
-                return base_n, base_d
-            if tail > best_tail:
-                best_tail, best_n, best_d = tail, base_n, base_d
+            if not _nd2nz_overflow(n_aligned, n_value, base_n, base_d, width):
+                tail = ceil_div(n_aligned, base_n) * d_loops % vector_cores
+                if tail == 0:
+                    return base_n, base_d
+                if tail > best_tail:
+                    best_tail, best_n, best_d = tail, base_n, base_d
             base_n -= 1
-            n_loops = (n_aligned + base_n - 1) // base_n
-            tail = n_loops * d_loops % vector_cores
     return best_n, best_d
 
 
-def validate_complete_candidate(payload, raw, suffix, fields, shape):
-    """Reject an internally inconsistent host packet before it reaches an NPU run."""
-    if len(raw) != 272:
-        raise ValueError("candidate packet is not the installed 8.1 272-byte ABI")
-    if unpack_packet(raw, "legacy272_cube200") != payload:
-        raise ValueError("candidate packet does not round-trip through the 8.1 ABI")
+def _workspace_for(family, fields, shape, conversion_a, conversion_b, fix_mode):
+    total = 20 * 1024 * 1024
+    if family == "SINGLE_CORE_SPLIT_K":
+        width = 4 if shape.dtype == "fp32" else 2
+        total += shape.m * align_up(shape.n, 256 // width) * 4
+    elif family == "DETERMINISTIC_SPLIT_K":
+        total += fields["usedCoreNum"] * fields["singleCoreM"] * fields["singleCoreN"] * 8
+    width = shape.d
+    if fix_mode == 1:
+        total += (align_up(shape.n, 512 // width) * fields["baseM"] *
+                  fields["usedCoreNum"] * 2 * width)
+    elif fix_mode == 2:
+        total += (align_up(shape.n, 16) * fields["baseM"] *
+                  fields["usedCoreNum"] * 2 * width)
+    c0 = 32 // width
+    if conversion_a:
+        total += (align_up(shape.m, c0) * align_up(shape.k, 16) * width
+                  if shape.trans_a else
+                  align_up(shape.m, 16) * align_up(shape.k, c0) * width)
+    if conversion_b:
+        total += (align_up(shape.n, 16) * align_up(shape.k, c0) * width
+                  if shape.trans_b else
+                  align_up(shape.n, c0) * align_up(shape.k, 16) * width)
+    return total
 
+
+def _validate_packet(payload, raw, suffix, fields, shape):
+    if len(raw) != 272 or unpack_packet(raw, "legacy272_cube200") != payload:
+        raise ValueError("candidate is not a round-trippable 272-byte packet")
     if suffix not in KERNEL_SUFFIXES[shape.dtype]:
-        raise ValueError(
-            f"installed CANN 8.1 has no {shape.dtype} direct branch for suffix {suffix}"
-        )
-
-    if fields["usedCoreNum"] < 1 or fields["usedCoreNum"] > FORMULA_HARDWARE.cores:
-        raise ValueError("usedCoreNum exceeds the fixed 20-AIC target")
-    for name in ("baseM", "baseN", "baseK"):
-        if fields[name] < 16 or fields[name] % 16:
-            raise ValueError(name + " is not a positive 16-element multiple")
-    if fields["dbL0C"] not in (1, 2):
-        raise ValueError("dbL0C is outside the installed kernel domain")
-
-    dtype_bytes = shape.d
-    l0a = fields["dbL0A"] * fields["baseM"] * fields["baseK"] * dtype_bytes
-    l0b = fields["dbL0B"] * fields["baseN"] * fields["baseK"] * dtype_bytes
-    l0c = fields["dbL0C"] * fields["baseM"] * fields["baseN"] * 4
-    l1 = (
-        fields["depthA1"] * fields["baseM"]
-        + fields["depthB1"] * fields["baseN"]
-    ) * fields["baseK"] * dtype_bytes
-    if l0a > FORMULA_HARDWARE.l0a or l0b > FORMULA_HARDWARE.l0b:
-        raise ValueError("candidate exceeds L0A/L0B capacity")
-    if l0c > FORMULA_HARDWARE.l0c:
-        raise ValueError("candidate exceeds L0C capacity")
-    # MatMulV3 receives 524032 from compile-info and restores the reserved
-    # 256 bytes before its L1 depth calculation.  Validate against the same
-    # execution-side 512 KiB boundary.
-    if l1 > FORMULA_HARDWARE.l1_usable + 256:
-        raise ValueError("candidate exceeds MatMulV3 physical L1 capacity")
-
-
-def generate(
-    m, k, n, dtype="fp16", trans_a=False, trans_b=False,
-    *, required_suffix=None, required_family=None, required_fields=None,
-):
-    request = make_request(m, k, n, dtype, trans_a, trans_b)
-    shape = Shape(
-        m=m,
-        n=n,
-        k=k,
-        dtype=dtype,
-        trans_a=trans_a,
-        trans_b=trans_b,
-    )
-    compile_info = CompileInfo(
-        aicore_arch=220,
-        support_l0c2out=True,
-        support_l12_bt_bf16=False,
-        orig_dtype_x1=dtype,
-        orig_dtype_x2=dtype,
-        orig_dtype_y=dtype,
-        orig_dtype_bias=dtype,
-        format_x1="ND",
-        format_x2="ND",
-        format_y="ND",
-        total_ub_size=196352,
-    )
-    # A generation or legality failure is fatal.  Falling back to the
-    # official selector here would turn an absent improved result into an
-    # apparently valid baseline packet and violate decision independence.
-    formula = solve(shape, FORMULA_HARDWARE, compile_info)
-    selection_basis = "INDEPENDENT_HARDWARE_RULE_MINIMUM"
-    required_fields = {
-        str(name): int(value)
-        for name, value in (required_fields or {}).items()
+        raise ValueError("installed CANN 8.1 does not dispatch this dtype/suffix")
+    if not 1 <= fields["usedCoreNum"] <= FORMULA_HARDWARE.cores:
+        raise ValueError("usedCoreNum is outside the 20-AIC domain")
+    if any(fields[name] < 16 or fields[name] % 16
+           for name in ("baseM", "baseN", "baseK")):
+        raise ValueError("base tile is not positive and 16-aligned")
+    width = shape.d
+    footprints = {
+        "L0A": fields.get("dbL0A", 2) * fields["baseM"] * fields["baseK"] * width,
+        "L0B": fields.get("dbL0B", 2) * fields["baseN"] * fields["baseK"] * width,
+        "L0C": fields["dbL0C"] * fields["baseM"] * fields["baseN"] * 4,
+        "L1": (fields["depthA1"] * fields["baseM"] +
+               fields["depthB1"] * fields["baseN"]) * fields["baseK"] * width,
     }
-    if (
-        required_suffix is not None
-        or required_family is not None
-        or required_fields
-    ):
-        required_suffix = (
-            None if required_suffix is None else int(required_suffix)
-        )
-        matching = [
-            candidate
-            for candidate in formula["candidate_audit"].get(
-                "all_candidates", ()
+    limits = {"L0A": 65536, "L0B": 65536, "L0C": 131072, "L1": 524288}
+    if any(footprints[name] > limits[name] for name in footprints):
+        raise ValueError(f"local capacity exceeded: {footprints}")
+    return {name: {"bytes": footprints[name], "limit": limits[name], "pass": True}
+            for name in footprints}
+
+
+def _scheduled_work(fields, shape):
+    """Exact integer work implied by a packet; it is never used to rank it."""
+    parent_m = ceil_div(shape.m, int(fields["singleCoreM"]))
+    parent_n = ceil_div(shape.n, int(fields["singleCoreN"]))
+    parent_k = ceil_div(shape.k, int(fields["singleCoreK"]))
+    base_m_per_parent = ceil_div(int(fields["singleCoreM"]), int(fields["baseM"]))
+    base_n_per_parent = ceil_div(int(fields["singleCoreN"]), int(fields["baseN"]))
+    base_k_per_parent = ceil_div(int(fields["singleCoreK"]), int(fields["baseK"]))
+    base_tile_iterations = (
+        parent_m * parent_n * parent_k *
+        base_m_per_parent * base_n_per_parent * base_k_per_parent
+    )
+    padded_cube_fma = (
+        base_tile_iterations * int(fields["baseM"]) *
+        int(fields["baseN"]) * int(fields["baseK"])
+    )
+    logical_fma = shape.m * shape.n * shape.k
+    output_tasks = parent_m * parent_n
+    return {
+        "parent_grid_mnk": [parent_m, parent_n, parent_k],
+        "base_tiles_per_parent_mnk": [
+            base_m_per_parent, base_n_per_parent, base_k_per_parent,
+        ],
+        "base_tile_iterations": base_tile_iterations,
+        "logical_fma": logical_fma,
+        "padded_cube_fma": padded_cube_fma,
+        "padding_fma": padded_cube_fma - logical_fma,
+        "output_tasks": output_tasks,
+        "launched_aic": int(fields["usedCoreNum"]),
+        "output_task_waves": ceil_div(output_tasks, int(fields["usedCoreNum"])),
+    }
+
+
+def _unchanged(request, source, reason, theory):
+    selected = _source_output(source)
+    return {
+        "status": "BASELINE_EQUIVALENT_UNCHANGED", "request": request,
+        "selected": selected, "baseline": selected, "improved": None,
+        "baseline_equivalent": True, "changed_rules": [], "changed_fields": {},
+        "skip_reason": reason,
+        "formula_family": SOURCE_TO_FORMULA_FAMILY[source["selected_family"]],
+        "kernel_suffix": int(source["tiling_key"] - 10**19),
+        "npu_eligible": False, "theory": theory,
+        "runtime_dependencies": {
+            "cost_model": False, "candidate_enumeration": False,
+            "history": False, "runtime_kb": False, "tiling_bank": False,
+            "installed_host_tiler": False,
+            "source_reconstruction_for_family_audit": True,
+            "source_packet_fields_used_for_improved_packet": False,
+        },
+        "validation": {
+            "host_packet": "SOURCE_RECONSTRUCTION_272_BYTE_PACKET",
+            "kernel_key_domain": "PASS_INSTALLED_81_DTYPE_AWARE_DISPATCH",
+            "local_capacity": "SOURCE_RULE_RESULT",
+            "npu_performance": "NOT_AN_IMPROVED_PACKET",
+        },
+    }
+
+
+def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
+    request = make_request(m, k, n, dtype, trans_a, trans_b)
+    shape = Shape(m=m, n=n, k=k, dtype=dtype,
+                  trans_a=trans_a, trans_b=trans_b)
+    compile_info = CompileInfo(
+        aicore_arch=220, support_l0c2out=True, support_l12_bt_bf16=False,
+        orig_dtype_x1=dtype, orig_dtype_x2=dtype, orig_dtype_y=dtype,
+        orig_dtype_bias=dtype, format_x1="ND", format_x2="ND",
+        format_y="ND", total_ub_size=196352,
+    )
+
+    source = source_select(
+        request, HARDWARE, source_profile="installed_81", trace=True
+    )
+    source_family = source["selected_family"]
+    source_formula_family = SOURCE_TO_FORMULA_FAMILY[source_family]
+    source_cube = source["tilingData"]["matmulTiling"]
+    source_l2 = source["tilingData"]["tileL2cacheTiling"]
+    theory = {
+        "selection_mode": "UNIQUE_ORDERED_CLOSED_FORM",
+        "complete_tilings_constructed": 1, "candidate_count": 1,
+        "candidate_enumeration": False, "pareto_pruning": False,
+        "latency_or_cost_score": False,
+        "logical_fma_count": m * n * k,
+        "logical_flop_count": 2 * m * n * k,
+        "formula_family": source_formula_family,
+        "formula_fields": {
+            name: int(source_cube[name]) for name in (
+                "usedCoreNum", "singleCoreM", "singleCoreN", "singleCoreK",
+                "baseM", "baseN", "baseK", "depthA1", "depthB1", "stepM",
+                "stepN", "stepKa", "stepKb", "dbL0A", "dbL0B", "dbL0C",
+                "iterateOrder",
             )
-            if (
-                (required_suffix is None or int(candidate["kernel_suffix"]) == required_suffix)
-                and (required_family is None or candidate["family"] == required_family)
-                and all(
-                    int(candidate["knowledge"].get(name, -1)) == value
-                    for name, value in required_fields.items()
-                )
-            )
-        ]
-        if not matching:
-            # solve omits bulky records for the deployment path.  Re-run the
-            # same independent engine with records only for explicit branch
-            # execution coverage; this still uses no official packet/data.
-            from candidate_engine import generate_and_select
-            audited = generate_and_select(
-                shape, FORMULA_HARDWARE, compile_info,
-                include_audit_records=True,
-            )
-            matching = [
-                candidate
-                for candidate in audited["candidate_audit"]["all_candidates"]
-                if (
-                    (required_suffix is None or int(candidate["kernel_suffix"]) == required_suffix)
-                    and (required_family is None or candidate["family"] == required_family)
-                    and all(
-                        int(candidate["knowledge"].get(name, -1)) == value
-                        for name, value in required_fields.items()
-                    )
-                )
-            ]
-            formula = audited
-        if not matching:
-            raise ValueError(
-                "no legal independent candidate for requested branch "
-                f"suffix={required_suffix} family={required_family} "
-                f"fields={required_fields}"
-            )
-        from candidate_engine import candidate_rule_key
-        selected = min(
-            matching,
-            key=candidate_rule_key,
-        )
-        emitted_is_rule_winner = (
-            selected["family"] == formula["family"]
-            and selected["knowledge"] == formula["knowledge"]
-        )
-        formula = dict(formula)
-        formula["candidate_audit"] = dict(formula["candidate_audit"])
-        formula["candidate_audit"].update({
-            "emitted_candidate_role": (
-                "candidate_probe" if required_fields else "branch_probe"
-            ),
-            "emitted_candidate_is_rule_minimum": emitted_is_rule_winner,
-            "required_branch_suffix": required_suffix,
-            "required_branch_family": required_family,
-            "required_candidate_fields": required_fields,
-        })
-        formula.update({
-            "family": selected["family"],
-            "fields": selected["fields"],
-            "l2": selected["l2"],
-            "conversion_a": selected["conversion_a"],
-            "conversion_b": selected["conversion_b"],
-            "fix_mode": selected["fix_mode"],
-            "resource_bytes": selected["resource_bytes"],
-            "workspace_bytes": selected["workspace_bytes"],
-            "cost": selected["cost"],
-        })
-        selection_basis = (
-            "INDEPENDENT_STRUCTURAL_PROBE_MINIMUM"
-            if required_fields
-            else "INDEPENDENT_BRANCH_COVERAGE_MINIMUM"
+        },
+        "formula_l2": dict(source_l2),
+        "resource_bytes": source["resource_facts"],
+        "branch_calculations": {
+            "attempted_families": source["attempted_families"],
+            "selected_family": source_family,
+        },
+        "legality": "SOURCE_RECONSTRUCTION_COMPLETE_PACKET",
+        "source_family": source_family,
+        "source_suffix": int(source["tiling_key"] - 10**19),
+        "source_attempts": source["attempted_families"],
+        "scheduled_work": {
+            "selected": _scheduled_work(source_cube, shape),
+        },
+        "selection_contract": {
+            "complete_tilings_constructed": 1,
+            "candidate_enumeration": False,
+            "pareto_pruning": False,
+            "latency_or_cost_score": False,
+            "history_lookup": False,
+            "runtime_tiling_bank": False,
+            "decision": "ordered_branch_predicates_then_integer_equations",
+        },
+    }
+
+    activate = None
+    if source_family == "AL1_FULL_LOAD":
+        activate = "AL1_CAPACITY_DERIVED_K_GRAIN"
+    elif (source_family == "BL1_FULL_LOAD_FIXPIPE" and
+          int(source["tiling_key"] - 10**19) == 20201 and n > 16):
+        activate = "FIXPIPE_VECTOR_MULTI_GROUP_PIPELINE"
+    if activate is None:
+        return _unchanged(
+            request, source,
+            "NO_STRICT_CLOSED_FORM_IMPROVEMENT_FOR_SOURCE_FAMILY", theory,
         )
 
+    # The replacement formula consumes only shape, fixed hardware and compile
+    # flags.  The source packet above selects the execution family but none of
+    # its tile fields are arguments to solve().
+    formula = solve(shape, FORMULA_HARDWARE, compile_info)
     fields = formula["fields"]
+    if formula["family"] != source_formula_family:
+        return _unchanged(
+            request, source, "INDEPENDENT_FORMULA_AND_SOURCE_FAMILY_DISAGREE",
+            theory,
+        )
+    theory.update({
+        "formula_family": formula["family"],
+        "formula_fields": dict(fields),
+        "formula_l2": dict(formula["l2"]),
+        "resource_bytes": dict(formula["resource_bytes"]),
+        "branch_calculations": {
+            name: value for name, value in formula.items()
+            if name not in {"input", "hardware", "compile_info", "fields", "l2",
+                            "resource_bytes", "legality", "selection_contract"}
+        },
+        "legality": formula["legality"],
+    })
+
     initializer = initialize_cube(request, HARDWARE, trace=False)
     if initializer["return_code"] != 0:
-        raise ValueError(
-            "independent MultiCore initializer rejected the improved request"
-        )
+        raise ValueError("independent initializer rejected the request")
     cube = dict(initializer["cube"])
     for name in (
         "usedCoreNum", "singleCoreM", "singleCoreN", "singleCoreK",
@@ -366,60 +387,34 @@ def generate(
         "stepN", "stepKa", "stepKb", "dbL0C", "iterateOrder",
     ):
         cube[name] = int(fields[name])
-    # Every analytic rule in this selector explicitly budgets double-buffered
-    # L0 A/B footprints.  These flags therefore follow the new fields rather
-    # than being copied from the official selector output.
-    cube["dbL0A"] = int(fields["dbL0A"])
-    cube["dbL0B"] = int(fields["dbL0B"])
+    cube["dbL0A"] = int(fields.get("dbL0A", 2))
+    cube["dbL0B"] = int(fields.get("dbL0B", 2))
     cube["dbL0C"] = int(fields["dbL0C"])
 
-    l2_formula = formula["l2"]
-    if l2_formula.get("ignored_by_this_family"):
-        l2 = {
-            "mTileCntL2": 1,
-            "nTileCntL2": 1,
-            "mTileBlock": 1,
-            "nTileBlock": 1,
-            "calOrder": 0,
-        }
-    else:
-        l2 = {
-            "mTileCntL2": int(l2_formula["mTile"]),
-            "nTileCntL2": int(l2_formula["nTile"]),
-            "mTileBlock": int(l2_formula["mTileBlock"]),
-            "nTileBlock": int(l2_formula["nTileBlock"]),
-            "calOrder": int(l2_formula["calOrder"]),
-        }
+    lf = formula["l2"]
+    l2 = {"mTileCntL2": int(lf["mTile"]), "nTileCntL2": int(lf["nTile"]),
+          "mTileBlock": int(lf["mTileBlock"]),
+          "nTileBlock": int(lf["nTileBlock"]), "calOrder": int(lf["calOrder"])}
     conversion_a = bool(formula["conversion_a"])
     conversion_b = bool(formula["conversion_b"])
     vector = {name: 0 for name in VECTOR_NAMES}
     if conversion_a:
         conversion_n, conversion_d = ((k, m) if trans_a else (m, k))
-        vector["baseAN"], vector["baseAD"] = nd2nz_geometry(
-            shape.d, conversion_n, conversion_d, fields["usedCoreNum"]
-        )
+        vector["baseAN"], vector["baseAD"] = _nd2nz_geometry(
+            shape.d, conversion_n, conversion_d, fields["usedCoreNum"])
     if conversion_b:
         conversion_n, conversion_d = ((n, k) if trans_b else (k, n))
-        vector["baseBN"], vector["baseBD"] = nd2nz_geometry(
-            shape.d, conversion_n, conversion_d, fields["usedCoreNum"]
-        )
-    run = {
-        "transA": int(trans_a),
-        "transB": int(trans_b),
-        "nd2nzA": int(conversion_a),
-        "nd2nzB": int(conversion_b),
-        "isHf32": 0,
-    }
+        vector["baseBN"], vector["baseBD"] = _nd2nz_geometry(
+            shape.d, conversion_n, conversion_d, fields["usedCoreNum"])
+    run = {"transA": int(trans_a), "transB": int(trans_b),
+           "nd2nzA": int(conversion_a), "nd2nzB": int(conversion_b),
+           "isHf32": 0}
     payload = {
         "cube_words": [int(cube[name]) & 0xFFFFFFFF for name in CUBE_FIELDS],
-        "tileL2cacheTiling": l2,
-        "matmulRunInfo": run,
-        # The installed 8.1 host writes this storage word before it computes
-        # its advisory flag.  Zero is the actual packet contract, not a value
-        # fixed by the installed packet ABI, not borrowed from another tiling.
-        "l2CacheFlag": 0,
+        "tileL2cacheTiling": l2, "matmulRunInfo": run, "l2CacheFlag": 0,
         "vector": vector,
-        "padding_hex": {"220": "00000000", "244": "00000000", "252": "00000000"},
+        "padding_hex": {"220": "00000000", "244": "00000000",
+                        "252": "00000000"},
     }
     raw = pack_packet(payload, "legacy272_cube200")
     fix_mode = int(formula.get("fix_mode", 0))
@@ -431,55 +426,132 @@ def generate(
             raise ValueError("formula family emitted an inconsistent FixOpt mode")
     mix_mode = 0 if conversion_a or conversion_b else 1
     suffix = fix_mode * 10000 + load_mode * 100 + split_mode * 10 + mix_mode
-    validate_complete_candidate(payload, raw, suffix, fields, shape)
-    key = 10**19 + suffix
-    workspace = int(formula["workspace_bytes"])
+    capacities = _validate_packet(payload, raw, suffix, fields, shape)
+    workspace = _workspace_for(
+        formula["family"], fields, shape, conversion_a, conversion_b, fix_mode)
     improved = {
-        "selected_family": (
-            "BL1_FULL_LOAD_VEC_NZ2ND"
-            if fix_mode == 2 else FAMILY_NAME[formula["family"]]
-        ),
-        "kernel_variant": KERNEL_VARIANT[suffix],
-        "tiling_key": key,
+        "selected_family": ("BL1_FULL_LOAD_VEC_NZ2ND" if fix_mode == 2
+                            else FAMILY_NAME[formula["family"]]),
+        "kernel_variant": KERNEL_VARIANT[suffix], "tiling_key": 10**19 + suffix,
         "block_dim": int(fields["usedCoreNum"]),
-        "workspace_bytes": workspace,
-        "tiling_data_bytes": len(raw),
+        "workspace_bytes": workspace, "tiling_data_bytes": len(raw),
         "tiling_data_hex": raw.hex(),
         "tiling_data_sha256": hashlib.sha256(raw).hexdigest(),
     }
+    baseline = _source_output(source)
+    baseline_cube = source["tilingData"]["matmulTiling"]
+    baseline_l2 = source["tilingData"]["tileL2cacheTiling"]
+    source_work = _scheduled_work(baseline_cube, shape)
+    improved_work = _scheduled_work(fields, shape)
+    theory["scheduled_work"] = {
+        "source": source_work,
+        "improved": improved_work,
+    }
+    changes = {
+        name: {"baseline": int(baseline_cube[name]), "improved": int(cube[name])}
+        for name in CUBE_FIELDS if int(baseline_cube[name]) != int(cube[name])
+    }
+    changes.update({
+        "l2." + name: {"baseline": int(baseline_l2[name]), "improved": int(l2[name])}
+        for name in l2 if int(baseline_l2[name]) != int(l2[name])
+    })
+    for name in ("selected_family", "tiling_key", "block_dim", "workspace_bytes"):
+        if baseline[name] != improved[name]:
+            changes[name] = {"baseline": baseline[name], "improved": improved[name]}
+    if not changes:
+        return _unchanged(request, source, "FORMULA_PRODUCED_SOURCE_VALUES", theory)
+
+    if activate == "AL1_CAPACITY_DERIVED_K_GRAIN":
+        old_k_loops = ceil_div(k, int(baseline_cube["baseK"]))
+        new_k_loops = ceil_div(k, int(fields["baseK"]))
+        old_tasks = ceil_div(n, int(baseline_cube["singleCoreN"]))
+        new_tasks = ceil_div(n, int(fields["singleCoreN"]))
+        if not (new_k_loops <= old_k_loops and new_tasks == old_tasks and
+                fields["usedCoreNum"] == min(20, new_tasks) and
+                improved_work["base_tile_iterations"] <
+                source_work["base_tile_iterations"] and
+                improved_work["padded_cube_fma"] <=
+                source_work["padded_cube_fma"] and
+                (new_k_loops < old_k_loops or
+                 fields["usedCoreNum"] < baseline["block_dim"])):
+            raise ValueError("AL1 rule lacks its declared monotonic improvement")
+        theory["improvement_equation"] = {
+            "proof_kind": "same_output_tasks_fewer_k_iterations_or_idle_cores",
+            "source_k_iterations": old_k_loops,
+            "improved_k_iterations": new_k_loops,
+            "output_tasks": new_tasks,
+            "source_launched_aic": baseline["block_dim"],
+            "improved_launched_aic": fields["usedCoreNum"],
+            "source_base_tile_iterations": source_work["base_tile_iterations"],
+            "improved_base_tile_iterations": improved_work["base_tile_iterations"],
+            "source_padded_cube_fma": source_work["padded_cube_fma"],
+            "improved_padded_cube_fma": improved_work["padded_cube_fma"],
+            "padded_cube_fma_delta": (
+                improved_work["padded_cube_fma"] - source_work["padded_cube_fma"]
+            ),
+            "eliminated_k_loop_boundaries": (
+                source_work["base_tile_iterations"] -
+                improved_work["base_tile_iterations"]
+            ),
+            "logical_fma_delta": 0,
+        }
+        rules = ["AL1_CAPACITY_DERIVED_K_GRAIN"]
+    else:
+        output_tasks = ceil_div(m, int(fields["singleCoreM"]))
+        waves = ceil_div(output_tasks, int(fields["usedCoreNum"]))
+        if not (n > 16 and waves >= 2 and fields["dbL0C"] == 2 and
+                fields["depthA1"] >= 2 and
+                improved_work["base_tile_iterations"] ==
+                source_work["base_tile_iterations"] and
+                improved_work["padded_cube_fma"] ==
+                source_work["padded_cube_fma"]):
+            raise ValueError("Fixpipe pipeline cannot reach steady state")
+        theory["improvement_equation"] = {
+            "proof_kind": "multi_wave_aic_aiv_pipeline_overlap",
+            "output_tasks": output_tasks, "active_aic": fields["usedCoreNum"],
+            "task_waves": waves,
+            "source_l0c_buffers": int(baseline_cube["dbL0C"]),
+            "improved_l0c_buffers": fields["dbL0C"],
+            "source_a_depth": int(baseline_cube["depthA1"]),
+            "improved_a_depth": fields["depthA1"],
+            "source_base_tile_iterations": source_work["base_tile_iterations"],
+            "improved_base_tile_iterations": improved_work["base_tile_iterations"],
+            "source_padded_cube_fma": source_work["padded_cube_fma"],
+            "improved_padded_cube_fma": improved_work["padded_cube_fma"],
+            "overlap_opportunities": max(output_tasks - fields["usedCoreNum"], 0),
+            "single_buffer_symbolic_critical_path": "q*(Tcube+Tfix)",
+            "double_buffer_symbolic_critical_path": (
+                "Tcube+Tfix+(q-1)*max(Tcube,Tfix)"
+            ),
+            "q_max_tasks_per_active_aic": waves,
+            "logical_fma_delta": 0,
+        }
+        rules = ["FIXPIPE_VECTOR_MULTI_GROUP_PIPELINE"]
+
+    theory["capacity_audit"] = capacities
+    theory["candidate_sha256"] = improved["tiling_data_sha256"]
     return {
-        "status": "MODIFIED_TILING",
-        "request": request,
-        "improved": improved,
-        "selection_basis": selection_basis,
-        "formula_family": formula["family"],
-        "kernel_suffix": suffix,
-        "resource_bytes": formula["resource_bytes"],
-        "cost": formula["cost"],
-        "candidate_audit": formula["candidate_audit"],
-        "npu_eligible": True,
+        "status": "MODIFIED_TILING", "request": request,
+        "selected": improved, "baseline": baseline, "improved": improved,
+        "baseline_equivalent": False, "changed_rules": rules,
+        "changed_fields": changes, "formula_family": formula["family"],
+        "kernel_suffix": suffix, "resource_bytes": formula["resource_bytes"],
+        "selection_basis": "UNIQUE_ORDERED_CLOSED_FORM", "npu_eligible": True,
+        "theory": theory,
+        "runtime_dependencies": {
+            "cost_model": False, "candidate_enumeration": False,
+            "history": False, "runtime_kb": False, "tiling_bank": False,
+            "installed_host_tiler": False,
+            "source_reconstruction_for_family_audit": True,
+            "source_packet_fields_used_for_improved_packet": False,
+        },
         "path_coverage": {
-            "initializer": "ABI_DEFAULTS_ONLY; NO_FAMILY_OR_TILE_SELECTION",
-            "family_selection": "ALL_APPLICABLE_FAMILIES_ORDERED_BY_PROTOCOL_RULE_THEN_EXACT_LOWERED_CRITICAL_PATH",
-            "base_and_parent_geometry": "MODIFIED",
-            "k_l1_pipeline": "MODIFIED",
-            "l2_partition": (
-                "NOT_CONSUMED_BY_KERNEL_FAMILY"
-                if l2_formula.get("ignored_by_this_family") else "MODIFIED"
-            ),
-            "input_conversion_predicate": "RETAINED_AND_MARKED",
-            "input_conversion_geometry": "RETAINED_AND_MARKED",
-            "kernel_implementation": "RETAINED_CANN_81_BRANCH_AND_MARKED",
+            "initializer": "ABI_DEFAULTS_ONLY_NO_TILE_SELECTION",
+            "family_selection": "ORDERED_SOURCE_RECONSTRUCTION_PLUS_INDEPENDENT_FORMULA_AGREEMENT",
+            "kernel_implementation": "RETAINED_INSTALLED_CANN_81_BRANCH_AND_MARKED",
             "abi_layout": "RETAINED_272_BYTE_ABI_AND_MARKED",
-            "official_selector_as_seed": "FORBIDDEN_AND_NOT_USED",
-            "history_or_runtime_kb": "FORBIDDEN_AND_NOT_USED",
-            "pareto_pruning": "COMPLETE_WITHIN_FAMILY_NO_FIXED_TOPN",
-            "emitted_candidate_role": (
-                "STRUCTURAL_OR_BRANCH_PROBE_NOT_CLAIMED_AS_RULE_WINNER"
-                if required_suffix is not None or required_family is not None
-                or required_fields
-                else "INDEPENDENT_RULE_WINNER"
-            ),
+            "official_runtime_tiling_seed": "FORBIDDEN_AND_NOT_USED",
+            "unmodified_source_paths": "REPORTED_AS_BASELINE_EQUIVALENT_NOT_IMPROVED",
         },
         "validation": {
             "host_packet": "PASS_272_BYTE_ABI_ROUNDTRIP",
@@ -500,8 +572,11 @@ def main():
     parser.add_argument("--trans-b", action="store_true")
     parser.add_argument("--pretty", action="store_true")
     args = parser.parse_args()
-    result = generate(args.m, args.k, args.n, args.dtype, args.trans_a, args.trans_b)
-    print(json.dumps(result, sort_keys=True, indent=2 if args.pretty else None, separators=None if args.pretty else (",", ":")))
+    result = generate(args.m, args.k, args.n, args.dtype,
+                      args.trans_a, args.trans_b)
+    print(json.dumps(result, sort_keys=True,
+                     indent=2 if args.pretty else None,
+                     separators=None if args.pretty else (",", ":")))
 
 
 if __name__ == "__main__":

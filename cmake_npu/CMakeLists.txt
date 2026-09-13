@@ -30,9 +30,6 @@ set(CANN_ROOT_LIB "${ASCEND_CANN_PACKAGE_PATH}/lib64")
 set(MATMUL_V3_KERNEL_DIR
     "${ASCEND_CANN_PACKAGE_PATH}/opp/built-in/op_impl/ai_core/tbe/impl/ascendc/mat_mul_v3"
 )
-set(MATMUL_V3_C220_KERNEL_DIR
-    "${PROJECT_ROOT}/colleague_matmul_v3/op_kernel"
-)
 add_executable(official_matmul_runner
     "${PROJECT_ROOT}/runner/official_matmul_runner.cpp"
 )
@@ -57,9 +54,6 @@ if(NOT EXISTS "${ASCENDC_CMAKE}")
 endif()
 if(NOT EXISTS "${MATMUL_V3_KERNEL_DIR}/mat_mul_v3.cpp")
     message(FATAL_ERROR "installed CANN 8.1 MatMulV3 kernel source was not found")
-endif()
-if(NOT EXISTS "${MATMUL_V3_C220_KERNEL_DIR}/mat_mul_v3.cpp")
-    message(FATAL_ERROR "bundled C220 MatMulV3 family source was not found")
 endif()
 
 # CANN 8.1's device sub-project assigns the real ld.lld path internally, so an
@@ -137,26 +131,6 @@ function(add_direct_matmul_kernel target kernel dtype suffix)
     )
 endfunction()
 
-function(add_c220_direct_matmul_kernel target kernel dtype suffix suffix_value)
-    ascendc_library(${target} STATIC
-        "${PROJECT_ROOT}/direct_matmul/kernel_entry_c220.cpp"
-    )
-    ascendc_include_directories(${target} PRIVATE
-        "${PROJECT_ROOT}/direct_matmul"
-        "${MATMUL_V3_C220_KERNEL_DIR}"
-        "${PLATFORM_ROOT}/ascendc/include"
-    )
-    ascendc_compile_definitions(${target} PRIVATE
-        MATMUL_DIRECT_KERNEL=${kernel}
-        DTYPE_X1=${dtype}
-        DTYPE_X2=${dtype}
-        DTYPE_Y=${dtype}
-        DTYPE_BIAS=${dtype}
-        MATMUL_C220_SUFFIX_VALUE=${suffix_value}
-        MATMUL_DIRECT_TILING_KEY=100000000000000${suffix}UL
-    )
-endfunction()
-
 set(DIRECT_MATMUL_KERNEL_TARGETS "")
 function(register_direct_matmul dtype_name dtype suffix suffix_padded)
     set(target "direct_matmul_kernel_${dtype_name}_${suffix}")
@@ -169,20 +143,9 @@ function(register_direct_matmul dtype_name dtype suffix suffix_padded)
     )
 endfunction()
 
-function(register_c220_direct_matmul dtype_name dtype suffix suffix_padded)
-    set(target "direct_matmul_kernel_${dtype_name}_${suffix}")
-    set(kernel "direct_matmul_${dtype_name}_k${suffix}")
-    add_c220_direct_matmul_kernel(
-        ${target} ${kernel} ${dtype} ${suffix_padded} ${suffix}
-    )
-    set(DIRECT_MATMUL_KERNEL_TARGETS
-        ${DIRECT_MATMUL_KERNEL_TARGETS} ${target} PARENT_SCOPE
-    )
-endfunction()
-
-# Exact dtype/suffix combinations emitted by the fixed 70-shape campaign.
-# Each library compiles one original CANN branch; this keeps compiler memory
-# bounded and avoids compiling impossible dtype/family combinations.
+# Exact installed CANN 8.1 dtype/suffix dispatch domain used by the selector.
+# Each library compiles one original kernel branch; the run builds only the
+# two suffixes emitted by the current theoretical validation matrix.
 register_direct_matmul(fp16 half 0 00000)
 register_direct_matmul(fp16 half 1 00001)
 register_direct_matmul(fp16 half 20 00020)
@@ -217,18 +180,6 @@ register_direct_matmul(fp32 float 201 00201)
 register_direct_matmul(fp32 float 10200 10200)
 register_direct_matmul(fp32 float 10201 10201)
 register_direct_matmul(fp32 float 20201 20201)
-
-# C220 structural paths that are absent from the installed 8.1 kernel source.
-# They use the later 280-byte packet and are measured as experimental families,
-# never as a silent fallback to an installed branch.
-register_c220_direct_matmul(fp16 half 60 00060)
-register_c220_direct_matmul(fp16 half 61 00061)
-register_c220_direct_matmul(fp16 half 121 00121)
-register_c220_direct_matmul(bf16 bfloat16_t 60 00060)
-register_c220_direct_matmul(bf16 bfloat16_t 61 00061)
-register_c220_direct_matmul(bf16 bfloat16_t 121 00121)
-register_c220_direct_matmul(fp32 float 41 00041)
-register_c220_direct_matmul(fp32 float 51 00051)
 
 # direct_matmul_runner is intentionally linked outside this CMake graph by
 # build_all.sh.  Depending on any ascendc_library target here would retraverse

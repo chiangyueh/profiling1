@@ -1,0 +1,15 @@
+[
+  {"workload_id":"audit_base_unaligned","m":10000,"n":33,"k":17,"dtype":"fp16","trans_a":false,"trans_b":false,"expected_family":"BASE","expected_suffix":0},
+  {"workload_id":"audit_base_aligned","m":2048,"n":2048,"k":512,"dtype":"bf16","trans_a":false,"trans_b":false,"expected_family":"BASE","expected_suffix":1},
+  {"workload_id":"audit_sc_unaligned","m":896,"n":4097,"k":32768,"dtype":"fp16","trans_a":false,"trans_b":false,"expected_family":"SINGLE_CORE_SPLIT_K","expected_suffix":20},
+  {"workload_id":"audit_sc_aligned","m":1024,"n":3072,"k":32768,"dtype":"bf16","trans_a":false,"trans_b":false,"expected_family":"SINGLE_CORE_SPLIT_K","expected_suffix":21},
+  {"workload_id":"audit_det_unaligned","m":16,"n":17,"k":7680,"dtype":"fp16","trans_a":false,"trans_b":false,"expected_family":"DETERMINISTIC_SPLIT_K","expected_suffix":30},
+  {"workload_id":"audit_det_aligned","m":512,"n":512,"k":27392,"dtype":"fp16","trans_a":false,"trans_b":false,"expected_family":"DETERMINISTIC_SPLIT_K","expected_suffix":31},
+  {"workload_id":"audit_al1","m":8,"n":96,"k":6144,"dtype":"fp32","trans_a":false,"trans_b":true,"expected_family":"AL1_FULL_LOAD","expected_suffix":101},
+  {"workload_id":"audit_bl1_unaligned","m":80000,"n":256,"k":7,"dtype":"fp32","trans_a":false,"trans_b":false,"expected_family":"BL1_FULL_LOAD","expected_suffix":200},
+  {"workload_id":"audit_bl1_aligned","m":32768,"n":128,"k":16,"dtype":"fp16","trans_a":false,"trans_b":false,"expected_family":"BL1_FULL_LOAD","expected_suffix":201},
+  {"workload_id":"audit_fix_unaligned","m":10240,"n":9,"k":2,"dtype":"fp32","trans_a":false,"trans_b":false,"expected_family":"BL1_FULL_LOAD_FIXPIPE","expected_suffix":10200},
+  {"workload_id":"audit_fix_aligned","m":10240,"n":65,"k":128,"dtype":"fp16","trans_a":false,"trans_b":false,"expected_family":"BL1_FULL_LOAD_FIXPIPE","expected_suffix":10201},
+  {"workload_id":"audit_fix_vector","m":12288,"n":17,"k":16,"dtype":"fp32","trans_a":false,"trans_b":false,"expected_family":"BL1_FULL_LOAD_FIXPIPE","expected_suffix":20201},
+  {"workload_id":"audit_incremental","m":64,"n":1024,"k":4096,"dtype":"fp16","trans_a":false,"trans_b":true,"expected_family":"INCREMENTAL_PATTERN","expected_suffix":1}
+]
