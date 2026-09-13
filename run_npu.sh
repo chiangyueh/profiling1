@@ -98,6 +98,28 @@ ANALYSIS="${CAMPAIGN_DIR}/analysis.json"
 SUMMARY="${CAMPAIGN_DIR}/summary.csv"
 mkdir -p "${CAMPAIGN_DIR}"
 
+cleanup_generated_state() {
+    local generated_file generated_dir
+    for generated_file in \
+        "${MANIFEST}" "${SELECTION}" "${THEORY_AUDIT}" "${RUNNER_LOG}" \
+        "${OFFICIAL_PROFILE}" "${OFFICIAL_SAMPLES}" "${ANALYSIS}"; do
+        [[ ! -e "${generated_file}" ]] || rm -f -- "${generated_file}"
+    done
+    for generated_dir in "${PACKET_DIR}" "${VARIANT_DIR}" "${SEQUENCE_DIR}"; do
+        if [[ -d "${generated_dir}" ]]; then
+            find "${generated_dir}" -mindepth 1 -delete
+            rmdir -- "${generated_dir}" 2>/dev/null || true
+        fi
+    done
+}
+
+cleanup_build_state() {
+    if [[ -d "${ROOT}/build" ]]; then
+        find "${ROOT}/build" -mindepth 1 -delete
+        rmdir -- "${ROOT}/build" 2>/dev/null || true
+    fi
+}
+
 emit_final_results() {
     local final_lines
     [[ -s "${SUMMARY}" ]] || {
@@ -116,19 +138,14 @@ if len(rows) != expected:
     raise SystemExit(f"expected {expected} final rows, found {len(rows)}")
 print("FINAL_RESULTS_BEGIN")
 by_axis = defaultdict(list)
-by_role = defaultdict(list)
 for row in rows:
     by_axis[row["selection_axis"]].append(row)
-    by_role[row["case_role"]].append(row)
     print(
         "FINAL_RESULT "
         f"id={row['workload_id']} "
         f"m={row['m']} n={row['n']} k={row['k']} "
         f"dtype={row['dtype']} trans_a={row['trans_a']} trans_b={row['trans_b']} "
         f"axis={row['selection_axis']} "
-        f"role={row['case_role']} "
-        f"applicable={row['required_applicable_family']} "
-        f"selected={row['selected_family']} "
         f"official_ms={float(row['official_median_ms']):.9g} "
         f"candidate_ms={float(row['candidate_median_ms']):.9g} "
         f"delta_pct={float(row['delta_pct']):+.3f} "
@@ -148,28 +165,6 @@ for axis in sorted(by_axis):
         f"clear_official_wins={sum(row['sample_separation'] == 'CLEAR_OFFICIAL_WINNER' for row in axis_rows)} "
         f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in axis_rows)}"
     )
-for role in sorted(by_role):
-    role_rows = by_role[role]
-    print(
-        "FINAL_ROLE_SUMMARY "
-        f"role={role} "
-        f"shapes={len(role_rows)} "
-        f"candidate_wins={sum(row['median_winner'] == 'candidate' for row in role_rows)} "
-        f"official_wins={sum(row['median_winner'] == 'official' for row in role_rows)} "
-        f"clear_candidate_wins={sum(row['sample_separation'] == 'CLEAR_CANDIDATE_WINNER' for row in role_rows)} "
-        f"clear_official_wins={sum(row['sample_separation'] == 'CLEAR_OFFICIAL_WINNER' for row in role_rows)} "
-        f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in role_rows)}"
-    )
-selector_rows = by_role["unique_theoretical_improvement"]
-print(
-    "FINAL_THEORETICAL_SUMMARY "
-    f"shapes={len(selector_rows)} "
-    f"candidate_wins={sum(row['median_winner'] == 'candidate' for row in selector_rows)} "
-    f"official_wins={sum(row['median_winner'] == 'official' for row in selector_rows)} "
-    f"clear_candidate_wins={sum(row['sample_separation'] == 'CLEAR_CANDIDATE_WINNER' for row in selector_rows)} "
-    f"clear_official_wins={sum(row['sample_separation'] == 'CLEAR_OFFICIAL_WINNER' for row in selector_rows)} "
-    f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in selector_rows)}"
-)
 print(
     "FINAL_RESULT_SUMMARY "
     f"shapes={len(rows)} "
@@ -182,23 +177,35 @@ print(
 print("FINAL_RESULTS_END")
 PY
     )"
-    while IFS= read -r result_line; do
-        announce "${result_line}"
-    done <<<"${final_lines}"
+    printf '%s\n' "${final_lines}" >"${RUN_LOG}"
+    printf '%s\n' "${final_lines}" >&3
 }
 
 on_error() {
     local rc=$?
-    announce "RULE_VALIDATION_FATAL rc=${rc} line=${BASH_LINENO[0]} results=${CAMPAIGN_DIR} log=${RUN_LOG}"
-    tail -40 "${RUN_LOG}" >&3 || true
+    local fatal_message diagnostic_tail
+    fatal_message="RULE_VALIDATION_FATAL rc=${rc} line=${BASH_LINENO[0]} results=${CAMPAIGN_DIR} log=${RUN_LOG}"
+    diagnostic_tail="$(tail -40 "${RUN_LOG}" 2>/dev/null || true)"
+    printf '%s\n%s\n' "${fatal_message}" "${diagnostic_tail}" >"${RUN_LOG}"
+    printf '%s\n' "${fatal_message}" >&3
+    printf '%s\n' "${diagnostic_tail}" >&3
+    cleanup_generated_state || true
+    rm -f -- "${SUMMARY}" || true
+    cleanup_build_state || true
     exit "${rc}"
 }
 trap on_error ERR
 
 fail() {
-    echo "fatal: $*"
-    announce "RULE_VALIDATION_FATAL rc=1 results=${CAMPAIGN_DIR} log=${RUN_LOG}"
-    tail -40 "${RUN_LOG}" >&3 || true
+    local fatal_message diagnostic_tail
+    fatal_message="RULE_VALIDATION_FATAL rc=1 error=$* results=${CAMPAIGN_DIR} log=${RUN_LOG}"
+    diagnostic_tail="$(tail -40 "${RUN_LOG}" 2>/dev/null || true)"
+    printf '%s\n%s\n' "${fatal_message}" "${diagnostic_tail}" >"${RUN_LOG}"
+    printf '%s\n' "${fatal_message}" >&3
+    printf '%s\n' "${diagnostic_tail}" >&3
+    cleanup_generated_state || true
+    rm -f -- "${SUMMARY}" || true
+    cleanup_build_state || true
     exit 1
 }
 
@@ -216,9 +223,11 @@ announce "unmodified_paths=reported_as_baseline_equivalent_and_excluded_from_imp
 announce "CANN_ENV root=${CANN_ROOT} soc=${SOC_VERSION} aic=20 visible_devices=${ASCEND_RT_VISIBLE_DEVICES}"
 announce "results=${CAMPAIGN_DIR}"
 
-if [[ -s "${ANALYSIS}" ]] && grep -q '"status": "complete"' "${ANALYSIS}"; then
+if [[ -s "${SUMMARY}" ]] && [[ "$(( $(wc -l <"${SUMMARY}") - 1 ))" -eq "${VALIDATION_SHAPES}" ]]; then
+    cleanup_generated_state
+    cleanup_build_state
     emit_final_results
-    announce "UNIQUE_FORMULA_VALIDATION_COMPLETE cached=1 analysis=${ANALYSIS} summary=${SUMMARY} theory=${THEORY_AUDIT} log=${RUN_LOG}"
+    printf '%s\n' "UNIQUE_FORMULA_VALIDATION_COMPLETE cached=1 summary=${SUMMARY} log=${RUN_LOG}" >&3
     exit 0
 fi
 : >"${RUNNER_LOG}"
@@ -487,5 +496,7 @@ python3 tools/analyze_matmul_rule_matrix.py \
     --output-csv "${SUMMARY}"
 analysis_wall_ms=$(( ($(date +%s%N) - analysis_started_ns) / 1000000 ))
 announce "CAMPAIGN_STAGE_TIMING stage=analysis wall_ms=${analysis_wall_ms}"
+cleanup_generated_state
+cleanup_build_state
 emit_final_results
-announce "UNIQUE_FORMULA_VALIDATION_COMPLETE cached=0 analysis=${ANALYSIS} summary=${SUMMARY} theory=${THEORY_AUDIT} packets=${PACKET_DIR} log=${RUN_LOG}"
+printf '%s\n' "UNIQUE_FORMULA_VALIDATION_COMPLETE cached=0 summary=${SUMMARY} log=${RUN_LOG}" >&3
