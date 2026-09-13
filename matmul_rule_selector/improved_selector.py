@@ -36,6 +36,7 @@ from formula_rules import CompileInfo, Hardware, Shape, solve  # noqa: E402
 from base_schedule_theory import (  # noqa: E402
     BaseShape as TheoryBaseShape,
     analyze as analyze_base_schedule,
+    pack_schedule_extension,
 )
 
 
@@ -318,7 +319,8 @@ def _base_schedule_formula(shape, analysis):
             "one_L2_rectangle": "PASS",
             "ownership_exact_cover": "PASS",
             "aggregate_issued_work_equal": "PASS",
-            "pipeline_envelope_dominance": "PASS",
+            "all_resource_maxima_nonincreasing": "PASS",
+            "multidimensional_balance_strictly_improved": "PASS",
         },
         "base_schedule_analysis": analysis,
         "selection_contract": analysis["selection_contract"],
@@ -454,7 +456,7 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
             base_schedule_analysis["decision"] == "ENABLE_NEW_SCHEDULER"
             and all(source_audit.values())
         ):
-            activate = "BASE_NATIVE_TILE_FLAT_RR_OWNERSHIP"
+            activate = "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE"
     elif source_family == "AL1_FULL_LOAD":
         activate = "AL1_CAPACITY_DERIVED_K_GRAIN"
     elif (source_family == "BL1_FULL_LOAD_FIXPIPE" and
@@ -469,7 +471,7 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
     # The replacement formula consumes only shape, fixed hardware and compile
     # flags.  The source packet above selects the execution family but none of
     # its tile fields are arguments to solve().
-    if activate == "BASE_NATIVE_TILE_FLAT_RR_OWNERSHIP":
+    if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE":
         formula = _base_schedule_formula(shape, base_schedule_analysis)
     else:
         formula = solve(shape, FORMULA_HARDWARE, compile_info)
@@ -542,6 +544,8 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
     mix_mode = 0 if conversion_a or conversion_b else 1
     suffix = fix_mode * 10000 + load_mode * 100 + split_mode * 10 + mix_mode
     capacities = _validate_packet(payload, raw, suffix, fields, shape)
+    if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE":
+        raw += pack_schedule_extension(base_schedule_analysis)
     workspace = _workspace_for(
         formula["family"], fields, shape, conversion_a, conversion_b, fix_mode)
     improved = {
@@ -553,11 +557,11 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
         "tiling_data_hex": raw.hex(),
         "tiling_data_sha256": hashlib.sha256(raw).hexdigest(),
     }
-    if activate == "BASE_NATIVE_TILE_FLAT_RR_OWNERSHIP":
-        improved["selected_family"] = "BASE_TAIL_BALANCED"
-        improved["kernel_variant"] = "BASE_ALIGNED_CUSTOM_FLAT_RR"
+    if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE":
+        improved["selected_family"] = "BASE_MULTIDIMENSIONAL_BALANCED"
+        improved["kernel_variant"] = "BASE_ALIGNED_CUSTOM_BALANCED_RANGES"
     runner_suffix = (
-        901 if activate == "BASE_NATIVE_TILE_FLAT_RR_OWNERSHIP" else suffix
+        901 if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE" else suffix
     )
     baseline = _source_output(source)
     baseline_cube = source["tilingData"]["matmulTiling"]
@@ -579,19 +583,19 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
     for name in ("selected_family", "tiling_key", "block_dim", "workspace_bytes"):
         if baseline[name] != improved[name]:
             changes[name] = {"baseline": baseline[name], "improved": improved[name]}
-    if activate == "BASE_NATIVE_TILE_FLAT_RR_OWNERSHIP":
+    if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE":
         changes["kernel_scheduler"] = {
             "baseline": "LCM_STAGGERED",
-            "improved": "FLAT_ROW_MAJOR_ROUND_ROBIN",
+            "improved": "FOUR_CLASS_MULTIDIMENSIONAL_BALANCED_RANGES",
         }
     if not changes:
         return _unchanged(request, source, "FORMULA_PRODUCED_SOURCE_VALUES", theory)
 
-    if activate == "BASE_NATIVE_TILE_FLAT_RR_OWNERSHIP":
+    if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE":
         analysis = base_schedule_analysis
         if not (
             analysis["invariants"]["aggregate_issued_work_equal"]
-            and analysis["proposed_vectors_covered_by_source"]
+            and analysis["all_resource_maxima_nonincreasing"]
             and analysis["decision"] == "ENABLE_NEW_SCHEDULER"
             and fields["baseM"] == 128
             and fields["baseN"] == 256
@@ -602,18 +606,25 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
         ):
             raise ValueError("BASE scheduler lacks its parameter-free dominance proof")
         theory["improvement_equation"] = {
-            "proof_kind": "componentwise_per_core_pipeline_envelope_dominance",
+            "proof_kind": "coefficient_free_multidimensional_load_balance",
             "ownership_before": "LCM-staggered source mapping",
-            "ownership_after": "linear_task=core+round*20",
+            "ownership_after": "four exact task classes with per-core ranges",
             "native_tile": [fields["baseM"], fields["baseN"], fields["baseK"]],
             "source_max_per_core": analysis["source_max_per_core"],
             "improved_max_per_core": analysis["proposed_max_per_core"],
             "strictly_reduced_resources": analysis["strictly_reduced_resources"],
+            "source_worst_normalized_load": analysis["source_balance"][
+                "worst_normalized_max_over_mean"],
+            "improved_worst_normalized_load": analysis["proposed_balance"][
+                "worst_normalized_max_over_mean"],
+            "indivisibility_lower_bound": analysis["proposed_balance"][
+                "indivisibility_lower_bound"],
+            "all_resource_maxima_nonincreasing": True,
             "aggregate_issued_work_equal": True,
             "latency_weights": False,
             "logical_fma_delta": 0,
         }
-        rules = ["BASE_NATIVE_TILE_FLAT_RR_OWNERSHIP"]
+        rules = ["BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE"]
     elif activate == "AL1_CAPACITY_DERIVED_K_GRAIN":
         old_k_loops = ceil_div(k, int(baseline_cube["baseK"]))
         new_k_loops = ceil_div(k, int(fields["baseK"]))
@@ -703,18 +714,26 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
             "family_selection": "ORDERED_SOURCE_RECONSTRUCTION_PLUS_INDEPENDENT_FORMULA_AGREEMENT",
             "kernel_implementation": (
                 "CUSTOM_BASE_OWNERSHIP_WITH_RETAINED_CANN81_MATMUL_PIPELINE"
-                if activate == "BASE_NATIVE_TILE_FLAT_RR_OWNERSHIP" else
+                if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE" else
                 "RETAINED_INSTALLED_CANN_81_BRANCH_AND_MARKED"
             ),
-            "abi_layout": "RETAINED_272_BYTE_ABI_AND_MARKED",
+            "abi_layout": (
+                "RETAINED_272_BYTE_BASE_PLUS_672_BYTE_BALANCE_SCHEDULE"
+                if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE" else
+                "RETAINED_272_BYTE_ABI_AND_MARKED"
+            ),
             "official_runtime_tiling_seed": "FORBIDDEN_AND_NOT_USED",
             "unmodified_source_paths": "REPORTED_AS_BASELINE_EQUIVALENT_NOT_IMPROVED",
         },
         "validation": {
-            "host_packet": "PASS_272_BYTE_ABI_ROUNDTRIP",
+            "host_packet": (
+                "PASS_272_BYTE_BASE_PLUS_AUDITED_672_BYTE_SCHEDULE"
+                if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE" else
+                "PASS_272_BYTE_ABI_ROUNDTRIP"
+            ),
             "kernel_key_domain": (
                 "CUSTOM_DIRECT_BASE_KERNEL_COMPILED_FOR_SUFFIX_1"
-                if activate == "BASE_NATIVE_TILE_FLAT_RR_OWNERSHIP" else
+                if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE" else
                 "PASS_INSTALLED_81_DTYPE_AWARE_DISPATCH"
             ),
             "local_capacity": "PASS_FIXED_910B3_CAPACITIES",

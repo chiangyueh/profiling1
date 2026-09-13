@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Parameter-free BASE scheduling analysis for the 20-AIC C220 kernel.
 
-This module compares two ownership formulas for an otherwise identical BASE
+This module compares two ownership schedules for an otherwise identical BASE
 packet.  It does not estimate latency, fit coefficients, enumerate tilings, or
-change baseM/baseN/baseK.  A proposed schedule is admissible only when its
-per-core pipeline work is covered component-by-component by the existing
-schedule and the aggregate issued work is identical.
+change baseM/baseN/baseK.  Every shape is decomposed into its exact full/tail
+task classes and every participating core is audited on seven additive
+pipeline resources.  A proposed schedule is admissible only when no resource
+maximum increases, normalized multidimensional imbalance strictly falls and
+aggregate issued work is identical.
 """
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from math import gcd
+from fractions import Fraction
+from math import gcd, sqrt
+import struct
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 
@@ -129,6 +133,16 @@ def derive_native_nn_packet(shape: BaseShape, cores: int = 20) -> NativeBasePack
 
 Task = Tuple[int, int]
 
+TASK_GROUPS: Tuple[str, ...] = (
+    "FULL_M_FULL_N",
+    "FULL_M_TAIL_N",
+    "TAIL_M_FULL_N",
+    "TAIL_M_TAIL_N",
+)
+BALANCED_SCHEDULE_MAGIC = 0x32425342
+BALANCED_SCHEDULE_VERSION = 2
+BALANCED_SCHEDULE_BYTES = 32 + 20 * len(TASK_GROUPS) * 8
+
 
 def source_staggered_ownership(m_count: int, n_count: int, cores: int) -> List[List[Task]]:
     """Exact one-L2-window calOrder=0 mapping in MatmulBaseBlock."""
@@ -157,6 +171,221 @@ def flat_round_robin_ownership(m_count: int, n_count: int, cores: int) -> List[L
             owned[core].append((linear // n_count, linear % n_count))
     _validate_ownership(owned, m_count, n_count)
     return owned
+
+
+@dataclass(frozen=True)
+class TaskGroup:
+    name: str
+    count: int
+    m_tail: bool
+    n_tail: bool
+    resources: Dict[str, int]
+
+
+def _task_groups(
+    shape: BaseShape, packet: NativeBasePacket,
+) -> List[TaskGroup]:
+    """Return the four exact output-tile classes for an arbitrary shape."""
+    m_count = ceil_div(shape.m, packet.single_core_m)
+    n_count = ceil_div(shape.n, packet.single_core_n)
+    has_m_tail = shape.m % packet.single_core_m != 0
+    has_n_tail = shape.n % packet.single_core_n != 0
+    full_m_count = m_count - int(has_m_tail)
+    full_n_count = n_count - int(has_n_tail)
+    representatives = (
+        ("FULL_M_FULL_N", full_m_count * full_n_count, False, False,
+         (0, 0)),
+        ("FULL_M_TAIL_N", full_m_count * int(has_n_tail), False, True,
+         (0, n_count - 1)),
+        ("TAIL_M_FULL_N", int(has_m_tail) * full_n_count, True, False,
+         (m_count - 1, 0)),
+        ("TAIL_M_TAIL_N", int(has_m_tail and has_n_tail), True, True,
+         (m_count - 1, n_count - 1)),
+    )
+    return [
+        TaskGroup(name, count, m_tail, n_tail,
+                  _task_resources(shape, packet, representative))
+        for name, count, m_tail, n_tail, representative in representatives
+    ]
+
+
+def _ratio_float(load: Dict[str, int], totals: Dict[str, int], cores: int) -> float:
+    return max(
+        load[name] * cores / totals[name]
+        for name in PIPELINE_RESOURCES
+    )
+
+
+def _assign_group_jobs(
+    loads: List[Dict[str, int]], counts: List[List[int]], group_index: int,
+    group: TaskGroup, totals: Dict[str, int], cores: int,
+) -> None:
+    """Assign one exact task class without iterating over a large tile grid.
+
+    For a fixed task vector, the per-core normalized load after x additional
+    tasks is monotone.  Bisection finds the smallest common ceiling capable of
+    accepting the whole class.  Capacity-proportional integer apportionment
+    then fills that ceiling with at most 19 deterministic remainder steps.
+    """
+    if group.count == 0:
+        return
+    vector = group.resources
+
+    def capacity(core: int, ceiling: float) -> int:
+        result = group.count
+        for name in PIPELINE_RESOURCES:
+            room = ceiling * totals[name] / cores - loads[core][name]
+            result = min(result, max(0, int((room + 1.0e-9) // vector[name])))
+        return result
+
+    low = max(_ratio_float(load, totals, cores) for load in loads)
+    high = max(
+        _ratio_float({
+            name: load[name] + group.count * vector[name]
+            for name in PIPELINE_RESOURCES
+        }, totals, cores)
+        for load in loads
+    )
+    # 32 steps resolve every uint32 task count while keeping host tiling cheap.
+    for _ in range(32):
+        middle = (low + high) / 2.0
+        if sum(capacity(core, middle) for core in range(cores)) >= group.count:
+            high = middle
+        else:
+            low = middle
+    capacities = [capacity(core, high * (1.0 + 1.0e-12) + 1.0e-12)
+                  for core in range(cores)]
+    capacity_total = sum(capacities)
+    if capacity_total < group.count:
+        raise AssertionError("water-filling ceiling cannot contain the task group")
+    assigned = [group.count * value // capacity_total for value in capacities]
+    while sum(assigned) < group.count:
+        available = [
+            core for core in range(cores) if assigned[core] < capacities[core]
+        ]
+        core = min(
+            available,
+            key=lambda index: (
+                _ratio_float({
+                    name: loads[index][name]
+                    + (assigned[index] + 1) * vector[name]
+                    for name in PIPELINE_RESOURCES
+                }, totals, cores),
+                index,
+            ),
+        )
+        assigned[core] += 1
+    for core, amount in enumerate(assigned):
+        counts[core][group_index] += amount
+        for name in PIPELINE_RESOURCES:
+            loads[core][name] += amount * vector[name]
+
+
+def _group_tasks(
+    group: TaskGroup, start: int, count: int,
+    m_count: int, n_count: int, has_m_tail: bool, has_n_tail: bool,
+) -> List[Task]:
+    full_m_count = m_count - int(has_m_tail)
+    full_n_count = n_count - int(has_n_tail)
+    tasks: List[Task] = []
+    for offset in range(start, start + count):
+        if group.name == "FULL_M_FULL_N":
+            task = (offset // full_n_count, offset % full_n_count)
+        elif group.name == "FULL_M_TAIL_N":
+            task = (offset, n_count - 1)
+        elif group.name == "TAIL_M_FULL_N":
+            task = (m_count - 1, offset)
+        elif group.name == "TAIL_M_TAIL_N":
+            task = (m_count - 1, n_count - 1)
+        else:
+            raise AssertionError("unknown task group")
+        tasks.append(task)
+    return tasks
+
+
+def balanced_group_ownership(
+    shape: BaseShape, packet: NativeBasePacket, cores: int,
+) -> Tuple[List[List[Task]], List[List[Dict[str, int]]], List[TaskGroup]]:
+    """Balance every exact tile class for any positive BASE shape.
+
+    The returned ranges are sufficient for the kernel: each core receives at
+    most one contiguous range from each of the four semantic task classes.
+    No tiling alternatives, measured weights or history are consulted.
+    """
+    m_count = ceil_div(shape.m, packet.single_core_m)
+    n_count = ceil_div(shape.n, packet.single_core_n)
+    has_m_tail = shape.m % packet.single_core_m != 0
+    has_n_tail = shape.n % packet.single_core_n != 0
+    groups = _task_groups(shape, packet)
+    totals = {
+        name: sum(group.count * group.resources[name] for group in groups)
+        for name in PIPELINE_RESOURCES
+    }
+    loads = [{name: 0 for name in PIPELINE_RESOURCES} for _ in range(cores)]
+    counts = [[0 for _ in TASK_GROUPS] for _ in range(cores)]
+    order = sorted(
+        range(len(groups)),
+        key=lambda index: (
+            max(Fraction(groups[index].resources[name] * cores, totals[name])
+                for name in PIPELINE_RESOURCES),
+            groups[index].resources["cube_mmad_fractals"],
+            -index,
+        ),
+        reverse=True,
+    )
+    for group_index in order:
+        _assign_group_jobs(
+            loads, counts, group_index, groups[group_index], totals, cores)
+
+    ranges: List[List[Dict[str, int]]] = [
+        [{"start": 0, "count": 0} for _ in TASK_GROUPS]
+        for _ in range(cores)
+    ]
+    owned: List[List[Task]] = [[] for _ in range(cores)]
+    for group_index, group in enumerate(groups):
+        start = 0
+        for core in range(cores):
+            count = counts[core][group_index]
+            ranges[core][group_index] = {"start": start, "count": count}
+            owned[core].extend(
+                _group_tasks(
+                    group, start, count, m_count, n_count,
+                    has_m_tail, has_n_tail,
+                ))
+            start += count
+        if start != group.count:
+            raise AssertionError("task-group ranges do not cover the group")
+    _validate_ownership(owned, m_count, n_count)
+    if _core_resources(shape, packet, owned) != loads:
+        raise AssertionError("range reconstruction changed per-core resources")
+    return owned, ranges, groups
+
+
+def pack_schedule_extension(analysis: dict) -> bytes:
+    """Serialize the audited four-class schedule consumed by suffix 901."""
+    grid = analysis["grid"]
+    ranges = analysis["schedule_ranges"]
+    if len(ranges) != 20 or any(len(core) != len(TASK_GROUPS) for core in ranges):
+        raise ValueError("balanced schedule must contain 20 cores and four groups")
+    values = [
+        BALANCED_SCHEDULE_MAGIC,
+        BALANCED_SCHEDULE_VERSION,
+        20,
+        len(TASK_GROUPS),
+        int(grid["tasks"]),
+        int(grid["m_count"]),
+        int(grid["n_count"]),
+        0,
+    ]
+    for core_ranges in ranges:
+        for item in core_ranges:
+            values.extend((int(item["start"]), int(item["count"])))
+    if any(value < 0 or value > 0xFFFFFFFF for value in values):
+        raise ValueError("balanced schedule exceeds the uint32 direct ABI")
+    raw = struct.pack("<" + "I" * len(values), *values)
+    if len(raw) != BALANCED_SCHEDULE_BYTES:
+        raise AssertionError("balanced schedule extension has an unexpected size")
+    return raw
 
 
 def _validate_ownership(owned: Sequence[Sequence[Task]], m_count: int, n_count: int) -> None:
@@ -219,6 +448,79 @@ def _maxima(vectors: Sequence[Dict[str, int]]) -> Dict[str, int]:
     return {name: max(vector[name] for vector in vectors) for name in PIPELINE_RESOURCES}
 
 
+def _balance_metrics(
+    vectors: Sequence[Dict[str, int]], owned: Sequence[Sequence[Task]],
+    groups: Sequence[TaskGroup],
+) -> dict:
+    participating = [
+        index for index, tasks in enumerate(owned) if len(tasks) > 0
+    ]
+    if not participating:
+        raise AssertionError("a positive shape must have a participating core")
+    resources = {}
+    global_worst = 1.0
+    lower_bound = 1.0
+    for name in PIPELINE_RESOURCES:
+        values = [vectors[index][name] for index in participating]
+        mean = sum(values) / len(values)
+        variance = sum((value - mean) ** 2 for value in values) / len(values)
+        maximum = max(values)
+        individual = max(
+            (group.resources[name] for group in groups if group.count),
+            default=0,
+        )
+        quantum = 0
+        for group in groups:
+            if group.count:
+                quantum = gcd(quantum, group.resources[name])
+        quantized_average = ceil_div(sum(values), len(values) * quantum) * quantum
+        ratio = maximum / mean
+        resource_lower = max(mean, individual, quantized_average) / mean
+        global_worst = max(global_worst, ratio)
+        lower_bound = max(lower_bound, resource_lower)
+        resources[name] = {
+            "min": min(values),
+            "mean": mean,
+            "max": maximum,
+            "max_over_mean": ratio,
+            "coefficient_of_variation": sqrt(variance) / mean,
+            "indivisible_task_lower_bound": resource_lower,
+        }
+    return {
+        "participating_cores": participating,
+        "participating_core_count": len(participating),
+        "launched_core_count": len(vectors),
+        "per_core_task_count": [len(tasks) for tasks in owned],
+        "per_core_resources": [dict(vector) for vector in vectors],
+        "resources": resources,
+        "worst_normalized_max_over_mean": global_worst,
+        "indivisibility_lower_bound": lower_bound,
+        "gap_above_lower_bound": global_worst - lower_bound,
+        "exactly_equal": all(
+            len({vectors[index][name] for index in participating}) == 1
+            for name in PIPELINE_RESOURCES
+        ),
+    }
+
+
+def _locality_metrics(owned: Sequence[Sequence[Task]]) -> dict:
+    per_core = []
+    for tasks in owned:
+        per_core.append({
+            "distinct_m_tiles": len({task[0] for task in tasks}),
+            "distinct_n_tiles": len({task[1] for task in tasks}),
+            "same_m_transitions": sum(
+                tasks[index - 1][0] == tasks[index][0]
+                for index in range(1, len(tasks))
+            ),
+            "same_n_transitions": sum(
+                tasks[index - 1][1] == tasks[index][1]
+                for index in range(1, len(tasks))
+            ),
+        })
+    return {"per_core": per_core}
+
+
 def _covered_by_source(
     proposed: Sequence[Dict[str, int]], source: Sequence[Dict[str, int]]
 ) -> Tuple[bool, List[int]]:
@@ -247,7 +549,8 @@ def analyze(shape: BaseShape, cores: int = 20, l2_bytes: int = 192 * 1024 * 1024
     m_count = ceil_div(shape.m, packet.single_core_m)
     n_count = ceil_div(shape.n, packet.single_core_n)
     source_owned = source_staggered_ownership(m_count, n_count, cores)
-    proposed_owned = flat_round_robin_ownership(m_count, n_count, cores)
+    proposed_owned, proposed_ranges, groups = balanced_group_ownership(
+        shape, packet, cores)
     source_vectors = _core_resources(shape, packet, source_owned)
     proposed_vectors = _core_resources(shape, packet, proposed_owned)
     source_total = _aggregate(source_vectors)
@@ -260,6 +563,16 @@ def analyze(shape: BaseShape, cores: int = 20, l2_bytes: int = 192 * 1024 * 1024
         name for name in PIPELINE_RESOURCES
         if proposed_max[name] < source_max[name]
     ]
+    source_balance = _balance_metrics(source_vectors, source_owned, groups)
+    proposed_balance = _balance_metrics(proposed_vectors, proposed_owned, groups)
+    balance_strict = (
+        proposed_balance["worst_normalized_max_over_mean"]
+        < source_balance["worst_normalized_max_over_mean"] - 1.0e-12
+    )
+    maxima_nonincreasing = all(
+        proposed_max[name] <= source_max[name]
+        for name in PIPELINE_RESOURCES
+    )
 
     width = shape.input_bytes
     full_problem_bytes = (
@@ -275,15 +588,27 @@ def analyze(shape: BaseShape, cores: int = 20, l2_bytes: int = 192 * 1024 * 1024
     eligible = (
         cores == 20
         and m_count * n_count > cores
-        and shape.m % packet.base_m != 0
+        and (shape.m % packet.base_m != 0 or shape.n % packet.base_n != 0)
         and all(fast_granularity.values())
         and full_problem_bytes <= l2_bytes
         and aggregate_equal
-        and covered
-        and "cube_mmad_fractals" in strict
+        and maxima_nonincreasing
+        and balance_strict
     )
+    if eligible:
+        balance_outcome = "PROPOSED_STRICTLY_BETTER_WITHOUT_RESOURCE_MAX_REGRESSION"
+    elif m_count * n_count <= cores:
+        balance_outcome = "INDIVISIBLE_OUTPUT_TASK_LIMIT"
+    elif not (shape.m % packet.base_m or shape.n % packet.base_n):
+        balance_outcome = "EQUAL_WEIGHT_TILES_NATIVE_ALREADY_BALANCED"
+    elif not balance_strict:
+        balance_outcome = "NATIVE_NOT_WORSE_ON_COEFFICIENT_FREE_BALANCE"
+    elif not maxima_nonincreasing:
+        balance_outcome = "PROPOSED_HAS_A_PIPELINE_RESOURCE_TRADEOFF"
+    else:
+        balance_outcome = "OUTSIDE_PROVEN_KERNEL_SCOPE"
     return {
-        "model": "BASE_NATIVE_TILE_FLAT_RR_OWNERSHIP_V1",
+        "model": "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE_V2",
         "shape": asdict(shape),
         "native_packet": asdict(packet),
         "grid": {"m_count": m_count, "n_count": n_count, "tasks": m_count * n_count},
@@ -304,13 +629,38 @@ def analyze(shape: BaseShape, cores: int = 20, l2_bytes: int = 192 * 1024 * 1024
         "source_max_per_core": source_max,
         "proposed_max_per_core": proposed_max,
         "strictly_reduced_resources": strict,
+        "all_resource_maxima_nonincreasing": maxima_nonincreasing,
         "proposed_vectors_covered_by_source": covered,
         "source_witness_core_for_each_proposed_core": witnesses,
+        "source_balance": source_balance,
+        "proposed_balance": proposed_balance,
+        "source_locality": _locality_metrics(source_owned),
+        "proposed_locality": _locality_metrics(proposed_owned),
+        "balance_certificate": {
+            "outcome": balance_outcome,
+            "selected_schedule": "PROPOSED" if eligible else "NATIVE",
+            "all_participating_cores_evaluated": True,
+            "all_seven_pipeline_resources_evaluated": True,
+            "unavoidable_exact_equality_exception": (
+                "indivisible output tasks can prevent exact equality"
+            ),
+        },
+        "task_groups": [
+            {
+                "name": group.name,
+                "count": group.count,
+                "m_tail": group.m_tail,
+                "n_tail": group.n_tail,
+                "resources": dict(group.resources),
+            }
+            for group in groups
+        ],
+        "schedule_ranges": proposed_ranges,
         "decision": "ENABLE_NEW_SCHEDULER" if eligible else "KEEP_NATIVE_SCHEDULER",
         "reason": (
-            "componentwise pipeline envelope is strictly reduced without changing the tiling geometry"
+            "all resource maxima are nonincreasing and multidimensional imbalance is strictly reduced"
             if eligible else
-            "no parameter-free strict pipeline-envelope improvement was proven"
+            balance_outcome
         ),
         "selection_contract": {
             "candidate_enumeration": False,
@@ -318,7 +668,9 @@ def analyze(shape: BaseShape, cores: int = 20, l2_bytes: int = 192 * 1024 * 1024
             "fitted_coefficients": False,
             "history_lookup": False,
             "official_tiling_seed": False,
-            "closed_form_owner": "linear_task = core + round * used_cores",
+            "schedule_generation": "four exact task classes plus normalized per-class water filling",
+            "balance_weights": False,
+            "balance_normalization": "each pipeline resource divided by its all-core mean",
         },
     }
 
