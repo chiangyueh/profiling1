@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare MatMulV3 with one closed-form improved tiling per shape."""
+"""Compare public MatMulV3 with proof-carrying AL1 packets."""
 from __future__ import annotations
 
 import argparse
@@ -109,6 +109,7 @@ def main() -> None:
                 "independent_structural_probe",
                 "independent_experimental_family",
                 "unique_theoretical_improvement",
+                "certified_instruction_deletion",
             )
             and new.get("measurement_source") == "direct_tiling_buffer"
             and new.get("tiling_applied") == 1
@@ -139,6 +140,26 @@ def main() -> None:
             separation = "OVERLAPPING_SAMPLES"
         selection = selections[workload_id]
         equation = selection["theory"]["improvement_equation"]
+        if not (
+            equation.get("proof_kind") ==
+            "AL1_IDLE_AIC_FULL_A_COPY_ELIMINATION"
+            and int(equation["source_launched_aic"]) == 20
+            and 5 <= int(equation["improved_launched_aic"]) <= 10
+            and int(equation["eliminated_idle_aic"]) ==
+            int(equation["source_launched_aic"]) -
+            int(equation["improved_launched_aic"])
+            and int(equation["eliminated_full_a_copy_bytes"]) ==
+            int(equation["source_full_a_copy_bytes"]) -
+            int(equation["improved_full_a_copy_bytes"])
+            and int(equation["eliminated_full_a_copy_bytes"]) > 0
+            and int(equation["new_kernel_instructions"]) == 0
+            and int(equation["new_workspace_bytes"]) == 0
+            and int(equation["new_MMAD_commands"]) == 0
+            and int(equation["new_output_tasks"]) == 0
+        ):
+            raise RuntimeError(
+                f"strict-dominance certificate failed for {workload_id}"
+            )
         row = {
             "workload_id": workload_id,
             "selection_axis": selection["selection_axis"],
@@ -158,18 +179,25 @@ def main() -> None:
                 "candidate" if new_median < old_median else "official"
             ),
             "sample_separation": separation,
-            "source_worst_normalized_load": equation[
-                "source_worst_normalized_load"
-            ],
-            "candidate_worst_normalized_load": equation[
-                "improved_worst_normalized_load"
-            ],
+            "source_launched_aic": int(equation["source_launched_aic"]),
+            "candidate_launched_aic": int(equation["improved_launched_aic"]),
+            "eliminated_idle_aic": int(equation["eliminated_idle_aic"]),
+            "source_full_a_copy_bytes": int(
+                equation["source_full_a_copy_bytes"]
+            ),
+            "candidate_full_a_copy_bytes": int(
+                equation["improved_full_a_copy_bytes"]
+            ),
+            "eliminated_full_a_copy_bytes": int(
+                equation["eliminated_full_a_copy_bytes"]
+            ),
+            "dominance_certificate": "PASS_AL1_IDLE_AIC_COPY_DELETION",
             "correctness": "PASS_BOTH_CURRENT_RUN_OUTPUTS",
         }
         output_rows.append(row)
 
     result = {
-        "schema": "matmul_unique_theoretical_selector_v1",
+        "schema": "matmul_al1_instruction_deletion_selector_v1",
         "status": "complete",
         "comparison_basis": "same_campaign_official_api_vs_unique_closed_form_tiling",
         "reference_remeasured": True,
@@ -205,8 +233,8 @@ def main() -> None:
                 for row in output_rows
             ),
             "all_current_outputs_validated": True,
-            "unique_theoretical_cases_executed": sum(
-                row["case_role"] == "unique_theoretical_improvement"
+            "certified_instruction_deletion_cases_executed": sum(
+                row["case_role"] == "certified_instruction_deletion"
                 for row in output_rows
             ),
         },
@@ -223,7 +251,7 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(output_rows)
     print(
-        "UNIQUE_FORMULA_COMPLETE "
+        "CERTIFIED_AL1_COMPLETE "
         f"shapes={len(output_rows)} candidate_wins={result['aggregate']['candidate_median_wins']} "
         f"official_wins={result['aggregate']['official_median_wins']} "
         f"overlap={result['aggregate']['overlap']}"

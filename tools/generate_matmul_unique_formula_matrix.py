@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate one closed-form improved MatMul tiling for each validation shape."""
+"""Generate proof-carrying AL1 idle-core-elimination validation packets."""
 from __future__ import annotations
 
 import argparse
@@ -28,7 +28,7 @@ FIELDS = (
     "nd2nz_b", "required_successful_tilings",
 )
 EXPECTED_VALIDATION_SHAPES = 100
-EXPECTED_VARIANTS = {("fp16", 901), ("bf16", 901)}
+EXPECTED_VARIANTS = {("fp32", 101)}
 EXPECTED_SOURCE_FAMILIES = {
     "BASE", "AL1_FULL_LOAD", "BL1_FULL_LOAD", "BL1_FULL_LOAD_FIXPIPE",
     "SINGLE_CORE_SPLIT_K", "DETERMINISTIC_SPLIT_K", "INCREMENTAL_PATTERN",
@@ -82,7 +82,7 @@ def run_selector(row: dict) -> dict:
     )
     theory = result["theory"]
     if not (
-        theory["selection_mode"] == "UNIQUE_ORDERED_CLOSED_FORM"
+        theory["selection_mode"] == "PROOF_CARRYING_CLOSED_FORM"
         and theory["complete_tilings_constructed"] == 1
         and theory["candidate_count"] == 1
         and theory["candidate_enumeration"] is False
@@ -99,97 +99,76 @@ def run_selector(row: dict) -> dict:
 
 
 def generate_validation_cases(spec: dict) -> list[tuple[dict, dict]]:
-    """Create a reproducible, stratified random BASE validation set.
-
-    M, N, K, dtype, B transpose, tail side and tail magnitude all vary.  A
-    transpose is intentionally excluded because the retained 8.1 BASE path
-    inserts an ND2NZ head there; that is a different kernel/data-flow proof.
-    Rejection only removes shapes outside the proved custom BASE scheduler.
-    """
+    """Create varied shapes inside the non-vacuous AL1 dominance domain."""
     required = {
-        "schema", "seed", "count", "m_tile_count_min", "m_tile_count_max",
-        "n_tile_count_min", "n_tile_count_max", "k_multiple_64_min",
-        "k_multiple_64_max", "dtypes", "trans_a", "trans_b",
-        "tail_patterns", "max_input_bytes", "max_attempts",
+        "schema", "seed", "count", "m_min", "m_max", "n_task_min",
+        "n_task_max", "k_multiple_128_min", "k_multiple_128_max",
+        "dtypes", "trans_a", "trans_b", "max_input_bytes", "max_attempts",
     }
     if set(spec) != required:
         raise RuntimeError("random validation specification fields changed")
     count = int(spec["count"])
     if not (1 <= count <= 100) or count != EXPECTED_VALIDATION_SHAPES:
         raise RuntimeError("NPU validation must contain 1..100 shapes")
-    if spec["schema"] != "base_balance_stratified_random_v1":
+    if spec["schema"] != "al1_idle_core_elimination_stratified_random_v1":
         raise RuntimeError("unexpected random validation schema")
-    if spec["trans_a"] != [False]:
-        raise RuntimeError("balanced BASE kernel does not contain the ND2NZ-A head")
+    if spec["trans_a"] != [False] or spec["trans_b"] != [True]:
+        raise RuntimeError("certified AL1 route requires transA=false/transB=true")
     dtypes = tuple(str(value) for value in spec["dtypes"])
-    trans_b_values = tuple(bool(value) for value in spec["trans_b"])
-    tail_patterns = tuple(str(value) for value in spec["tail_patterns"])
-    if (set(dtypes) != {"fp16", "bf16"} or
-            set(trans_b_values) != {False, True} or
-            set(tail_patterns) != {"m_tail", "n_tail", "mn_tail"}):
-        raise RuntimeError("random validation axes were reduced")
-
-    strata = [
-        (dtype, trans_b, tail_pattern)
-        for dtype in dtypes
-        for trans_b in trans_b_values
-        for tail_pattern in tail_patterns
-    ]
+    if dtypes != ("fp32",):
+        raise RuntimeError("installed suffix 101 AL1 kernel is FP32-only")
+    task_min = int(spec["n_task_min"])
+    task_max = int(spec["n_task_max"])
+    if not (5 <= task_min <= task_max <= 10):
+        raise RuntimeError("AL1 certificate requires five to ten N tasks")
+    strata = list(range(task_min, task_max + 1))
     rng = random.Random(int(spec["seed"]))
     rng.shuffle(strata)
     accepted: list[tuple[dict, dict]] = []
     seen_shapes: set[tuple] = set()
     attempts = 0
     while len(accepted) < count and attempts < int(spec["max_attempts"]):
-        dtype, trans_b, tail_pattern = strata[len(accepted) % len(strata)]
+        n_tasks = strata[len(accepted) % len(strata)]
         attempts += 1
-        m_count = rng.randint(
-            int(spec["m_tile_count_min"]), int(spec["m_tile_count_max"])
+        m = rng.randint(int(spec["m_min"]), int(spec["m_max"]))
+        # Include aligned and unaligned N tails while preserving n_tasks.
+        n = (n_tasks - 1) * 16 + rng.randint(1, 16)
+        k = 128 * rng.randint(
+            int(spec["k_multiple_128_min"]),
+            int(spec["k_multiple_128_max"]),
         )
-        n_count = rng.randint(
-            int(spec["n_tile_count_min"]), int(spec["n_tile_count_max"])
-        )
-        if m_count * n_count <= 20:
-            continue
-        m_tail = tail_pattern in ("m_tail", "mn_tail")
-        n_tail = tail_pattern in ("n_tail", "mn_tail")
-        m_tail_value = 16 * rng.randint(1, 7)
-        n_tail_value = 16 * rng.randint(1, 15)
-        m = ((m_count - 1) * 128 + m_tail_value
-             if m_tail else m_count * 128)
-        n = ((n_count - 1) * 256 + n_tail_value
-             if n_tail else n_count * 256)
-        k = 64 * rng.randint(
-            int(spec["k_multiple_64_min"]), int(spec["k_multiple_64_max"])
-        )
-        identity = (m, n, k, dtype, False, trans_b)
+        identity = (m, n, k, "fp32", False, True)
         if identity in seen_shapes:
             continue
-        input_bytes = ((m * k) + (k * n)) * 2
+        input_bytes = ((m * k) + (k * n)) * 4
         if input_bytes > int(spec["max_input_bytes"]):
             continue
         row = {
-            "workload_id": f"base_random_{len(accepted):03d}",
-            "m": m, "n": n, "k": k, "dtype": dtype,
-            "trans_a": False, "trans_b": trans_b,
-            "selection_axis": f"base_balance_{tail_pattern}",
+            "workload_id": f"al1_certified_{len(accepted):03d}",
+            "m": m, "n": n, "k": k, "dtype": "fp32",
+            "trans_a": False, "trans_b": True,
+            "selection_axis": (
+                "al1_eliminate_14_15_idle_aic" if n_tasks <= 6 else
+                "al1_eliminate_12_13_idle_aic" if n_tasks <= 8 else
+                "al1_eliminate_10_11_idle_aic"
+            ),
         }
         result = run_selector(row)
         if not (
             result["status"] == "MODIFIED_TILING"
             and result["npu_eligible"]
             and result["changed_rules"] == [
-                "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE"
+                "AL1_IDLE_CORE_FULL_A_COPY_ELIMINATION"
             ]
-            and result["kernel_suffix"] == 901
-            and result["theory"]["source_family"] == "BASE"
+            and result["kernel_suffix"] == 101
+            and result["theory"]["source_family"] == "AL1_FULL_LOAD"
         ):
             continue
         seen_shapes.add(identity)
         accepted.append((row, result))
     if len(accepted) != count:
         raise RuntimeError(
-            f"only generated {len(accepted)} eligible random BASE shapes "
+            f"only generated {len(accepted)} certified AL1 shapes "
             f"after {attempts} attempts"
         )
 
@@ -200,18 +179,19 @@ def generate_validation_cases(spec: dict) -> list[tuple[dict, dict]]:
         "k": len({row["k"] for row in rows}),
     }
     if not (
-        variation["m"] >= 50
+        variation["m"] >= 16
         and variation["n"] >= 50
         and variation["k"] >= 16
-        and {row["dtype"] for row in rows} == {"fp16", "bf16"}
-        and {row["trans_b"] for row in rows} == {False, True}
+        and {row["dtype"] for row in rows} == {"fp32"}
+        and {row["trans_b"] for row in rows} == {True}
         and {row["selection_axis"] for row in rows} == {
-            "base_balance_m_tail", "base_balance_n_tail",
-            "base_balance_mn_tail",
+            "al1_eliminate_14_15_idle_aic",
+            "al1_eliminate_12_13_idle_aic",
+            "al1_eliminate_10_11_idle_aic",
         }
     ):
         raise RuntimeError(
-            f"random BASE set lacks independent axis variation: {variation}"
+            f"certified AL1 set lacks independent axis variation: {variation}"
         )
     return accepted
 
@@ -232,6 +212,9 @@ def compact_theory(workload_id: str, result: dict) -> dict:
         "selection_contract": theory["selection_contract"],
         "scheduled_work": theory.get("scheduled_work"),
         "improvement_equation": theory.get("improvement_equation"),
+        "strict_dominance_certificate": theory.get(
+            "strict_dominance_certificate"
+        ),
         "skip_reason": result.get("skip_reason"),
     }
 
@@ -300,19 +283,19 @@ def main() -> None:
                 result["npu_eligible"] and not result["baseline_equivalent"]):
             raise RuntimeError(f"{workload_id}: no distinct improved packet")
         if result["changed_rules"] != [
-                "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE"]:
-            raise RuntimeError(f"{workload_id}: unexpected theoretical rule")
+                "AL1_IDLE_CORE_FULL_A_COPY_ELIMINATION"]:
+            raise RuntimeError(f"{workload_id}: unexpected certified rule")
         packet = result["improved"]
         blob = bytes.fromhex(packet["tiling_data_hex"])
-        if (len(blob) != 944 or result["kernel_suffix"] != 901 or
+        if (len(blob) != 272 or result["kernel_suffix"] != 101 or
                 hashlib.sha256(blob).hexdigest() != packet["tiling_data_sha256"]):
-            raise RuntimeError(f"{workload_id}: invalid 944-byte BASE packet")
+            raise RuntimeError(f"{workload_id}: invalid 272-byte AL1 packet")
         path = args.output_dir / f"{workload_id}.bin"
         path.write_bytes(blob)
         words = struct.unpack("<68I", blob[:272])
         manifest_rows.append({
             "workload_id": workload_id, "rank": "0",
-            "candidate_role": "unique_theoretical_improvement",
+            "candidate_role": "certified_instruction_deletion",
             "m": str(row["m"]), "n": str(row["n"]), "k": str(row["k"]),
             "dtype": str(row["dtype"]),
             "trans_a": str(int(row["trans_a"])),
@@ -335,7 +318,7 @@ def main() -> None:
             "workload_id": workload_id,
             "selection_axis": row["selection_axis"],
             "required_applicable_family": result["theory"]["source_family"],
-            "case_role": "unique_theoretical_improvement",
+            "case_role": "certified_instruction_deletion",
         })
         selections.append(result)
         audit_rows.append(compact_theory(workload_id, result))
@@ -363,7 +346,7 @@ def main() -> None:
             stream.write(json.dumps(result, sort_keys=True,
                                     separators=(",", ":")) + "\n")
     print(
-        "UNIQUE_FORMULA_MATRIX_GENERATED "
+        "CERTIFIED_AL1_MATRIX_GENERATED "
         f"audit_shapes={len(audit_contract)} source_families={len(source_families)} "
         f"source_suffixes={len(source_suffixes)} npu_shapes={len(manifest_rows)} "
         f"complete_tilings_per_shape=1 variants={len(grouped)} "

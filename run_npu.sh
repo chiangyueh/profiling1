@@ -8,7 +8,7 @@ WARMUP=3
 REPEAT=10
 SAMPLES=15
 VALIDATION_SHAPES=100
-EXPECTED_VARIANTS=2
+EXPECTED_VARIANTS=1
 NUMERIC_PREFLIGHT_MAX_MIB=64
 
 usage() {
@@ -73,10 +73,8 @@ CAMPAIGN_ID="$({
         scripts/env.sh \
         cmake_npu/CMakeLists.txt \
         direct_matmul/kernel_entry.cpp \
-        direct_matmul/kernel_entry_base_balanced.cpp \
         direct_matmul/mat_mul_v3_tiling_data.h \
         direct_matmul/runner.cpp \
-        matmul_rule_selector/base_schedule_theory.py \
         matmul_rule_selector/formula_rules.py \
         matmul_rule_selector/improved_selector.py \
         matmul_rule_selector/source_family_audit_contract.json \
@@ -84,7 +82,7 @@ CAMPAIGN_ID="$({
     find matmul_rule_selector/baseline_core -type f -name '*.py' -print0 |
         sort -z | xargs -0 sha256sum
 } | sha256sum | cut -c1-20)"
-CAMPAIGN_DIR="${ROOT}/results/matmul_unique_theoretical_selector_v1/${CAMPAIGN_ID}"
+CAMPAIGN_DIR="${ROOT}/results/matmul_al1_instruction_deletion_v1/${CAMPAIGN_ID}"
 PACKET_DIR="${CAMPAIGN_DIR}/packets"
 MANIFEST="${CAMPAIGN_DIR}/improved_manifest.csv"
 SELECTION="${CAMPAIGN_DIR}/selection.jsonl"
@@ -149,8 +147,10 @@ for row in rows:
         f"official_ms={float(row['official_median_ms']):.9g} "
         f"candidate_ms={float(row['candidate_median_ms']):.9g} "
         f"delta_pct={float(row['delta_pct']):+.3f} "
-        f"load_before={float(row['source_worst_normalized_load']):.6f} "
-        f"load_after={float(row['candidate_worst_normalized_load']):.6f} "
+        f"cores_before={row['source_launched_aic']} "
+        f"cores_after={row['candidate_launched_aic']} "
+        f"eliminated_idle_aic={row['eliminated_idle_aic']} "
+        f"eliminated_a_copy_bytes={row['eliminated_full_a_copy_bytes']} "
         f"winner={row['median_winner']} "
         f"separation={row['sample_separation']}"
     )
@@ -212,11 +212,11 @@ fail() {
 announce "RUN_LOG path=${RUN_LOG}"
 source_revision="$(git rev-parse HEAD 2>/dev/null || printf unknown)"
 announce "SOURCE_REVISION commit=${source_revision}"
-announce "CAMPAIGN_READY operator=matmul selector=base_multidimensional_balance random_seed=910813 npu_shapes=${VALIDATION_SHAPES} candidate_measurements=${VALIDATION_SHAPES} official_measurements=${VALIDATION_SHAPES} compiled_variants=${EXPECTED_VARIANTS} physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
+announce "CAMPAIGN_READY operator=matmul selector=al1_idle_aic_copy_elimination random_seed=910813 npu_shapes=${VALIDATION_SHAPES} candidate_measurements=${VALIDATION_SHAPES} official_measurements=${VALIDATION_SHAPES} compiled_variants=${EXPECTED_VARIANTS} physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
 announce "measurement=${WARMUP}_warmup+${SAMPLES}_device_event_samples+repeat_${REPEAT}+validate_last_timed_output"
 announce "numeric_preflight_limit_mib=${NUMERIC_PREFLIGHT_MAX_MIB}"
-announce "selection=one_parameter_free_base_schedule_per_random_shape_no_cross_family_ranking"
-announce "selector=shape_and_frozen_910b3_hardware_integer_equations_only"
+announce "selection=one_proof_carrying_al1_packet_per_shape_no_cross_family_ranking"
+announce "selector=shape_and_frozen_910b3_hardware_instruction_deletion_only"
 announce "official_reference=same_campaign_installed_aclnn_matmul_public_api"
 announce "forbidden=cost_model,measured_latency_at_selection,history_lookup_at_runtime,repo_lookup,tiling_bank,candidate_enumeration,pareto,installed_host_tiler"
 announce "unmodified_paths=reported_as_baseline_equivalent_and_excluded_from_improved_measurement"
@@ -227,7 +227,7 @@ if [[ -s "${SUMMARY}" ]] && [[ "$(( $(wc -l <"${SUMMARY}") - 1 ))" -eq "${VALIDA
     cleanup_generated_state
     cleanup_build_state
     emit_final_results
-    printf '%s\n' "UNIQUE_FORMULA_VALIDATION_COMPLETE cached=1 summary=${SUMMARY} log=${RUN_LOG}" >&3
+    printf '%s\n' "CERTIFIED_AL1_VALIDATION_COMPLETE cached=1 summary=${SUMMARY} log=${RUN_LOG}" >&3
     exit 0
 fi
 : >"${RUNNER_LOG}"
@@ -244,7 +244,7 @@ actual_variants="$(find "${VARIANT_DIR}" -maxdepth 1 -type f -name '*.csv' | wc 
 [[ "${actual_variants}" -eq "${EXPECTED_VARIANTS}" ]] || \
     fail "generated ${actual_variants} dtype/suffix variants; expected ${EXPECTED_VARIANTS}"
 generation_wall_ms=$(( ($(date +%s%N) - generation_started_ns) / 1000000 ))
-announce "UNIQUE_FORMULA_PACKET_GENERATION passed shapes=${VALIDATION_SHAPES} source_families=7 source_suffixes=12 variants=${EXPECTED_VARIANTS} complete_tilings_per_shape=1 packet_bytes=944"
+announce "CERTIFIED_AL1_PACKET_GENERATION passed shapes=${VALIDATION_SHAPES} source_families=7 source_suffixes=12 variants=${EXPECTED_VARIANTS} complete_tilings_per_shape=1 packet_bytes=272 proof=AL1_IDLE_AIC_FULL_A_COPY_ELIMINATION"
 announce "CAMPAIGN_STAGE_TIMING stage=unique_formula_packet_generation wall_ms=${generation_wall_ms}"
 
 input_cap_audit="$(python3 - "${MANIFEST}" "${NUMERIC_PREFLIGHT_MAX_MIB}" <<'PY'
@@ -458,7 +458,7 @@ for packet_manifest in "${SEQUENCE_DIR}"/*.csv; do
     fi
     canary_invalid="$(grep -c 'DIRECT_MATMUL_RESULT .*"status":"failed"' <<<"${canary_output}" || true)"
     if [[ "${canary_rc}" -ne 0 || "${canary_invalid}" -ne 0 ]]; then
-        printf '%s\n' "${canary_output}" | sed 's/^/UNIQUE_FORMULA_CANARY_RECORD /'
+        printf '%s\n' "${canary_output}" | sed 's/^/CERTIFIED_AL1_CANARY_RECORD /'
         candidate_batch_failures=$((candidate_batch_failures + 1))
         announce "CANDIDATE_CANARY ${batch_index}/${EXPECTED_VARIANTS} failed variant=${variant} rc=${canary_rc} invalid_shapes=${canary_invalid}; formal_measurement=skipped"
         continue
@@ -499,4 +499,4 @@ announce "CAMPAIGN_STAGE_TIMING stage=analysis wall_ms=${analysis_wall_ms}"
 cleanup_generated_state
 cleanup_build_state
 emit_final_results
-printf '%s\n' "UNIQUE_FORMULA_VALIDATION_COMPLETE cached=0 summary=${SUMMARY} log=${RUN_LOG}" >&3
+printf '%s\n' "CERTIFIED_AL1_VALIDATION_COMPLETE cached=0 summary=${SUMMARY} log=${RUN_LOG}" >&3

@@ -32,12 +32,7 @@ from matmul_reconstruction._core.initializer import (  # noqa: E402
 )
 from matmul_reconstruction.api import select as source_select  # noqa: E402
 
-from formula_rules import CompileInfo, Hardware, Shape, solve  # noqa: E402
-from base_schedule_theory import (  # noqa: E402
-    BaseShape as TheoryBaseShape,
-    analyze as analyze_base_schedule,
-    pack_schedule_extension,
-)
+from formula_rules import Hardware, Shape  # noqa: E402
 
 
 HARDWARE = {
@@ -263,67 +258,100 @@ def _scheduled_work(fields, shape):
     }
 
 
-def _base_schedule_formula(shape, analysis):
-    """Build the one packet admitted by the BASE ownership proof.
+def _al1_idle_core_formula(shape):
+    """Derive the source-backed AL1 packet with idle AICs removed.
 
-    Tile geometry is derived by base_schedule_theory and is not copied from
-    the reconstructed source packet.  The custom kernel changes ownership;
-    the packet deliberately retains the native C220 pipeline geometry.
+    The CANN 8.1 AL1 kernel copies the complete A matrix into every launched
+    AIC's L1 before it checks whether that AIC owns an output task.  The
+    installed host rule always launches all 20 AICs.  In this deliberately
+    narrow domain there are only ceil(N/16) output tasks, so launching exactly
+    that many AICs deletes complete GM-to-L1 copies on otherwise idle AICs.
+
+    Every field below is derived from shape and fixed C220 capacities.  No
+    source packet field is used to construct the candidate.
     """
-    packet = analysis["native_packet"]
+    if not (
+        shape.dtype == "fp32"
+        and not shape.trans_a
+        and shape.trans_b
+        and 1 <= shape.m <= 16
+        and 16 < shape.n <= 160
+        and 5120 <= shape.k <= 7168
+        and shape.k % 128 == 0
+    ):
+        raise ValueError("shape is outside the certified AL1 idle-core domain")
+    output_tasks = ceil_div(shape.n, 16)
+    if not 5 <= output_tasks <= 10:
+        raise ValueError("certified AL1 domain requires five to ten N tasks")
+    k_iterations = ceil_div(shape.k, 256)
     fields = {
-        "baseM": int(packet["base_m"]),
-        "baseN": int(packet["base_n"]),
-        "baseK": int(packet["base_k"]),
-        "singleCoreM": int(packet["single_core_m"]),
-        "singleCoreN": int(packet["single_core_n"]),
-        "singleCoreK": int(packet["single_core_k"]),
-        "usedCoreNum": int(packet["used_cores"]),
-        "stepM": 1,
-        "stepN": 1,
-        "stepKa": int(packet["step_ka"]),
-        "stepKb": int(packet["step_kb"]),
-        "depthA1": int(packet["depth_a1"]),
-        "depthB1": int(packet["depth_b1"]),
-        "dbL0A": 2,
-        "dbL0B": 2,
-        "dbL0C": int(packet["db_l0c"]),
+        "baseM": 16, "baseN": 16, "baseK": 256,
+        "singleCoreM": shape.m, "singleCoreN": 16,
+        "singleCoreK": shape.k, "usedCoreNum": output_tasks,
+        "stepM": 1, "stepN": 1,
+        "stepKa": k_iterations, "stepKb": 1,
+        "depthA1": k_iterations, "depthB1": 2,
+        "dbL0A": 2, "dbL0B": 2, "dbL0C": 2,
         "iterateOrder": 0,
     }
-    width = shape.d
+    full_a_copy_bytes = align_up(shape.m, 16) * align_up(shape.k, 8) * 4
+    eliminated_idle_aic = FORMULA_HARDWARE.cores - output_tasks
+    eliminated_full_a_copy_bytes = eliminated_idle_aic * full_a_copy_bytes
     resource_bytes = {
-        "L0A_double": 2 * fields["baseM"] * fields["baseK"] * width,
-        "L0B_double": 2 * fields["baseN"] * fields["baseK"] * width,
+        "L0A_double": 2 * fields["baseM"] * fields["baseK"] * 4,
+        "L0B_double": 2 * fields["baseN"] * fields["baseK"] * 4,
         "L0C": fields["dbL0C"] * fields["baseM"] * fields["baseN"] * 4,
-        "L1_AB": (
-            fields["depthA1"] * fields["baseM"]
-            + fields["depthB1"] * fields["baseN"]
-        ) * fields["baseK"] * width,
+        "L1_AB": (fields["depthA1"] * fields["baseM"]
+                  + fields["depthB1"] * fields["baseN"]) * fields["baseK"] * 4,
         "bias_reserved": 0,
     }
     return {
-        "family": "BASE",
+        "family": "AL1",
         "fields": fields,
         "l2": {
-            "mTile": 1,
-            "nTile": 1,
-            "mTileBlock": int(analysis["grid"]["m_count"]),
-            "nTileBlock": int(analysis["grid"]["n_count"]),
-            "calOrder": 0,
+            "mTile": 1, "nTile": 1,
+            "mTileBlock": 1, "nTileBlock": output_tasks,
+            "calOrder": 1,
         },
         "resource_bytes": resource_bytes,
         "conversion_a": False,
         "conversion_b": False,
+        "fix_mode": 0,
         "legality": {
-            "native_C220_capacity": "PASS",
-            "one_L2_rectangle": "PASS",
-            "ownership_exact_cover": "PASS",
-            "aggregate_issued_work_equal": "PASS",
-            "all_resource_maxima_nonincreasing": "PASS",
-            "multidimensional_balance_strictly_improved": "PASS",
+            "source_AL1_predicate": "PASS",
+            "same_suffix_101_kernel": "PASS",
+            "same_active_core_output_ownership": "PASS",
+            "same_MMAD_and_output_work": "PASS",
+            "strictly_fewer_full_A_copies": "PASS",
+            "no_new_kernel_instructions": "PASS",
+            "local_capacity": "PASS",
         },
-        "base_schedule_analysis": analysis,
-        "selection_contract": analysis["selection_contract"],
+        "dominance_certificate": {
+            "proof_kind": "AL1_IDLE_AIC_FULL_A_COPY_ELIMINATION",
+            "source_launched_aic": FORMULA_HARDWARE.cores,
+            "improved_launched_aic": output_tasks,
+            "output_tasks": output_tasks,
+            "eliminated_idle_aic": eliminated_idle_aic,
+            "full_a_copy_bytes_per_launched_aic": full_a_copy_bytes,
+            "source_full_a_copy_bytes": FORMULA_HARDWARE.cores * full_a_copy_bytes,
+            "improved_full_a_copy_bytes": output_tasks * full_a_copy_bytes,
+            "eliminated_full_a_copy_bytes": eliminated_full_a_copy_bytes,
+            "source_copy_order": "COPY_FULL_A_BEFORE_OUTPUT_TASK_GUARD",
+            "active_core_instruction_stream": "UNCHANGED_SUFFIX_101",
+            "new_kernel_instructions": 0,
+            "new_workspace_bytes": 0,
+            "new_MMAD_commands": 0,
+            "new_output_tasks": 0,
+        },
+        "selection_contract": {
+            "complete_tilings_constructed": 1,
+            "candidate_enumeration": False,
+            "pareto_pruning": False,
+            "latency_or_cost_score": False,
+            "history_lookup": False,
+            "runtime_tiling_bank": False,
+            "decision": "closed_form_AL1_idle_AIC_elimination",
+        },
     }
 
 
@@ -357,13 +385,6 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
     request = make_request(m, k, n, dtype, trans_a, trans_b)
     shape = Shape(m=m, n=n, k=k, dtype=dtype,
                   trans_a=trans_a, trans_b=trans_b)
-    compile_info = CompileInfo(
-        aicore_arch=220, support_l0c2out=True, support_l12_bt_bf16=False,
-        orig_dtype_x1=dtype, orig_dtype_x2=dtype, orig_dtype_y=dtype,
-        orig_dtype_bias=dtype, format_x1="ND", format_x2="ND",
-        format_y="ND", total_ub_size=196352,
-    )
-
     source = source_select(
         request, HARDWARE, source_profile="installed_81", trace=True
     )
@@ -372,7 +393,7 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
     source_cube = source["tilingData"]["matmulTiling"]
     source_l2 = source["tilingData"]["tileL2cacheTiling"]
     theory = {
-        "selection_mode": "UNIQUE_ORDERED_CLOSED_FORM",
+        "selection_mode": "PROOF_CARRYING_CLOSED_FORM",
         "complete_tilings_constructed": 1, "candidate_count": 1,
         "candidate_enumeration": False, "pareto_pruning": False,
         "latency_or_cost_score": False,
@@ -412,69 +433,28 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
     }
 
     activate = None
-    base_schedule_analysis = None
-    if source_family == "BASE" and dtype in ("fp16", "bf16") and not trans_a:
-        base_schedule_analysis = analyze_base_schedule(
-            TheoryBaseShape(m=m, n=n, k=k, dtype=dtype)
-        )
-        native = base_schedule_analysis["native_packet"]
-        expected_cube = {
-            "baseM": native["base_m"], "baseN": native["base_n"],
-            "baseK": native["base_k"],
-            "singleCoreM": native["single_core_m"],
-            "singleCoreN": native["single_core_n"],
-            "singleCoreK": native["single_core_k"],
-            "usedCoreNum": native["used_cores"],
-            "stepM": 1, "stepN": 1,
-            "stepKa": native["step_ka"], "stepKb": native["step_kb"],
-            "depthA1": native["depth_a1"], "depthB1": native["depth_b1"],
-            "dbL0C": native["db_l0c"], "iterateOrder": 0,
-        }
-        expected_l2 = {
-            "mTileCntL2": 1, "nTileCntL2": 1,
-            "mTileBlock": base_schedule_analysis["grid"]["m_count"],
-            "nTileBlock": base_schedule_analysis["grid"]["n_count"],
-            "calOrder": 0,
-        }
-        source_audit = {
-            "cube_native_match": all(
-                int(source_cube[name]) == int(value)
-                for name, value in expected_cube.items()
-            ),
-            "one_rectangle_match": all(
-                int(source_l2[name]) == int(value)
-                for name, value in expected_l2.items()
-            ),
-            "no_head_conversion": not (
-                source["tilingData"]["matmulRunInfo"]["nd2nzA"]
-                or source["tilingData"]["matmulRunInfo"]["nd2nzB"]
-            ),
-        }
-        base_schedule_analysis["source_scope_audit"] = source_audit
-        theory["base_schedule_analysis"] = base_schedule_analysis
-        if (
-            base_schedule_analysis["decision"] == "ENABLE_NEW_SCHEDULER"
-            and all(source_audit.values())
-        ):
-            activate = "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE"
-    elif source_family == "AL1_FULL_LOAD":
-        activate = "AL1_CAPACITY_DERIVED_K_GRAIN"
-    elif (source_family == "BL1_FULL_LOAD_FIXPIPE" and
-          int(source["tiling_key"] - 10**19) == 20201 and n > 16):
-        activate = "FIXPIPE_VECTOR_MULTI_GROUP_PIPELINE"
+    if (
+        source_family == "AL1_FULL_LOAD"
+        and dtype == "fp32"
+        and not trans_a
+        and trans_b
+        and 1 <= m <= 16
+        and 16 < n <= 160
+        and 5120 <= k <= 7168
+        and k % 128 == 0
+        and 5 <= ceil_div(n, 16) <= 10
+    ):
+        activate = "AL1_IDLE_CORE_FULL_A_COPY_ELIMINATION"
     if activate is None:
         return _unchanged(
             request, source,
             "NO_STRICT_CLOSED_FORM_IMPROVEMENT_FOR_SOURCE_FAMILY", theory,
         )
 
-    # The replacement formula consumes only shape, fixed hardware and compile
-    # flags.  The source packet above selects the execution family but none of
-    # its tile fields are arguments to solve().
-    if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE":
-        formula = _base_schedule_formula(shape, base_schedule_analysis)
-    else:
-        formula = solve(shape, FORMULA_HARDWARE, compile_info)
+    # The replacement consumes shape and fixed hardware only.  The source
+    # reconstruction above audits applicability but contributes no packet
+    # field to the candidate.
+    formula = _al1_idle_core_formula(shape)
     fields = formula["fields"]
     if formula["family"] != source_formula_family:
         return _unchanged(
@@ -544,8 +524,6 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
     mix_mode = 0 if conversion_a or conversion_b else 1
     suffix = fix_mode * 10000 + load_mode * 100 + split_mode * 10 + mix_mode
     capacities = _validate_packet(payload, raw, suffix, fields, shape)
-    if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE":
-        raw += pack_schedule_extension(base_schedule_analysis)
     workspace = _workspace_for(
         formula["family"], fields, shape, conversion_a, conversion_b, fix_mode)
     improved = {
@@ -557,12 +535,7 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
         "tiling_data_hex": raw.hex(),
         "tiling_data_sha256": hashlib.sha256(raw).hexdigest(),
     }
-    if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE":
-        improved["selected_family"] = "BASE_MULTIDIMENSIONAL_BALANCED"
-        improved["kernel_variant"] = "BASE_ALIGNED_CUSTOM_BALANCED_RANGES"
-    runner_suffix = (
-        901 if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE" else suffix
-    )
+    runner_suffix = suffix
     baseline = _source_output(source)
     baseline_cube = source["tilingData"]["matmulTiling"]
     baseline_l2 = source["tilingData"]["tileL2cacheTiling"]
@@ -583,114 +556,40 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
     for name in ("selected_family", "tiling_key", "block_dim", "workspace_bytes"):
         if baseline[name] != improved[name]:
             changes[name] = {"baseline": baseline[name], "improved": improved[name]}
-    if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE":
-        changes["kernel_scheduler"] = {
-            "baseline": "LCM_STAGGERED",
-            "improved": "FOUR_CLASS_MULTIDIMENSIONAL_BALANCED_RANGES",
-        }
     if not changes:
         return _unchanged(request, source, "FORMULA_PRODUCED_SOURCE_VALUES", theory)
 
-    if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE":
-        analysis = base_schedule_analysis
-        if not (
-            analysis["invariants"]["aggregate_issued_work_equal"]
-            and analysis["all_resource_maxima_nonincreasing"]
-            and analysis["decision"] == "ENABLE_NEW_SCHEDULER"
-            and fields["baseM"] == 128
-            and fields["baseN"] == 256
-            and fields["baseK"] == 64
-            and l2["mTileCntL2"] == 1
-            and l2["nTileCntL2"] == 1
-            and l2["calOrder"] == 0
-        ):
-            raise ValueError("BASE scheduler lacks its parameter-free dominance proof")
-        theory["improvement_equation"] = {
-            "proof_kind": "coefficient_free_multidimensional_load_balance",
-            "ownership_before": "LCM-staggered source mapping",
-            "ownership_after": "four exact task classes with per-core ranges",
-            "native_tile": [fields["baseM"], fields["baseN"], fields["baseK"]],
-            "source_max_per_core": analysis["source_max_per_core"],
-            "improved_max_per_core": analysis["proposed_max_per_core"],
-            "strictly_reduced_resources": analysis["strictly_reduced_resources"],
-            "source_worst_normalized_load": analysis["source_balance"][
-                "worst_normalized_max_over_mean"],
-            "improved_worst_normalized_load": analysis["proposed_balance"][
-                "worst_normalized_max_over_mean"],
-            "indivisibility_lower_bound": analysis["proposed_balance"][
-                "indivisibility_lower_bound"],
-            "all_resource_maxima_nonincreasing": True,
-            "aggregate_issued_work_equal": True,
-            "latency_weights": False,
-            "logical_fma_delta": 0,
-        }
-        rules = ["BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE"]
-    elif activate == "AL1_CAPACITY_DERIVED_K_GRAIN":
-        old_k_loops = ceil_div(k, int(baseline_cube["baseK"]))
-        new_k_loops = ceil_div(k, int(fields["baseK"]))
-        old_tasks = ceil_div(n, int(baseline_cube["singleCoreN"]))
-        new_tasks = ceil_div(n, int(fields["singleCoreN"]))
-        if not (new_k_loops <= old_k_loops and new_tasks == old_tasks and
-                fields["usedCoreNum"] == min(20, new_tasks) and
-                improved_work["base_tile_iterations"] <
-                source_work["base_tile_iterations"] and
-                improved_work["padded_cube_fma"] <=
-                source_work["padded_cube_fma"] and
-                (new_k_loops < old_k_loops or
-                 fields["usedCoreNum"] < baseline["block_dim"])):
-            raise ValueError("AL1 rule lacks its declared monotonic improvement")
-        theory["improvement_equation"] = {
-            "proof_kind": "same_output_tasks_fewer_k_iterations_or_idle_cores",
-            "source_k_iterations": old_k_loops,
-            "improved_k_iterations": new_k_loops,
-            "output_tasks": new_tasks,
-            "source_launched_aic": baseline["block_dim"],
-            "improved_launched_aic": fields["usedCoreNum"],
-            "source_base_tile_iterations": source_work["base_tile_iterations"],
-            "improved_base_tile_iterations": improved_work["base_tile_iterations"],
-            "source_padded_cube_fma": source_work["padded_cube_fma"],
-            "improved_padded_cube_fma": improved_work["padded_cube_fma"],
-            "padded_cube_fma_delta": (
-                improved_work["padded_cube_fma"] - source_work["padded_cube_fma"]
-            ),
-            "eliminated_k_loop_boundaries": (
-                source_work["base_tile_iterations"] -
-                improved_work["base_tile_iterations"]
-            ),
-            "logical_fma_delta": 0,
-        }
-        rules = ["AL1_CAPACITY_DERIVED_K_GRAIN"]
-    else:
-        output_tasks = ceil_div(m, int(fields["singleCoreM"]))
-        waves = ceil_div(output_tasks, int(fields["usedCoreNum"]))
-        if not (n > 16 and waves >= 2 and fields["dbL0C"] == 2 and
-                fields["depthA1"] >= 2 and
-                improved_work["base_tile_iterations"] ==
-                source_work["base_tile_iterations"] and
-                improved_work["padded_cube_fma"] ==
-                source_work["padded_cube_fma"]):
-            raise ValueError("Fixpipe pipeline cannot reach steady state")
-        theory["improvement_equation"] = {
-            "proof_kind": "multi_wave_aic_aiv_pipeline_overlap",
-            "output_tasks": output_tasks, "active_aic": fields["usedCoreNum"],
-            "task_waves": waves,
-            "source_l0c_buffers": int(baseline_cube["dbL0C"]),
-            "improved_l0c_buffers": fields["dbL0C"],
-            "source_a_depth": int(baseline_cube["depthA1"]),
-            "improved_a_depth": fields["depthA1"],
-            "source_base_tile_iterations": source_work["base_tile_iterations"],
-            "improved_base_tile_iterations": improved_work["base_tile_iterations"],
-            "source_padded_cube_fma": source_work["padded_cube_fma"],
-            "improved_padded_cube_fma": improved_work["padded_cube_fma"],
-            "overlap_opportunities": max(output_tasks - fields["usedCoreNum"], 0),
-            "single_buffer_symbolic_critical_path": "q*(Tcube+Tfix)",
-            "double_buffer_symbolic_critical_path": (
-                "Tcube+Tfix+(q-1)*max(Tcube,Tfix)"
-            ),
-            "q_max_tasks_per_active_aic": waves,
-            "logical_fma_delta": 0,
-        }
-        rules = ["FIXPIPE_VECTOR_MULTI_GROUP_PIPELINE"]
+    certificate = formula["dominance_certificate"]
+    cube_differences = {
+        name for name in CUBE_FIELDS
+        if int(baseline_cube[name]) != int(cube[name])
+    }
+    if not (
+        int(source["tiling_key"] - 10**19) == 101
+        and suffix == 101
+        and baseline["block_dim"] == FORMULA_HARDWARE.cores
+        and cube_differences == {"usedCoreNum"}
+        and all(int(baseline_l2[name]) == int(l2[name]) for name in l2)
+        and baseline["workspace_bytes"] == improved["workspace_bytes"]
+        and all(
+            source_work[name] == improved_work[name]
+            for name in (
+                "parent_grid_mnk", "base_tiles_per_parent_mnk",
+                "base_tile_iterations", "logical_fma", "padded_cube_fma",
+                "padding_fma", "output_tasks", "output_task_waves",
+            )
+        )
+        and certificate["eliminated_idle_aic"] > 0
+        and certificate["eliminated_full_a_copy_bytes"] > 0
+        and certificate["new_kernel_instructions"] == 0
+        and certificate["new_workspace_bytes"] == 0
+        and certificate["new_MMAD_commands"] == 0
+        and certificate["new_output_tasks"] == 0
+    ):
+        raise ValueError("AL1 candidate lacks exact instruction-deletion dominance")
+    theory["improvement_equation"] = dict(certificate)
+    theory["strict_dominance_certificate"] = dict(certificate)
+    rules = ["AL1_IDLE_CORE_FULL_A_COPY_ELIMINATION"]
 
     theory["capacity_audit"] = capacities
     theory["candidate_sha256"] = improved["tiling_data_sha256"]
@@ -700,7 +599,7 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
         "baseline_equivalent": False, "changed_rules": rules,
         "changed_fields": changes, "formula_family": formula["family"],
         "kernel_suffix": runner_suffix, "resource_bytes": formula["resource_bytes"],
-        "selection_basis": "UNIQUE_ORDERED_CLOSED_FORM", "npu_eligible": True,
+        "selection_basis": "PROOF_CARRYING_CLOSED_FORM", "npu_eligible": True,
         "theory": theory,
         "runtime_dependencies": {
             "cost_model": False, "candidate_enumeration": False,
@@ -712,30 +611,14 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
         "path_coverage": {
             "initializer": "ABI_DEFAULTS_ONLY_NO_TILE_SELECTION",
             "family_selection": "ORDERED_SOURCE_RECONSTRUCTION_PLUS_INDEPENDENT_FORMULA_AGREEMENT",
-            "kernel_implementation": (
-                "CUSTOM_BASE_OWNERSHIP_WITH_RETAINED_CANN81_MATMUL_PIPELINE"
-                if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE" else
-                "RETAINED_INSTALLED_CANN_81_BRANCH_AND_MARKED"
-            ),
-            "abi_layout": (
-                "RETAINED_272_BYTE_BASE_PLUS_672_BYTE_BALANCE_SCHEDULE"
-                if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE" else
-                "RETAINED_272_BYTE_ABI_AND_MARKED"
-            ),
+            "kernel_implementation": "UNCHANGED_SUFFIX_101_AL1_KERNEL",
+            "abi_layout": "RETAINED_272_BYTE_ABI_ONLY_USED_CORE_NUM_DIFFERS",
             "official_runtime_tiling_seed": "FORBIDDEN_AND_NOT_USED",
             "unmodified_source_paths": "REPORTED_AS_BASELINE_EQUIVALENT_NOT_IMPROVED",
         },
         "validation": {
-            "host_packet": (
-                "PASS_272_BYTE_BASE_PLUS_AUDITED_672_BYTE_SCHEDULE"
-                if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE" else
-                "PASS_272_BYTE_ABI_ROUNDTRIP"
-            ),
-            "kernel_key_domain": (
-                "CUSTOM_DIRECT_BASE_KERNEL_COMPILED_FOR_SUFFIX_1"
-                if activate == "BASE_NATIVE_TILE_MULTIDIMENSIONAL_BALANCE" else
-                "PASS_INSTALLED_81_DTYPE_AWARE_DISPATCH"
-            ),
+            "host_packet": "PASS_272_BYTE_ABI_ROUNDTRIP",
+            "kernel_key_domain": "PASS_INSTALLED_81_FP32_SUFFIX_101_DISPATCH",
             "local_capacity": "PASS_FIXED_910B3_CAPACITIES",
             "npu_performance": "NOT_MEASURED",
         },

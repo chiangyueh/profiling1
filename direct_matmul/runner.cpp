@@ -251,7 +251,8 @@ std::vector<Candidate> LoadManifest(const std::string &path)
              row.role != "independent_global_winner" &&
              row.role != "independent_branch_probe" &&
              row.role != "independent_experimental_family" &&
-             row.role != "unique_theoretical_improvement") ||
+             row.role != "unique_theoretical_improvement" &&
+             row.role != "certified_instruction_deletion") ||
             row.m <= 0 || row.n <= 0 || row.k <= 0 || row.usedCores == 0 ||
             row.workspaceBytes < 20U * 1024U * 1024U ||
             row.requiredSuccessfulTilings == 0) {
@@ -429,9 +430,7 @@ std::vector<uint8_t> ReadTiling(const Candidate &candidate)
     if (!input) throw std::runtime_error("cannot read tiling file " + candidate.tilingPath);
     std::vector<uint8_t> result(
         (std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    const size_t expectedBytes = candidate.suffix == 901
-        ? sizeof(DirectBalancedMatmulTilingData)
-        : sizeof(MatmulTilingData);
+    const size_t expectedBytes = sizeof(MatmulTilingData);
     if (result.size() != expectedBytes) {
         throw std::runtime_error(
             "tiling ABI size mismatch expected=" +
@@ -453,55 +452,6 @@ std::vector<uint8_t> ReadTiling(const Candidate &candidate)
         decoded.matmulTiling.Ka != candidate.k ||
         decoded.matmulTiling.Kb != candidate.k) {
         throw std::runtime_error("tiling content does not match manifest shape/core count");
-    }
-    if (candidate.suffix == 901) {
-        DirectBalancedMatmulTilingData extended{};
-        std::memcpy(&extended, result.data(), sizeof(extended));
-        const auto &schedule = extended.schedule;
-        const auto &cube = extended.base.matmulTiling;
-        const uint32_t expectedMCount = static_cast<uint32_t>(
-            (cube.M + cube.singleCoreM - 1) / cube.singleCoreM);
-        const uint32_t expectedNCount = static_cast<uint32_t>(
-            (cube.N + cube.singleCoreN - 1) / cube.singleCoreN);
-        if (schedule.magic != DIRECT_BALANCED_SCHEDULE_MAGIC ||
-            schedule.version != DIRECT_BALANCED_SCHEDULE_VERSION ||
-            schedule.coreCount != DIRECT_BALANCED_CORE_COUNT ||
-            schedule.groupCount != DIRECT_BALANCED_GROUP_COUNT ||
-            schedule.mCount != expectedMCount ||
-            schedule.nCount != expectedNCount ||
-            static_cast<uint64_t>(schedule.mCount) * schedule.nCount !=
-                schedule.totalTasks) {
-            throw std::runtime_error("invalid multidimensional balance schedule header");
-        }
-        const bool hasMTail = cube.M % cube.singleCoreM != 0;
-        const bool hasNTail = cube.N % cube.singleCoreN != 0;
-        const std::array<uint64_t, DIRECT_BALANCED_GROUP_COUNT> groupCounts = {
-            static_cast<uint64_t>(expectedMCount - hasMTail) *
-                (expectedNCount - hasNTail),
-            static_cast<uint64_t>(expectedMCount - hasMTail) * hasNTail,
-            static_cast<uint64_t>(hasMTail) * (expectedNCount - hasNTail),
-            static_cast<uint64_t>(hasMTail && hasNTail),
-        };
-        uint64_t assigned = 0;
-        for (uint32_t group = 0; group < schedule.groupCount; ++group) {
-            uint64_t cursor = 0;
-            for (uint32_t core = 0; core < schedule.coreCount; ++core) {
-                const auto &range = schedule.ranges[core][group];
-                if (range.start != cursor) {
-                    throw std::runtime_error(
-                        "balanced schedule task-group ranges overlap or have a gap");
-                }
-                cursor += range.count;
-                assigned += range.count;
-            }
-            if (cursor != groupCounts[group]) {
-                throw std::runtime_error(
-                    "balanced schedule task-group cardinality mismatch");
-            }
-        }
-        if (assigned != schedule.totalTasks) {
-            throw std::runtime_error("balanced schedule does not assign every task");
-        }
     }
     return result;
 }
@@ -809,9 +759,7 @@ int main(int argc, char **argv)
         const auto candidates = LoadManifest(options.manifest);
         for (const auto &candidate : candidates) (void)ReadTiling(candidate);
         if (args.count("--validate-input")) {
-            const size_t packetBytes = candidates.front().suffix == 901
-                ? sizeof(DirectBalancedMatmulTilingData)
-                : sizeof(MatmulTilingData);
+            const size_t packetBytes = sizeof(MatmulTilingData);
             std::cout << "DIRECT_MATMUL_INPUT status=passed candidates="
                       << candidates.size() << " tiling_bytes="
                       << packetBytes << '\n';
@@ -861,7 +809,7 @@ int main(int argc, char **argv)
                 StructuredInputs(aHost, bHost, workload);
                 const auto expected = StructuredExpected(workload);
                 DeviceBuffer a(aBytes), b(bBytes), c(cBytes), workspace(maxWorkspace);
-                DeviceBuffer tiling(sizeof(DirectBalancedMatmulTilingData));
+                DeviceBuffer tiling(sizeof(MatmulTilingData));
                 Check(aclrtMemcpy(
                     a.ptr, a.bytes, aHost.data(), aHost.size(),
                     ACL_MEMCPY_HOST_TO_DEVICE), "copy structured A");

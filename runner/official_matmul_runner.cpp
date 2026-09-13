@@ -762,6 +762,18 @@ ProfileSummary ProfileOfficial(
                 aclnnMatmul(workspace.ptr, workspaceBytes, executor.ptr, stream),
                 "aclnnMatmul");
         };
+        auto reset = [&]() {
+            CheckAcl(
+                aclrtMemset(c.ptr, c.bytes, 0x5a, c.bytes),
+                "poison official output");
+            if (workspaceBytes != 0) {
+                CheckAcl(
+                    aclrtMemset(
+                        workspace.ptr, static_cast<size_t>(workspaceBytes), 0,
+                        static_cast<size_t>(workspaceBytes)),
+                    "clear official workspace");
+            }
+        };
 
         const size_t outputBytes = ElementBytes(workload.dtype);
         auto validateOutput = [&]() {
@@ -852,6 +864,10 @@ ProfileSummary ProfileOfficial(
         if (!options.validateAfterMeasurement || options.preflightOnly) {
             const auto preflightStarted = SteadyClock::now();
             LogStage(workload, "preflight_launch_begin");
+            reset();
+            CheckAcl(
+                aclrtSynchronizeStream(stream),
+                "official preflight reset synchronize");
             launch();
             LogStage(workload, "preflight_launch_returned");
             LogStage(workload, "preflight_sync_begin");
@@ -870,8 +886,14 @@ ProfileSummary ProfileOfficial(
 
         const auto warmupStarted = SteadyClock::now();
         LogStage(workload, "warmup");
-        for (int32_t i = 0; i < options.warmup; ++i) launch();
-        CheckAcl(aclrtSynchronizeStream(stream), "official warmup synchronize");
+        for (int32_t i = 0; i < options.warmup; ++i) {
+            reset();
+            CheckAcl(
+                aclrtSynchronizeStream(stream),
+                "official warmup reset synchronize");
+            launch();
+            CheckAcl(aclrtSynchronizeStream(stream), "official warmup synchronize");
+        }
         summary.warmupWallMs = ElapsedMs(warmupStarted);
 
         const auto measurementStarted = SteadyClock::now();
@@ -882,6 +904,10 @@ ProfileSummary ProfileOfficial(
             CheckAcl(aclrtCreateEvent(&end), "aclrtCreateEvent official end");
             for (int32_t sample = 0; sample < options.samples; ++sample) {
                 LogStage(workload, "sample_" + std::to_string(sample));
+                reset();
+                CheckAcl(
+                    aclrtSynchronizeStream(stream),
+                    "official pre-measurement reset synchronize");
                 CheckAcl(aclrtRecordEvent(start, stream), "aclrtRecordEvent official start");
                 for (int32_t repeat = 0; repeat < options.repeat; ++repeat) launch();
                 CheckAcl(aclrtRecordEvent(end, stream), "aclrtRecordEvent official end");

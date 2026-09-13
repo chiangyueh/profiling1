@@ -44,33 +44,6 @@ struct alignas(8) MatmulTilingData {
     uint32_t baseBD;
 };
 
-constexpr uint32_t DIRECT_BALANCED_SCHEDULE_MAGIC = 0x32425342U;
-constexpr uint32_t DIRECT_BALANCED_SCHEDULE_VERSION = 2U;
-constexpr uint32_t DIRECT_BALANCED_CORE_COUNT = 20U;
-constexpr uint32_t DIRECT_BALANCED_GROUP_COUNT = 4U;
-
-struct DirectBalancedTaskRange {
-    uint32_t start;
-    uint32_t count;
-};
-
-struct alignas(8) DirectBalancedSchedule {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t coreCount;
-    uint32_t groupCount;
-    uint32_t totalTasks;
-    uint32_t mCount;
-    uint32_t nCount;
-    uint32_t reserved;
-    DirectBalancedTaskRange ranges[DIRECT_BALANCED_CORE_COUNT]
-                                  [DIRECT_BALANCED_GROUP_COUNT];
-};
-
-struct alignas(8) DirectBalancedMatmulTilingData {
-    MatmulTilingData base;
-    DirectBalancedSchedule schedule;
-};
 #pragma pack(pop)
 
 static_assert(sizeof(TCubeTiling) == 200, "unexpected CANN 8.1 TCubeTiling ABI");
@@ -84,11 +57,4 @@ static_assert(offsetof(MatmulTilingData, baseAN) == 256,
               "unexpected CANN 8.1 ND2NZ offset");
 static_assert(sizeof(MatmulTilingData) == 272,
               "unexpected CANN 8.1 MatmulTilingData ABI");
-static_assert(sizeof(DirectBalancedSchedule) == 672,
-              "unexpected balanced schedule ABI");
-static_assert(offsetof(DirectBalancedMatmulTilingData, schedule) == 272,
-              "balanced schedule must follow the retained CANN packet");
-static_assert(sizeof(DirectBalancedMatmulTilingData) == 944,
-              "unexpected extended balanced tiling ABI");
-
 #endif
