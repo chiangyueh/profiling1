@@ -26,9 +26,15 @@ FIELDS = (
     "model_schedule_sha256", "is_reserve", "l2_cache_flag", "nd2nz_a",
     "nd2nz_b", "required_successful_tilings",
 )
-EXPECTED_VALIDATION_CASES = 15
-EXPECTED_NPU_SHAPES = 15
-EXPECTED_VARIANTS = {("fp16", 1), ("bf16", 1)}
+EXPECTED_VALIDATION_SHAPES = 8
+EXPECTED_VARIANTS = {("fp32", 101), ("fp32", 20201)}
+EXPECTED_SOURCE_FAMILIES = {
+    "BASE", "AL1_FULL_LOAD", "BL1_FULL_LOAD", "BL1_FULL_LOAD_FIXPIPE",
+    "SINGLE_CORE_SPLIT_K", "DETERMINISTIC_SPLIT_K", "INCREMENTAL_PATTERN",
+}
+EXPECTED_SOURCE_SUFFIXES = {
+    0, 1, 20, 21, 30, 31, 101, 200, 201, 10200, 10201, 20201,
+}
 
 
 def fnv1a64(blob: bytes) -> str:
@@ -127,14 +133,47 @@ def main() -> None:
             encoding="utf-8"
         )
     )
-    if (len(validation) != EXPECTED_VALIDATION_CASES or
+    audit_contract = json.loads(
+        (SELECTOR_ROOT / "source_family_audit_contract.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    if (len(validation) != EXPECTED_VALIDATION_SHAPES or
             len({row["workload_id"] for row in validation}) != len(validation)):
         raise RuntimeError("unique validation contract was reduced or duplicated")
+    if (len(audit_contract) != 13 or
+            len({row["workload_id"] for row in audit_contract}) !=
+            len(audit_contract)):
+        raise RuntimeError("source family audit contract was reduced or duplicated")
 
     for directory in (args.output_dir, args.variant_dir, args.sequence_dir):
         clear_files(directory)
 
     audit_rows = []
+    source_families, source_suffixes = set(), set()
+    for row in audit_contract:
+        result = run_selector(row)
+        theory = result["theory"]
+        if (theory["source_family"] != row["expected_family"] or
+                int(theory["source_suffix"]) != int(row["expected_suffix"])):
+            raise RuntimeError(
+                f"{row['workload_id']}: source decision drift "
+                f"family={theory['source_family']} suffix={theory['source_suffix']}"
+            )
+        selected = result["selected"]
+        raw = bytes.fromhex(selected["tiling_data_hex"])
+        if (len(raw) != 272 or selected["tiling_data_bytes"] != 272 or
+                hashlib.sha256(raw).hexdigest() !=
+                selected["tiling_data_sha256"]):
+            raise RuntimeError(
+                f"{row['workload_id']}: source path is not one complete packet"
+            )
+        source_families.add(theory["source_family"])
+        source_suffixes.add(int(theory["source_suffix"]))
+        audit_rows.append(compact_theory(row["workload_id"], result))
+    if (source_families != EXPECTED_SOURCE_FAMILIES or
+            source_suffixes != EXPECTED_SOURCE_SUFFIXES):
+        raise RuntimeError("full source family/suffix audit coverage was reduced")
 
     manifest_rows = []
     selections = []
@@ -144,45 +183,13 @@ def main() -> None:
         if not (result["status"] == "MODIFIED_TILING" and
                 result["npu_eligible"] and not result["baseline_equivalent"]):
             raise RuntimeError(f"{workload_id}: no distinct improved packet")
-        expected_rules = {
-            "al1_capacity_k_grain": "AL1_CAPACITY_DERIVED_K_GRAIN",
-            "fixpipe_vector_pipeline": "FIXPIPE_VECTOR_MULTI_GROUP_PIPELINE",
-            "base_same_grid_tail": "BASE_SAME_GRID_TAIL_REBALANCE",
-        }
-        expected_rule = expected_rules.get(row["selection_axis"])
-        if expected_rule is None:
-            raise RuntimeError(f"{workload_id}: unknown selection axis")
+        expected_rule = (
+            "AL1_CAPACITY_DERIVED_K_GRAIN"
+            if row["selection_axis"] == "al1_capacity_k_grain"
+            else "FIXPIPE_VECTOR_MULTI_GROUP_PIPELINE"
+        )
         if result["changed_rules"] != [expected_rule]:
             raise RuntimeError(f"{workload_id}: unexpected theoretical rule")
-        if not (
-            result["theory"]["source_family"] == "BASE"
-            and result["theory"]["formula_family"] == "BASE"
-            and result["theory"]["source_suffix"] == 1
-            and set(result["changed_fields"]) == {"baseM", "singleCoreM"}
-        ):
-            raise RuntimeError(
-                f"{workload_id}: BASE-only baseM isolation contract failed"
-            )
-        equation = result["theory"]["improvement_equation"]
-        predicted_pct = 100.0 * (
-            equation["critical_M_rows_after"] /
-            equation["critical_M_rows_before"] - 1.0
-        )
-        print(
-            "BASE_THEORY_PREDICTION "
-            f"id={workload_id} "
-            f"baseM={equation['original_baseM']}->{equation['improved_baseM']} "
-            f"m_count={equation['m_count']} n_count={equation['n_count']} "
-            f"tasks={equation['output_tasks_before']} "
-            f"waves={equation['task_waves_before']} "
-            f"critical_M_rows={equation['critical_M_rows_before']}->"
-            f"{equation['critical_M_rows_after']} "
-            f"predicted_critical_component_delta_pct={predicted_pct:+.3f} "
-            "changed_fields=baseM,singleCoreM"
-        )
-        audit_rows.append(compact_theory(workload_id, result))
-        if not bool(row.get("npu_measure", True)):
-            continue
         packet = result["improved"]
         blob = bytes.fromhex(packet["tiling_data_hex"])
         if (len(blob) != 272 or
@@ -219,11 +226,7 @@ def main() -> None:
             "case_role": "unique_theoretical_improvement",
         })
         selections.append(result)
-
-    if len(manifest_rows) != EXPECTED_NPU_SHAPES:
-        raise RuntimeError(
-            f"expected {EXPECTED_NPU_SHAPES} NPU shapes, found {len(manifest_rows)}"
-        )
+        audit_rows.append(compact_theory(workload_id, result))
 
     variants = {(row["dtype"], int(row["kernel_suffix"]))
                 for row in manifest_rows}
@@ -249,9 +252,8 @@ def main() -> None:
                                     separators=(",", ":")) + "\n")
     print(
         "UNIQUE_FORMULA_MATRIX_GENERATED "
-        "scope=BASE_baseM_only source_families=1 source_suffixes=1 "
-        f"validation_cases={len(validation)} "
-        f"npu_shapes={len(manifest_rows)} "
+        f"audit_shapes={len(audit_contract)} source_families={len(source_families)} "
+        f"source_suffixes={len(source_suffixes)} npu_shapes={len(manifest_rows)} "
         f"complete_tilings_per_shape=1 variants={len(grouped)}"
     )
 
