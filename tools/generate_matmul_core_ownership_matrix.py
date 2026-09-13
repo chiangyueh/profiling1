@@ -28,27 +28,67 @@ FIELDS = (
     "nd2nz_b", "required_successful_tilings",
 )
 
-CANDIDATE_CASES = (
+BRANCH_CASES = (
     ("base0_core_00", 17, 17, 17, "fp16", False, False, 0),
     ("base0_core_01", 19, 23, 31, "fp16", False, False, 0),
-    ("base0_core_02", 31, 17, 33, "fp16", False, False, 0),
-    ("base0_core_03", 33, 31, 17, "fp16", False, False, 0),
+    ("base0_core_02", 31, 27, 33, "fp16", False, False, 0),
+    ("base0_core_03", 33, 31, 37, "fp16", False, False, 0),
     ("base0_core_04", 47, 19, 29, "fp16", False, False, 0),
     ("base1_core_00", 16, 16, 16, "fp16", False, False, 1),
     ("base1_core_01", 32, 32, 32, "fp16", False, False, 1),
     ("base1_core_02", 48, 64, 64, "fp16", False, False, 1),
     ("base1_core_03", 64, 48, 128, "fp16", False, False, 1),
     ("base1_core_04", 80, 80, 256, "fp16", False, False, 1),
+    ("sc20_core_00", 896, 2049, 27392, "fp16", False, False, 20),
+    ("sc20_core_01", 1152, 1921, 28032, "fp16", False, False, 20),
+    ("sc20_core_02", 1280, 1793, 28416, "fp16", False, False, 20),
+    ("sc20_core_03", 1408, 1665, 28800, "fp16", False, False, 20),
+    ("sc20_core_04", 1536, 1537, 29056, "fp16", False, False, 20),
+    ("sc21_core_00", 896, 2176, 30336, "fp16", False, False, 21),
+    ("sc21_core_01", 1024, 2944, 31616, "fp16", False, False, 21),
+    ("sc21_core_02", 1152, 2816, 28032, "fp16", False, False, 21),
+    ("sc21_core_03", 1280, 2560, 33024, "fp16", False, False, 21),
+    ("sc21_core_04", 1408, 2304, 29696, "fp16", False, False, 21),
+    ("det30_core_00", 32, 49, 7808, "fp16", False, False, 30),
+    ("det30_core_01", 48, 97, 8064, "fp16", False, False, 30),
+    ("det30_core_02", 96, 113, 10368, "fp16", False, False, 30),
+    ("det30_core_03", 64, 65, 13056, "fp16", False, False, 30),
+    ("det30_core_04", 80, 17, 11392, "fp16", False, False, 30),
+    ("det31_core_00", 80, 112, 12032, "fp16", False, False, 31),
+    ("det31_core_01", 64, 96, 14208, "fp16", False, False, 31),
+    ("det31_core_02", 128, 512, 28032, "fp16", False, False, 31),
+    ("det31_core_03", 512, 48, 14592, "fp16", False, False, 31),
+    ("det31_core_04", 112, 64, 17024, "fp16", False, False, 31),
     ("al1_core_00", 1, 65, 5120, "fp32", False, True, 101),
     ("al1_core_01", 4, 80, 5504, "fp32", False, True, 101),
     ("al1_core_02", 8, 96, 6144, "fp32", False, True, 101),
     ("al1_core_03", 12, 128, 6656, "fp32", False, True, 101),
     ("al1_core_04", 16, 160, 7168, "fp32", False, True, 101),
-    ("bl1_core_00", 4097, 128, 16, "fp16", False, False, 201),
-    ("bl1_core_01", 4352, 128, 16, "fp16", False, False, 201),
-    ("bl1_core_02", 4608, 128, 16, "fp16", False, False, 201),
-    ("bl1_core_03", 4864, 128, 16, "fp16", False, False, 201),
-    ("bl1_core_04", 4097, 256, 16, "fp16", False, False, 201),
+    ("bl1200_core_00", 74432, 32, 9, "fp32", False, False, 200),
+    ("bl1200_core_01", 72848, 64, 5, "fp32", False, False, 200),
+    ("bl1200_core_02", 80240, 128, 3, "fp32", False, False, 200),
+    ("bl1200_core_03", 83776, 192, 11, "fp32", False, False, 200),
+    ("bl1200_core_04", 88560, 256, 13, "fp32", False, False, 200),
+    ("bl1201_core_00", 4109, 96, 48, "fp16", False, False, 201),
+    ("bl1201_core_01", 4276, 64, 112, "fp16", False, False, 201),
+    ("bl1201_core_02", 4463, 128, 32, "fp16", False, False, 201),
+    ("bl1201_core_03", 4413, 256, 96, "fp16", False, False, 201),
+    ("bl1201_core_04", 4381, 192, 128, "fp16", False, False, 201),
+    ("fix10200_core_00", 17408, 11, 11, "fp32", False, False, 10200),
+    ("fix10200_core_01", 14848, 7, 15, "fp32", False, False, 10200),
+    ("fix10200_core_02", 18176, 3, 9, "fp32", False, False, 10200),
+    ("fix10200_core_03", 22144, 13, 5, "fp32", False, False, 10200),
+    ("fix10200_core_04", 21504, 9, 3, "fp32", False, False, 10200),
+    ("fix10201_core_00", 24064, 34, 112, "fp16", False, False, 10201),
+    ("fix10201_core_01", 19200, 25, 16, "fp16", False, False, 10201),
+    ("fix10201_core_02", 28160, 153, 96, "fp16", False, False, 10201),
+    ("fix10201_core_03", 18560, 61, 80, "fp16", False, False, 10201),
+    ("fix10201_core_04", 23424, 130, 48, "fp16", False, False, 10201),
+    ("vec20201_core_00", 11776, 56, 240, "fp32", False, False, 20201),
+    ("vec20201_core_01", 12288, 17, 16, "fp32", False, False, 20201),
+    ("vec20201_core_02", 16384, 31, 24, "fp32", False, False, 20201),
+    ("vec20201_core_03", 20480, 47, 32, "fp32", False, False, 20201),
+    ("vec20201_core_04", 22528, 63, 40, "fp32", False, False, 20201),
 )
 
 
@@ -122,68 +162,76 @@ def main() -> None:
     ):
         clear_files(directory)
 
-    audit_contract = json.loads(
-        (SELECTOR_ROOT / "source_family_audit_contract.json").read_text()
-    )
-    audit_rows = []
-    seen_suffixes = set()
-    for row in audit_contract:
-        result = generate(
-            row["m"], row["k"], row["n"], row["dtype"],
-            row["trans_a"], row["trans_b"],
-        )
-        plan = result["core_plan"]
-        if (
-            result["theory"]["source_family"] != row["expected_family"] or
-            int(plan["suffix"]) != int(row["expected_suffix"])
-        ):
-            raise RuntimeError(f"{row['workload_id']}: source route drift")
-        seen_suffixes.add(int(plan["suffix"]))
-        audit_rows.append({
-            "workload_id": row["workload_id"],
-            "source_family": row["expected_family"],
-            **plan,
-        })
-    if tuple(sorted(seen_suffixes)) != INSTALLED_SUFFIXES:
-        raise RuntimeError("audit did not execute every installed suffix rule")
-
     baseline_rows = []
     candidate_rows = []
     selections = []
+    audit_rows = []
+    seen_suffixes = set()
+    suffix_counts = defaultdict(int)
+    suffix_shapes = defaultdict(list)
     changed_suffixes = set()
-    for workload_id, m, n, k, dtype, trans_a, trans_b, expected_suffix in CANDIDATE_CASES:
+    for workload_id, m, n, k, dtype, trans_a, trans_b, expected_suffix in BRANCH_CASES:
         result = generate(m, k, n, dtype, trans_a, trans_b)
-        if not (
-            result["status"] == "MODIFIED_TILING" and result["npu_eligible"] and
-            int(result["kernel_suffix"]) == expected_suffix and
-            result["core_plan"]["eliminated_cores"] > 0
-        ):
-            raise RuntimeError(f"{workload_id}: no strict core-deletion candidate")
+        if int(result["kernel_suffix"]) != expected_suffix:
+            raise RuntimeError(
+                f"{workload_id}: source suffix {result['kernel_suffix']} != {expected_suffix}"
+            )
         request = result["request"]
         schedule = {
             "workload_id": workload_id,
             "suffix": expected_suffix,
             "core_plan": result["core_plan"],
-            "changed_words": ["usedCoreNum"],
+            "changed_words": (
+                ["usedCoreNum"] if result["status"] == "MODIFIED_TILING" else []
+            ),
         }
         baseline_rows.append(manifest_row(
             workload_id=workload_id, request=request, packet=result["baseline"],
             suffix=expected_suffix, role="family_core_baseline",
             path=args.baseline_dir / f"{workload_id}.bin", schedule=schedule,
         ))
-        candidate_rows.append(manifest_row(
-            workload_id=workload_id, request=request, packet=result["improved"],
-            suffix=expected_suffix, role="family_core_candidate",
-            path=args.candidate_dir / f"{workload_id}.bin", schedule=schedule,
-        ))
+        if result["status"] == "MODIFIED_TILING":
+            if not (
+                result["npu_eligible"] and
+                result["core_plan"]["eliminated_cores"] > 0
+            ):
+                raise RuntimeError(f"{workload_id}: invalid modified packet")
+            candidate_rows.append(manifest_row(
+                workload_id=workload_id, request=request, packet=result["improved"],
+                suffix=expected_suffix, role="family_core_candidate",
+                path=args.candidate_dir / f"{workload_id}.bin", schedule=schedule,
+            ))
+            changed_suffixes.add(expected_suffix)
         result["workload_id"] = workload_id
         result["selection_axis"] = result["core_plan"]["branch"]
         selections.append(result)
-        changed_suffixes.add(expected_suffix)
+        audit_rows.append({
+            "workload_id": workload_id,
+            "source_family": result["theory"]["source_family"],
+            **result["core_plan"],
+        })
+        seen_suffixes.add(expected_suffix)
+        suffix_counts[expected_suffix] += 1
+        suffix_shapes[expected_suffix].append((m, n, k))
 
     expected_changed = {0, 1, 101, 201}
+    if tuple(sorted(seen_suffixes)) != INSTALLED_SUFFIXES:
+        raise RuntimeError("matrix did not execute every installed suffix rule")
+    if any(suffix_counts[suffix] != 5 for suffix in INSTALLED_SUFFIXES):
+        raise RuntimeError(f"each suffix requires five shapes: {dict(suffix_counts)}")
+    for suffix, shapes in suffix_shapes.items():
+        for axis, index in (("M", 0), ("N", 1), ("K", 2)):
+            if len({shape[index] for shape in shapes}) != 5:
+                raise RuntimeError(
+                    f"suffix {suffix} does not vary {axis} across all five shapes"
+                )
     if changed_suffixes != expected_changed:
         raise RuntimeError(f"changed suffix coverage drift: {sorted(changed_suffixes)}")
+    if len(baseline_rows) != 60 or len(candidate_rows) != 20:
+        raise RuntimeError(
+            f"expected 60 branch executions and 20 paired changes; got "
+            f"{len(baseline_rows)} and {len(candidate_rows)}"
+        )
     write_csv(args.baseline_manifest, baseline_rows)
     write_csv(args.candidate_manifest, candidate_rows)
 
@@ -193,12 +241,17 @@ def main() -> None:
         grouped_baseline[(row["dtype"], row["kernel_suffix"])].append(row)
     for row in candidate_rows:
         grouped_candidate[(row["dtype"], row["kernel_suffix"])].append(row)
-    if set(grouped_baseline) != set(grouped_candidate):
-        raise RuntimeError("paired variant coverage mismatch")
-    for index, key in enumerate(sorted(grouped_candidate)):
+    if len(grouped_baseline) != 12 or len(grouped_candidate) != 4:
+        raise RuntimeError("expected twelve baseline variants and four changed variants")
+    if not set(grouped_candidate).issubset(grouped_baseline):
+        raise RuntimeError("candidate variant is absent from baseline matrix")
+    for key in sorted(grouped_baseline):
         dtype, suffix = key
-        name = f"{index:02d}__{dtype}_k{suffix}.csv"
+        name = f"{dtype}_k{suffix}.csv"
         write_csv(args.baseline_variants / name, grouped_baseline[key])
+    for key in sorted(grouped_candidate):
+        dtype, suffix = key
+        name = f"{dtype}_k{suffix}.csv"
         write_csv(args.candidate_variants / name, grouped_candidate[key])
 
     args.selection.parent.mkdir(parents=True, exist_ok=True)
@@ -210,9 +263,9 @@ def main() -> None:
             stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
     print(
         "CORE_OWNERSHIP_MATRIX_GENERATED "
-        f"audited_suffixes={len(seen_suffixes)} audit_witnesses={len(audit_rows)} "
+        f"audited_suffixes={len(seen_suffixes)} branch_shapes={len(audit_rows)} "
         f"paired_shapes={len(candidate_rows)} changed_suffixes={len(changed_suffixes)} "
-        f"compiled_variants={len(grouped_candidate)}"
+        f"compiled_variants={len(grouped_baseline)}"
     )
 
 
