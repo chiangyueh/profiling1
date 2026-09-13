@@ -413,7 +413,7 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
 
     activate = None
     base_schedule_analysis = None
-    if source_family == "BASE" and dtype in ("fp16", "bf16") and not trans_a and not trans_b:
+    if source_family == "BASE" and dtype in ("fp16", "bf16") and not trans_a:
         base_schedule_analysis = analyze_base_schedule(
             TheoryBaseShape(m=m, n=n, k=k, dtype=dtype)
         )

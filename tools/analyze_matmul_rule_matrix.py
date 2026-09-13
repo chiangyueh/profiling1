@@ -10,7 +10,7 @@ from pathlib import Path
 import statistics
 
 
-EXPECTED_SHAPES = 8
+EXPECTED_SHAPES = 100
 EXPECTED_SAMPLES = 15
 EXPECTED_WARMUP = 3
 EXPECTED_REPEAT = 10
@@ -138,6 +138,7 @@ def main() -> None:
         else:
             separation = "OVERLAPPING_SAMPLES"
         selection = selections[workload_id]
+        equation = selection["theory"]["improvement_equation"]
         row = {
             "workload_id": workload_id,
             "selection_axis": selection["selection_axis"],
@@ -157,16 +158,15 @@ def main() -> None:
                 "candidate" if new_median < old_median else "official"
             ),
             "sample_separation": separation,
+            "source_worst_normalized_load": equation[
+                "source_worst_normalized_load"
+            ],
+            "candidate_worst_normalized_load": equation[
+                "improved_worst_normalized_load"
+            ],
             "correctness": "PASS_BOTH_CURRENT_RUN_OUTPUTS",
         }
         output_rows.append(row)
-        print(
-            "UNIQUE_FORMULA_RESULT "
-            f"id={workload_id} applicable={row['required_applicable_family']} "
-            f"selected={row['selected_family']} suffix={row['kernel_suffix']} "
-            f"role={row['case_role']} official_ms={old_median:.9g} candidate_ms={new_median:.9g} "
-            f"delta_pct={delta_pct:+.3f} separation={separation}"
-        )
 
     result = {
         "schema": "matmul_unique_theoretical_selector_v1",

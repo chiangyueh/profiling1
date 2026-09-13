@@ -125,19 +125,15 @@ private:
     const DirectBalancedTaskRange *ranges_ = nullptr;
 };
 
-extern "C" __global__ __aicore__ void MATMUL_DIRECT_KERNEL(
+template <bool TRANS_B>
+__aicore__ inline void DirectRunBalancedBase(
     GM_ADDR aGM, GM_ADDR bGM, GM_ADDR biasGM, GM_ADDR offsetWGM,
-    GM_ADDR cGM, GM_ADDR workspaceGM, GM_ADDR tilingGM)
+    GM_ADDR cGM, GM_ADDR workspaceGM,
+    DirectBalancedLocalTilingData &tilingData)
 {
-    DirectBalancedLocalTilingData tilingData;
-    DirectReadBalancedTiling(tilingGM, tilingData);
     __gm__ uint8_t *user = reinterpret_cast<__gm__ uint8_t *>(workspaceGM);
-
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
-    KERNEL_TASK_TYPE(MATMUL_DIRECT_TILING_KEY, KERNEL_TYPE_AIC_ONLY);
-
     using aType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_X1, false>;
-    using bType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_X2, false>;
+    using bType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_X2, TRANS_B>;
     using cType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_Y>;
     using biasType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_BIAS>;
     TPipe pipe;
@@ -145,4 +141,26 @@ extern "C" __global__ __aicore__ void MATMUL_DIRECT_KERNEL(
         MatmulBaseBalancedBlock, MM_CFG_NO_PRELOAD> op;
     op.Init(aGM, bGM, cGM, biasGM, offsetWGM, user, &tilingData, &pipe);
     op.Process();
+}
+
+extern "C" __global__ __aicore__ void MATMUL_DIRECT_KERNEL(
+    GM_ADDR aGM, GM_ADDR bGM, GM_ADDR biasGM, GM_ADDR offsetWGM,
+    GM_ADDR cGM, GM_ADDR workspaceGM, GM_ADDR tilingGM)
+{
+    DirectBalancedLocalTilingData tilingData;
+    DirectReadBalancedTiling(tilingGM, tilingData);
+
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    KERNEL_TASK_TYPE(MATMUL_DIRECT_TILING_KEY, KERNEL_TYPE_AIC_ONLY);
+
+    // Transposed A requires MatMulV3's ND2NZ head and is rejected by the host
+    // proof.  B transpose changes only the retained BASE template type, so the
+    // same audited ownership schedule is valid for both NN and NT layouts.
+    if (tilingData.base.matmulRunInfo.transB != 0) {
+        DirectRunBalancedBase<true>(
+            aGM, bGM, biasGM, offsetWGM, cGM, workspaceGM, tilingData);
+    } else {
+        DirectRunBalancedBase<false>(
+            aGM, bGM, biasGM, offsetWGM, cGM, workspaceGM, tilingData);
+    }
 }

@@ -7,7 +7,7 @@ PHYSICAL_DEVICE="${PHYSICAL_NPU_ID:-2}"
 WARMUP=3
 REPEAT=10
 SAMPLES=15
-VALIDATION_SHAPES=8
+VALIDATION_SHAPES=100
 EXPECTED_VARIANTS=2
 NUMERIC_PREFLIGHT_MAX_MIB=64
 
@@ -91,7 +91,7 @@ SELECTION="${CAMPAIGN_DIR}/selection.jsonl"
 THEORY_AUDIT="${CAMPAIGN_DIR}/theory_audit.jsonl"
 VARIANT_DIR="${CAMPAIGN_DIR}/variants"
 SEQUENCE_DIR="${CAMPAIGN_DIR}/sequence"
-RUNNER_LOG="${RUN_LOG}"
+RUNNER_LOG="${CAMPAIGN_DIR}/direct_results.jsonl"
 OFFICIAL_PROFILE="${CAMPAIGN_DIR}/official_profile.csv"
 OFFICIAL_SAMPLES="${CAMPAIGN_DIR}/official_samples.csv"
 ANALYSIS="${CAMPAIGN_DIR}/analysis.json"
@@ -123,6 +123,8 @@ for row in rows:
     print(
         "FINAL_RESULT "
         f"id={row['workload_id']} "
+        f"m={row['m']} n={row['n']} k={row['k']} "
+        f"dtype={row['dtype']} trans_a={row['trans_a']} trans_b={row['trans_b']} "
         f"axis={row['selection_axis']} "
         f"role={row['case_role']} "
         f"applicable={row['required_applicable_family']} "
@@ -130,6 +132,8 @@ for row in rows:
         f"official_ms={float(row['official_median_ms']):.9g} "
         f"candidate_ms={float(row['candidate_median_ms']):.9g} "
         f"delta_pct={float(row['delta_pct']):+.3f} "
+        f"load_before={float(row['source_worst_normalized_load']):.6f} "
+        f"load_after={float(row['candidate_worst_normalized_load']):.6f} "
         f"winner={row['median_winner']} "
         f"separation={row['sample_separation']}"
     )
@@ -201,10 +205,10 @@ fail() {
 announce "RUN_LOG path=${RUN_LOG}"
 source_revision="$(git rev-parse HEAD 2>/dev/null || printf unknown)"
 announce "SOURCE_REVISION commit=${source_revision}"
-announce "CAMPAIGN_READY operator=matmul selector=unique_ordered_closed_form source_families=7 source_suffixes=12 npu_shapes=${VALIDATION_SHAPES} candidate_measurements=${VALIDATION_SHAPES} official_measurements=${VALIDATION_SHAPES} compiled_variants=${EXPECTED_VARIANTS} physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
+announce "CAMPAIGN_READY operator=matmul selector=base_multidimensional_balance random_seed=910813 npu_shapes=${VALIDATION_SHAPES} candidate_measurements=${VALIDATION_SHAPES} official_measurements=${VALIDATION_SHAPES} compiled_variants=${EXPECTED_VARIANTS} physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
 announce "measurement=${WARMUP}_warmup+${SAMPLES}_device_event_samples+repeat_${REPEAT}+validate_last_timed_output"
 announce "numeric_preflight_limit_mib=${NUMERIC_PREFLIGHT_MAX_MIB}"
-announce "selection=one_source_family_then_one_closed_form_tiling_no_cross_family_ranking"
+announce "selection=one_parameter_free_base_schedule_per_random_shape_no_cross_family_ranking"
 announce "selector=shape_and_frozen_910b3_hardware_integer_equations_only"
 announce "official_reference=same_campaign_installed_aclnn_matmul_public_api"
 announce "forbidden=cost_model,measured_latency_at_selection,history_lookup_at_runtime,repo_lookup,tiling_bank,candidate_enumeration,pareto,installed_host_tiler"
@@ -217,6 +221,7 @@ if [[ -s "${ANALYSIS}" ]] && grep -q '"status": "complete"' "${ANALYSIS}"; then
     announce "UNIQUE_FORMULA_VALIDATION_COMPLETE cached=1 analysis=${ANALYSIS} summary=${SUMMARY} theory=${THEORY_AUDIT} log=${RUN_LOG}"
     exit 0
 fi
+: >"${RUNNER_LOG}"
 
 generation_started_ns="$(date +%s%N)"
 python3 tools/generate_matmul_unique_formula_matrix.py \
@@ -229,17 +234,8 @@ python3 tools/generate_matmul_unique_formula_matrix.py \
 actual_variants="$(find "${VARIANT_DIR}" -maxdepth 1 -type f -name '*.csv' | wc -l)"
 [[ "${actual_variants}" -eq "${EXPECTED_VARIANTS}" ]] || \
     fail "generated ${actual_variants} dtype/suffix variants; expected ${EXPECTED_VARIANTS}"
-printf '%s\n' 'SELECTION_RECORDS_BEGIN'
-sed 's/^/SELECTION_RECORD /' "${SELECTION}"
-printf '%s\n' 'SELECTION_RECORDS_END'
-printf '%s\n' 'THEORETICAL_RESULTS_BEGIN'
-sed 's/^/THEORETICAL_RESULT /' "${THEORY_AUDIT}"
-printf '%s\n' 'THEORETICAL_RESULTS_END'
-printf '%s\n' 'CANDIDATE_MANIFEST_CSV_BEGIN'
-cat "${MANIFEST}"
-printf '%s\n' 'CANDIDATE_MANIFEST_CSV_END'
 generation_wall_ms=$(( ($(date +%s%N) - generation_started_ns) / 1000000 ))
-announce "UNIQUE_FORMULA_PACKET_GENERATION passed shapes=${VALIDATION_SHAPES} source_families=7 source_suffixes=12 variants=${EXPECTED_VARIANTS} complete_tilings_per_shape=1 packet_bytes=272"
+announce "UNIQUE_FORMULA_PACKET_GENERATION passed shapes=${VALIDATION_SHAPES} source_families=7 source_suffixes=12 variants=${EXPECTED_VARIANTS} complete_tilings_per_shape=1 packet_bytes=944"
 announce "CAMPAIGN_STAGE_TIMING stage=unique_formula_packet_generation wall_ms=${generation_wall_ms}"
 
 input_cap_audit="$(python3 - "${MANIFEST}" "${NUMERIC_PREFLIGHT_MAX_MIB}" <<'PY'
@@ -430,12 +426,6 @@ announce "OFFICIAL_MEASUREMENT begin shapes=${VALIDATION_SHAPES}"
     --structured-full-preflight \
     --validate-after-measurement
 announce "OFFICIAL_MEASUREMENT passed shapes=${VALIDATION_SHAPES}"
-printf '%s\n' 'OFFICIAL_PROFILE_CSV_BEGIN'
-cat "${OFFICIAL_PROFILE}"
-printf '%s\n' 'OFFICIAL_PROFILE_CSV_END'
-printf '%s\n' 'OFFICIAL_SAMPLES_CSV_BEGIN'
-cat "${OFFICIAL_SAMPLES}"
-printf '%s\n' 'OFFICIAL_SAMPLES_CSV_END'
 
 batch_index=0
 candidate_batch_failures=0
@@ -457,9 +447,9 @@ for packet_manifest in "${SEQUENCE_DIR}"/*.csv; do
     else
         canary_rc=$?
     fi
-    printf '%s\n' "${canary_output}" | sed 's/^/UNIQUE_FORMULA_CANARY_RECORD /'
     canary_invalid="$(grep -c 'DIRECT_MATMUL_RESULT .*"status":"failed"' <<<"${canary_output}" || true)"
     if [[ "${canary_rc}" -ne 0 || "${canary_invalid}" -ne 0 ]]; then
+        printf '%s\n' "${canary_output}" | sed 's/^/UNIQUE_FORMULA_CANARY_RECORD /'
         candidate_batch_failures=$((candidate_batch_failures + 1))
         announce "CANDIDATE_CANARY ${batch_index}/${EXPECTED_VARIANTS} failed variant=${variant} rc=${canary_rc} invalid_shapes=${canary_invalid}; formal_measurement=skipped"
         continue
@@ -471,10 +461,11 @@ for packet_manifest in "${SEQUENCE_DIR}"/*.csv; do
         --device "${DEVICE_ID}" \
         --warmup "${WARMUP}" \
         --repeat "${REPEAT}" \
-        --samples "${SAMPLES}"; then
+        --samples "${SAMPLES}" >>"${RUNNER_LOG}" 2>&1; then
         announce "CANDIDATE_MEASUREMENT_BATCH ${batch_index}/${EXPECTED_VARIANTS} passed variant=${variant} shapes=${batch_shapes}"
     else
         candidate_batch_failures=$((candidate_batch_failures + 1))
+        tail -40 "${RUNNER_LOG}" || true
         announce "CANDIDATE_MEASUREMENT_BATCH ${batch_index}/${EXPECTED_VARIANTS} failed variant=${variant}; continuing_remaining_variants=1"
     fi
 done
@@ -494,12 +485,6 @@ python3 tools/analyze_matmul_rule_matrix.py \
     --selection "${SELECTION}" \
     --output-json "${ANALYSIS}" \
     --output-csv "${SUMMARY}"
-printf '%s\n' 'FINAL_ANALYSIS_JSON_BEGIN'
-cat "${ANALYSIS}"
-printf '%s\n' 'FINAL_ANALYSIS_JSON_END'
-printf '%s\n' 'FINAL_SUMMARY_CSV_BEGIN'
-cat "${SUMMARY}"
-printf '%s\n' 'FINAL_SUMMARY_CSV_END'
 analysis_wall_ms=$(( ($(date +%s%N) - analysis_started_ns) / 1000000 ))
 announce "CAMPAIGN_STAGE_TIMING stage=analysis wall_ms=${analysis_wall_ms}"
 emit_final_results

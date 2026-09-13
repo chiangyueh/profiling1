@@ -809,9 +809,12 @@ int main(int argc, char **argv)
         const auto candidates = LoadManifest(options.manifest);
         for (const auto &candidate : candidates) (void)ReadTiling(candidate);
         if (args.count("--validate-input")) {
+            const size_t packetBytes = candidates.front().suffix == 901
+                ? sizeof(DirectBalancedMatmulTilingData)
+                : sizeof(MatmulTilingData);
             std::cout << "DIRECT_MATMUL_INPUT status=passed candidates="
                       << candidates.size() << " tiling_bytes="
-                      << sizeof(MatmulTilingData) << '\n';
+                      << packetBytes << '\n';
             return 0;
         }
 
