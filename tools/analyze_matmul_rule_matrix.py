@@ -10,7 +10,7 @@ from pathlib import Path
 import statistics
 
 
-EXPECTED_SHAPES = 3
+EXPECTED_SHAPES = 15
 EXPECTED_SAMPLES = 15
 EXPECTED_WARMUP = 3
 EXPECTED_REPEAT = 10
@@ -217,7 +217,7 @@ def main() -> None:
 
     if all(row["theory_evidence"] == "STRONG_SUPPORT"
            for row in output_rows):
-        theory_verdict = "SUPPORTED_ON_THREE_BASEM_SHAPES"
+        theory_verdict = "SUPPORTED_ON_ALL_BASEM_SHAPES"
     elif any(row["theory_evidence"] == "STRONG_CONTRADICTION"
              for row in output_rows):
         theory_verdict = "REJECTED_ON_VALIDATION_SET"

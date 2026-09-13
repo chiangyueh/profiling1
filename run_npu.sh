@@ -7,7 +7,7 @@ PHYSICAL_DEVICE="${PHYSICAL_NPU_ID:-2}"
 WARMUP=3
 REPEAT=10
 SAMPLES=15
-VALIDATION_SHAPES=3
+VALIDATION_SHAPES=15
 EXPECTED_VARIANTS=2
 NUMERIC_PREFLIGHT_MAX_MIB=64
 
@@ -180,7 +180,7 @@ print(
 )
 evidence = [row["theory_evidence"] for row in rows]
 if all(value == "STRONG_SUPPORT" for value in evidence):
-    verdict = "SUPPORTED_ON_THREE_BASEM_SHAPES"
+    verdict = "SUPPORTED_ON_ALL_BASEM_SHAPES"
 elif any(value == "STRONG_CONTRADICTION" for value in evidence):
     verdict = "REJECTED_ON_VALIDATION_SET"
 else:
@@ -223,7 +223,7 @@ announce "selector=shape_and_frozen_910b3_hardware_integer_equations_only"
 announce "official_reference=same_campaign_installed_aclnn_matmul_public_api"
 announce "BASE_HYPOTHESIS official_81_gap=fixed_baseM_128_has_no_exact_20_core_same_grid_owner_rebalance"
 announce "BASE_HYPOTHESIS transform=preserve_MN_grid_tasks_waves_pipeline_and_change_only_baseM_singleCoreM"
-announce "BASE_HYPOTHESIS acceptance=all_three_shapes_clear_candidate_winner rejection=any_clear_official_winner otherwise=inconclusive"
+announce "BASE_HYPOTHESIS acceptance=all_${VALIDATION_SHAPES}_shapes_clear_candidate_winner rejection=any_clear_official_winner otherwise=inconclusive"
 announce "forbidden=cost_model,measured_latency_at_selection,history_lookup_at_runtime,repo_lookup,tiling_bank,candidate_enumeration,pareto,installed_host_tiler"
 announce "unmodified_paths=reported_as_baseline_equivalent_and_excluded_from_improved_measurement"
 announce "CANN_ENV root=${CANN_ROOT} soc=${SOC_VERSION} aic=20 visible_devices=${ASCEND_RT_VISIBLE_DEVICES}"

@@ -26,8 +26,8 @@ FIELDS = (
     "model_schedule_sha256", "is_reserve", "l2_cache_flag", "nd2nz_a",
     "nd2nz_b", "required_successful_tilings",
 )
-EXPECTED_VALIDATION_CASES = 3
-EXPECTED_NPU_SHAPES = 3
+EXPECTED_VALIDATION_CASES = 15
+EXPECTED_NPU_SHAPES = 15
 EXPECTED_VARIANTS = {("fp16", 1), ("bf16", 1)}
 
 
