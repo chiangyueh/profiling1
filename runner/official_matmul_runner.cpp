@@ -608,11 +608,6 @@ void ComputeStats(ProfileSummary &summary, const Workload &workload)
     summary.success = true;
 }
 
-void LogStage(const Workload &workload, const std::string &stage)
-{
-    std::cout << "official_stage " << workload.id << " stage=" << stage << std::endl;
-}
-
 ProfileSummary ProfileOfficial(
     const Workload &workload,
     aclrtStream stream,
@@ -633,7 +628,6 @@ ProfileSummary ProfileOfficial(
         const size_t aBytes = CheckedBytes(workload.m, workload.k, elementBytes, "A");
         const size_t bBytes = CheckedBytes(workload.k, workload.n, elementBytes, "B");
         const size_t cBytes = CheckedBytes(workload.m, workload.n, elementBytes, "C");
-        LogStage(workload, "device_malloc");
         DeviceBuffer a(aBytes);
         DeviceBuffer b(bBytes);
         DeviceBuffer c(cBytes);
@@ -699,7 +693,6 @@ ProfileSummary ProfileOfficial(
         SharedLibrary privateTiling;
         SharedLibrary privateOpApi;
         ExecutorHandle executor;
-        LogStage(workload, "get_workspace");
         if (const char *library = std::getenv("MATMUL_SOURCE_TILING_LIBRARY")) {
             if (*library != '\0') {
                 privateTiling.ptr = dlopen(library, RTLD_NOW | RTLD_GLOBAL);
@@ -749,7 +742,6 @@ ProfileSummary ProfileOfficial(
             summary.preflightPassed = true;
             summary.success = true;
             summary.runnerTotalMs = ElapsedMs(runnerStarted);
-            LogStage(workload, "planning_complete");
             return summary;
         }
         CheckAclnn(
@@ -863,16 +855,12 @@ ProfileSummary ProfileOfficial(
 
         if (!options.validateAfterMeasurement || options.preflightOnly) {
             const auto preflightStarted = SteadyClock::now();
-            LogStage(workload, "preflight_launch_begin");
             reset();
             CheckAcl(
                 aclrtSynchronizeStream(stream),
                 "official preflight reset synchronize");
             launch();
-            LogStage(workload, "preflight_launch_returned");
-            LogStage(workload, "preflight_sync_begin");
             CheckAcl(aclrtSynchronizeStream(stream), "official preflight synchronize");
-            LogStage(workload, "preflight_sync_done");
             validateOutput();
             summary.numericPreflightMs = ElapsedMs(preflightStarted);
             summary.preflightPassed = true;
@@ -880,12 +868,10 @@ ProfileSummary ProfileOfficial(
         if (options.preflightOnly) {
             summary.success = true;
             summary.runnerTotalMs = ElapsedMs(runnerStarted);
-            LogStage(workload, "preflight_complete");
             return summary;
         }
 
         const auto warmupStarted = SteadyClock::now();
-        LogStage(workload, "warmup");
         for (int32_t i = 0; i < options.warmup; ++i) {
             reset();
             CheckAcl(
@@ -903,7 +889,6 @@ ProfileSummary ProfileOfficial(
         try {
             CheckAcl(aclrtCreateEvent(&end), "aclrtCreateEvent official end");
             for (int32_t sample = 0; sample < options.samples; ++sample) {
-                LogStage(workload, "sample_" + std::to_string(sample));
                 reset();
                 CheckAcl(
                     aclrtSynchronizeStream(stream),
@@ -934,11 +919,9 @@ ProfileSummary ProfileOfficial(
         summary.measurementWallMs = ElapsedMs(measurementStarted);
         if (options.validateAfterMeasurement) {
             const auto validationStarted = SteadyClock::now();
-            LogStage(workload, "measurement_output_validation_begin");
             validateOutput();
             summary.numericPreflightMs = ElapsedMs(validationStarted);
             summary.preflightPassed = true;
-            LogStage(workload, "measurement_output_validation_done");
         }
         ComputeStats(summary, workload);
     } catch (const std::exception &exception) {
@@ -1158,25 +1141,13 @@ int main(int argc, char **argv)
             CheckAcl(aclrtCreateContext(&context, options.deviceId), "aclrtCreateContext");
             CheckAcl(aclrtCreateStream(&stream), "aclrtCreateStream");
 
-            for (size_t index = 0; index < workloads.size(); ++index) {
-                const Workload &workload = workloads[index];
-                std::cout << "installed_reference_progress: [" << index + 1 << '/' << workloads.size()
-                          << "] " << workload.id << " M=" << workload.m << " N=" << workload.n
-                          << " K=" << workload.k << " dtype=" << workload.dtype << std::endl;
+            for (const Workload &workload : workloads) {
                 const ProfileSummary summary =
                     ProfileOfficial(workload, stream, options, samplesOutput);
                 WriteProfileRow(output, workload, summary, options);
-                std::cout << "installed_reference_done " << workload.id
-                          << " supported=" << summary.supported
-                          << " success=" << summary.success;
-                if (options.preflightOnly) {
-                    std::cout << " preflight_only=1";
-                } else {
-                    std::cout << " median_ms=" << std::setprecision(12) << summary.median;
-                }
-                if (!summary.error.empty()) std::cout << " reason=" << summary.error;
-                std::cout << std::endl;
                 if (summary.supported && !summary.success) {
+                    std::cerr << "official workload failed id=" << workload.id
+                              << " reason=" << summary.error << '\n';
                     ++failures;
                     break;
                 }
