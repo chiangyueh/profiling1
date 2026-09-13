@@ -165,6 +165,7 @@ DIRECT_KERNEL_TARGETS=(
     direct_matmul_kernel_fp16_201
     direct_matmul_kernel_fp16_10200
     direct_matmul_kernel_fp16_10201
+    direct_matmul_kernel_fp16_901
     direct_matmul_kernel_bf16_0 direct_matmul_kernel_bf16_1
     direct_matmul_kernel_bf16_20 direct_matmul_kernel_bf16_21
     direct_matmul_kernel_bf16_30 direct_matmul_kernel_bf16_31
@@ -172,6 +173,7 @@ DIRECT_KERNEL_TARGETS=(
     direct_matmul_kernel_bf16_201
     direct_matmul_kernel_bf16_10200
     direct_matmul_kernel_bf16_10201
+    direct_matmul_kernel_bf16_901
     direct_matmul_kernel_fp32_0 direct_matmul_kernel_fp32_1
     direct_matmul_kernel_fp32_20 direct_matmul_kernel_fp32_21
     direct_matmul_kernel_fp32_30 direct_matmul_kernel_fp32_31
@@ -184,11 +186,12 @@ MATMUL_V3_KERNEL_DIR="${CANN_ROOT}/opp/built-in/op_impl/ai_core/tbe/impl/ascendc
 DIRECT_KERNEL_BUILD_SIGNATURE="$({
     sha256sum \
         "${ROOT}/direct_matmul/kernel_entry.cpp" \
+        "${ROOT}/direct_matmul/kernel_entry_base_balanced.cpp" \
         "${ROOT}/direct_matmul/mat_mul_v3_tiling_data.h"
     find "${MATMUL_V3_KERNEL_DIR}" -type f -print0 | \
         sort -z | xargs -0 sha256sum
     printf '%s\n' \
-        "installed-81-single-abi-direct-kernel-v5:${ASCENDC_SOC_VERSION}:${DIRECT_KERNEL_TARGETS[*]}"
+        "installed-81-single-abi-direct-kernel-v6:${ASCENDC_SOC_VERSION}:${DIRECT_KERNEL_TARGETS[*]}"
 } | sha256sum | cut -d' ' -f1)"
 kernel_count="${#DIRECT_KERNEL_TARGETS[@]}"
 

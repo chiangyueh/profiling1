@@ -33,6 +33,10 @@ from matmul_reconstruction._core.initializer import (  # noqa: E402
 from matmul_reconstruction.api import select as source_select  # noqa: E402
 
 from formula_rules import CompileInfo, Hardware, Shape, solve  # noqa: E402
+from base_schedule_theory import (  # noqa: E402
+    BaseShape as TheoryBaseShape,
+    analyze as analyze_base_schedule,
+)
 
 
 HARDWARE = {
@@ -258,6 +262,69 @@ def _scheduled_work(fields, shape):
     }
 
 
+def _base_schedule_formula(shape, analysis):
+    """Build the one packet admitted by the BASE ownership proof.
+
+    Tile geometry is derived by base_schedule_theory and is not copied from
+    the reconstructed source packet.  The custom kernel changes ownership;
+    the packet deliberately retains the native C220 pipeline geometry.
+    """
+    packet = analysis["native_packet"]
+    fields = {
+        "baseM": int(packet["base_m"]),
+        "baseN": int(packet["base_n"]),
+        "baseK": int(packet["base_k"]),
+        "singleCoreM": int(packet["single_core_m"]),
+        "singleCoreN": int(packet["single_core_n"]),
+        "singleCoreK": int(packet["single_core_k"]),
+        "usedCoreNum": int(packet["used_cores"]),
+        "stepM": 1,
+        "stepN": 1,
+        "stepKa": int(packet["step_ka"]),
+        "stepKb": int(packet["step_kb"]),
+        "depthA1": int(packet["depth_a1"]),
+        "depthB1": int(packet["depth_b1"]),
+        "dbL0A": 2,
+        "dbL0B": 2,
+        "dbL0C": int(packet["db_l0c"]),
+        "iterateOrder": 0,
+    }
+    width = shape.d
+    resource_bytes = {
+        "L0A_double": 2 * fields["baseM"] * fields["baseK"] * width,
+        "L0B_double": 2 * fields["baseN"] * fields["baseK"] * width,
+        "L0C": fields["dbL0C"] * fields["baseM"] * fields["baseN"] * 4,
+        "L1_AB": (
+            fields["depthA1"] * fields["baseM"]
+            + fields["depthB1"] * fields["baseN"]
+        ) * fields["baseK"] * width,
+        "bias_reserved": 0,
+    }
+    return {
+        "family": "BASE",
+        "fields": fields,
+        "l2": {
+            "mTile": 1,
+            "nTile": 1,
+            "mTileBlock": int(analysis["grid"]["m_count"]),
+            "nTileBlock": int(analysis["grid"]["n_count"]),
+            "calOrder": 0,
+        },
+        "resource_bytes": resource_bytes,
+        "conversion_a": False,
+        "conversion_b": False,
+        "legality": {
+            "native_C220_capacity": "PASS",
+            "one_L2_rectangle": "PASS",
+            "ownership_exact_cover": "PASS",
+            "aggregate_issued_work_equal": "PASS",
+            "pipeline_envelope_dominance": "PASS",
+        },
+        "base_schedule_analysis": analysis,
+        "selection_contract": analysis["selection_contract"],
+    }
+
+
 def _unchanged(request, source, reason, theory):
     selected = _source_output(source)
     return {
@@ -343,7 +410,52 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
     }
 
     activate = None
-    if source_family == "AL1_FULL_LOAD":
+    base_schedule_analysis = None
+    if source_family == "BASE" and dtype in ("fp16", "bf16") and not trans_a and not trans_b:
+        base_schedule_analysis = analyze_base_schedule(
+            TheoryBaseShape(m=m, n=n, k=k, dtype=dtype)
+        )
+        native = base_schedule_analysis["native_packet"]
+        expected_cube = {
+            "baseM": native["base_m"], "baseN": native["base_n"],
+            "baseK": native["base_k"],
+            "singleCoreM": native["single_core_m"],
+            "singleCoreN": native["single_core_n"],
+            "singleCoreK": native["single_core_k"],
+            "usedCoreNum": native["used_cores"],
+            "stepM": 1, "stepN": 1,
+            "stepKa": native["step_ka"], "stepKb": native["step_kb"],
+            "depthA1": native["depth_a1"], "depthB1": native["depth_b1"],
+            "dbL0C": native["db_l0c"], "iterateOrder": 0,
+        }
+        expected_l2 = {
+            "mTileCntL2": 1, "nTileCntL2": 1,
+            "mTileBlock": base_schedule_analysis["grid"]["m_count"],
+            "nTileBlock": base_schedule_analysis["grid"]["n_count"],
+            "calOrder": 0,
+        }
+        source_audit = {
+            "cube_native_match": all(
+                int(source_cube[name]) == int(value)
+                for name, value in expected_cube.items()
+            ),
+            "one_rectangle_match": all(
+                int(source_l2[name]) == int(value)
+                for name, value in expected_l2.items()
+            ),
+            "no_head_conversion": not (
+                source["tilingData"]["matmulRunInfo"]["nd2nzA"]
+                or source["tilingData"]["matmulRunInfo"]["nd2nzB"]
+            ),
+        }
+        base_schedule_analysis["source_scope_audit"] = source_audit
+        theory["base_schedule_analysis"] = base_schedule_analysis
+        if (
+            base_schedule_analysis["decision"] == "ENABLE_NEW_SCHEDULER"
+            and all(source_audit.values())
+        ):
+            activate = "BASE_NATIVE_TILE_FLAT_RR_OWNERSHIP"
+    elif source_family == "AL1_FULL_LOAD":
         activate = "AL1_CAPACITY_DERIVED_K_GRAIN"
     elif (source_family == "BL1_FULL_LOAD_FIXPIPE" and
           int(source["tiling_key"] - 10**19) == 20201 and n > 16):
@@ -357,7 +469,10 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
     # The replacement formula consumes only shape, fixed hardware and compile
     # flags.  The source packet above selects the execution family but none of
     # its tile fields are arguments to solve().
-    formula = solve(shape, FORMULA_HARDWARE, compile_info)
+    if activate == "BASE_NATIVE_TILE_FLAT_RR_OWNERSHIP":
+        formula = _base_schedule_formula(shape, base_schedule_analysis)
+    else:
+        formula = solve(shape, FORMULA_HARDWARE, compile_info)
     fields = formula["fields"]
     if formula["family"] != source_formula_family:
         return _unchanged(
@@ -438,6 +553,12 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
         "tiling_data_hex": raw.hex(),
         "tiling_data_sha256": hashlib.sha256(raw).hexdigest(),
     }
+    if activate == "BASE_NATIVE_TILE_FLAT_RR_OWNERSHIP":
+        improved["selected_family"] = "BASE_TAIL_BALANCED"
+        improved["kernel_variant"] = "BASE_ALIGNED_CUSTOM_FLAT_RR"
+    runner_suffix = (
+        901 if activate == "BASE_NATIVE_TILE_FLAT_RR_OWNERSHIP" else suffix
+    )
     baseline = _source_output(source)
     baseline_cube = source["tilingData"]["matmulTiling"]
     baseline_l2 = source["tilingData"]["tileL2cacheTiling"]
@@ -458,10 +579,42 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
     for name in ("selected_family", "tiling_key", "block_dim", "workspace_bytes"):
         if baseline[name] != improved[name]:
             changes[name] = {"baseline": baseline[name], "improved": improved[name]}
+    if activate == "BASE_NATIVE_TILE_FLAT_RR_OWNERSHIP":
+        changes["kernel_scheduler"] = {
+            "baseline": "LCM_STAGGERED",
+            "improved": "FLAT_ROW_MAJOR_ROUND_ROBIN",
+        }
     if not changes:
         return _unchanged(request, source, "FORMULA_PRODUCED_SOURCE_VALUES", theory)
 
-    if activate == "AL1_CAPACITY_DERIVED_K_GRAIN":
+    if activate == "BASE_NATIVE_TILE_FLAT_RR_OWNERSHIP":
+        analysis = base_schedule_analysis
+        if not (
+            analysis["invariants"]["aggregate_issued_work_equal"]
+            and analysis["proposed_vectors_covered_by_source"]
+            and analysis["decision"] == "ENABLE_NEW_SCHEDULER"
+            and fields["baseM"] == 128
+            and fields["baseN"] == 256
+            and fields["baseK"] == 64
+            and l2["mTileCntL2"] == 1
+            and l2["nTileCntL2"] == 1
+            and l2["calOrder"] == 0
+        ):
+            raise ValueError("BASE scheduler lacks its parameter-free dominance proof")
+        theory["improvement_equation"] = {
+            "proof_kind": "componentwise_per_core_pipeline_envelope_dominance",
+            "ownership_before": "LCM-staggered source mapping",
+            "ownership_after": "linear_task=core+round*20",
+            "native_tile": [fields["baseM"], fields["baseN"], fields["baseK"]],
+            "source_max_per_core": analysis["source_max_per_core"],
+            "improved_max_per_core": analysis["proposed_max_per_core"],
+            "strictly_reduced_resources": analysis["strictly_reduced_resources"],
+            "aggregate_issued_work_equal": True,
+            "latency_weights": False,
+            "logical_fma_delta": 0,
+        }
+        rules = ["BASE_NATIVE_TILE_FLAT_RR_OWNERSHIP"]
+    elif activate == "AL1_CAPACITY_DERIVED_K_GRAIN":
         old_k_loops = ceil_div(k, int(baseline_cube["baseK"]))
         new_k_loops = ceil_div(k, int(fields["baseK"]))
         old_tasks = ceil_div(n, int(baseline_cube["singleCoreN"]))
@@ -535,7 +688,7 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
         "selected": improved, "baseline": baseline, "improved": improved,
         "baseline_equivalent": False, "changed_rules": rules,
         "changed_fields": changes, "formula_family": formula["family"],
-        "kernel_suffix": suffix, "resource_bytes": formula["resource_bytes"],
+        "kernel_suffix": runner_suffix, "resource_bytes": formula["resource_bytes"],
         "selection_basis": "UNIQUE_ORDERED_CLOSED_FORM", "npu_eligible": True,
         "theory": theory,
         "runtime_dependencies": {
@@ -548,14 +701,22 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
         "path_coverage": {
             "initializer": "ABI_DEFAULTS_ONLY_NO_TILE_SELECTION",
             "family_selection": "ORDERED_SOURCE_RECONSTRUCTION_PLUS_INDEPENDENT_FORMULA_AGREEMENT",
-            "kernel_implementation": "RETAINED_INSTALLED_CANN_81_BRANCH_AND_MARKED",
+            "kernel_implementation": (
+                "CUSTOM_BASE_OWNERSHIP_WITH_RETAINED_CANN81_MATMUL_PIPELINE"
+                if activate == "BASE_NATIVE_TILE_FLAT_RR_OWNERSHIP" else
+                "RETAINED_INSTALLED_CANN_81_BRANCH_AND_MARKED"
+            ),
             "abi_layout": "RETAINED_272_BYTE_ABI_AND_MARKED",
             "official_runtime_tiling_seed": "FORBIDDEN_AND_NOT_USED",
             "unmodified_source_paths": "REPORTED_AS_BASELINE_EQUIVALENT_NOT_IMPROVED",
         },
         "validation": {
             "host_packet": "PASS_272_BYTE_ABI_ROUNDTRIP",
-            "kernel_key_domain": "PASS_INSTALLED_81_DTYPE_AWARE_DISPATCH",
+            "kernel_key_domain": (
+                "CUSTOM_DIRECT_BASE_KERNEL_COMPILED_FOR_SUFFIX_1"
+                if activate == "BASE_NATIVE_TILE_FLAT_RR_OWNERSHIP" else
+                "PASS_INSTALLED_81_DTYPE_AWARE_DISPATCH"
+            ),
             "local_capacity": "PASS_FIXED_910B3_CAPACITIES",
             "npu_performance": "NOT_MEASURED",
         },

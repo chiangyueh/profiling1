@@ -113,9 +113,9 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
 set(ASCENDC_CMAKE "${ASCENDC_CMAKE_PRIVATE_DIR}/ascendc.cmake")
 include("${ASCENDC_CMAKE}")
 
-function(add_direct_matmul_kernel target kernel dtype suffix)
+function(add_direct_matmul_kernel target kernel dtype suffix kernel_entry)
     ascendc_library(${target} STATIC
-        "${PROJECT_ROOT}/direct_matmul/kernel_entry.cpp"
+        "${kernel_entry}"
     )
     ascendc_include_directories(${target} PRIVATE
         "${PROJECT_ROOT}/direct_matmul"
@@ -137,6 +137,19 @@ function(register_direct_matmul dtype_name dtype suffix suffix_padded)
     set(kernel "direct_matmul_${dtype_name}_k${suffix}")
     add_direct_matmul_kernel(
         ${target} ${kernel} ${dtype} ${suffix_padded}
+        "${PROJECT_ROOT}/direct_matmul/kernel_entry.cpp"
+    )
+    set(DIRECT_MATMUL_KERNEL_TARGETS
+        ${DIRECT_MATMUL_KERNEL_TARGETS} ${target} PARENT_SCOPE
+    )
+endfunction()
+
+function(register_balanced_base dtype_name dtype)
+    set(target "direct_matmul_kernel_${dtype_name}_901")
+    set(kernel "direct_matmul_${dtype_name}_k901")
+    add_direct_matmul_kernel(
+        ${target} ${kernel} ${dtype} 00001
+        "${PROJECT_ROOT}/direct_matmul/kernel_entry_base_balanced.cpp"
     )
     set(DIRECT_MATMUL_KERNEL_TARGETS
         ${DIRECT_MATMUL_KERNEL_TARGETS} ${target} PARENT_SCOPE
@@ -180,6 +193,11 @@ register_direct_matmul(fp32 float 201 00201)
 register_direct_matmul(fp32 float 10200 10200)
 register_direct_matmul(fp32 float 10201 10201)
 register_direct_matmul(fp32 float 20201 20201)
+
+# Synthetic runner suffix 901 identifies the new ownership kernel.  Its
+# internal MatMul tiling key remains the legal CANN BASE_ALIGNED key 1.
+register_balanced_base(fp16 half)
+register_balanced_base(bf16 bfloat16_t)
 
 # direct_matmul_runner is intentionally linked outside this CMake graph by
 # build_all.sh.  Depending on any ascendc_library target here would retraverse

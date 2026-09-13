@@ -73,8 +73,10 @@ CAMPAIGN_ID="$({
         scripts/env.sh \
         cmake_npu/CMakeLists.txt \
         direct_matmul/kernel_entry.cpp \
+        direct_matmul/kernel_entry_base_balanced.cpp \
         direct_matmul/mat_mul_v3_tiling_data.h \
         direct_matmul/runner.cpp \
+        matmul_rule_selector/base_schedule_theory.py \
         matmul_rule_selector/formula_rules.py \
         matmul_rule_selector/improved_selector.py \
         matmul_rule_selector/source_family_audit_contract.json \
