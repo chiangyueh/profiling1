@@ -26,8 +26,9 @@ FIELDS = (
     "model_schedule_sha256", "is_reserve", "l2_cache_flag", "nd2nz_a",
     "nd2nz_b", "required_successful_tilings",
 )
-EXPECTED_VALIDATION_SHAPES = 8
-EXPECTED_VARIANTS = {("fp32", 101), ("fp32", 20201)}
+EXPECTED_VALIDATION_CASES = 11
+EXPECTED_NPU_SHAPES = 3
+EXPECTED_VARIANTS = {("fp16", 1), ("bf16", 1)}
 EXPECTED_SOURCE_FAMILIES = {
     "BASE", "AL1_FULL_LOAD", "BL1_FULL_LOAD", "BL1_FULL_LOAD_FIXPIPE",
     "SINGLE_CORE_SPLIT_K", "DETERMINISTIC_SPLIT_K", "INCREMENTAL_PATTERN",
@@ -138,7 +139,7 @@ def main() -> None:
             encoding="utf-8"
         )
     )
-    if (len(validation) != EXPECTED_VALIDATION_SHAPES or
+    if (len(validation) != EXPECTED_VALIDATION_CASES or
             len({row["workload_id"] for row in validation}) != len(validation)):
         raise RuntimeError("unique validation contract was reduced or duplicated")
     if (len(audit_contract) != 13 or
@@ -183,13 +184,19 @@ def main() -> None:
         if not (result["status"] == "MODIFIED_TILING" and
                 result["npu_eligible"] and not result["baseline_equivalent"]):
             raise RuntimeError(f"{workload_id}: no distinct improved packet")
-        expected_rule = (
-            "AL1_CAPACITY_DERIVED_K_GRAIN"
-            if row["selection_axis"] == "al1_capacity_k_grain"
-            else "FIXPIPE_VECTOR_MULTI_GROUP_PIPELINE"
-        )
+        expected_rules = {
+            "al1_capacity_k_grain": "AL1_CAPACITY_DERIVED_K_GRAIN",
+            "fixpipe_vector_pipeline": "FIXPIPE_VECTOR_MULTI_GROUP_PIPELINE",
+            "base_same_grid_tail": "BASE_SAME_GRID_TAIL_REBALANCE",
+        }
+        expected_rule = expected_rules.get(row["selection_axis"])
+        if expected_rule is None:
+            raise RuntimeError(f"{workload_id}: unknown selection axis")
         if result["changed_rules"] != [expected_rule]:
             raise RuntimeError(f"{workload_id}: unexpected theoretical rule")
+        audit_rows.append(compact_theory(workload_id, result))
+        if not bool(row.get("npu_measure", True)):
+            continue
         packet = result["improved"]
         blob = bytes.fromhex(packet["tiling_data_hex"])
         if (len(blob) != 272 or
@@ -226,7 +233,11 @@ def main() -> None:
             "case_role": "unique_theoretical_improvement",
         })
         selections.append(result)
-        audit_rows.append(compact_theory(workload_id, result))
+
+    if len(manifest_rows) != EXPECTED_NPU_SHAPES:
+        raise RuntimeError(
+            f"expected {EXPECTED_NPU_SHAPES} NPU shapes, found {len(manifest_rows)}"
+        )
 
     variants = {(row["dtype"], int(row["kernel_suffix"]))
                 for row in manifest_rows}
@@ -253,7 +264,8 @@ def main() -> None:
     print(
         "UNIQUE_FORMULA_MATRIX_GENERATED "
         f"audit_shapes={len(audit_contract)} source_families={len(source_families)} "
-        f"source_suffixes={len(source_suffixes)} npu_shapes={len(manifest_rows)} "
+        f"source_suffixes={len(source_suffixes)} validation_cases={len(validation)} "
+        f"npu_shapes={len(manifest_rows)} "
         f"complete_tilings_per_shape=1 variants={len(grouped)}"
     )
 

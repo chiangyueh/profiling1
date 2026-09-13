@@ -32,7 +32,9 @@ from matmul_reconstruction._core.initializer import (  # noqa: E402
 )
 from matmul_reconstruction.api import select as source_select  # noqa: E402
 
-from formula_rules import CompileInfo, Hardware, Shape, solve  # noqa: E402
+from formula_rules import (  # noqa: E402
+    CompileInfo, Hardware, Shape, solve, solve_base_same_grid_tail,
+)
 
 
 HARDWARE = {
@@ -343,11 +345,18 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
     }
 
     activate = None
+    formula_override = None
     if source_family == "AL1_FULL_LOAD":
         activate = "AL1_CAPACITY_DERIVED_K_GRAIN"
     elif (source_family == "BL1_FULL_LOAD_FIXPIPE" and
           int(source["tiling_key"] - 10**19) == 20201 and n > 16):
         activate = "FIXPIPE_VECTOR_MULTI_GROUP_PIPELINE"
+    elif source_family == "BASE":
+        formula_override = solve_base_same_grid_tail(
+            shape, FORMULA_HARDWARE, compile_info
+        )
+        if formula_override is not None:
+            activate = "BASE_SAME_GRID_TAIL_REBALANCE"
     if activate is None:
         return _unchanged(
             request, source,
@@ -357,7 +366,8 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
     # The replacement formula consumes only shape, fixed hardware and compile
     # flags.  The source packet above selects the execution family but none of
     # its tile fields are arguments to solve().
-    formula = solve(shape, FORMULA_HARDWARE, compile_info)
+    formula = (formula_override if formula_override is not None else
+               solve(shape, FORMULA_HARDWARE, compile_info))
     fields = formula["fields"]
     if formula["family"] != source_formula_family:
         return _unchanged(
@@ -461,7 +471,45 @@ def generate(m, k, n, dtype="fp16", trans_a=False, trans_b=False):
     if not changes:
         return _unchanged(request, source, "FORMULA_PRODUCED_SOURCE_VALUES", theory)
 
-    if activate == "AL1_CAPACITY_DERIVED_K_GRAIN":
+    if activate == "BASE_SAME_GRID_TAIL_REBALANCE":
+        balance = formula["same_grid_tail_balance"]
+        expected_source = {
+            "baseM": 128, "baseN": 256, "baseK": 64,
+            "singleCoreM": 128, "singleCoreN": 256,
+            "singleCoreK": k, "usedCoreNum": 20,
+            "stepM": 1, "stepN": 1, "stepKa": 8, "stepKb": 4,
+            "depthA1": 16, "depthB1": 8, "dbL0C": 1,
+            "iterateOrder": 0,
+        }
+        if any(int(baseline_cube[name]) != value
+               for name, value in expected_source.items()):
+            raise ValueError("BASE source audit is outside the retained geometry")
+        if not (
+            balance["output_tasks_after"] == balance["output_tasks_before"]
+            and balance["task_waves_after"] == balance["task_waves_before"]
+            and balance["total_M_rows_after"] == balance["total_M_rows_before"]
+            and balance["critical_M_rows_after"] < balance["critical_M_rows_before"]
+            and fields["baseN"] == 256 and fields["baseK"] == 64
+            and fields["stepKa"] == 8 and fields["stepKb"] == 4
+            and fields["depthA1"] == 16 and fields["depthB1"] == 8
+            and fields["dbL0C"] == 1
+        ):
+            raise ValueError("BASE tail rule lacks its exact owner-load proof")
+        changed_names = set(changes)
+        if changed_names != {"baseM", "singleCoreM"}:
+            raise ValueError(
+                "BASE same-grid rule changed fields outside baseM/singleCoreM: "
+                + str(sorted(changed_names))
+            )
+        theory["improvement_equation"] = {
+            "proof_kind": "same_tasks_same_pipeline_lower_exact_critical_core_rows",
+            **balance,
+            "changed_packet_fields": ["baseM", "singleCoreM"],
+            "logical_fma_delta": 0,
+            "candidate_or_latency_score": False,
+        }
+        rules = ["BASE_SAME_GRID_TAIL_REBALANCE"]
+    elif activate == "AL1_CAPACITY_DERIVED_K_GRAIN":
         old_k_loops = ceil_div(k, int(baseline_cube["baseK"]))
         new_k_loops = ceil_div(k, int(fields["baseK"]))
         old_tasks = ceil_div(n, int(baseline_cube["singleCoreN"]))

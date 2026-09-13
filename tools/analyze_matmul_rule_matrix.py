@@ -10,7 +10,7 @@ from pathlib import Path
 import statistics
 
 
-EXPECTED_SHAPES = 8
+EXPECTED_SHAPES = 3
 EXPECTED_SAMPLES = 15
 EXPECTED_WARMUP = 3
 EXPECTED_REPEAT = 10
