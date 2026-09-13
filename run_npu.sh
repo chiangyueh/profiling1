@@ -88,12 +88,17 @@ SELECTION="${CAMPAIGN_DIR}/selection.jsonl"
 THEORY_AUDIT="${CAMPAIGN_DIR}/theory_audit.jsonl"
 VARIANT_DIR="${CAMPAIGN_DIR}/variants"
 SEQUENCE_DIR="${CAMPAIGN_DIR}/sequence"
-RUNNER_LOG="${RUN_LOG}"
 OFFICIAL_PROFILE="${CAMPAIGN_DIR}/official_profile.csv"
 OFFICIAL_SAMPLES="${CAMPAIGN_DIR}/official_samples.csv"
 ANALYSIS="${CAMPAIGN_DIR}/analysis.json"
 SUMMARY="${CAMPAIGN_DIR}/summary.csv"
-mkdir -p "${CAMPAIGN_DIR}"
+DETAIL_DIR="${CAMPAIGN_DIR}/details"
+GENERATION_DETAIL="${DETAIL_DIR}/generation.log"
+OFFICIAL_BUILD_DETAIL="${DETAIL_DIR}/official_build.log"
+OFFICIAL_RUN_DETAIL="${DETAIL_DIR}/official_run.log"
+RUNNER_LOG="${DETAIL_DIR}/candidate_runner.log"
+ANALYSIS_DETAIL="${DETAIL_DIR}/analysis.log"
+mkdir -p "${CAMPAIGN_DIR}" "${DETAIL_DIR}"
 
 emit_final_results() {
     local final_lines
@@ -104,7 +109,6 @@ emit_final_results() {
     final_lines="$(python3 - "${SUMMARY}" "${VALIDATION_SHAPES}" <<'PY'
 import csv
 import sys
-from collections import defaultdict
 
 with open(sys.argv[1], newline="", encoding="utf-8") as stream:
     rows = list(csv.DictReader(stream))
@@ -112,63 +116,19 @@ expected = int(sys.argv[2])
 if len(rows) != expected:
     raise SystemExit(f"expected {expected} final rows, found {len(rows)}")
 print("FINAL_RESULTS_BEGIN")
-by_axis = defaultdict(list)
-by_role = defaultdict(list)
 for row in rows:
-    by_axis[row["selection_axis"]].append(row)
-    by_role[row["case_role"]].append(row)
     print(
         "FINAL_RESULT "
         f"id={row['workload_id']} "
-        f"axis={row['selection_axis']} "
-        f"role={row['case_role']} "
-        f"applicable={row['required_applicable_family']} "
-        f"selected={row['selected_family']} "
+        f"shape={row['m']}x{row['n']}x{row['k']} "
+        f"dtype={row['dtype']} "
         f"baseM={row['official_baseM']}->{row['candidate_baseM']} "
-        f"critical_M_rows={row['critical_M_rows_before']}->"
-        f"{row['critical_M_rows_after']} "
-        f"predicted_critical_component_delta_pct="
-        f"{float(row['predicted_critical_component_delta_pct']):+.3f} "
         f"official_ms={float(row['official_median_ms']):.9g} "
         f"candidate_ms={float(row['candidate_median_ms']):.9g} "
         f"delta_pct={float(row['delta_pct']):+.3f} "
         f"winner={row['median_winner']} "
-        f"separation={row['sample_separation']} "
-        f"theory_evidence={row['theory_evidence']}"
+        f"correctness={row['correctness']}"
     )
-for axis in sorted(by_axis):
-    axis_rows = by_axis[axis]
-    print(
-        "FINAL_RULE_RESULT "
-        f"axis={axis} "
-        f"shapes={len(axis_rows)} "
-        f"candidate_wins={sum(row['median_winner'] == 'candidate' for row in axis_rows)} "
-        f"clear_candidate_wins={sum(row['sample_separation'] == 'CLEAR_CANDIDATE_WINNER' for row in axis_rows)} "
-        f"clear_official_wins={sum(row['sample_separation'] == 'CLEAR_OFFICIAL_WINNER' for row in axis_rows)} "
-        f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in axis_rows)}"
-    )
-for role in sorted(by_role):
-    role_rows = by_role[role]
-    print(
-        "FINAL_ROLE_SUMMARY "
-        f"role={role} "
-        f"shapes={len(role_rows)} "
-        f"candidate_wins={sum(row['median_winner'] == 'candidate' for row in role_rows)} "
-        f"official_wins={sum(row['median_winner'] == 'official' for row in role_rows)} "
-        f"clear_candidate_wins={sum(row['sample_separation'] == 'CLEAR_CANDIDATE_WINNER' for row in role_rows)} "
-        f"clear_official_wins={sum(row['sample_separation'] == 'CLEAR_OFFICIAL_WINNER' for row in role_rows)} "
-        f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in role_rows)}"
-    )
-selector_rows = by_role["unique_theoretical_improvement"]
-print(
-    "FINAL_THEORETICAL_SUMMARY "
-    f"shapes={len(selector_rows)} "
-    f"candidate_wins={sum(row['median_winner'] == 'candidate' for row in selector_rows)} "
-    f"official_wins={sum(row['median_winner'] == 'official' for row in selector_rows)} "
-    f"clear_candidate_wins={sum(row['sample_separation'] == 'CLEAR_CANDIDATE_WINNER' for row in selector_rows)} "
-    f"clear_official_wins={sum(row['sample_separation'] == 'CLEAR_OFFICIAL_WINNER' for row in selector_rows)} "
-    f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in selector_rows)}"
-)
 print(
     "FINAL_RESULT_SUMMARY "
     f"shapes={len(rows)} "
@@ -236,25 +196,19 @@ if [[ -s "${ANALYSIS}" ]] && grep -q '"status": "complete"' "${ANALYSIS}"; then
 fi
 
 generation_started_ns="$(date +%s%N)"
-python3 tools/generate_matmul_unique_formula_matrix.py \
+if ! python3 tools/generate_matmul_unique_formula_matrix.py \
     --output-dir "${PACKET_DIR}" \
     --manifest "${MANIFEST}" \
     --selection "${SELECTION}" \
     --theory-audit "${THEORY_AUDIT}" \
     --variant-dir "${VARIANT_DIR}" \
-    --sequence-dir "${SEQUENCE_DIR}"
+    --sequence-dir "${SEQUENCE_DIR}" >"${GENERATION_DETAIL}" 2>&1; then
+    tail -80 "${GENERATION_DETAIL}"
+    fail "BASE packet generation failed"
+fi
 actual_variants="$(find "${VARIANT_DIR}" -maxdepth 1 -type f -name '*.csv' | wc -l)"
 [[ "${actual_variants}" -eq "${EXPECTED_VARIANTS}" ]] || \
     fail "generated ${actual_variants} dtype/suffix variants; expected ${EXPECTED_VARIANTS}"
-printf '%s\n' 'SELECTION_RECORDS_BEGIN'
-sed 's/^/SELECTION_RECORD /' "${SELECTION}"
-printf '%s\n' 'SELECTION_RECORDS_END'
-printf '%s\n' 'THEORETICAL_RESULTS_BEGIN'
-sed 's/^/THEORETICAL_RESULT /' "${THEORY_AUDIT}"
-printf '%s\n' 'THEORETICAL_RESULTS_END'
-printf '%s\n' 'CANDIDATE_MANIFEST_CSV_BEGIN'
-cat "${MANIFEST}"
-printf '%s\n' 'CANDIDATE_MANIFEST_CSV_END'
 generation_wall_ms=$(( ($(date +%s%N) - generation_started_ns) / 1000000 ))
 announce "UNIQUE_FORMULA_PACKET_GENERATION passed scope=BASE_baseM_only shapes=${VALIDATION_SHAPES} source_families=1 source_suffixes=1 variants=${EXPECTED_VARIANTS} complete_tilings_per_shape=1 packet_bytes=272"
 announce "CAMPAIGN_STAGE_TIMING stage=unique_formula_packet_generation wall_ms=${generation_wall_ms}"
@@ -400,12 +354,18 @@ announce "DEVICE_PREFLIGHT passed physical_device=${PHYSICAL_DEVICE} runtime_use
 
 official_build_started_ns="$(date +%s%N)"
 announce "OFFICIAL_RUNNER_BUILD begin jobs=1"
-if ! BUILD_COMPONENTS=official BUILD_JOBS=1 scripts/build_all.sh; then
+if ! BUILD_COMPONENTS=official BUILD_JOBS=1 scripts/build_all.sh \
+    >"${OFFICIAL_BUILD_DETAIL}" 2>&1; then
+    tail -80 "${OFFICIAL_BUILD_DETAIL}"
     fail "official runner build failed"
 fi
 official_runner="${ROOT}/build/official_matmul_runner"
 [[ -x "${official_runner}" ]] || fail "official runner missing after build: ${official_runner}"
-"${official_runner}" --candidates "${MANIFEST}" --validate-input >/dev/null
+if ! "${official_runner}" --candidates "${MANIFEST}" --validate-input \
+    >>"${OFFICIAL_BUILD_DETAIL}" 2>&1; then
+    tail -80 "${OFFICIAL_BUILD_DETAIL}"
+    fail "official runner input validation failed"
+fi
 official_build_wall_ms=$(( ($(date +%s%N) - official_build_started_ns) / 1000000 ))
 announce "OFFICIAL_RUNNER_BUILD passed"
 announce "CAMPAIGN_STAGE_TIMING stage=official_runner_build wall_ms=${official_build_wall_ms}"
@@ -417,15 +377,21 @@ for variant_manifest in "${VARIANT_DIR}"/*.csv; do
     dtype="${variant%%_k*}"
     suffix="${variant##*_k}"
     target="direct_matmul_kernel_${dtype}_${suffix}"
+    variant_build_detail="${DETAIL_DIR}/variant_build_${variant}.log"
     variant_count=$((variant_count + 1))
     announce "DIRECT_VARIANT_BUILD ${variant_count}/${EXPECTED_VARIANTS} begin variant=${variant} jobs=1"
     if ! BUILD_COMPONENTS=variant BUILD_JOBS=1 DIRECT_KERNEL_TARGET="${target}" \
-        scripts/build_all.sh; then
+        scripts/build_all.sh >"${variant_build_detail}" 2>&1; then
+        tail -80 "${variant_build_detail}"
         fail "direct variant build failed: variant=${variant}"
     fi
     runner="${ROOT}/build/direct_runners/direct_matmul_${variant}"
     [[ -x "${runner}" ]] || fail "direct runner missing after build: ${runner}"
-    "${runner}" --manifest "${variant_manifest}" --validate-input >/dev/null
+    if ! "${runner}" --manifest "${variant_manifest}" --validate-input \
+        >>"${variant_build_detail}" 2>&1; then
+        tail -80 "${variant_build_detail}"
+        fail "direct runner input validation failed: variant=${variant}"
+    fi
     announce "DIRECT_VARIANT_BUILD ${variant_count}/${EXPECTED_VARIANTS} passed variant=${variant}"
 done
 [[ "${variant_count}" -eq "${EXPECTED_VARIANTS}" ]] || \
@@ -435,7 +401,7 @@ announce "CAMPAIGN_STAGE_TIMING stage=selected_variant_build wall_ms=${build_wal
 
 measurement_started_ns="$(date +%s%N)"
 announce "OFFICIAL_MEASUREMENT begin shapes=${VALIDATION_SHAPES}"
-"${official_runner}" \
+if ! "${official_runner}" \
     --candidates "${MANIFEST}" \
     --output "${OFFICIAL_PROFILE}" \
     --samples-output "${OFFICIAL_SAMPLES}" \
@@ -445,14 +411,12 @@ announce "OFFICIAL_MEASUREMENT begin shapes=${VALIDATION_SHAPES}"
     --samples "${SAMPLES}" \
     --numeric-preflight-max-mib "${NUMERIC_PREFLIGHT_MAX_MIB}" \
     --structured-full-preflight \
-    --validate-after-measurement
+    --validate-after-measurement >"${OFFICIAL_RUN_DETAIL}" 2>&1; then
+    tail -80 "${OFFICIAL_RUN_DETAIL}"
+    fail "official measurement failed"
+fi
 announce "OFFICIAL_MEASUREMENT passed shapes=${VALIDATION_SHAPES}"
-printf '%s\n' 'OFFICIAL_PROFILE_CSV_BEGIN'
-cat "${OFFICIAL_PROFILE}"
-printf '%s\n' 'OFFICIAL_PROFILE_CSV_END'
-printf '%s\n' 'OFFICIAL_SAMPLES_CSV_BEGIN'
-cat "${OFFICIAL_SAMPLES}"
-printf '%s\n' 'OFFICIAL_SAMPLES_CSV_END'
+: >"${RUNNER_LOG}"
 
 batch_index=0
 candidate_batch_failures=0
@@ -474,10 +438,10 @@ for packet_manifest in "${SEQUENCE_DIR}"/*.csv; do
     else
         canary_rc=$?
     fi
-    printf '%s\n' "${canary_output}" | sed 's/^/UNIQUE_FORMULA_CANARY_RECORD /'
     canary_invalid="$(grep -c 'DIRECT_MATMUL_RESULT .*"status":"failed"' <<<"${canary_output}" || true)"
     if [[ "${canary_rc}" -ne 0 || "${canary_invalid}" -ne 0 ]]; then
         candidate_batch_failures=$((candidate_batch_failures + 1))
+        printf '%s\n' "${canary_output}" | tail -40
         announce "CANDIDATE_CANARY ${batch_index}/${EXPECTED_VARIANTS} failed variant=${variant} rc=${canary_rc} invalid_shapes=${canary_invalid}; formal_measurement=skipped"
         continue
     fi
@@ -488,10 +452,11 @@ for packet_manifest in "${SEQUENCE_DIR}"/*.csv; do
         --device "${DEVICE_ID}" \
         --warmup "${WARMUP}" \
         --repeat "${REPEAT}" \
-        --samples "${SAMPLES}"; then
+        --samples "${SAMPLES}" >>"${RUNNER_LOG}" 2>&1; then
         announce "CANDIDATE_MEASUREMENT_BATCH ${batch_index}/${EXPECTED_VARIANTS} passed variant=${variant} shapes=${batch_shapes}"
     else
         candidate_batch_failures=$((candidate_batch_failures + 1))
+        tail -40 "${RUNNER_LOG}"
         announce "CANDIDATE_MEASUREMENT_BATCH ${batch_index}/${EXPECTED_VARIANTS} failed variant=${variant}; continuing_remaining_variants=1"
     fi
 done
@@ -503,20 +468,17 @@ announce "CAMPAIGN_STAGE_TIMING stage=paired_npu_measurement wall_ms=${measureme
     fail "all ${EXPECTED_VARIANTS} variants were attempted; ${candidate_batch_failures} variant batches failed correctness or execution"
 
 analysis_started_ns="$(date +%s%N)"
-python3 tools/analyze_matmul_rule_matrix.py \
+if ! python3 tools/analyze_matmul_rule_matrix.py \
     --manifest "${MANIFEST}" \
     --runner-log "${RUNNER_LOG}" \
     --official-profile "${OFFICIAL_PROFILE}" \
     --official-samples "${OFFICIAL_SAMPLES}" \
     --selection "${SELECTION}" \
     --output-json "${ANALYSIS}" \
-    --output-csv "${SUMMARY}"
-printf '%s\n' 'FINAL_ANALYSIS_JSON_BEGIN'
-cat "${ANALYSIS}"
-printf '%s\n' 'FINAL_ANALYSIS_JSON_END'
-printf '%s\n' 'FINAL_SUMMARY_CSV_BEGIN'
-cat "${SUMMARY}"
-printf '%s\n' 'FINAL_SUMMARY_CSV_END'
+    --output-csv "${SUMMARY}" >"${ANALYSIS_DETAIL}" 2>&1; then
+    tail -80 "${ANALYSIS_DETAIL}"
+    fail "result analysis failed"
+fi
 analysis_wall_ms=$(( ($(date +%s%N) - analysis_started_ns) / 1000000 ))
 announce "CAMPAIGN_STAGE_TIMING stage=analysis wall_ms=${analysis_wall_ms}"
 emit_final_results
