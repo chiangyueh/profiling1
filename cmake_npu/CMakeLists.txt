@@ -146,7 +146,7 @@ endfunction()
 
 # Exact installed CANN 8.1 dtype/suffix dispatch domain known to the runner.
 # Each library compiles one original kernel branch; run_npu.sh builds only the
-# fp32/suffix101 branch emitted by the certified validation matrix.
+# four dtype/suffix variants with a proven zero-owner core deletion.
 register_direct_matmul(fp16 half 0 00000)
 register_direct_matmul(fp16 half 1 00001)
 register_direct_matmul(fp16 half 20 00020)

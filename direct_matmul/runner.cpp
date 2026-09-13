@@ -252,7 +252,9 @@ std::vector<Candidate> LoadManifest(const std::string &path)
              row.role != "independent_branch_probe" &&
              row.role != "independent_experimental_family" &&
              row.role != "unique_theoretical_improvement" &&
-             row.role != "certified_instruction_deletion") ||
+             row.role != "certified_instruction_deletion" &&
+             row.role != "family_core_baseline" &&
+             row.role != "family_core_candidate") ||
             row.m <= 0 || row.n <= 0 || row.k <= 0 || row.usedCores == 0 ||
             row.workspaceBytes < 20U * 1024U * 1024U ||
             row.requiredSuccessfulTilings == 0) {
