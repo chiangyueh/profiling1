@@ -15,8 +15,8 @@ usage() {
     printf '%s\n' \
         'Usage: ./run_npu.sh --mode full [-d PHYSICAL_NPU_ID]' \
         '' \
-        'Audits the complete source family chain, then measures exactly one' \
-        'closed-form improved tiling and one official reference per workload.'
+        'Measures only the BASE same-grid baseM rule: exactly one closed-form' \
+        'tiling and one same-campaign official reference per workload.'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -77,7 +77,6 @@ CAMPAIGN_ID="$({
         direct_matmul/runner.cpp \
         matmul_rule_selector/formula_rules.py \
         matmul_rule_selector/improved_selector.py \
-        matmul_rule_selector/source_family_audit_contract.json \
         matmul_rule_selector/unique_formula_validation_contract.json
     find matmul_rule_selector/baseline_core -type f -name '*.py' -print0 |
         sort -z | xargs -0 sha256sum
@@ -125,11 +124,17 @@ for row in rows:
         f"role={row['case_role']} "
         f"applicable={row['required_applicable_family']} "
         f"selected={row['selected_family']} "
+        f"baseM={row['official_baseM']}->{row['candidate_baseM']} "
+        f"critical_M_rows={row['critical_M_rows_before']}->"
+        f"{row['critical_M_rows_after']} "
+        f"predicted_critical_component_delta_pct="
+        f"{float(row['predicted_critical_component_delta_pct']):+.3f} "
         f"official_ms={float(row['official_median_ms']):.9g} "
         f"candidate_ms={float(row['candidate_median_ms']):.9g} "
         f"delta_pct={float(row['delta_pct']):+.3f} "
         f"winner={row['median_winner']} "
-        f"separation={row['sample_separation']}"
+        f"separation={row['sample_separation']} "
+        f"theory_evidence={row['theory_evidence']}"
     )
 for axis in sorted(by_axis):
     axis_rows = by_axis[axis]
@@ -173,6 +178,17 @@ print(
     f"clear_official_wins={sum(row['sample_separation'] == 'CLEAR_OFFICIAL_WINNER' for row in rows)} "
     f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in rows)}"
 )
+evidence = [row["theory_evidence"] for row in rows]
+if all(value == "STRONG_SUPPORT" for value in evidence):
+    verdict = "SUPPORTED_ON_THREE_BASEM_SHAPES"
+elif any(value == "STRONG_CONTRADICTION" for value in evidence):
+    verdict = "REJECTED_ON_VALIDATION_SET"
+else:
+    verdict = "INCONCLUSIVE_ON_VALIDATION_SET"
+print(
+    "FINAL_BASEM_THEORY_VERDICT "
+    f"scope=BASE_same_grid_baseM_rebalance_only verdict={verdict}"
+)
 print("FINAL_RESULTS_END")
 PY
     )"
@@ -199,12 +215,15 @@ fail() {
 announce "RUN_LOG path=${RUN_LOG}"
 source_revision="$(git rev-parse HEAD 2>/dev/null || printf unknown)"
 announce "SOURCE_REVISION commit=${source_revision}"
-announce "CAMPAIGN_READY operator=matmul selector=unique_ordered_closed_form focus=base_same_grid_tail source_families=7 source_suffixes=12 retained_rule_host_checks=8 npu_shapes=${VALIDATION_SHAPES} candidate_measurements=${VALIDATION_SHAPES} official_measurements=${VALIDATION_SHAPES} compiled_variants=${EXPECTED_VARIANTS} physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
+announce "CAMPAIGN_READY operator=matmul selector=unique_ordered_closed_form focus=base_same_grid_tail_only source_families=1 source_suffixes=1 npu_shapes=${VALIDATION_SHAPES} candidate_measurements=${VALIDATION_SHAPES} official_measurements=${VALIDATION_SHAPES} compiled_variants=${EXPECTED_VARIANTS} physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
 announce "measurement=${WARMUP}_warmup+${SAMPLES}_device_event_samples+repeat_${REPEAT}+validate_last_timed_output"
 announce "numeric_preflight_limit_mib=${NUMERIC_PREFLIGHT_MAX_MIB}"
-announce "selection=one_source_family_then_one_closed_form_tiling_no_cross_family_ranking"
+announce "selection=BASE_only_one_closed_form_baseM_tiling_no_cross_family_ranking"
 announce "selector=shape_and_frozen_910b3_hardware_integer_equations_only"
 announce "official_reference=same_campaign_installed_aclnn_matmul_public_api"
+announce "BASE_HYPOTHESIS official_81_gap=fixed_baseM_128_has_no_exact_20_core_same_grid_owner_rebalance"
+announce "BASE_HYPOTHESIS transform=preserve_MN_grid_tasks_waves_pipeline_and_change_only_baseM_singleCoreM"
+announce "BASE_HYPOTHESIS acceptance=all_three_shapes_clear_candidate_winner rejection=any_clear_official_winner otherwise=inconclusive"
 announce "forbidden=cost_model,measured_latency_at_selection,history_lookup_at_runtime,repo_lookup,tiling_bank,candidate_enumeration,pareto,installed_host_tiler"
 announce "unmodified_paths=reported_as_baseline_equivalent_and_excluded_from_improved_measurement"
 announce "CANN_ENV root=${CANN_ROOT} soc=${SOC_VERSION} aic=20 visible_devices=${ASCEND_RT_VISIBLE_DEVICES}"
@@ -237,7 +256,7 @@ printf '%s\n' 'CANDIDATE_MANIFEST_CSV_BEGIN'
 cat "${MANIFEST}"
 printf '%s\n' 'CANDIDATE_MANIFEST_CSV_END'
 generation_wall_ms=$(( ($(date +%s%N) - generation_started_ns) / 1000000 ))
-announce "UNIQUE_FORMULA_PACKET_GENERATION passed shapes=${VALIDATION_SHAPES} source_families=7 source_suffixes=12 variants=${EXPECTED_VARIANTS} complete_tilings_per_shape=1 packet_bytes=272"
+announce "UNIQUE_FORMULA_PACKET_GENERATION passed scope=BASE_baseM_only shapes=${VALIDATION_SHAPES} source_families=1 source_suffixes=1 variants=${EXPECTED_VARIANTS} complete_tilings_per_shape=1 packet_bytes=272"
 announce "CAMPAIGN_STAGE_TIMING stage=unique_formula_packet_generation wall_ms=${generation_wall_ms}"
 
 input_cap_audit="$(python3 - "${MANIFEST}" "${NUMERIC_PREFLIGHT_MAX_MIB}" <<'PY'

@@ -138,6 +138,32 @@ def main() -> None:
         else:
             separation = "OVERLAPPING_SAMPLES"
         selection = selections[workload_id]
+        equation = selection["theory"]["improvement_equation"]
+        if not (
+            equation["proof_kind"] ==
+            "same_tasks_same_pipeline_lower_exact_critical_core_rows"
+            and equation["changed_packet_fields"] ==
+            ["baseM", "singleCoreM"]
+            and equation["output_tasks_before"] ==
+            equation["output_tasks_after"]
+            and equation["task_waves_before"] ==
+            equation["task_waves_after"]
+            and equation["critical_M_rows_after"] <
+            equation["critical_M_rows_before"]
+        ):
+            raise RuntimeError(
+                f"BASE theoretical contract failed for {workload_id}"
+            )
+        predicted_critical_delta_pct = 100.0 * (
+            equation["critical_M_rows_after"] /
+            equation["critical_M_rows_before"] - 1.0
+        )
+        if separation == "CLEAR_CANDIDATE_WINNER":
+            theory_evidence = "STRONG_SUPPORT"
+        elif separation == "CLEAR_OFFICIAL_WINNER":
+            theory_evidence = "STRONG_CONTRADICTION"
+        else:
+            theory_evidence = "INCONCLUSIVE_OVERLAP"
         row = {
             "workload_id": workload_id,
             "selection_axis": selection["selection_axis"],
@@ -149,6 +175,20 @@ def main() -> None:
             "k": int(expected["k"]), "dtype": expected["dtype"],
             "trans_a": int(expected["trans_a"]),
             "trans_b": int(expected["trans_b"]),
+            "official_baseM": int(equation["original_baseM"]),
+            "candidate_baseM": int(equation["improved_baseM"]),
+            "m_count": int(equation["m_count"]),
+            "n_count": int(equation["n_count"]),
+            "output_tasks": int(equation["output_tasks_before"]),
+            "task_waves": int(equation["task_waves_before"]),
+            "critical_M_rows_before": int(
+                equation["critical_M_rows_before"]
+            ),
+            "critical_M_rows_after": int(
+                equation["critical_M_rows_after"]
+            ),
+            "predicted_critical_component_delta_pct":
+                predicted_critical_delta_pct,
             "official_median_ms": old_median,
             "candidate_median_ms": new_median,
             "delta_pct": delta_pct,
@@ -157,6 +197,7 @@ def main() -> None:
                 "candidate" if new_median < old_median else "official"
             ),
             "sample_separation": separation,
+            "theory_evidence": theory_evidence,
             "correctness": "PASS_BOTH_CURRENT_RUN_OUTPUTS",
         }
         output_rows.append(row)
@@ -165,15 +206,31 @@ def main() -> None:
             f"id={workload_id} applicable={row['required_applicable_family']} "
             f"selected={row['selected_family']} suffix={row['kernel_suffix']} "
             f"role={row['case_role']} official_ms={old_median:.9g} candidate_ms={new_median:.9g} "
-            f"delta_pct={delta_pct:+.3f} separation={separation}"
+            f"delta_pct={delta_pct:+.3f} "
+            f"baseM={row['official_baseM']}->{row['candidate_baseM']} "
+            f"critical_M_rows={row['critical_M_rows_before']}->"
+            f"{row['critical_M_rows_after']} "
+            f"predicted_critical_component_delta_pct="
+            f"{predicted_critical_delta_pct:+.3f} "
+            f"separation={separation} theory_evidence={theory_evidence}"
         )
 
+    if all(row["theory_evidence"] == "STRONG_SUPPORT"
+           for row in output_rows):
+        theory_verdict = "SUPPORTED_ON_THREE_BASEM_SHAPES"
+    elif any(row["theory_evidence"] == "STRONG_CONTRADICTION"
+             for row in output_rows):
+        theory_verdict = "REJECTED_ON_VALIDATION_SET"
+    else:
+        theory_verdict = "INCONCLUSIVE_ON_VALIDATION_SET"
     result = {
         "schema": "matmul_unique_theoretical_selector_v1",
         "status": "complete",
         "comparison_basis": "same_campaign_official_api_vs_unique_closed_form_tiling",
         "reference_remeasured": True,
         "selection_uses_measurements": False,
+        "theory_scope": "BASE_same_grid_baseM_rebalance_only",
+        "theory_verdict": theory_verdict,
         "measurement_contract": {
             "warmup": EXPECTED_WARMUP,
             "repeat": EXPECTED_REPEAT,
@@ -226,7 +283,8 @@ def main() -> None:
         "UNIQUE_FORMULA_COMPLETE "
         f"shapes={len(output_rows)} candidate_wins={result['aggregate']['candidate_median_wins']} "
         f"official_wins={result['aggregate']['official_median_wins']} "
-        f"overlap={result['aggregate']['overlap']}"
+        f"overlap={result['aggregate']['overlap']} "
+        f"theory_verdict={theory_verdict}"
     )
 
 
