@@ -1,10 +1,9 @@
 """910B3/CANN 8.1 MatMulV3 improved tiling decision rules.
 
-This module owns family selection and every field changed by the fourteen
-structural rules.  ``improved_selector.py`` combines these decisions with the
-independently reconstructed initializer, vector geometry, kernel key,
-workspace calculation, and the fixed 272-byte ABI packet.  The official
-selector is not an input to any decision in this module.
+This module owns family selection and every performance-relevant Cube/L2
+field. ``complete_formula_selector.py`` independently completes vector
+geometry, kernel-key digits, workspace sizing, and the fixed 272-byte ABI.
+The official selector and reconstructed baseline are not inputs to this path.
 """
 from __future__ import annotations
 
@@ -273,6 +272,24 @@ def validate_generated_rules(s: Shape, h: Hardware, ci: CompileInfo, state: dict
     require(l2['calOrder'] in (0, 1, 2), 'L2_ORDER', 'only existing calOrder values are used')
     for key in ('mTile', 'nTile', 'mTileBlock', 'nTileBlock'):
         require(type(l2[key]) is int and 1 <= l2[key] <= INT32_MAX, 'L2_FIELD_RANGE', key)
+    # Suffixes 0/1/101/200/201/10200/10201/20201 all execute
+    # MatmulBaseBlock.  Its nested loops require TileCnt*TileBlock to cover the
+    # complete parent grid exactly, with a strictly positive final block.
+    # Validate that kernel equation here instead of treating the five L2 words
+    # as descriptive metadata.
+    if family in ('BASE', 'FIXPIPE_BL1', 'AL1', 'BL1'):
+        parent_m = cd(s.m, f['singleCoreM'])
+        parent_n = cd(s.n, f['singleCoreN'])
+        require(l2['mTile'] == cd(parent_m, l2['mTileBlock']) and
+                l2['nTile'] == cd(parent_n, l2['nTileBlock']),
+                'BASE_BLOCK_L2_COVERAGE',
+                'L2 TileCnt/TileBlock must exactly cover the MatmulBaseBlock parent grid')
+        m_tail = parent_m - (l2['mTile'] - 1) * l2['mTileBlock']
+        n_tail = parent_n - (l2['nTile'] - 1) * l2['nTileBlock']
+        require(1 <= m_tail <= l2['mTileBlock'] and
+                1 <= n_tail <= l2['nTileBlock'],
+                'BASE_BLOCK_L2_TAIL',
+                'MatmulBaseBlock final L2 rectangle must be positive and bounded')
     if family == 'BASE':
         require(f['singleCoreM'] == f['baseM'] and f['singleCoreN'] == f['baseN'] and
                 f['singleCoreK'] == s.k, 'BASE_SINGLE_ITERATE', 'BASE owns exactly one MN base tile')
@@ -309,10 +326,12 @@ def validate_generated_rules(s: Shape, h: Hardware, ci: CompileInfo, state: dict
         require((f['baseM'], f['baseN'], f['baseK']) == (128, 128, 256 // s.d),
                 'DET_STATIC_BASE', 'production GetMMConfig shapeParams fix these values')
         require(f['stepKa'] == f['stepKb'] == 3, 'DET_FIXED_PROFILE', 'retain the existing 33 profile')
-        if state['NBuffer33_K_span_unchanged']:
-            require((f['stepM'], f['stepN'], f['depthA1'], f['depthB1'], f['singleCoreK']) ==
-                    (3, 1, 9, 6, 3 * f['baseK']), 'DET_NBUFFER33_VISIBLE_PROFILE',
-                    'do not infer a new K span for the absent NBuffer33 policy')
+        require(f['singleCoreK'] % (3 * f['baseK']) == 0,
+                'DET_OWNER_K_ALIGNMENT',
+                'every owner interval must contain an integral number of 3x3 pipeline K spans')
+        require(cd(s.k, f['singleCoreK']) == f['usedCoreNum'],
+                'DET_ONE_INTERVAL_PER_OWNER',
+                'the deterministic schedule assigns exactly one contiguous K interval per launched AIC')
     else:
         raise TilingRuleError('UNKNOWN_FAMILY: ' + family)
     return dict(visible_input_and_branch_checks='PASS',
@@ -575,12 +594,18 @@ def _solve_unique_theoretical(
             ta = tb = 3
             da, db1 = (6, 9) if nk else (9, 6)
             order = 0 if nk else 1
-            quanta = cd(s.k, bk)
-            desired = min(h.cores, quanta)
-            guarded_33mk = not nk and s.m <= 256
-            chunk_quanta = 3 if guarded_33mk else cd(quanta, desired)
-            state['NBuffer33_K_span_unchanged'] = guarded_33mk
-            single_k = chunk_quanta * bk
+            # The 3x3 Matmul pipeline consumes three baseK blocks per L1
+            # refill.  The stock rule exposes that internal refill as the
+            # outer deterministic-K task too, so every AIC repeatedly emits
+            # and locally accumulates short partial-C packets.  Keep the same
+            # 3x3 L1 geometry but make the outer owner interval the balanced
+            # union of complete pipeline spans.  This yields exactly one
+            # contiguous K interval and one partial-C publication per AIC.
+            pipeline_span = 3 * bk
+            pipeline_quanta = cd(s.k, pipeline_span)
+            desired = min(h.cores, pipeline_quanta)
+            owner_pipeline_quanta = cd(pipeline_quanta, desired)
+            single_k = owner_pipeline_quanta * pipeline_span
             kcnt = cd(s.k, single_k)
             used = min(h.cores, kcnt)
             panel = (sn * bn if nk else sm * bm)
@@ -606,7 +631,10 @@ def _solve_unique_theoretical(
                 start = core * rounds if core < first_count else first_count * rounds + (core - first_count) * (rounds - 1)
                 owner_ranges.append(dict(core=core, first_chunk=start, chunk_count=count,
                                          K_begin=start * single_k, K_end=min(s.k, (start + count) * single_k)))
-            state.update(K_quanta=quanta, K_chunk_quanta=chunk_quanta,
+            state.update(K_base_quanta=cd(s.k, bk),
+                         K_pipeline_span=pipeline_span,
+                         K_pipeline_quanta=pipeline_quanta,
+                         K_owner_pipeline_quanta=owner_pipeline_quanta,
                          K_chunk_count=kcnt, L2_opposite_capacity=long_cap, L2_capacity_rule=l2_capacity,
                          K_owner_intervals=owner_ranges)
             l2 = dict(mTile=1, nTile=1, mTileBlock=1, nTileBlock=1, calOrder=0,

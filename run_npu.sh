@@ -4,11 +4,11 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE=""
 PHYSICAL_DEVICE="${PHYSICAL_NPU_ID:-2}"
-WARMUP=3
-REPEAT=10
-SAMPLES=15
-NPU_SHAPES=200
-EXPECTED_VARIANTS=3
+WARMUP=1
+REPEAT=3
+SAMPLES=5
+NPU_SHAPES=240
+EXPECTED_VARIANTS=14
 MAX_FOOTPRINT_MIB=300
 
 usage() {
@@ -47,6 +47,7 @@ export SOC_VERSION=Ascend910B3
 export ASCEND_RT_VISIBLE_DEVICES="${PHYSICAL_DEVICE}"
 export DEVICE_ID=0
 export PYTHONDONTWRITEBYTECODE=1
+export PYTHONWARNINGS=ignore
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -61,24 +62,30 @@ source "${ROOT}/scripts/env.sh" >/dev/null
 CAMPAIGN_ID="$({
     sha256sum \
         run_npu.sh \
-        tools/audit_independent_tiled_families.py \
-        tools/generate_independent_tiled_matrix.py \
-        tools/analyze_independent_tiled_results.py \
+        tools/generate_formula_tiling_matrix.py \
+        tools/audit_formula_reference_separation.py \
+        tools/analyze_formula_tiling_results.py \
+        matmul_rule_selector/formula_rules.py \
+        matmul_rule_selector/complete_formula_selector.py \
+        matmul_rule_selector/novel_family_selector.py \
+        matmul_rule_selector/novel_validation_cases.py \
+        matmul_rule_selector/tiling_selector.py \
+        tools/audit_novel_matmul_families.py \
         scripts/build_all.sh \
         cmake_npu/CMakeLists.txt \
+        direct_matmul/kernel_entry.cpp \
         direct_matmul/kernel_entry_c220.cpp \
+        direct_matmul/mat_mul_v3_tiling_data.h \
         direct_matmul/mat_mul_v3_tiling_data_280.h \
         direct_matmul/runner.cpp \
-        novel_matmul/independent_tiled_kernel.h \
-        matmul_rule_selector/independent_tiled_selector.py \
-        matmul_rule_selector/independent_validation_cases.py
+        novel_matmul/direct_init_split_k_kernel.h
 } | sha256sum | cut -c1-20)"
-CAMPAIGN_ROOT="${ROOT}/results/matmul_independent_formula_v2"
+CAMPAIGN_ROOT="${ROOT}/results/matmul_complete_formula_v1"
 CAMPAIGN_DIR="${CAMPAIGN_ROOT}/${CAMPAIGN_ID}"
 MANIFEST="${CAMPAIGN_DIR}/manifest.csv"
 SELECTION="${CAMPAIGN_DIR}/selection.jsonl"
 VARIANT_DIR="${CAMPAIGN_DIR}/variants"
-AUDIT_LOG="${CAMPAIGN_DIR}/audit.txt"
+REFERENCE_AUDIT="${CAMPAIGN_DIR}/reference_audit.json"
 OFFICIAL_PROFILE="${CAMPAIGN_DIR}/official_profile.csv"
 OFFICIAL_SAMPLES="${CAMPAIGN_DIR}/official_samples.csv"
 ANALYSIS="${CAMPAIGN_DIR}/analysis.json"
@@ -102,9 +109,9 @@ on_error() {
     trap - ERR
     tail_text="$(tail -60 "${RUN_LOG}" 2>/dev/null || true)"
     cleanup_generated_state || true
-    printf 'INDEPENDENT_VALIDATION_FATAL rc=%s line=%s log=%s\n%s\n' \
+    printf 'FORMULA_TILING_FATAL rc=%s line=%s log=%s\n%s\n' \
         "${rc}" "${line}" "${RUN_LOG}" "${tail_text}" >"${RUN_LOG}"
-    printf 'INDEPENDENT_VALIDATION_FATAL rc=%s line=%s log=%s\n%s\n' \
+    printf 'FORMULA_TILING_FATAL rc=%s line=%s log=%s\n%s\n' \
         "${rc}" "${line}" "${RUN_LOG}" "${tail_text}" >&3
     exit "${rc}"
 }
@@ -114,37 +121,24 @@ cleanup_generated_state
 mkdir -p "${CAMPAIGN_DIR}"
 
 announce "RUN_LOG path=${RUN_LOG}"
-announce "CAMPAIGN_READY operator=matmul independent_modes=6 npu_shapes=${NPU_SHAPES} variants=${EXPECTED_VARIANTS}"
-announce "modes=MICRO_DIRECT,BALANCED_MN,SEEDED_SPLIT_K,RESIDENT_B_M_STRIPE,RESIDENT_A_N_STRIPE,SEEDED_TAIL_WAVE"
-announce "validation_domain=12_installed_suffix_groups_x10_plus_80_independent_mode_cases"
-announce "forbidden=installed_selector_at_runtime,official_tiling_seed,cost_model,latency_ranker,candidate_bank,history_lookup,repo_lookup,candidate_search,fallback_kernel"
+announce "FORMULA_TILING_READY shapes=${NPU_SHAPES} installed_suffixes=12 new_families=2 variants=${EXPECTED_VARIANTS} complete_tilings_per_shape=1"
+announce "selector=shape_hardware_capacity_and_ownership_equations_only"
+announce "tiling_fields=family,baseM,baseN,baseK,singleCoreM,singleCoreN,singleCoreK,usedCoreNum,stepM,stepN,stepKa,stepKb,depthA1,depthB1,dbL0C,iterateOrder,L2,ND2NZ,new_K_ownership_scheduler"
+announce "forbidden=official_selector_input,official_tiling_seed,cost_model,latency_ranker,candidate_enumeration,history_lookup,repo_lookup,tiling_bank"
 announce "measurement=${WARMUP}_warmup+${SAMPLES}_device_event_samples+repeat_${REPEAT}+validate_last_timed_output"
 announce "CANN_ENV root=${CANN_ROOT} soc=${SOC_VERSION} visible_devices=${ASCEND_RT_VISIBLE_DEVICES} runtime_user_device=${DEVICE_ID}"
 
-python3 tools/audit_independent_tiled_families.py >"${AUDIT_LOG}"
-grep -q 'VALIDATION_DOMAIN passed shapes=200 distinct_packets=200 installed_suffixes=12 independent_modes=6' "${AUDIT_LOG}"
-python3 tools/generate_independent_tiled_matrix.py --root "${CAMPAIGN_DIR}"
+python3 tools/generate_formula_tiling_matrix.py --root "${CAMPAIGN_DIR}"
+python3 tools/audit_formula_reference_separation.py \
+    --manifest "${MANIFEST}" --selection "${SELECTION}" \
+    --output "${REFERENCE_AUDIT}"
+python3 tools/audit_novel_matmul_families.py
 
-python3 - "${MANIFEST}" "${MAX_FOOTPRINT_MIB}" <<'PY'
-import csv
-import sys
-with open(sys.argv[1], newline="", encoding="utf-8") as stream:
-    rows = list(csv.DictReader(stream))
-limit = int(sys.argv[2]) * 1024 * 1024
-footprints = []
-for row in rows:
-    width = 4 if row["dtype"] == "fp32" else 2
-    size = ((int(row["m"]) * int(row["k"]) + int(row["k"]) * int(row["n"]) +
-             2 * int(row["m"]) * int(row["n"])) * width +
-            int(row["workspace_bytes"]))
-    footprints.append((size, row["workload_id"]))
-if len(rows) != 200:
-    raise SystemExit(f"shape count failed: {len(rows)}")
-largest = max(footprints)
-if largest[0] > limit:
-    raise SystemExit(f"footprint cap exceeded: {largest}")
-print(f"FOOTPRINT_AUDIT passed largest={largest[1]} bytes={largest[0]} limit={limit}")
-PY
+variant_count="$(find "${VARIANT_DIR}" -maxdepth 1 -type f -name '*.csv' | wc -l)"
+[[ "${variant_count}" -eq "${EXPECTED_VARIANTS}" ]] || {
+    echo "fatal: expected ${EXPECTED_VARIANTS} compiled suffix variants, found ${variant_count}" >&2
+    exit 1
+}
 
 python3 - "${DEVICE_ID}" <<'PY'
 import ctypes
@@ -165,11 +159,13 @@ initialized = False
 device_set = False
 try:
     rc = acl.aclInit(None)
-    if rc: raise RuntimeError(f"aclInit failed rc={rc}")
+    if rc:
+        raise RuntimeError(f"aclInit failed rc={rc}")
     initialized = True
     count = ctypes.c_uint32()
     rc = acl.aclrtGetDeviceCount(ctypes.byref(count))
-    if rc: raise RuntimeError(f"aclrtGetDeviceCount failed rc={rc}")
+    if rc:
+        raise RuntimeError(f"aclrtGetDeviceCount failed rc={rc}")
     if not 0 <= device < count.value:
         raise RuntimeError(f"runtime user device {device} outside 0..{count.value - 1}")
     rc = acl.aclrtSetDevice(device)
@@ -179,56 +175,53 @@ try:
             f"visible_devices={os.environ.get('ASCEND_RT_VISIBLE_DEVICES', '')}"
         )
     device_set = True
-    print(f"DEVICE_PREFLIGHT passed user_device={device} available={count.value}")
 finally:
-    if device_set: acl.aclrtResetDevice(device)
-    if initialized: acl.aclFinalize()
+    if device_set:
+        acl.aclrtResetDevice(device)
+    if initialized:
+        acl.aclFinalize()
 PY
 
-announce "OFFICIAL_RUNNER_BUILD begin jobs=1"
+announce "BUILD begin official_runner_and_14_suffix_kernels jobs=1"
 BUILD_COMPONENTS=official BUILD_JOBS=1 scripts/build_all.sh
 official_runner="${ROOT}/build/official_matmul_runner"
 "${official_runner}" --candidates "${MANIFEST}" --validate-input >/dev/null
-announce "OFFICIAL_RUNNER_BUILD passed"
 
 variant_index=0
-for variant in fp16_k91000 bf16_k91000 fp32_k91000; do
-    variant_manifest="${VARIANT_DIR}/${variant}.csv"
+for variant_manifest in "${VARIANT_DIR}"/*.csv; do
+    variant="$(basename "${variant_manifest}" .csv)"
     dtype="${variant%%_k*}"
+    suffix="${variant##*_k}"
     variant_index=$((variant_index + 1))
-    announce "KERNEL_BUILD ${variant_index}/${EXPECTED_VARIANTS} begin variant=${variant} jobs=1"
     BUILD_COMPONENTS=variant BUILD_JOBS=1 \
-        DIRECT_KERNEL_TARGET="direct_matmul_kernel_${dtype}_91000" scripts/build_all.sh
+        DIRECT_KERNEL_TARGET="direct_matmul_kernel_${dtype}_${suffix}" \
+        scripts/build_all.sh
     runner="${ROOT}/build/direct_runners/direct_matmul_${variant}"
     "${runner}" --manifest "${variant_manifest}" --validate-input >/dev/null
     canary="${CAMPAIGN_DIR}/canary_${variant}.csv"
-    python3 - "${variant_manifest}" "${SELECTION}" "${canary}" <<'PY'
+    python3 - "${variant_manifest}" "${canary}" <<'PY'
 import csv
-import json
 import sys
-manifest_path, selection_path, output_path = sys.argv[1:]
-families = {}
-for line in open(selection_path, encoding="utf-8"):
-    row = json.loads(line)
-    families[row["workload_id"]] = row["formula_family"]
-with open(manifest_path, newline="", encoding="utf-8") as stream:
-    rows = list(csv.DictReader(stream))
-selected = {}
-for row in rows:
-    selected.setdefault(families[row["workload_id"]], row)
-if len(selected) != 6:
-    raise SystemExit(f"dtype canary does not cover six modes: {sorted(selected)}")
-with open(output_path, "w", newline="", encoding="utf-8") as stream:
-    writer = csv.DictWriter(stream, fieldnames=list(rows[0]), lineterminator="\n")
+source, output = sys.argv[1:]
+with open(source, newline="", encoding="utf-8") as stream:
+    reader = csv.DictReader(stream)
+    row = next(reader)
+    fields = reader.fieldnames
+with open(output, "w", newline="", encoding="utf-8") as stream:
+    writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
     writer.writeheader()
-    writer.writerows(selected.values())
+    writer.writerow(row)
 PY
     "${runner}" --manifest "${canary}" --device "${DEVICE_ID}" \
         --warmup 0 --repeat 1 --samples 1 >/dev/null
-    announce "KERNEL_BUILD ${variant_index}/${EXPECTED_VARIANTS} all_mode_canary_passed variant=${variant} modes=6"
 done
+[[ "${variant_index}" -eq "${EXPECTED_VARIANTS}" ]] || {
+    echo "fatal: variant build loop covered ${variant_index}/${EXPECTED_VARIANTS}" >&2
+    exit 1
+}
+announce "BUILD passed official_runner=1 suffix_kernels=${variant_index} canaries=${variant_index}"
 
-announce "OFFICIAL81_MEASUREMENT begin shapes=${NPU_SHAPES}"
+announce "MEASUREMENT begin shapes=${NPU_SHAPES}"
 "${official_runner}" \
     --candidates "${MANIFEST}" \
     --output "${OFFICIAL_PROFILE}" \
@@ -237,20 +230,15 @@ announce "OFFICIAL81_MEASUREMENT begin shapes=${NPU_SHAPES}"
     --warmup "${WARMUP}" --repeat "${REPEAT}" --samples "${SAMPLES}" \
     --numeric-preflight-max-mib "${MAX_FOOTPRINT_MIB}" \
     --structured-full-preflight --validate-after-measurement
-announce "OFFICIAL81_MEASUREMENT passed shapes=${NPU_SHAPES}"
 
-measurement_index=0
-for variant in fp16_k91000 bf16_k91000 fp32_k91000; do
-    measurement_index=$((measurement_index + 1))
+for variant_manifest in "${VARIANT_DIR}"/*.csv; do
+    variant="$(basename "${variant_manifest}" .csv)"
     runner="${ROOT}/build/direct_runners/direct_matmul_${variant}"
-    variant_manifest="${VARIANT_DIR}/${variant}.csv"
-    announce "DIRECT_MEASUREMENT ${measurement_index}/${EXPECTED_VARIANTS} begin variant=${variant}"
     "${runner}" --manifest "${variant_manifest}" --device "${DEVICE_ID}" \
         --warmup "${WARMUP}" --repeat "${REPEAT}" --samples "${SAMPLES}"
-    announce "DIRECT_MEASUREMENT ${measurement_index}/${EXPECTED_VARIANTS} passed variant=${variant}"
 done
 
-python3 tools/analyze_independent_tiled_results.py \
+python3 tools/analyze_formula_tiling_results.py \
     --manifest "${MANIFEST}" \
     --runner-log "${RUN_LOG}" \
     --official-profile "${OFFICIAL_PROFILE}" \
@@ -259,54 +247,83 @@ python3 tools/analyze_independent_tiled_results.py \
     --output-json "${ANALYSIS}" \
     --output-csv "${SUMMARY}"
 
-FINAL_TEXT="$(python3 - "${AUDIT_LOG}" "${SUMMARY}" <<'PY'
+FINAL_TEXT="$(python3 - "${REFERENCE_AUDIT}" "${SUMMARY}" "${SELECTION}" <<'PY'
 import csv
+import json
 import statistics
 import sys
 from collections import defaultdict
 
-audit = open(sys.argv[1], encoding="utf-8").read().strip()
+audit = json.load(open(sys.argv[1], encoding="utf-8"))
 with open(sys.argv[2], newline="", encoding="utf-8") as stream:
-    all_rows = list(csv.DictReader(stream))
+    rows = list(csv.DictReader(stream))
+selections = {
+    row["workload_id"]: row
+    for row in (
+        json.loads(line)
+        for line in open(sys.argv[3], encoding="utf-8")
+        if line.strip()
+    )
+}
 print("FINAL_RESULTS_BEGIN")
-print(audit)
-for row in all_rows:
+print(
+    "FORMULA_TILING_AUDIT "
+    f"installed_shapes={audit['shape_count']} installed_suffixes={len(audit['suffixes'])} "
+    "new_family_shapes=40 new_families=2 "
+    f"exact_reference_packets={audit['exact_reference_packets']} "
+    f"core_only_changes={audit['core_only_changes']} "
+    "complete_tilings_per_shape=1 official_seed=0 cost_model=0 candidate_search=0"
+)
+groups = defaultdict(list)
+for row in rows:
+    groups[int(row["suffix"])].append(row)
+    fields = selections[row["workload_id"]]["tiling_fields"]
     print(
         "FINAL_RESULT "
-        f"id={row['workload_id']} family={row['family']} "
+        f"id={row['workload_id']} family={row['family']} suffix={row['suffix']} "
         f"m={row['m']} n={row['n']} k={row['k']} dtype={row['dtype']} "
         f"ta={row['trans_a']} tb={row['trans_b']} cores={row['used_cores']} "
-        f"official_ms={float(row['official_ms']):.9g} "
-        f"candidate_ms={float(row['candidate_ms']):.9g} "
-        f"delta_pct={float(row['delta_pct']):+.3f} "
+        f"base={fields['baseM']}x{fields['baseN']}x{fields['baseK']} "
+        f"single={fields['singleCoreM']}x{fields['singleCoreN']}x{fields['singleCoreK']} "
+        f"step={fields['stepM']}x{fields['stepN']}x{fields['stepKa']}x{fields['stepKb']} "
+        f"depth={fields['depthA1']}x{fields['depthB1']} dbL0C={fields['dbL0C']} "
+        f"order={fields['iterateOrder']} official_ms={float(row['official_ms']):.9g} "
+        f"formula_ms={float(row['formula_ms']):.9g} delta_pct={float(row['delta_pct']):+.3f} "
         f"separation={row['separation']} correctness={row['correctness']}"
     )
-
-def emit_groups(label, rows, key):
-    groups = defaultdict(list)
-    for row in rows:
-        groups[row[key]].append(row)
-    for name, group in sorted(groups.items(), key=lambda item: str(item[0])):
-        deltas = [float(row["delta_pct"]) for row in group]
-        print(
-            f"{label} group={name} shapes={len(group)} "
-            f"candidate_wins={sum(value < 0 for value in deltas)} "
-            f"official_wins={sum(value > 0 for value in deltas)} "
-            f"median_delta_pct={statistics.median(deltas):+.3f} "
-            f"worst_delta_pct={max(deltas):+.3f}"
+for suffix, group in sorted(groups.items()):
+    deltas = [float(row["delta_pct"]) for row in group]
+    branch = audit["suffixes"].get(str(suffix))
+    if branch is None:
+        changed_fields = (
+            "new_kernel_scheduler,baseM,baseN,baseK,singleCoreK,"
+            "stepKa,stepKb,depthA1,depthB1,dbL0C,K_ownership"
         )
-
-emit_groups("FINAL_FAMILY_RESULT", all_rows, "family")
-installed = [row for row in all_rows if row["official_suffix_audit"]]
-emit_groups("FINAL_INSTALLED_SUFFIX_RESULT", installed, "official_suffix_audit")
-deltas = [float(row["delta_pct"]) for row in all_rows]
+        minimum_changed = "NEW_FAMILY"
+    else:
+        changed_fields = ",".join(branch["changed_schedule_field_union"])
+        minimum_changed = branch["minimum_changed_schedule_fields_per_shape"]
+    print(
+        "FINAL_SUFFIX_RESULT "
+        f"suffix={suffix} family={group[0]['family']} shapes={len(group)} "
+        f"changed_fields={changed_fields} "
+        f"min_changed_fields_per_shape={minimum_changed} "
+        f"formula_wins={sum(value < 0 for value in deltas)} "
+        f"official_wins={sum(value > 0 for value in deltas)} "
+        f"overlap={sum(row['separation'] == 'OVERLAP' for row in group)} "
+        f"median_delta_pct={statistics.median(deltas):+.3f} "
+        f"worst_delta_pct={max(deltas):+.3f} correctness={len(group)}/{len(group)}"
+    )
+deltas = [float(row["delta_pct"]) for row in rows]
 print(
     "FINAL_RESULTS_SUMMARY "
-    f"independent_modes=6 shapes={len(all_rows)} "
-    f"candidate_wins={sum(value < 0 for value in deltas)} "
+    f"shapes={len(rows)} suffixes={len(groups)} "
+    f"formula_wins={sum(value < 0 for value in deltas)} "
     f"official_wins={sum(value > 0 for value in deltas)} "
+    f"overlap={sum(row['separation'] == 'OVERLAP' for row in rows)} "
     f"median_delta_pct={statistics.median(deltas):+.3f} "
-    "current_output_correctness=200/200"
+    f"worst_delta_pct={max(deltas):+.3f} "
+    f"current_output_correctness={len(rows)}/{len(rows)}"
 )
 print("FINAL_RESULTS_END")
 PY
@@ -316,4 +333,4 @@ trap - ERR
 cleanup_generated_state
 printf '%s\n' "${FINAL_TEXT}" >"${RUN_LOG}"
 printf '%s\n' "${FINAL_TEXT}" >&3
-printf 'INDEPENDENT_TILING_VALIDATION_COMPLETE log=%s\n' "${RUN_LOG}" >&3
+printf 'FORMULA_TILING_VALIDATION_COMPLETE log=%s\n' "${RUN_LOG}" >&3

@@ -1,5 +1,5 @@
-#ifndef NOVEL_MATMUL_SEEDED_SPLIT_K_KERNEL_H
-#define NOVEL_MATMUL_SEEDED_SPLIT_K_KERNEL_H
+#ifndef NOVEL_MATMUL_DIRECT_INIT_SPLIT_K_KERNEL_H
+#define NOVEL_MATMUL_DIRECT_INIT_SPLIT_K_KERNEL_H
 
 #include "mat_mul_v3_common.h"
 
@@ -8,8 +8,8 @@ namespace NovelMatmul {
 using namespace AscendC;
 using namespace matmul;
 
-constexpr uint32_t SEEDED_ATOMIC_MODE = 1;
-constexpr uint32_t SEEDED_TAIL_WAVE_MODE = 2;
+constexpr uint32_t DIRECT_INIT_WHOLE_OUTPUT_MODE = 1;
+constexpr uint32_t DIRECT_INIT_TAIL_WAVE_MODE = 2;
 
 __aicore__ inline uint64_t CeilDivU64(uint64_t value, uint64_t divisor)
 {
@@ -51,13 +51,13 @@ __aicore__ inline TailOwner MapTailOwner(uint64_t block, uint64_t cores, uint64_
 }
 
 template <class A_TYPE, class B_TYPE, class C_TYPE, class BIAS_TYPE>
-class SeededSplitKKernel {
+class DirectInitSplitKKernel {
 public:
     using A_T = typename A_TYPE::T;
     using B_T = typename B_TYPE::T;
     using C_T = typename C_TYPE::T;
 
-    __aicore__ inline SeededSplitKKernel() {}
+    __aicore__ inline DirectInitSplitKKernel() {}
 
     __aicore__ inline void Init(
         GM_ADDR aGM, GM_ADDR bGM, GM_ADDR cGM,
@@ -83,9 +83,9 @@ public:
     __aicore__ inline void Process()
     {
         SetAtomicNone();
-        if (mode_ == SEEDED_ATOMIC_MODE) {
+        if (mode_ == DIRECT_INIT_WHOLE_OUTPUT_MODE) {
             ProcessWholeOutputSplitK();
-        } else if (mode_ == SEEDED_TAIL_WAVE_MODE) {
+        } else if (mode_ == DIRECT_INIT_TAIL_WAVE_MODE) {
             ProcessTailWaveSplitK();
         }
         SetAtomicNone();
@@ -137,7 +137,7 @@ private:
         SetTile(mStart, nStart, kStart, mUse, nUse, kUse);
     }
 
-    // Every owner computes one disjoint K interval.  Rank zero directly seeds
+    // Every owner computes one disjoint K interval.  Rank zero directly initializes
     // C; only the remaining owners use atomic accumulation.  Unlike the later
     // official multi-core Split-K protocol, this performs no prior C clear.
     __aicore__ inline void ProcessWholeOutputSplitK()
@@ -164,7 +164,7 @@ private:
 
     // Full 20-tile waves retain ordinary disjoint-MN ownership and direct C
     // stores.  Only the final incomplete wave is repartitioned along K.  Its
-    // first owner seeds C and the other owners atomically add, so no workspace
+    // first owner initializes C and the other owners atomically add, so no workspace
     // reducer and no C clear are required.
     __aicore__ inline void ProcessTailWaveSplitK()
     {
@@ -220,7 +220,7 @@ private:
 };
 
 template <class A_TYPE, class B_TYPE, class C_TYPE, class BIAS_TYPE>
-__aicore__ inline void RunSeededSplitK(
+__aicore__ inline void RunDirectInitSplitK(
     GM_ADDR aGM, GM_ADDR bGM, GM_ADDR cGM,
     const MatmulTilingData &tilingData)
 {
@@ -229,7 +229,7 @@ __aicore__ inline void RunSeededSplitK(
     }
     if ASCEND_IS_AIC {
         TPipe pipe;
-        SeededSplitKKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE> op;
+        DirectInitSplitKKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE> op;
         op.Init(aGM, bGM, cGM, tilingData, &pipe);
         op.Process();
     }

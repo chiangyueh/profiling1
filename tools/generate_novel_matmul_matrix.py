@@ -102,7 +102,7 @@ def main() -> None:
             blob, "repository_owned",
         ))
 
-        if case["required_family"] == "SEEDED_ATOMIC_SPLIT_K":
+        if case["required_family"] == "DIRECT_INIT_WHOLE_OUTPUT_SPLIT_K":
             control = bytearray(blob)
             struct.pack_into("<I", control, 49 * 4, 0)
             control_cube = dict(result["cube"])
@@ -138,7 +138,7 @@ def main() -> None:
         for row in selection_rows:
             stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
     print(
-        "NOVEL_MATRIX_GENERATED shapes=200 seeded_atomic=100 seeded_tail=100 "
+        "NOVEL_MATRIX_GENERATED shapes=200 direct_init_whole=100 direct_init_tail=100 "
         "closest_official_controls=100 variants=3 packet_bytes=280"
     )
 

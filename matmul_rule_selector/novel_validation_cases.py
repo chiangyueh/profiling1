@@ -29,15 +29,15 @@ def build_cases() -> list[dict]:
         if key not in seen:
             seen.add(key)
             cases.append({
-                "workload_id": f"novel_seeded_atomic_{len(cases):03d}",
-                "required_family": "SEEDED_ATOMIC_SPLIT_K",
+                "workload_id": f"novel_direct_init_whole_{len(cases):03d}",
+                "required_family": "DIRECT_INIT_WHOLE_OUTPUT_SPLIT_K",
                 "m": m, "n": n, "k": k, "dtype": "fp32",
                 "trans_a": False, "trans_b": True,
                 "scale_band": "small_output_long_k",
             })
         cursor += 1
         if cursor > 10000:
-            raise RuntimeError("could not construct unique seeded atomic cases")
+            raise RuntimeError("could not construct unique direct-init whole-output cases")
 
     tail_m = (16, 48, 80, 112, 127)
     tail_n = (24, 56, 88, 120, 127)
@@ -85,8 +85,8 @@ def build_cases() -> list[dict]:
         tail_seen.add(key)
         index = len(cases) - 100
         cases.append({
-            "workload_id": f"novel_seeded_tail_{index:03d}",
-            "required_family": "SEEDED_TAIL_WAVE_SPLIT_K",
+            "workload_id": f"novel_direct_init_tail_{index:03d}",
+            "required_family": "DIRECT_INIT_TAIL_WAVE_SPLIT_K",
             "m": m, "n": n, "k": k, "dtype": "fp32",
             "trans_a": False, "trans_b": True,
             "scale_band": "medium" if total <= 80 else "large",

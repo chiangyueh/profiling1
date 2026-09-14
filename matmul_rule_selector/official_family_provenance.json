@@ -141,20 +141,20 @@
   ],
   "repository_owned_families": [
     {
-      "family": "SEEDED_ATOMIC_SPLIT_K",
+      "family": "DIRECT_INIT_WHOLE_OUTPUT_SPLIT_K",
       "suffix": 90001,
       "novel_component": "cross-core output initialization and accumulation protocol",
-      "known_lineage": "K partition and MatmulImpl are standard; deterministic and single-core paths already seed then add within one AIC, but no supplied path assigns seed and atomic roles to different AIC owners without clear or workspace; no official kernel body is embedded",
-      "distinction": "one owner directly seeds C, a global AIC barrier follows, and only remaining owners atomic-add; there is no pre-clear",
-      "source": "novel_matmul/seeded_split_k_kernel.h"
+      "known_lineage": "K partition and MatmulImpl are standard; deterministic and single-core paths already initialize then add within one AIC, but no supplied path assigns direct-initialization and atomic roles to different AIC owners without clear or workspace; no official kernel body is embedded",
+      "distinction": "one owner directly initializes C, a global AIC barrier follows, and only remaining owners atomic-add; there is no pre-clear",
+      "source": "novel_matmul/direct_init_split_k_kernel.h"
     },
     {
-      "family": "SEEDED_TAIL_WAVE_SPLIT_K",
+      "family": "DIRECT_INIT_TAIL_WAVE_SPLIT_K",
       "suffix": 90002,
-      "novel_component": "workspace-free direct-seed plus atomic-remainder tail reduction on C220",
+      "novel_component": "workspace-free direct-initialization plus atomic-remainder tail reduction on C220",
       "known_lineage": "tail-only K redistribution is known from later Arch35 Stream-K",
-      "distinction": "full MN waves directly store C; each final-wave output group directly seeds C then atomically accumulates without workspace or AIV reducer",
-      "source": "novel_matmul/seeded_split_k_kernel.h"
+      "distinction": "full MN waves directly store C; each final-wave output group directly initializes C then atomically accumulates without workspace or AIV reducer",
+      "source": "novel_matmul/direct_init_split_k_kernel.h"
     }
   ]
 }

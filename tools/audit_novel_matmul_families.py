@@ -25,7 +25,7 @@ BUNDLED = ROOT / "colleague_matmul_v3/op_kernel"
 ARCH35 = BUNDLED / "arch35"
 C220_HOST = ROOT / "colleague_matmul_v3/op_host/op_tiling"
 ARCH35_HOST = C220_HOST / "arch35"
-CUSTOM = ROOT / "novel_matmul/seeded_split_k_kernel.h"
+CUSTOM = ROOT / "novel_matmul/direct_init_split_k_kernel.h"
 LEDGER = SELECTOR / "official_family_provenance.json"
 
 
@@ -83,7 +83,7 @@ def audit_provenance() -> dict:
             "custom protocol silently acquired an official reduction mechanism")
     require("owner.rank == 0" in custom and "SyncAll();" in custom and
             "GetTensorC(cGlobal_[offsetC], 1)" in custom,
-            "custom direct-seed/barrier/atomic protocol is incomplete")
+            "custom direct-initialization/barrier/atomic protocol is incomplete")
     require("mat_mul_multi_core_splitk_kernel.h" not in custom and
             "mat_mul_stream_k_kernel.h" not in custom,
             "custom implementation embeds an official family body")
@@ -93,7 +93,11 @@ def audit_provenance() -> dict:
         for root in (INSTALLED, BUNDLED)
         for path in root.rglob("*") if path.is_file()
     )
-    for token in ("SEEDED_ATOMIC_SPLIT_K", "SEEDED_TAIL_WAVE_SPLIT_K", "90001", "90002"):
+    for token in (
+        "DIRECT_INIT_WHOLE_OUTPUT_SPLIT_K",
+        "DIRECT_INIT_TAIL_WAVE_SPLIT_K",
+        "90001", "90002",
+    ):
         require(token not in official_text, f"custom identity already exists in official source: {token}")
 
     return {
@@ -145,15 +149,16 @@ def audit_case(case: dict) -> dict:
     require(result["origin"] == "REPOSITORY_OWNED_NOT_OFFICIAL_BACKPORT",
             f"{case['workload_id']}: provenance drift")
     cube = result["cube"]
-    k_quanta = (case["k"] + 63) // 64
+    k_quantum = int(cube["baseK"])
+    k_quanta = (case["k"] + k_quantum - 1) // k_quantum
 
-    if case["required_family"] == "SEEDED_ATOMIC_SPLIT_K":
+    if case["required_family"] == "DIRECT_INIT_WHOLE_OUTPUT_SPLIT_K":
         ranges = split_ranges(k_quanta, cube["usedCoreNum"])
         require(exact_cover(ranges, k_quanta),
                 f"{case['workload_id']}: K ownership is not exact")
         require(cube["reserved"] == 1 and cube["singleCoreM"] == case["m"] and
                 cube["singleCoreN"] == case["n"],
-                f"{case['workload_id']}: pure seeded mode packet mismatch")
+                f"{case['workload_id']}: direct-init whole-output packet mismatch")
     else:
         m_tiles = (case["m"] + 127) // 128
         n_tiles = (case["n"] + 127) // 128
@@ -191,8 +196,8 @@ def main() -> None:
     family_counts = Counter(result["formula_family"] for result in results)
     packet_hashes = {result["packet_sha256"] for result in results}
     require(family_counts == {
-        "SEEDED_ATOMIC_SPLIT_K": 100,
-        "SEEDED_TAIL_WAVE_SPLIT_K": 100,
+        "DIRECT_INIT_WHOLE_OUTPUT_SPLIT_K": 100,
+        "DIRECT_INIT_TAIL_WAVE_SPLIT_K": 100,
     }, "validation family coverage changed")
     require(len(packet_hashes) == 200, "every validation shape must produce a distinct packet")
     print(
