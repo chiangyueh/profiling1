@@ -26,8 +26,8 @@ FIELDS = (
     "model_schedule_sha256", "is_reserve", "l2_cache_flag", "nd2nz_a",
     "nd2nz_b", "required_successful_tilings",
 )
-EXPECTED_ROWS = 12
-EXPECTED_NPU_ROWS = 8
+EXPECTED_ROWS = 52
+EXPECTED_NPU_ROWS = 48
 EXPECTED_FAMILIES = {
     "MULTI_CORE_SPLIT_K", "SINGLE_CORE_NKM_SPLIT_K",
     "SINGLE_CORE_SPLIT_K_GM_TO_L1",

@@ -55,7 +55,7 @@ def main() -> None:
         changed = sum(row["status"] == "MODIFIED_TILING" for row in rows)
         branch = rows[0]["core_plan"]["branch"]
         print(
-            f"INSTALLED_FAMILY_SOLVED suffix={suffix} branch={branch} "
+            f"INSTALLED_FAMILY_AUDITED suffix={suffix} branch={branch} "
             f"shapes={len(rows)} distinct_packets={len(rows)} "
             f"joint_core_changes={changed} illegal=0"
         )
@@ -65,7 +65,7 @@ def main() -> None:
     )
     for family in sorted(by_family):
         print(
-            f"EXPANDED_FAMILY_SOLVED family={family} shapes={by_family[family]} "
+            f"EXPANDED_FAMILY_PACKET_AUDITED family={family} shapes={by_family[family]} "
             f"cann81_npu_shapes={npu_by_family[family]} "
             f"fallback_kernel=0"
         )

@@ -7,8 +7,8 @@ PHYSICAL_DEVICE="${PHYSICAL_NPU_ID:-2}"
 WARMUP=3
 REPEAT=10
 SAMPLES=15
-NPU_SHAPES=8
-SOLVED_EXPANDED_SHAPES=12
+NPU_SHAPES=48
+SOLVED_EXPANDED_SHAPES=52
 EXPECTED_VARIANTS=4
 MAX_FOOTPRINT_MIB=320
 
@@ -130,7 +130,7 @@ announce "measurement=${WARMUP}_warmup+${SAMPLES}_device_event_samples+repeat_${
 announce "CANN_ENV root=${CANN_ROOT} soc=${SOC_VERSION} visible_devices=${ASCEND_RT_VISIBLE_DEVICES} runtime_user_device=${DEVICE_ID}"
 
 python3 tools/audit_matmul_family_solver.py >"${AUDIT_LOG}"
-grep -q 'installed_suffixes=12 installed_shapes=60 expanded_families=5 expanded_shapes=12 cann81_buildable_expanded_shapes=8' "${AUDIT_LOG}"
+grep -q 'installed_suffixes=12 installed_shapes=60 expanded_families=5 expanded_shapes=52 cann81_buildable_expanded_shapes=48' "${AUDIT_LOG}"
 
 python3 tools/generate_matmul_c220_experimental_matrix.py \
     --output-dir "${PACKET_DIR}" \
@@ -267,14 +267,19 @@ with open(sys.argv[2], newline="", encoding="utf-8") as stream:
 selections = [json.loads(line) for line in open(sys.argv[3], encoding="utf-8") if line.strip()]
 print("FINAL_RESULTS_BEGIN")
 print(audit)
+blocked = defaultdict(list)
 for row in selections:
     if not row["npu_eligible"]:
-        print(
-            "EXPANDED_FAMILY_NOT_MEASURED "
-            f"family={row['formula_family']} suffix={row['kernel_suffix']} "
-            f"reason={row['toolchain_contract']['cann81_kernel_build']} "
-            "fallback_kernel=0"
-        )
+        blocked[(
+            row["formula_family"], row["kernel_suffix"],
+            row["toolchain_contract"]["cann81_kernel_build"],
+        )].append(row["workload_id"])
+for (family, suffix, reason), blocked_rows in sorted(blocked.items()):
+    print(
+        "EXPANDED_FAMILY_NOT_MEASURED "
+        f"family={family} suffix={suffix} shapes={len(blocked_rows)} "
+        f"reason={reason} fallback_kernel=0"
+    )
 for row in rows:
     print(
         "FINAL_RESULT "
@@ -299,9 +304,25 @@ for family in sorted(groups):
         f"clear_official_wins={sum(row['sample_separation'] == 'CLEAR_OFFICIAL_WINNER' for row in group)} "
         f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in group)}"
     )
+subgroups = defaultdict(list)
+for row in rows:
+    if row["family"] == "SINGLE_CORE_SPLIT_K_AL1_FULL_LOAD":
+        layout = "NT" if int(row["trans_b"]) else "NN"
+        subgroups[(row["dtype"], layout)].append(row)
+for (dtype, layout), group in sorted(subgroups.items()):
+    print(
+        "FINAL_SUBGROUP_RESULT "
+        "family=SINGLE_CORE_SPLIT_K_AL1_FULL_LOAD "
+        f"dtype={dtype} layout={layout} shapes={len(group)} "
+        f"candidate_wins={sum(row['median_winner'] == 'candidate' for row in group)} "
+        f"official_wins={sum(row['median_winner'] == 'official' for row in group)} "
+        f"clear_candidate_wins={sum(row['sample_separation'] == 'CLEAR_CANDIDATE_WINNER' for row in group)} "
+        f"clear_official_wins={sum(row['sample_separation'] == 'CLEAR_OFFICIAL_WINNER' for row in group)} "
+        f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in group)}"
+    )
 print(
     "FINAL_RESULT_SUMMARY "
-    f"installed_suffixes_audited=12 expanded_families_solved=5 "
+    f"installed_suffixes_audited=12 expanded_families_packet_audited=5 "
     f"npu_shapes={len(rows)} candidate_wins={sum(row['median_winner'] == 'candidate' for row in rows)} "
     f"official_wins={sum(row['median_winner'] == 'official' for row in rows)} "
     f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in rows)}"
