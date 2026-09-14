@@ -286,7 +286,10 @@ def _cube_words(shape: Shape, state: dict) -> tuple[list[int], dict]:
         "iterateOrder": f["iterateOrder"],
         "shareMode": 0,
         "shareL1Size": usage["L1_AB"] + usage["bias_reserved"],
-        "shareL0CSize": usage["L0C"],
+        # MatmulTilingAlgorithm::GetUsedSize publishes one base-MN FP32
+        # buffer here. dbL0C is a separate pipeline-depth field and must not
+        # be multiplied into the shared-buffer ABI length.
+        "shareL0CSize": f["baseM"] * f["baseN"] * 4,
         "shareUbSize": 0,
         "batchM": 1,
         "batchN": 1,

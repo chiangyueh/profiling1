@@ -161,6 +161,17 @@ def build_cases() -> list[dict]:
                 or _footprint(result) > MAX_FOOTPRINT
             ):
                 continue
+            if target in (30, 31):
+                fields = result["tiling_fields"]
+                k_tasks = (
+                    k + fields["singleCoreK"] - 1
+                ) // fields["singleCoreK"]
+                if fields["usedCoreNum"] >= min(20, k_tasks):
+                    # This campaign measures an active formula rule, not an
+                    # unchanged deterministic packet.  Keep shapes for which
+                    # the same-critical-path equation removes at least one
+                    # reduction owner.
+                    continue
             values = {"m": m, "n": n, "k": k}
             if any(
                 len(axis_seen[axis]) < axis_minimum[axis]

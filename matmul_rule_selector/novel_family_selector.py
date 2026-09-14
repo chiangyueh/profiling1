@@ -214,7 +214,9 @@ def common_cube(req: dict, *, used: int, single_m: int,
         "dbL0A": 2, "dbL0B": 2, "dbL0C": pipeline["db_l0c"],
         "iterateOrder": 0,
         "shareL1Size": pipeline["l1_bytes"],
-        "shareL0CSize": pipeline["l0c_bytes"],
+        # The ABI share length describes one L0C base tile.  dbL0C carries
+        # the independent ping-pong depth.
+        "shareL0CSize": pipeline["base_m"] * pipeline["base_n"] * 4,
         "reserved": mode,
     })
     return cube

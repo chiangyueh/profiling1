@@ -821,6 +821,7 @@ int main(int argc, char **argv)
                     ACL_MEMCPY_HOST_TO_DEVICE), "copy structured B");
                 const double devicePrepareMs = ElapsedMs(prepareStarted);
                 uint32_t successful = 0;
+                std::string lastFailure;
                 for (size_t candidateIndex = index; candidateIndex < end; ++candidateIndex) {
                     if (successful >= workload.requiredSuccessfulTilings) break;
                     const Candidate &candidate = candidates[candidateIndex];
@@ -833,6 +834,7 @@ int main(int argc, char **argv)
                             expected, options, devicePrepareMs);
                         ++successful;
                     } catch (const std::exception &error) {
+                        lastFailure = error.what();
                         EmitFailure(candidate, error.what());
                         if (std::string(error.what()).rfind(
                                 "full numeric validation mismatch", 0) != 0) {
@@ -843,7 +845,14 @@ int main(int argc, char **argv)
                 if (!options.allowPartial &&
                     successful != workload.requiredSuccessfulTilings) {
                     throw std::runtime_error(
-                        "workload exhausted legal reserves before reaching success target");
+                        "workload failed workload_id=" + workload.workloadId +
+                        " suffix=" + std::to_string(workload.suffix) +
+                        " shape=M" + std::to_string(workload.m) +
+                        "xN" + std::to_string(workload.n) +
+                        "xK" + std::to_string(workload.k) +
+                        " successful=" + std::to_string(successful) +
+                        "/" + std::to_string(workload.requiredSuccessfulTilings) +
+                        " last_error=" + lastFailure);
                 }
                 index = end;
             }

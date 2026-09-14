@@ -326,12 +326,20 @@ def validate_generated_rules(s: Shape, h: Hardware, ci: CompileInfo, state: dict
         require((f['baseM'], f['baseN'], f['baseK']) == (128, 128, 256 // s.d),
                 'DET_STATIC_BASE', 'production GetMMConfig shapeParams fix these values')
         require(f['stepKa'] == f['stepKb'] == 3, 'DET_FIXED_PROFILE', 'retain the existing 33 profile')
-        require(f['singleCoreK'] % (3 * f['baseK']) == 0,
-                'DET_OWNER_K_ALIGNMENT',
-                'every owner interval must contain an integral number of 3x3 pipeline K spans')
-        require(cd(s.k, f['singleCoreK']) == f['usedCoreNum'],
-                'DET_ONE_INTERVAL_PER_OWNER',
-                'the deterministic schedule assigns exactly one contiguous K interval per launched AIC')
+        require(f['singleCoreK'] == 3 * f['baseK'],
+                'DET_KERNEL_K_TASK_CONTRACT',
+                'DoDeterministicMultiCoreSplitKTiling defines one outer K task as stepK*baseK')
+        resident_axis = s.n if f['iterateOrder'] == 0 else s.m
+        parent_axis = f['singleCoreN'] if f['iterateOrder'] == 0 else f['singleCoreM']
+        require(parent_axis == min(3 * (f['baseN'] if f['iterateOrder'] == 0 else f['baseM']),
+                                   resident_axis),
+                'DET_PARTIAL_C_PANEL_TRIM',
+                'the 3x3 parent panel must not reserve rows or columns beyond the real output')
+        k_tasks = cd(s.k, f['singleCoreK'])
+        minimum_cores_at_same_critical_path = cd(k_tasks, cd(k_tasks, h.cores))
+        require(f['usedCoreNum'] == minimum_cores_at_same_critical_path,
+                'DET_KERNEL_CORE_CONTRACT',
+                'use the fewest AICs that preserve the full-core maximum K-task count')
     else:
         raise TilingRuleError('UNKNOWN_FAMILY: ' + family)
     return dict(visible_input_and_branch_checks='PASS',
@@ -594,22 +602,27 @@ def _solve_unique_theoretical(
             ta = tb = 3
             da, db1 = (6, 9) if nk else (9, 6)
             order = 0 if nk else 1
-            # The 3x3 Matmul pipeline consumes three baseK blocks per L1
-            # refill.  The stock rule exposes that internal refill as the
-            # outer deterministic-K task too, so every AIC repeatedly emits
-            # and locally accumulates short partial-C packets.  Keep the same
-            # 3x3 L1 geometry but make the outer owner interval the balanced
-            # union of complete pipeline spans.  This yields exactly one
-            # contiguous K interval and one partial-C publication per AIC.
+            # Device contract: the deterministic kernel treats singleCoreK as
+            # the outer task quantum and distributes those tasks across AICs.
+            # The host implementation defines that quantum as stepK*baseK.
+            # Coalescing several quanta changes the reduction protocol rather
+            # than merely balancing work, and is therefore not a legal tiling
+            # transformation for the installed kernel.
             pipeline_span = 3 * bk
             pipeline_quanta = cd(s.k, pipeline_span)
-            desired = min(h.cores, pipeline_quanta)
-            owner_pipeline_quanta = cd(pipeline_quanta, desired)
-            single_k = owner_pipeline_quanta * pipeline_span
+            single_k = pipeline_span
             kcnt = cd(s.k, single_k)
-            used = min(h.cores, kcnt)
-            panel = (sn * bn if nk else sm * bm)
-            live_panel = min(s.n if nk else s.m, panel)
+            full_core_rounds = cd(kcnt, h.cores)
+            used = cd(kcnt, full_core_rounds)
+            profile_panel = sn * bn if nk else sm * bm
+            live_panel = min(s.n if nk else s.m, profile_panel)
+            # The Cube call already receives the real tail through
+            # SetSingleShape.  Publishing the padded 3x3 parent dimension as
+            # singleCoreM/N only inflates every per-AIC partial-C slot and
+            # leaves most AIV reducers idle for narrow outputs.  Trim only
+            # this outer workspace/reduction panel; base/step/depth remain the
+            # installed 3x3 pipeline.
+            panel = live_panel
             l2_capacity = split_k_l2_long_capacity(h.l2, used, single_k, live_panel, d, d, 128)
             long_cap = l2_capacity['capacity']
             other = s.m if nk else s.n
@@ -634,7 +647,10 @@ def _solve_unique_theoretical(
             state.update(K_base_quanta=cd(s.k, bk),
                          K_pipeline_span=pipeline_span,
                          K_pipeline_quanta=pipeline_quanta,
-                         K_owner_pipeline_quanta=owner_pipeline_quanta,
+                         K_full_core_rounds=full_core_rounds,
+                         K_minimum_cores_same_critical_path=used,
+                         partial_C_profile_panel=profile_panel,
+                         partial_C_trimmed_panel=panel,
                          K_chunk_count=kcnt, L2_opposite_capacity=long_cap, L2_capacity_rule=l2_capacity,
                          K_owner_intervals=owner_ranges)
             l2 = dict(mTile=1, nTile=1, mTileBlock=1, nTileBlock=1, calOrder=0,

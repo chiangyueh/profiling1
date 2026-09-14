@@ -213,7 +213,7 @@ with open(output, "w", newline="", encoding="utf-8") as stream:
     writer.writerow(row)
 PY
     "${runner}" --manifest "${canary}" --device "${DEVICE_ID}" \
-        --warmup 0 --repeat 1 --samples 1 >/dev/null
+        --warmup 0 --repeat 1 --samples 1
 done
 [[ "${variant_index}" -eq "${EXPECTED_VARIANTS}" ]] || {
     echo "fatal: variant build loop covered ${variant_index}/${EXPECTED_VARIANTS}" >&2
