@@ -231,6 +231,13 @@ register_c220_direct_matmul(fp32 float 51 00051)
 register_c220_direct_matmul(fp32 float 90001 90001)
 register_c220_direct_matmul(fp32 float 90002 90002)
 
+# One repository-owned kernel ABI supports six independently selected device
+# schedules through the reserved mode word.  Dtype remains a compile-time
+# Matmul template axis; transpose is dispatched inside the kernel entry.
+register_c220_direct_matmul(fp16 half 91000 91000)
+register_c220_direct_matmul(bf16 bfloat16_t 91000 91000)
+register_c220_direct_matmul(fp32 float 91000 91000)
+
 # direct_matmul_runner is intentionally linked outside this CMake graph by
 # build_all.sh.  Depending on any ascendc_library target here would retraverse
 # CANN 8.1 BUILD_ALWAYS ExternalProjects after their archives already exist.

@@ -73,6 +73,27 @@
 #define DTYPE_X2 float
 #define DTYPE_Y float
 #define DTYPE_BIAS float
+#elif !defined(MATMUL_C220_SUFFIX_VALUE) && defined(direct_matmul_fp16_k91000)
+#define MATMUL_C220_SUFFIX_VALUE 91000
+#define MATMUL_DIRECT_KERNEL direct_matmul_fp16_k91000
+#define DTYPE_X1 half
+#define DTYPE_X2 half
+#define DTYPE_Y half
+#define DTYPE_BIAS half
+#elif !defined(MATMUL_C220_SUFFIX_VALUE) && defined(direct_matmul_bf16_k91000)
+#define MATMUL_C220_SUFFIX_VALUE 91000
+#define MATMUL_DIRECT_KERNEL direct_matmul_bf16_k91000
+#define DTYPE_X1 bfloat16_t
+#define DTYPE_X2 bfloat16_t
+#define DTYPE_Y bfloat16_t
+#define DTYPE_BIAS bfloat16_t
+#elif !defined(MATMUL_C220_SUFFIX_VALUE) && defined(direct_matmul_fp32_k91000)
+#define MATMUL_C220_SUFFIX_VALUE 91000
+#define MATMUL_DIRECT_KERNEL direct_matmul_fp32_k91000
+#define DTYPE_X1 float
+#define DTYPE_X2 float
+#define DTYPE_Y float
+#define DTYPE_BIAS float
 #endif
 
 #if !defined(MATMUL_C220_SUFFIX_VALUE)
@@ -101,6 +122,8 @@
 #include "mat_mul_sc_splitk_al1_fullload_kernel.h"
 #elif MATMUL_C220_SUFFIX_VALUE == 90001 || MATMUL_C220_SUFFIX_VALUE == 90002
 #include "seeded_split_k_kernel.h"
+#elif MATMUL_C220_SUFFIX_VALUE == 91000
+#include "independent_tiled_kernel.h"
 #else
 #error Unsupported C220 direct family suffix
 #endif
@@ -124,6 +147,12 @@ __aicore__ inline void DirectReadMatmulTiling280(
     using aType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_X1, false>;         \
     using bType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_X2, trans_b_value>; \
     using cType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_Y>;                  \
+    using biasType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_BIAS>
+
+#define MATMUL_INDEPENDENT_DECLARE_TYPES(trans_a_value, trans_b_value)                  \
+    using aType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_X1, trans_a_value>;   \
+    using bType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_X2, trans_b_value>;   \
+    using cType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_Y>;                    \
     using biasType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_BIAS>
 
 extern "C" __global__ __aicore__ void MATMUL_DIRECT_KERNEL(
@@ -185,7 +214,30 @@ extern "C" __global__ __aicore__ void MATMUL_DIRECT_KERNEL(
     MATMUL_DIRECT_DECLARE_TYPES(true);
     NovelMatmul::RunSeededSplitK<aType, bType, cType, biasType>(
         aGM, bGM, cGM, tilingData);
+#elif MATMUL_C220_SUFFIX_VALUE == 91000
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_0);
+    if (tilingData.matmulRunInfo.transA == 0 &&
+        tilingData.matmulRunInfo.transB == 0) {
+        MATMUL_INDEPENDENT_DECLARE_TYPES(false, false);
+        IndependentMatmul::RunIndependentTiled<aType, bType, cType, biasType>(
+            aGM, bGM, cGM, tilingData);
+    } else if (tilingData.matmulRunInfo.transA == 0 &&
+               tilingData.matmulRunInfo.transB != 0) {
+        MATMUL_INDEPENDENT_DECLARE_TYPES(false, true);
+        IndependentMatmul::RunIndependentTiled<aType, bType, cType, biasType>(
+            aGM, bGM, cGM, tilingData);
+    } else if (tilingData.matmulRunInfo.transA != 0 &&
+               tilingData.matmulRunInfo.transB == 0) {
+        MATMUL_INDEPENDENT_DECLARE_TYPES(true, false);
+        IndependentMatmul::RunIndependentTiled<aType, bType, cType, biasType>(
+            aGM, bGM, cGM, tilingData);
+    } else {
+        MATMUL_INDEPENDENT_DECLARE_TYPES(true, true);
+        IndependentMatmul::RunIndependentTiled<aType, bType, cType, biasType>(
+            aGM, bGM, cGM, tilingData);
+    }
 #endif
 }
 
 #undef MATMUL_DIRECT_DECLARE_TYPES
+#undef MATMUL_INDEPENDENT_DECLARE_TYPES
