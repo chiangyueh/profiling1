@@ -59,6 +59,20 @@
 #define DTYPE_X2 bfloat16_t
 #define DTYPE_Y bfloat16_t
 #define DTYPE_BIAS bfloat16_t
+#elif !defined(MATMUL_C220_SUFFIX_VALUE) && defined(direct_matmul_fp32_k90001)
+#define MATMUL_C220_SUFFIX_VALUE 90001
+#define MATMUL_DIRECT_KERNEL direct_matmul_fp32_k90001
+#define DTYPE_X1 float
+#define DTYPE_X2 float
+#define DTYPE_Y float
+#define DTYPE_BIAS float
+#elif !defined(MATMUL_C220_SUFFIX_VALUE) && defined(direct_matmul_fp32_k90002)
+#define MATMUL_C220_SUFFIX_VALUE 90002
+#define MATMUL_DIRECT_KERNEL direct_matmul_fp32_k90002
+#define DTYPE_X1 float
+#define DTYPE_X2 float
+#define DTYPE_Y float
+#define DTYPE_BIAS float
 #endif
 
 #if !defined(MATMUL_C220_SUFFIX_VALUE)
@@ -85,6 +99,8 @@
 #include "mat_mul_sc_splitk_kernel_gm_to_l1.h"
 #elif MATMUL_C220_SUFFIX_VALUE == 121
 #include "mat_mul_sc_splitk_al1_fullload_kernel.h"
+#elif MATMUL_C220_SUFFIX_VALUE == 90001 || MATMUL_C220_SUFFIX_VALUE == 90002
+#include "seeded_split_k_kernel.h"
 #else
 #error Unsupported C220 direct family suffix
 #endif
@@ -164,6 +180,11 @@ extern "C" __global__ __aicore__ void MATMUL_DIRECT_KERNEL(
         op.Init(aGM, bGM, cGM, biasGM, offsetWGM, user, &tilingData, &pipe);
         op.Process();
     }
+#elif MATMUL_C220_SUFFIX_VALUE == 90001 || MATMUL_C220_SUFFIX_VALUE == 90002
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_0);
+    MATMUL_DIRECT_DECLARE_TYPES(true);
+    NovelMatmul::RunSeededSplitK<aType, bType, cType, biasType>(
+        aGM, bGM, cGM, tilingData);
 #endif
 }
 

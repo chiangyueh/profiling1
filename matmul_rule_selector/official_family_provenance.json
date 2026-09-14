@@ -1,0 +1,160 @@
+{
+  "scope": {
+    "installed_cann81": "/usr/local/Ascend/ascend-toolkit/8.1/opp/built-in/op_impl/ai_core/tbe/impl/ascendc/mat_mul_v3",
+    "bundled_later_c220": "colleague_matmul_v3/op_kernel",
+    "bundled_later_arch35": "colleague_matmul_v3/op_kernel/arch35",
+    "claim_boundary": "Absence is asserted only against these supplied and installed MatMulV3 sources."
+  },
+  "official_families": [
+    {
+      "architecture": "C220",
+      "family": "BASE",
+      "variants": ["aligned", "unaligned", "AIC-only", "AIC-AIV", "K-shift"],
+      "sources": ["mat_mul_base_kernel.h", "mat_mul_unaligned_base_kernel.h", "mat_mul_base_block.h"]
+    },
+    {
+      "architecture": "C220",
+      "family": "ASW",
+      "variants": ["aligned"],
+      "sources": ["mat_mul_asw_kernel.h"]
+    },
+    {
+      "architecture": "C220",
+      "family": "AL1_FULL_LOAD",
+      "variants": ["base", "single-core-split-k"],
+      "sources": ["mat_mul_l1_full_load.h", "mat_mul_sc_splitk_al1_fullload_kernel.h", "mat_mul_sc_splitk_al1_fullload_block.h"]
+    },
+    {
+      "architecture": "C220",
+      "family": "BL1_FULL_LOAD",
+      "variants": ["aligned", "unaligned"],
+      "sources": ["mat_mul_l1_full_load.h"]
+    },
+    {
+      "architecture": "C220",
+      "family": "SINGLE_CORE_SPLIT_K",
+      "variants": ["MKN", "NKM", "aligned", "unaligned", "GM-to-L1", "AL1-full-load"],
+      "sources": ["mat_mul_sc_splitk_kernel.h", "mat_mul_unaligned_sc_splitk_kernel.h", "mat_mul_sc_splitk_kernel_gm_to_l1.h", "mat_mul_unaligned_sc_splitk_kernel_gm_to_l1.h", "mat_mul_sc_splitk_al1_fullload_kernel.h"]
+    },
+    {
+      "architecture": "C220",
+      "family": "DETERMINISTIC_SPLIT_K",
+      "variants": ["aligned", "unaligned", "NZ2ND"],
+      "sources": ["mat_mul_deterministic_splitk_kernel.h", "mat_mul_unaligned_deterministic_splitk_kernel.h"]
+    },
+    {
+      "architecture": "C220",
+      "family": "MULTI_CORE_SPLIT_K",
+      "variants": ["clear-C then every K owner atomic-add"],
+      "sources": ["mat_mul_multi_core_splitk_kernel.h"]
+    },
+    {
+      "architecture": "C220",
+      "family": "FIXPIPE",
+      "variants": ["base", "aligned-output", "vector-NZ2ND", "BL1-full-load"],
+      "sources": ["mat_mul_base_fixpipe_kernel.h", "mat_mul_optimized_fixpipe_algorithm.h", "mat_mul_base_kernel_vec_nz2nd.h"]
+    },
+    {
+      "architecture": "C220",
+      "family": "ND2NZ_NZ2ND",
+      "variants": ["serial", "parallel", "batch", "vector-output"],
+      "sources": ["mat_mul_nd2nz.h", "mat_mul_nd2nz_kernel.h", "mat_mul_nz2nd.h", "batch_mat_mul_nd2nz.h"]
+    },
+    {
+      "architecture": "Arch35",
+      "family": "ASWT_BASIC",
+      "variants": ["basic-API", "tensor-API", "slice", "ping-pong", "CMCT"],
+      "sources": ["mat_mul_asw_kernel.h", "mat_mul_asw_block.h", "block_scheduler_aswt.h", "mat_mul_pingpong_basic.h", "mat_mul_pingpong_basic_cmct.h", "mat_mul_mix_basic_cmct.h"]
+    },
+    {
+      "architecture": "Arch35",
+      "family": "FULL_LOAD",
+      "variants": ["A", "B", "AB", "basic-API", "tensor-API"],
+      "sources": ["mat_mul_full_load.h", "mat_mul_al1_full_load.h", "mat_mul_bl1_full_load.h", "mat_mul_v3_full_load_kernel_helper.h"]
+    },
+    {
+      "architecture": "Arch35",
+      "family": "BASIC_SPLIT_K",
+      "variants": ["tensor-API", "split-single-core-K"],
+      "sources": ["mat_mul_basic_split_k.h"]
+    },
+    {
+      "architecture": "Arch35",
+      "family": "STREAM_K",
+      "variants": ["pure-SK", "DP-plus-tail-SK", "split-single-core-K", "on-the-fly", "1V2-fixpipe"],
+      "sources": ["block_scheduler_streamk.h", "mat_mul_stream_k_block.h", "mat_mul_stream_k_kernel.h", "mat_mul_streamk.h", "mat_mul_streamk_split_k.h"]
+    },
+    {
+      "architecture": "Arch35",
+      "family": "FIXPIPE",
+      "variants": ["1V1", "1V2", "B-full-load", "basic-API", "tensor-API"],
+      "sources": ["mat_mul_fixpipe.h", "mat_mul_fixpipe_opti.h", "mat_mul_fixpipe_opti_basic_cmct.h"]
+    },
+    {
+      "architecture": "Arch35",
+      "family": "SPECIAL_DISPATCH",
+      "variants": ["K-equals-zero", "matmul-to-mul", "matmul-to-multi-mul"],
+      "sources": ["mat_mul_input_k_eq_zero_clear_output.h", "mat_mul_to_mul_cmct.h", "mat_mul_to_multi_mul_cmct.h"]
+    }
+  ],
+  "official_host_strategies": [
+    {
+      "architecture": "C220",
+      "strategy": "classic selector and base tiler",
+      "sources": ["matmul_v3_tiling.cpp", "matmul_v3_base_tiling.cpp", "matmul_v3_tiling.h", "matmul_v3_base_tiling.h"]
+    },
+    {
+      "architecture": "C220",
+      "strategy": "single-core Split-K plus AL1 full-load selector",
+      "sources": ["matmul_v3_sc_splitk_al1_fullload_tiling.cpp", "matmul_v3_sc_splitk_al1_fullload_tiling.h"]
+    },
+    {
+      "architecture": "C220",
+      "strategy": "L2 traversal policy",
+      "sources": ["matmul_v3_l2_cache.cpp", "matmul_v3_l2_cache.h"]
+    },
+    {
+      "architecture": "Arch35",
+      "strategy": "ASWT basic and tensor tiling",
+      "sources": ["matmul_v3_basic_aswt_tiling.cpp", "matmul_v3_basic_aswt_tiling.h", "matmul_v3_asw_tiling.cpp", "matmul_v3_asw_tiling.h"]
+    },
+    {
+      "architecture": "Arch35",
+      "strategy": "Stream-K and DP-plus-tail-SK tiling",
+      "sources": ["matmul_v3_basic_streamk_tiling.cpp", "matmul_v3_basic_streamk_tiling.h"]
+    },
+    {
+      "architecture": "Arch35",
+      "strategy": "advanced base geometry, full-load and tail-split helpers",
+      "sources": ["matmul_v3_tiling_helper.cpp", "matmul_v3_tiling_helper.h", "matmul_v3_base_tiling_advanced.h", "matmul_v3_tiling_advanced.cpp", "matmul_v3_tiling_advanced.h"]
+    },
+    {
+      "architecture": "Arch35",
+      "strategy": "matmul-to-mul and matmul-to-multi-mul",
+      "sources": ["matmul_v3_to_mul_tiling.cpp", "matmul_v3_to_mul_tiling.h", "matmul_v3_to_multi_mul_tiling.cpp", "matmul_v3_to_multi_mul_tiling.h"]
+    },
+    {
+      "architecture": "Arch35",
+      "strategy": "K-equals-zero",
+      "sources": ["matmul_v3_k_equal_zero_tiling.cpp", "matmul_v3_k_equal_zero_tiling.h"]
+    }
+  ],
+  "repository_owned_families": [
+    {
+      "family": "SEEDED_ATOMIC_SPLIT_K",
+      "suffix": 90001,
+      "novel_component": "cross-core output initialization and accumulation protocol",
+      "known_lineage": "K partition and MatmulImpl are standard; deterministic and single-core paths already seed then add within one AIC, but no supplied path assigns seed and atomic roles to different AIC owners without clear or workspace; no official kernel body is embedded",
+      "distinction": "one owner directly seeds C, a global AIC barrier follows, and only remaining owners atomic-add; there is no pre-clear",
+      "source": "novel_matmul/seeded_split_k_kernel.h"
+    },
+    {
+      "family": "SEEDED_TAIL_WAVE_SPLIT_K",
+      "suffix": 90002,
+      "novel_component": "workspace-free direct-seed plus atomic-remainder tail reduction on C220",
+      "known_lineage": "tail-only K redistribution is known from later Arch35 Stream-K",
+      "distinction": "full MN waves directly store C; each final-wave output group directly seeds C then atomically accumulates without workspace or AIV reducer",
+      "source": "novel_matmul/seeded_split_k_kernel.h"
+    }
+  ]
+}

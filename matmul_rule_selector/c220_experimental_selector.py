@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent finite-rule selector for the C220 structural MatMul paths."""
+"""Finite-rule selector for bundled later-official C220 backport paths."""
 from __future__ import annotations
 
 import hashlib
@@ -499,7 +499,8 @@ def generate(m: int, k: int, n: int, dtype: str, trans_a: bool, trans_b: bool,
     suffix = FAMILIES[selected_family][dtype]
     npu_eligible = selected_family in NPU_BUILDABLE_ON_CANN81
     return {
-        "status": "EXPERIMENTAL_FAMILY_TILING",
+        "status": "LATER_OFFICIAL_BACKPORT_TILING",
+        "origin": "BUNDLED_LATER_OFFICIAL_SOURCE_BACKPORT",
         "npu_eligible": npu_eligible,
         "formula_family": selected_family,
         "kernel_suffix": suffix,

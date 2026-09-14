@@ -143,6 +143,7 @@ function(add_c220_direct_matmul_kernel target kernel dtype suffix suffix_value)
     )
     ascendc_include_directories(${target} PRIVATE
         "${PROJECT_ROOT}/direct_matmul"
+        "${PROJECT_ROOT}/novel_matmul"
         "${MATMUL_V3_C220_KERNEL_DIR}"
         "${PLATFORM_ROOT}/ascendc/include"
     )
@@ -224,6 +225,11 @@ register_c220_direct_matmul(fp16 half 121 00121)
 register_c220_direct_matmul(bf16 bfloat16_t 121 00121)
 register_c220_direct_matmul(fp32 float 41 00041)
 register_c220_direct_matmul(fp32 float 51 00051)
+
+# Repository-owned execution protocols.  The high suffix range is kept
+# disjoint from every bundled official MatMulV3 tiling key.
+register_c220_direct_matmul(fp32 float 90001 90001)
+register_c220_direct_matmul(fp32 float 90002 90002)
 
 # direct_matmul_runner is intentionally linked outside this CMake graph by
 # build_all.sh.  Depending on any ascendc_library target here would retraverse

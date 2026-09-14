@@ -15,22 +15,18 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from c220_experimental_selector import generate as generate_expanded  # noqa: E402
 from core_ownership_rules import INSTALLED_SUFFIXES  # noqa: E402
-from expanded_family_rules import FAMILY_REGISTRY, proposed_family_plans  # noqa: E402
+from expanded_family_rules import FAMILY_REGISTRY  # noqa: E402
 from generate_matmul_core_ownership_matrix import BRANCH_CASES  # noqa: E402
 from improved_selector import generate as generate_installed  # noqa: E402
 
 
 def main() -> None:
     installed = defaultdict(list)
-    proposal_counts = Counter()
     for workload_id, m, n, k, dtype, trans_a, trans_b, expected_suffix in BRANCH_CASES:
         result = generate_installed(m, k, n, dtype, trans_a, trans_b)
         if int(result["kernel_suffix"]) != expected_suffix:
             raise RuntimeError(f"{workload_id}: installed suffix drift")
         installed[expected_suffix].append(result)
-        for plan in proposed_family_plans(result["request"]):
-            if not plan["hard_reject"]:
-                proposal_counts[plan["family"]] += 1
     if tuple(sorted(installed)) != INSTALLED_SUFFIXES:
         raise RuntimeError("not all installed suffixes were solved")
     if any(len(rows) != 5 for rows in installed.values()):
@@ -64,17 +60,18 @@ def main() -> None:
         row["formula_family"] for row in expanded if row["npu_eligible"]
     )
     for family in sorted(by_family):
+        registry_name = {
+            "MULTI_CORE_SPLIT_K": "ATOMIC_MULTI_CORE_SPLIT_K",
+            "SINGLE_CORE_NKM_SPLIT_K": "NKM_SINGLE_CORE_SPLIT_K",
+            "SINGLE_CORE_SPLIT_K_GM_TO_L1": "GM_TO_L1_SINGLE_CORE_SPLIT_K",
+            "SINGLE_CORE_SPLIT_K_GM_TO_L1_UNALIGNED": "GM_TO_L1_SINGLE_CORE_SPLIT_K",
+            "SINGLE_CORE_SPLIT_K_AL1_FULL_LOAD": "SINGLE_CORE_SPLIT_K_AL1_FULL_LOAD",
+        }[family]
         print(
-            f"EXPANDED_FAMILY_PACKET_AUDITED family={family} shapes={by_family[family]} "
+            f"OFFICIAL_BACKPORT_PACKET_AUDITED family={family} "
+            f"origin={FAMILY_REGISTRY[registry_name]['origin']} shapes={by_family[family]} "
             f"cann81_npu_shapes={npu_by_family[family]} "
             f"fallback_kernel=0"
-        )
-    for family in ("BALANCED_STREAM_K_REDUCTION", "CUBE_VECTOR_EDGE_SPLIT"):
-        entry = FAMILY_REGISTRY[family]
-        print(
-            f"NEW_FAMILY_PROPOSED family={family} "
-            f"applicable_existing_witnesses={proposal_counts[family]} "
-            f"npu_eligible=0 kernel_gap={entry['blocker'].replace(' ', '_')}"
         )
     print(
         "FAMILY_SOLVER_AUDIT_SUMMARY "
