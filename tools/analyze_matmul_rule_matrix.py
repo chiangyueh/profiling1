@@ -10,7 +10,7 @@ from pathlib import Path
 import statistics
 
 
-EXPECTED_SHAPES = 48
+EXPECTED_SHAPES = 224
 EXPECTED_SAMPLES = 15
 EXPECTED_WARMUP = 3
 EXPECTED_REPEAT = 10
@@ -136,6 +136,7 @@ def main() -> None:
             "k": int(expected["k"]), "dtype": expected["dtype"],
             "trans_a": int(expected["trans_a"]),
             "trans_b": int(expected["trans_b"]),
+            "scale_band": selection["scale_band"],
             "used_cores": int(expected["used_core_num"]),
             "official_median_ms": old_median,
             "candidate_median_ms": new_median,

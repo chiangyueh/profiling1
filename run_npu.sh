@@ -7,8 +7,8 @@ PHYSICAL_DEVICE="${PHYSICAL_NPU_ID:-2}"
 WARMUP=3
 REPEAT=10
 SAMPLES=15
-NPU_SHAPES=48
-SOLVED_EXPANDED_SHAPES=52
+NPU_SHAPES=224
+SOLVED_EXPANDED_SHAPES=228
 EXPECTED_VARIANTS=4
 MAX_FOOTPRINT_MIB=320
 
@@ -130,7 +130,7 @@ announce "measurement=${WARMUP}_warmup+${SAMPLES}_device_event_samples+repeat_${
 announce "CANN_ENV root=${CANN_ROOT} soc=${SOC_VERSION} visible_devices=${ASCEND_RT_VISIBLE_DEVICES} runtime_user_device=${DEVICE_ID}"
 
 python3 tools/audit_matmul_family_solver.py >"${AUDIT_LOG}"
-grep -q 'installed_suffixes=12 installed_shapes=60 expanded_families=5 expanded_shapes=52 cann81_buildable_expanded_shapes=48' "${AUDIT_LOG}"
+grep -q 'installed_suffixes=12 installed_shapes=60 expanded_families=5 expanded_shapes=228 cann81_buildable_expanded_shapes=224' "${AUDIT_LOG}"
 
 python3 tools/generate_matmul_c220_experimental_matrix.py \
     --output-dir "${PACKET_DIR}" \
@@ -285,6 +285,7 @@ for row in rows:
         "FINAL_RESULT "
         f"id={row['workload_id']} family={row['family']} suffix={row['kernel_suffix']} "
         f"m={row['m']} n={row['n']} k={row['k']} dtype={row['dtype']} "
+        f"scale={row['scale_band']} "
         f"cores={row['used_cores']} official_ms={float(row['official_median_ms']):.9g} "
         f"candidate_ms={float(row['candidate_median_ms']):.9g} "
         f"delta_pct={float(row['delta_pct']):+.3f} winner={row['median_winner']} "
@@ -314,6 +315,19 @@ for (dtype, layout), group in sorted(subgroups.items()):
         "FINAL_SUBGROUP_RESULT "
         "family=SINGLE_CORE_SPLIT_K_AL1_FULL_LOAD "
         f"dtype={dtype} layout={layout} shapes={len(group)} "
+        f"candidate_wins={sum(row['median_winner'] == 'candidate' for row in group)} "
+        f"official_wins={sum(row['median_winner'] == 'official' for row in group)} "
+        f"clear_candidate_wins={sum(row['sample_separation'] == 'CLEAR_CANDIDATE_WINNER' for row in group)} "
+        f"clear_official_wins={sum(row['sample_separation'] == 'CLEAR_OFFICIAL_WINNER' for row in group)} "
+        f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in group)}"
+    )
+scale_groups = defaultdict(list)
+for row in rows:
+    scale_groups[row["scale_band"]].append(row)
+for scale, group in sorted(scale_groups.items()):
+    print(
+        "FINAL_SCALE_RESULT "
+        f"scale={scale} shapes={len(group)} "
         f"candidate_wins={sum(row['median_winner'] == 'candidate' for row in group)} "
         f"official_wins={sum(row['median_winner'] == 'official' for row in group)} "
         f"clear_candidate_wins={sum(row['sample_separation'] == 'CLEAR_CANDIDATE_WINNER' for row in group)} "

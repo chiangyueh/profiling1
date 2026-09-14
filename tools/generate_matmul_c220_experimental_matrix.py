@@ -26,8 +26,8 @@ FIELDS = (
     "model_schedule_sha256", "is_reserve", "l2_cache_flag", "nd2nz_a",
     "nd2nz_b", "required_successful_tilings",
 )
-EXPECTED_ROWS = 52
-EXPECTED_NPU_ROWS = 48
+EXPECTED_ROWS = 228
+EXPECTED_NPU_ROWS = 224
 EXPECTED_FAMILIES = {
     "MULTI_CORE_SPLIT_K", "SINGLE_CORE_NKM_SPLIT_K",
     "SINGLE_CORE_SPLIT_K_GM_TO_L1",
@@ -133,6 +133,7 @@ def main() -> None:
             })
         result.update({
             "workload_id": row["workload_id"], "selection_axis": row["selection_axis"],
+            "scale_band": row["scale_band"],
             "required_applicable_family": row["required_family"],
             "case_role": "experimental_family" if result["npu_eligible"] else "host_solved_toolchain_blocked",
         })
