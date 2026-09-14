@@ -148,6 +148,9 @@ width = {"fp16": 2, "bf16": 2, "fp32": 4}
 with open(sys.argv[1], newline="", encoding="utf-8") as stream:
     rows = list(csv.DictReader(stream))
 limit = int(sys.argv[2]) * 1024 * 1024
+invalid_k = [row["workload_id"] for row in rows if int(row["k"]) > 60000]
+if invalid_k:
+    raise SystemExit(f"official structured validation K limit exceeded: {invalid_k}")
 largest = max((
     (int(row["m"]) * int(row["k"]) + int(row["k"]) * int(row["n"]) +
      2 * int(row["m"]) * int(row["n"])) * width[row["dtype"]] +
