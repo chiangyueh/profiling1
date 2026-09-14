@@ -7,17 +7,17 @@ PHYSICAL_DEVICE="${PHYSICAL_NPU_ID:-2}"
 WARMUP=3
 REPEAT=10
 SAMPLES=15
-BRANCH_SHAPES=60
-PAIRED_SHAPES=20
-EXPECTED_VARIANTS=12
+NPU_SHAPES=8
+SOLVED_EXPANDED_SHAPES=12
+EXPECTED_VARIANTS=4
 MAX_FOOTPRINT_MIB=320
 
 usage() {
     printf '%s\n' \
         'Usage: ./run_npu.sh --mode full [-d PHYSICAL_NPU_ID]' \
         '' \
-        'Runs five varied shapes for every C220 suffix and performs paired' \
-        'direct-baseline/candidate measurements for every strict core deletion.'
+        'Audits all twelve installed suffix rules, solves five expanded C220' \
+        'families, and measures the three families buildable with CANN 8.1.'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -66,30 +66,31 @@ source "${ROOT}/scripts/env.sh" >/dev/null
 CAMPAIGN_ID="$({
     sha256sum \
         run_npu.sh \
-        tools/generate_matmul_core_ownership_matrix.py \
-        tools/analyze_matmul_core_ownership.py \
+        tools/audit_matmul_family_solver.py \
+        tools/generate_matmul_c220_experimental_matrix.py \
+        tools/analyze_matmul_rule_matrix.py \
         scripts/build_all.sh \
-        scripts/env.sh \
         cmake_npu/CMakeLists.txt \
-        direct_matmul/kernel_entry.cpp \
-        direct_matmul/mat_mul_v3_tiling_data.h \
+        direct_matmul/kernel_entry_c220.cpp \
+        direct_matmul/mat_mul_v3_tiling_data_280.h \
         direct_matmul/runner.cpp \
+        matmul_rule_selector/c220_experimental_selector.py \
+        matmul_rule_selector/c220_validation_contract.json \
+        matmul_rule_selector/expanded_family_rules.py \
         matmul_rule_selector/core_ownership_rules.py \
         matmul_rule_selector/improved_selector.py
-    find matmul_rule_selector/baseline_core -type f -name '*.py' -print0 |
-        sort -z | xargs -0 sha256sum
+    find colleague_matmul_v3/op_kernel -type f -print0 | sort -z | xargs -0 sha256sum
+    find matmul_rule_selector/baseline_core -type f -name '*.py' -print0 | sort -z | xargs -0 sha256sum
 } | sha256sum | cut -c1-20)"
-CAMPAIGN_DIR="${ROOT}/results/matmul_core_ownership_v1/${CAMPAIGN_ID}"
-BASELINE_PACKET_DIR="${CAMPAIGN_DIR}/baseline_packets"
-CANDIDATE_PACKET_DIR="${CAMPAIGN_DIR}/candidate_packets"
-BASELINE_MANIFEST="${CAMPAIGN_DIR}/baseline_manifest.csv"
-CANDIDATE_MANIFEST="${CAMPAIGN_DIR}/candidate_manifest.csv"
-BASELINE_VARIANTS="${CAMPAIGN_DIR}/baseline_variants"
-CANDIDATE_VARIANTS="${CAMPAIGN_DIR}/candidate_variants"
+CAMPAIGN_DIR="${ROOT}/results/matmul_expanded_family_v1/${CAMPAIGN_ID}"
+PACKET_DIR="${CAMPAIGN_DIR}/packets"
+MANIFEST="${CAMPAIGN_DIR}/manifest.csv"
 SELECTION="${CAMPAIGN_DIR}/selection.jsonl"
-AUDIT="${CAMPAIGN_DIR}/branch_audit.jsonl"
-BASELINE_RESULTS="${CAMPAIGN_DIR}/baseline_results.jsonl"
-CANDIDATE_RESULTS="${CAMPAIGN_DIR}/candidate_results.jsonl"
+VARIANT_DIR="${CAMPAIGN_DIR}/variants"
+SEQUENCE_DIR="${CAMPAIGN_DIR}/sequence"
+AUDIT_LOG="${CAMPAIGN_DIR}/family_audit.txt"
+OFFICIAL_PROFILE="${CAMPAIGN_DIR}/official_profile.csv"
+OFFICIAL_SAMPLES="${CAMPAIGN_DIR}/official_samples.csv"
 ANALYSIS="${CAMPAIGN_DIR}/analysis.json"
 SUMMARY="${CAMPAIGN_DIR}/summary.csv"
 mkdir -p "${CAMPAIGN_DIR}"
@@ -107,163 +108,67 @@ cleanup_generated_state() {
 
 on_error() {
     local rc=$?
-    local fatal_message diagnostic_tail
-    fatal_message="RULE_VALIDATION_FATAL rc=${rc} line=${BASH_LINENO[0]} log=${RUN_LOG}"
-    diagnostic_tail="$(tail -40 "${RUN_LOG}" 2>/dev/null || true)"
-    printf '%s\n%s\n' "${fatal_message}" "${diagnostic_tail}" >"${RUN_LOG}"
-    printf '%s\n' "${fatal_message}" >&3
-    printf '%s\n' "${diagnostic_tail}" >&3
+    local line="${BASH_LINENO[0]}"
+    local tail_text
+    trap - ERR
+    tail_text="$(tail -50 "${RUN_LOG}" 2>/dev/null || true)"
     cleanup_generated_state || true
+    printf 'RULE_VALIDATION_FATAL rc=%s line=%s log=%s\n%s\n' \
+        "${rc}" "${line}" "${RUN_LOG}" "${tail_text}" >"${RUN_LOG}"
+    printf 'RULE_VALIDATION_FATAL rc=%s line=%s log=%s\n%s\n' \
+        "${rc}" "${line}" "${RUN_LOG}" "${tail_text}" >&3
     exit "${rc}"
 }
 trap on_error ERR
 
-fail() {
-    announce "RULE_VALIDATION_FATAL error=$* log=${RUN_LOG}"
-    return 1
-}
-
-emit_final_results() {
-    local final_lines
-    final_lines="$(python3 - "${SUMMARY}" "${ANALYSIS}" "${BRANCH_SHAPES}" <<'PY'
-import csv
-import json
-import sys
-from collections import defaultdict
-
-with open(sys.argv[1], newline='', encoding='utf-8') as stream:
-    rows = list(csv.DictReader(stream))
-with open(sys.argv[2], encoding='utf-8') as stream:
-    analysis = json.load(stream)
-expected = int(sys.argv[3])
-if len(rows) != expected:
-    raise SystemExit(f'expected {expected} final rows, found {len(rows)}')
-print('FINAL_RESULTS_BEGIN')
-audit_groups = defaultdict(list)
-for row in analysis['branch_audit']:
-    audit_groups[int(row['suffix'])].append(row)
-for suffix in sorted(audit_groups):
-    group = audit_groups[suffix]
-    actions = defaultdict(int)
-    for row in group:
-        actions[row['action']] += 1
-    print(
-        'CORE_BRANCH_AUDIT '
-        f"suffix={suffix} branch={group[0]['branch']} shapes={len(group)} "
-        f"source_cores={min(row['source_cores'] for row in group)}..{max(row['source_cores'] for row in group)} "
-        f"required_cores={min(row['required_cores'] for row in group)}..{max(row['required_cores'] for row in group)} "
-        f"deleted={actions['DELETE_ZERO_OWNERSHIP_CORES']} "
-        f"retained={len(group)-actions['DELETE_ZERO_OWNERSHIP_CORES']} "
-        f"proof={group[0]['proof_kind']}"
-    )
-by_suffix = defaultdict(list)
-for row in rows:
-    by_suffix[row['kernel_suffix']].append(row)
-    common = (
-        'FINAL_RESULT '
-        f"id={row['workload_id']} suffix={row['kernel_suffix']} branch={row['branch']} "
-        f"m={row['m']} n={row['n']} k={row['k']} dtype={row['dtype']} "
-        f"trans_a={row['trans_a']} trans_b={row['trans_b']} "
-        f"baseline_ms={float(row['baseline_median_ms']):.9g} "
-    )
-    if row['candidate_median_ms']:
-        print(
-            common +
-            f"candidate_ms={float(row['candidate_median_ms']):.9g} "
-            f"delta_pct={float(row['delta_pct']):+.3f} "
-            f"cores_before={row['cores_before']} cores_after={row['cores_after']} "
-            f"winner={row['median_winner']} separation={row['sample_separation']}"
-        )
-    else:
-        print(
-            common +
-            f"cores={row['cores_before']} result=CORE_COUNT_RETAINED "
-            f"correctness={row['correctness']}"
-        )
-for suffix in sorted(by_suffix, key=int):
-    group = by_suffix[suffix]
-    print(
-        'FINAL_BRANCH_RESULT '
-        f"suffix={suffix} shapes={len(group)} "
-        f"paired={sum(bool(row['candidate_median_ms']) for row in group)} "
-        f"candidate_wins={sum(row['median_winner'] == 'candidate' for row in group)} "
-        f"clear_candidate_wins={sum(row['sample_separation'] == 'CLEAR_CANDIDATE_WINNER' for row in group)} "
-        f"clear_baseline_wins={sum(row['sample_separation'] == 'CLEAR_BASELINE_WINNER' for row in group)} "
-        f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in group)}"
-    )
-aggregate = analysis['aggregate']
-print(
-    'FINAL_RESULT_SUMMARY '
-    f"audited_suffixes={aggregate['audited_suffixes']} "
-    f"measured_changed_suffixes={aggregate['measured_changed_suffixes']} "
-    f"shapes={aggregate['measured_shapes']} "
-    f"paired_shapes={aggregate['paired_shapes']} "
-    f"retained_core_shapes={aggregate['retained_core_shapes']} "
-    f"candidate_wins={aggregate['candidate_wins']} "
-    f"baseline_wins={aggregate['baseline_wins']} "
-    f"clear_candidate_wins={aggregate['clear_candidate_wins']} "
-    f"clear_baseline_wins={aggregate['clear_baseline_wins']} "
-    f"overlap={aggregate['overlap']}"
-)
-print('FINAL_RESULTS_END')
-PY
-)"
-    printf '%s\n' "${final_lines}" >"${RUN_LOG}"
-    printf '%s\n' "${final_lines}" >&3
-}
-
 announce "RUN_LOG path=${RUN_LOG}"
-announce "SOURCE_REVISION commit=$(git rev-parse HEAD 2>/dev/null || printf unknown)"
-announce "CAMPAIGN_READY operator=matmul selector=twelve_suffix_core_ownership audited_suffixes=12 branch_shapes=${BRANCH_SHAPES} paired_shapes=${PAIRED_SHAPES} compiled_variants=${EXPECTED_VARIANTS} physical_device=${PHYSICAL_DEVICE} runtime_user_device=${DEVICE_ID}"
+announce "SOURCE_REVISION commit=$(git rev-parse HEAD 2>/dev/null || printf unknown) result13_tag=result13-core-ownership-v1"
+announce "CAMPAIGN_READY operator=matmul installed_suffixes=12 installed_audit_shapes=60 expanded_families=5 solved_expanded_shapes=${SOLVED_EXPANDED_SHAPES} npu_shapes=${NPU_SHAPES} variants=${EXPECTED_VARIANTS}"
+announce "selection=disjoint_shape_and_c220_hardware_equations_only"
+announce "forbidden=cost_model,latency_ranker,candidate_bank,history_lookup,repo_lookup,official_tiling_seed,fallback_kernel"
 announce "measurement=${WARMUP}_warmup+${SAMPLES}_device_event_samples+repeat_${REPEAT}+validate_last_timed_output"
-announce "comparison=same_direct_kernel_same_suffix_same_packet_except_usedCoreNum"
-announce "forbidden=cost_model,candidate_enumeration,measured_latency_at_selection,history_lookup,repo_lookup,tiling_bank,installed_host_tiler"
+announce "CANN_ENV root=${CANN_ROOT} soc=${SOC_VERSION} visible_devices=${ASCEND_RT_VISIBLE_DEVICES} runtime_user_device=${DEVICE_ID}"
 
-generation_started_ns="$(date +%s%N)"
-python3 tools/generate_matmul_core_ownership_matrix.py \
-    --baseline-dir "${BASELINE_PACKET_DIR}" \
-    --candidate-dir "${CANDIDATE_PACKET_DIR}" \
-    --baseline-manifest "${BASELINE_MANIFEST}" \
-    --candidate-manifest "${CANDIDATE_MANIFEST}" \
-    --baseline-variants "${BASELINE_VARIANTS}" \
-    --candidate-variants "${CANDIDATE_VARIANTS}" \
+python3 tools/audit_matmul_family_solver.py >"${AUDIT_LOG}"
+grep -q 'installed_suffixes=12 installed_shapes=60 expanded_families=5 expanded_shapes=12 cann81_buildable_expanded_shapes=8' "${AUDIT_LOG}"
+
+python3 tools/generate_matmul_c220_experimental_matrix.py \
+    --output-dir "${PACKET_DIR}" \
+    --manifest "${MANIFEST}" \
     --selection "${SELECTION}" \
-    --audit "${AUDIT}"
-actual_variants="$(find "${BASELINE_VARIANTS}" -maxdepth 1 -type f -name '*.csv' | wc -l)"
-[[ "${actual_variants}" -eq "${EXPECTED_VARIANTS}" ]] || \
-    fail "generated ${actual_variants} variants; expected ${EXPECTED_VARIANTS}"
-announce "CORE_OWNERSHIP_PACKET_GENERATION passed audited_suffixes=12 branch_shapes=${BRANCH_SHAPES} paired_shapes=${PAIRED_SHAPES} variants=${EXPECTED_VARIANTS}"
-announce "CAMPAIGN_STAGE_TIMING stage=packet_generation wall_ms=$(( ($(date +%s%N) - generation_started_ns) / 1000000 ))"
+    --variant-dir "${VARIANT_DIR}" \
+    --sequence-dir "${SEQUENCE_DIR}"
+actual_variants="$(find "${VARIANT_DIR}" -maxdepth 1 -type f -name '*.csv' | wc -l)"
+[[ "${actual_variants}" -eq "${EXPECTED_VARIANTS}" ]]
 
-python3 - "${BASELINE_MANIFEST}" "${MAX_FOOTPRINT_MIB}" <<'PY'
+python3 - "${MANIFEST}" "${MAX_FOOTPRINT_MIB}" <<'PY'
 import csv
 import sys
-width = {'fp16': 2, 'bf16': 2, 'fp32': 4}
-with open(sys.argv[1], newline='', encoding='utf-8') as stream:
+width = {"fp16": 2, "bf16": 2, "fp32": 4}
+with open(sys.argv[1], newline="", encoding="utf-8") as stream:
     rows = list(csv.DictReader(stream))
 limit = int(sys.argv[2]) * 1024 * 1024
 largest = max((
-    (
-        (int(row['m']) * int(row['k']) + int(row['k']) * int(row['n']) +
-         2 * int(row['m']) * int(row['n'])) * width[row['dtype']] +
-        int(row['workspace_bytes']),
-        row['workload_id'],
-    )
-    for row in rows
-))
+    (int(row["m"]) * int(row["k"]) + int(row["k"]) * int(row["n"]) +
+     2 * int(row["m"]) * int(row["n"])) * width[row["dtype"]] +
+    int(row["workspace_bytes"]), row["workload_id"]
+) for row in rows)
 if largest[0] > limit:
-    raise SystemExit(f'combined tensor/workspace footprint cap exceeded: {largest}')
+    raise SystemExit(f"footprint cap exceeded: {largest}")
 print(f"FOOTPRINT_AUDIT passed largest={largest[1]} bytes={largest[0]} limit={limit}")
 PY
 
 python3 - "${DEVICE_ID}" <<'PY'
 import ctypes
+import os
 import sys
 device = int(sys.argv[1])
-acl = ctypes.CDLL('libascendcl.so', mode=ctypes.RTLD_GLOBAL)
+acl = ctypes.CDLL("libascendcl.so", mode=ctypes.RTLD_GLOBAL)
 acl.aclInit.argtypes = [ctypes.c_char_p]
 acl.aclInit.restype = ctypes.c_int
 acl.aclFinalize.restype = ctypes.c_int
+acl.aclrtGetDeviceCount.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
+acl.aclrtGetDeviceCount.restype = ctypes.c_int
 acl.aclrtSetDevice.argtypes = [ctypes.c_int32]
 acl.aclrtSetDevice.restype = ctypes.c_int
 acl.aclrtResetDevice.argtypes = [ctypes.c_int32]
@@ -272,83 +177,141 @@ initialized = False
 device_set = False
 try:
     rc = acl.aclInit(None)
-    if rc: raise RuntimeError(f'aclInit failed rc={rc}')
+    if rc: raise RuntimeError(f"aclInit failed rc={rc}")
     initialized = True
+    count = ctypes.c_uint32()
+    rc = acl.aclrtGetDeviceCount(ctypes.byref(count))
+    if rc: raise RuntimeError(f"aclrtGetDeviceCount failed rc={rc}")
+    if not 0 <= device < count.value:
+        raise RuntimeError(f"runtime user device {device} outside 0..{count.value - 1}")
     rc = acl.aclrtSetDevice(device)
-    if rc: raise RuntimeError(f'aclrtSetDevice failed rc={rc} user_device={device}')
+    if rc:
+        raise RuntimeError(
+            f"aclrtSetDevice failed rc={rc} user_device={device} "
+            f"visible_devices={os.environ.get('ASCEND_RT_VISIBLE_DEVICES', '')}"
+        )
     device_set = True
-    print(f'DEVICE_PREFLIGHT passed user_device={device}')
+    print(f"DEVICE_PREFLIGHT passed user_device={device} available={count.value}")
 finally:
     if device_set: acl.aclrtResetDevice(device)
     if initialized: acl.aclFinalize()
 PY
 
-build_started_ns="$(date +%s%N)"
+announce "OFFICIAL_RUNNER_BUILD begin jobs=1"
+BUILD_COMPONENTS=official BUILD_JOBS=1 scripts/build_all.sh
+official_runner="${ROOT}/build/official_matmul_runner"
+[[ -x "${official_runner}" ]]
+"${official_runner}" --candidates "${MANIFEST}" --validate-input >/dev/null
+announce "OFFICIAL_RUNNER_BUILD passed"
+
 variant_index=0
-for baseline_variant in "${BASELINE_VARIANTS}"/*.csv; do
-    filename="$(basename "${baseline_variant}" .csv)"
-    variant="${filename}"
+for variant_manifest in "${VARIANT_DIR}"/*.csv; do
+    variant="$(basename "${variant_manifest}" .csv)"
     dtype="${variant%%_k*}"
     suffix="${variant##*_k}"
-    candidate_variant="${CANDIDATE_VARIANTS}/${filename}.csv"
     target="direct_matmul_kernel_${dtype}_${suffix}"
     variant_index=$((variant_index + 1))
-    announce "DIRECT_VARIANT_BUILD ${variant_index}/${EXPECTED_VARIANTS} begin variant=${variant} jobs=1"
+    announce "EXPANDED_VARIANT_BUILD ${variant_index}/${EXPECTED_VARIANTS} begin variant=${variant} jobs=1"
     BUILD_COMPONENTS=variant BUILD_JOBS=1 DIRECT_KERNEL_TARGET="${target}" scripts/build_all.sh
     runner="${ROOT}/build/direct_runners/direct_matmul_${variant}"
-    [[ -x "${runner}" ]] || fail "direct runner missing: ${runner}"
-    "${runner}" --manifest "${baseline_variant}" --validate-input >/dev/null
-    if [[ -f "${candidate_variant}" ]]; then
-        "${runner}" --manifest "${candidate_variant}" --validate-input >/dev/null
-    fi
-    announce "DIRECT_VARIANT_BUILD ${variant_index}/${EXPECTED_VARIANTS} passed variant=${variant}"
+    [[ -x "${runner}" ]]
+    "${runner}" --manifest "${variant_manifest}" --validate-input >/dev/null
+    "${runner}" --manifest "${variant_manifest}" --device "${DEVICE_ID}" \
+        --warmup 0 --repeat 1 --samples 1 >/dev/null
+    announce "EXPANDED_VARIANT_BUILD ${variant_index}/${EXPECTED_VARIANTS} canary_passed variant=${variant}"
 done
-[[ "${variant_index}" -eq "${EXPECTED_VARIANTS}" ]] || fail "variant build count mismatch"
-announce "CAMPAIGN_STAGE_TIMING stage=variant_build wall_ms=$(( ($(date +%s%N) - build_started_ns) / 1000000 ))"
+[[ "${variant_index}" -eq "${EXPECTED_VARIANTS}" ]]
 
-: >"${BASELINE_RESULTS}"
-: >"${CANDIDATE_RESULTS}"
-measurement_started_ns="$(date +%s%N)"
-variant_index=0
-for baseline_variant in "${BASELINE_VARIANTS}"/*.csv; do
-    filename="$(basename "${baseline_variant}" .csv)"
-    variant="${filename}"
-    candidate_variant="${CANDIDATE_VARIANTS}/${filename}.csv"
+announce "OFFICIAL_MEASUREMENT begin shapes=${NPU_SHAPES}"
+"${official_runner}" \
+    --candidates "${MANIFEST}" \
+    --output "${OFFICIAL_PROFILE}" \
+    --samples-output "${OFFICIAL_SAMPLES}" \
+    --device "${DEVICE_ID}" \
+    --warmup "${WARMUP}" --repeat "${REPEAT}" --samples "${SAMPLES}" \
+    --numeric-preflight-max-mib "${MAX_FOOTPRINT_MIB}" \
+    --structured-full-preflight --validate-after-measurement
+announce "OFFICIAL_MEASUREMENT passed shapes=${NPU_SHAPES}"
+
+batch_index=0
+for packet_manifest in "${SEQUENCE_DIR}"/*.csv; do
+    filename="$(basename "${packet_manifest}" .csv)"
+    variant="${filename##*__}"
     runner="${ROOT}/build/direct_runners/direct_matmul_${variant}"
-    variant_index=$((variant_index + 1))
-    shapes=$(( $(wc -l <"${baseline_variant}") - 1 ))
-    announce "BRANCH_CANARY ${variant_index}/${EXPECTED_VARIANTS} begin variant=${variant} shapes=${shapes}"
-    "${runner}" --manifest "${baseline_variant}" --device "${DEVICE_ID}" --warmup 0 --repeat 1 --samples 1 >/dev/null
-    if [[ -f "${candidate_variant}" ]]; then
-        "${runner}" --manifest "${candidate_variant}" --device "${DEVICE_ID}" --warmup 0 --repeat 1 --samples 1 >/dev/null
-    fi
-    announce "BRANCH_CANARY ${variant_index}/${EXPECTED_VARIANTS} passed variant=${variant}"
-    "${runner}" --manifest "${baseline_variant}" --device "${DEVICE_ID}" \
-        --warmup "${WARMUP}" --repeat "${REPEAT}" --samples "${SAMPLES}" \
-        >>"${BASELINE_RESULTS}" 2>&1
-    if [[ -f "${candidate_variant}" ]]; then
-        "${runner}" --manifest "${candidate_variant}" --device "${DEVICE_ID}" \
-            --warmup "${WARMUP}" --repeat "${REPEAT}" --samples "${SAMPLES}" \
-            >>"${CANDIDATE_RESULTS}" 2>&1
-        pair_state="paired"
-    else
-        pair_state="retained_core"
-    fi
-    announce "BRANCH_MEASUREMENT ${variant_index}/${EXPECTED_VARIANTS} passed variant=${variant} shapes=${shapes} mode=${pair_state}"
+    batch_index=$((batch_index + 1))
+    announce "EXPANDED_MEASUREMENT ${batch_index}/${EXPECTED_VARIANTS} begin variant=${variant}"
+    "${runner}" --manifest "${packet_manifest}" --device "${DEVICE_ID}" \
+        --warmup "${WARMUP}" --repeat "${REPEAT}" --samples "${SAMPLES}"
+    announce "EXPANDED_MEASUREMENT ${batch_index}/${EXPECTED_VARIANTS} passed variant=${variant}"
 done
-[[ "${variant_index}" -eq "${EXPECTED_VARIANTS}" ]] || fail "variant measurement count mismatch"
-announce "CAMPAIGN_STAGE_TIMING stage=all_suffix_direct_measurement wall_ms=$(( ($(date +%s%N) - measurement_started_ns) / 1000000 ))"
+[[ "${batch_index}" -eq "${EXPECTED_VARIANTS}" ]]
 
-python3 tools/analyze_matmul_core_ownership.py \
-    --baseline-manifest "${BASELINE_MANIFEST}" \
-    --candidate-manifest "${CANDIDATE_MANIFEST}" \
-    --baseline-log "${BASELINE_RESULTS}" \
-    --candidate-log "${CANDIDATE_RESULTS}" \
+python3 tools/analyze_matmul_rule_matrix.py \
+    --manifest "${MANIFEST}" \
+    --runner-log "${RUN_LOG}" \
+    --official-profile "${OFFICIAL_PROFILE}" \
+    --official-samples "${OFFICIAL_SAMPLES}" \
     --selection "${SELECTION}" \
-    --audit "${AUDIT}" \
     --output-json "${ANALYSIS}" \
     --output-csv "${SUMMARY}"
 
-emit_final_results
+FINAL_TEXT="$(python3 - "${AUDIT_LOG}" "${SUMMARY}" "${SELECTION}" <<'PY'
+import csv
+import json
+import sys
+from collections import defaultdict
+
+audit = open(sys.argv[1], encoding="utf-8").read().strip()
+with open(sys.argv[2], newline="", encoding="utf-8") as stream:
+    rows = list(csv.DictReader(stream))
+selections = [json.loads(line) for line in open(sys.argv[3], encoding="utf-8") if line.strip()]
+print("FINAL_RESULTS_BEGIN")
+print(audit)
+for row in selections:
+    if not row["npu_eligible"]:
+        print(
+            "EXPANDED_FAMILY_NOT_MEASURED "
+            f"family={row['formula_family']} suffix={row['kernel_suffix']} "
+            f"reason={row['toolchain_contract']['cann81_kernel_build']} "
+            "fallback_kernel=0"
+        )
+for row in rows:
+    print(
+        "FINAL_RESULT "
+        f"id={row['workload_id']} family={row['family']} suffix={row['kernel_suffix']} "
+        f"m={row['m']} n={row['n']} k={row['k']} dtype={row['dtype']} "
+        f"cores={row['used_cores']} official_ms={float(row['official_median_ms']):.9g} "
+        f"candidate_ms={float(row['candidate_median_ms']):.9g} "
+        f"delta_pct={float(row['delta_pct']):+.3f} winner={row['median_winner']} "
+        f"separation={row['sample_separation']} correctness={row['correctness']}"
+    )
+groups = defaultdict(list)
+for row in rows:
+    groups[row["family"]].append(row)
+for family in sorted(groups):
+    group = groups[family]
+    print(
+        "FINAL_FAMILY_RESULT "
+        f"family={family} shapes={len(group)} "
+        f"candidate_wins={sum(row['median_winner'] == 'candidate' for row in group)} "
+        f"official_wins={sum(row['median_winner'] == 'official' for row in group)} "
+        f"clear_candidate_wins={sum(row['sample_separation'] == 'CLEAR_CANDIDATE_WINNER' for row in group)} "
+        f"clear_official_wins={sum(row['sample_separation'] == 'CLEAR_OFFICIAL_WINNER' for row in group)} "
+        f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in group)}"
+    )
+print(
+    "FINAL_RESULT_SUMMARY "
+    f"installed_suffixes_audited=12 expanded_families_solved=5 "
+    f"npu_shapes={len(rows)} candidate_wins={sum(row['median_winner'] == 'candidate' for row in rows)} "
+    f"official_wins={sum(row['median_winner'] == 'official' for row in rows)} "
+    f"overlap={sum(row['sample_separation'] == 'OVERLAPPING_SAMPLES' for row in rows)}"
+)
+print("FINAL_RESULTS_END")
+PY
+)"
+
+trap - ERR
 cleanup_generated_state
-printf '%s\n' "TWELVE_SUFFIX_CORE_VALIDATION_COMPLETE log=${RUN_LOG}" >&3
+printf '%s\n' "${FINAL_TEXT}" >"${RUN_LOG}"
+printf '%s\n' "${FINAL_TEXT}" >&3
+printf 'EXPANDED_FAMILY_VALIDATION_COMPLETE log=%s\n' "${RUN_LOG}" >&3

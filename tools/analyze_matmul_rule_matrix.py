@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare public MatMulV3 with proof-carrying AL1 packets."""
+"""Compare buildable expanded families with same-campaign public MatMulV3."""
 from __future__ import annotations
 
 import argparse
@@ -10,7 +10,7 @@ from pathlib import Path
 import statistics
 
 
-EXPECTED_SHAPES = 100
+EXPECTED_SHAPES = 8
 EXPECTED_SAMPLES = 15
 EXPECTED_WARMUP = 3
 EXPECTED_REPEAT = 10
@@ -26,23 +26,22 @@ def direct_results(path: Path) -> dict[str, dict]:
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.startswith("DIRECT_MATMUL_RESULT "):
             continue
-        result = json.loads(line.split(" ", 1)[1])
-        key = result["workload_id"]
-        if key in rows:
-            raise RuntimeError(f"duplicate direct result {key}")
-        rows[key] = result
+        row = json.loads(line.split(" ", 1)[1])
+        if row["workload_id"] in rows:
+            raise RuntimeError(f"duplicate direct result {row['workload_id']}")
+        rows[row["workload_id"]] = row
     return rows
+
+
+def sample_map(path: Path) -> dict[str, list[float]]:
+    result = {}
+    for row in read_csv(path):
+        result.setdefault(row["workload_id"], []).append(float(row["latency_ms"]))
+    return result
 
 
 def finite_positive(values: list[float]) -> bool:
     return all(math.isfinite(value) and value > 0 for value in values)
-
-
-def sample_map(path: Path) -> dict[str, list[float]]:
-    result: dict[str, list[float]] = {}
-    for row in read_csv(path):
-        result.setdefault(row["workload_id"], []).append(float(row["latency_ms"]))
-    return result
 
 
 def main() -> None:
@@ -57,18 +56,17 @@ def main() -> None:
     args = parser.parse_args()
 
     manifest = {row["workload_id"]: row for row in read_csv(args.manifest)}
-    official = {
-        row["workload_id"]: row for row in read_csv(args.official_profile)
-    }
+    official = {row["workload_id"]: row for row in read_csv(args.official_profile)}
     official_samples = sample_map(args.official_samples)
     direct = direct_results(args.runner_log)
-    selections = {
-        row["workload_id"]: row
-        for row in (
-            json.loads(line)
-            for line in args.selection.read_text(encoding="utf-8").splitlines()
-            if line
+    all_selections = {
+        row["workload_id"]: row for row in (
+            json.loads(line) for line in
+            args.selection.read_text(encoding="utf-8").splitlines() if line
         )
+    }
+    selections = {
+        key: row for key, row in all_selections.items() if row["npu_eligible"]
     }
     identities = set(manifest)
     if not (
@@ -102,15 +100,7 @@ def main() -> None:
             and len(old_samples) == EXPECTED_SAMPLES
             and finite_positive(old_samples)
             and new.get("status") == "success"
-            and new.get("candidate_role") == expected["candidate_role"]
-            and expected["candidate_role"] in (
-                "independent_rule_winner",
-                "independent_branch_probe",
-                "independent_structural_probe",
-                "independent_experimental_family",
-                "unique_theoretical_improvement",
-                "certified_instruction_deletion",
-            )
+            and new.get("candidate_role") == "independent_experimental_family"
             and new.get("measurement_source") == "direct_tiling_buffer"
             and new.get("tiling_applied") == 1
             and new.get("full_output_validated") == 1
@@ -131,7 +121,6 @@ def main() -> None:
             raise RuntimeError(f"official median mismatch for {workload_id}")
         if not math.isclose(float(new["median_ms"]), new_median, rel_tol=1e-9):
             raise RuntimeError(f"direct median mismatch for {workload_id}")
-        delta_pct = 100.0 * (new_median / old_median - 1.0)
         if max(new_samples) < min(old_samples):
             separation = "CLEAR_CANDIDATE_WINNER"
         elif min(new_samples) > max(old_samples):
@@ -139,105 +128,38 @@ def main() -> None:
         else:
             separation = "OVERLAPPING_SAMPLES"
         selection = selections[workload_id]
-        equation = selection["theory"]["improvement_equation"]
-        if not (
-            equation.get("proof_kind") ==
-            "AL1_IDLE_AIC_FULL_A_COPY_ELIMINATION"
-            and int(equation["source_launched_aic"]) == 20
-            and 5 <= int(equation["improved_launched_aic"]) <= 10
-            and int(equation["eliminated_idle_aic"]) ==
-            int(equation["source_launched_aic"]) -
-            int(equation["improved_launched_aic"])
-            and int(equation["eliminated_full_a_copy_bytes"]) ==
-            int(equation["source_full_a_copy_bytes"]) -
-            int(equation["improved_full_a_copy_bytes"])
-            and int(equation["eliminated_full_a_copy_bytes"]) > 0
-            and int(equation["new_kernel_instructions"]) == 0
-            and int(equation["new_workspace_bytes"]) == 0
-            and int(equation["new_MMAD_commands"]) == 0
-            and int(equation["new_output_tasks"]) == 0
-        ):
-            raise RuntimeError(
-                f"strict-dominance certificate failed for {workload_id}"
-            )
-        row = {
+        output_rows.append({
             "workload_id": workload_id,
-            "selection_axis": selection["selection_axis"],
-            "case_role": selection["case_role"],
-            "required_applicable_family": selection["required_applicable_family"],
-            "selected_family": selection["formula_family"],
+            "family": selection["formula_family"],
             "kernel_suffix": int(expected["kernel_suffix"]),
             "m": int(expected["m"]), "n": int(expected["n"]),
             "k": int(expected["k"]), "dtype": expected["dtype"],
             "trans_a": int(expected["trans_a"]),
             "trans_b": int(expected["trans_b"]),
+            "used_cores": int(expected["used_core_num"]),
             "official_median_ms": old_median,
             "candidate_median_ms": new_median,
-            "delta_pct": delta_pct,
-            "speedup": old_median / new_median,
-            "median_winner": (
-                "candidate" if new_median < old_median else "official"
-            ),
+            "delta_pct": 100.0 * (new_median / old_median - 1.0),
+            "median_winner": "candidate" if new_median < old_median else "official",
             "sample_separation": separation,
-            "source_launched_aic": int(equation["source_launched_aic"]),
-            "candidate_launched_aic": int(equation["improved_launched_aic"]),
-            "eliminated_idle_aic": int(equation["eliminated_idle_aic"]),
-            "source_full_a_copy_bytes": int(
-                equation["source_full_a_copy_bytes"]
-            ),
-            "candidate_full_a_copy_bytes": int(
-                equation["improved_full_a_copy_bytes"]
-            ),
-            "eliminated_full_a_copy_bytes": int(
-                equation["eliminated_full_a_copy_bytes"]
-            ),
-            "dominance_certificate": "PASS_AL1_IDLE_AIC_COPY_DELETION",
             "correctness": "PASS_BOTH_CURRENT_RUN_OUTPUTS",
-        }
-        output_rows.append(row)
+        })
 
+    aggregate = {
+        "shapes": len(output_rows),
+        "families": len({row["family"] for row in output_rows}),
+        "candidate_wins": sum(row["median_winner"] == "candidate" for row in output_rows),
+        "official_wins": sum(row["median_winner"] == "official" for row in output_rows),
+        "clear_candidate_wins": sum(row["sample_separation"] == "CLEAR_CANDIDATE_WINNER" for row in output_rows),
+        "clear_official_wins": sum(row["sample_separation"] == "CLEAR_OFFICIAL_WINNER" for row in output_rows),
+        "overlap": sum(row["sample_separation"] == "OVERLAPPING_SAMPLES" for row in output_rows),
+    }
     result = {
-        "schema": "matmul_al1_instruction_deletion_selector_v1",
+        "schema": "matmul_expanded_family_validation_v1",
         "status": "complete",
-        "comparison_basis": "same_campaign_official_api_vs_unique_closed_form_tiling",
-        "reference_remeasured": True,
         "selection_uses_measurements": False,
-        "measurement_contract": {
-            "warmup": EXPECTED_WARMUP,
-            "repeat": EXPECTED_REPEAT,
-            "samples": EXPECTED_SAMPLES,
-            "latency": "device_event_per_launch",
-        },
-        "aggregate": {
-            "shapes": len(output_rows),
-            "applicable_families": len({
-                row["required_applicable_family"] for row in output_rows
-            }),
-            "selected_families": len({row["selected_family"] for row in output_rows}),
-            "candidate_median_wins": sum(
-                row["median_winner"] == "candidate" for row in output_rows
-            ),
-            "official_median_wins": sum(
-                row["median_winner"] == "official" for row in output_rows
-            ),
-            "clear_candidate_wins": sum(
-                row["sample_separation"] == "CLEAR_CANDIDATE_WINNER"
-                for row in output_rows
-            ),
-            "clear_official_wins": sum(
-                row["sample_separation"] == "CLEAR_OFFICIAL_WINNER"
-                for row in output_rows
-            ),
-            "overlap": sum(
-                row["sample_separation"] == "OVERLAPPING_SAMPLES"
-                for row in output_rows
-            ),
-            "all_current_outputs_validated": True,
-            "certified_instruction_deletion_cases_executed": sum(
-                row["case_role"] == "certified_instruction_deletion"
-                for row in output_rows
-            ),
-        },
+        "all_current_outputs_validated": True,
+        "aggregate": aggregate,
         "shapes": output_rows,
     }
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
@@ -245,16 +167,14 @@ def main() -> None:
         json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     with args.output_csv.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(
-            stream, fieldnames=list(output_rows[0]), lineterminator="\n"
-        )
+        writer = csv.DictWriter(stream, fieldnames=list(output_rows[0]), lineterminator="\n")
         writer.writeheader()
         writer.writerows(output_rows)
     print(
-        "CERTIFIED_AL1_COMPLETE "
-        f"shapes={len(output_rows)} candidate_wins={result['aggregate']['candidate_median_wins']} "
-        f"official_wins={result['aggregate']['official_median_wins']} "
-        f"overlap={result['aggregate']['overlap']}"
+        "EXPANDED_FAMILY_VALIDATION_COMPLETE "
+        f"shapes={aggregate['shapes']} families={aggregate['families']} "
+        f"candidate_wins={aggregate['candidate_wins']} "
+        f"official_wins={aggregate['official_wins']} overlap={aggregate['overlap']}"
     )
 
 

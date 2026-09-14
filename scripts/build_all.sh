@@ -179,16 +179,24 @@ DIRECT_KERNEL_TARGETS=(
     direct_matmul_kernel_fp32_200 direct_matmul_kernel_fp32_201
     direct_matmul_kernel_fp32_10200 direct_matmul_kernel_fp32_10201
     direct_matmul_kernel_fp32_20201
+    direct_matmul_kernel_fp16_121
+    direct_matmul_kernel_bf16_121
+    direct_matmul_kernel_fp32_41 direct_matmul_kernel_fp32_51
 )
 MATMUL_V3_KERNEL_DIR="${CANN_ROOT}/opp/built-in/op_impl/ai_core/tbe/impl/ascendc/mat_mul_v3"
+MATMUL_V3_C220_KERNEL_DIR="${ROOT}/colleague_matmul_v3/op_kernel"
 DIRECT_KERNEL_BUILD_SIGNATURE="$({
     sha256sum \
         "${ROOT}/direct_matmul/kernel_entry.cpp" \
-        "${ROOT}/direct_matmul/mat_mul_v3_tiling_data.h"
+        "${ROOT}/direct_matmul/kernel_entry_c220.cpp" \
+        "${ROOT}/direct_matmul/mat_mul_v3_tiling_data.h" \
+        "${ROOT}/direct_matmul/mat_mul_v3_tiling_data_280.h"
     find "${MATMUL_V3_KERNEL_DIR}" -type f -print0 | \
         sort -z | xargs -0 sha256sum
+    find "${MATMUL_V3_C220_KERNEL_DIR}" -type f -print0 | \
+        sort -z | xargs -0 sha256sum
     printf '%s\n' \
-        "installed-81-single-abi-direct-kernel-v7:${ASCENDC_SOC_VERSION}:${DIRECT_KERNEL_TARGETS[*]}"
+        "installed-81-plus-c220-280-direct-kernel-v1:${ASCENDC_SOC_VERSION}:${DIRECT_KERNEL_TARGETS[*]}"
 } | sha256sum | cut -d' ' -f1)"
 kernel_count="${#DIRECT_KERNEL_TARGETS[@]}"
 
@@ -276,8 +284,19 @@ target_suffix="${target_identity#*_}"
 target_symbol="aclrtlaunch_direct_matmul_${target_dtype}_k${target_suffix}"
 target_include="${NPU_BUILD}/include/${target}"
 target_header="${target_include}/${target_symbol}.h"
-target_packet_header="${ROOT}/direct_matmul/mat_mul_v3_tiling_data.h"
-runner_packet_definition=''
+target_is_c220=0
+case "_${target_dtype}_${target_suffix}_" in
+    _fp16_121_|_bf16_121_|_fp32_41_|_fp32_51_)
+        target_is_c220=1
+        ;;
+esac
+if [[ "${target_is_c220}" -eq 1 ]]; then
+    target_packet_header="${ROOT}/direct_matmul/mat_mul_v3_tiling_data_280.h"
+    runner_packet_definition='-DDIRECT_MATMUL_PACKET_HEADER="mat_mul_v3_tiling_data_280.h"'
+else
+    target_packet_header="${ROOT}/direct_matmul/mat_mul_v3_tiling_data.h"
+    runner_packet_definition=''
+fi
 
 if ! kernel_archive_valid "${target}"; then
     recover_kernel_archive "${target}" || true
