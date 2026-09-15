@@ -231,12 +231,29 @@ announce "MEASUREMENT begin shapes=${NPU_SHAPES}"
     --numeric-preflight-max-mib "${MAX_FOOTPRINT_MIB}" \
     --structured-full-preflight --validate-after-measurement
 
+measurement_failures=()
 for variant_manifest in "${VARIANT_DIR}"/*.csv; do
     variant="$(basename "${variant_manifest}" .csv)"
     runner="${ROOT}/build/direct_runners/direct_matmul_${variant}"
-    "${runner}" --manifest "${variant_manifest}" --device "${DEVICE_ID}" \
-        --warmup "${WARMUP}" --repeat "${REPEAT}" --samples "${SAMPLES}"
+    if variant_output="$("${runner}" --manifest "${variant_manifest}" --device "${DEVICE_ID}" \
+        --warmup "${WARMUP}" --repeat "${REPEAT}" --samples "${SAMPLES}" 2>&1)"; then
+        printf '%s\n' "${variant_output}"
+    else
+        variant_rc=$?
+        printf '%s\n' "${variant_output}"
+        fatal_line="$(printf '%s\n' "${variant_output}" | awk '/^DIRECT_MATMUL_FATAL / { line=$0 } END { print line }')"
+        measurement_failures+=("variant=${variant} rc=${variant_rc} ${fatal_line}")
+    fi
 done
+
+if ((${#measurement_failures[@]})); then
+    announce "DIRECT_MEASUREMENT_FAILURES_BEGIN count=${#measurement_failures[@]}"
+    for failure in "${measurement_failures[@]}"; do
+        announce "DIRECT_VARIANT_FAILURE ${failure}"
+    done
+    announce "DIRECT_MEASUREMENT_FAILURES_END"
+    false
+fi
 
 python3 tools/analyze_formula_tiling_results.py \
     --manifest "${MANIFEST}" \

@@ -313,6 +313,15 @@ def validate_generated_rules(s: Shape, h: Hardware, ci: CompileInfo, state: dict
                 'mat_mul_v3.cpp requires ORIG_DTYPE_BIAS == ORIG_DTYPE_X1')
         require(f['singleCoreK'] == s.k and f['stepN'] * f['baseN'] == f['singleCoreN'] and
                 f['stepKb'] * f['baseK'] >= s.k, 'BL1_RESIDENT_DOMAIN', 'whole-K parent-N B resident')
+        require(s.trans_b or f['singleCoreN'] == s.n,
+                'BL1_NONTRANSPOSED_B_STRIDE',
+                'CopyBL1 uses useN as srcDValue, so non-transposed B must own the complete N axis')
+        bl1_m_tasks = cd(s.m, f['singleCoreM'])
+        bl1_n_tasks = cd(s.n, f['singleCoreN'])
+        require(f['singleCoreN'] == s.n or
+                bl1_m_tasks * bl1_n_tasks <= f['usedCoreNum'],
+                'BL1_CALLBACK_LIFETIME',
+                'CopyBL1 runs once per AIC, so an N-partitioned owner may execute only one MN parent')
     elif family == 'SINGLE_CORE_SPLIT_K':
         require((f['baseM'], f['baseN'], f['baseK']) == (128, 128, 256 // s.d),
                 'SC_RETAINED_BASE', 'keep the existing base profile')
@@ -552,8 +561,17 @@ def _solve_unique_theoretical(
     elif family != 'FIXPIPE_BL1':
         kp = up(s.k)
         ncap = down((l1 - 2 * 16 * 16 * d) // (kp * d))
-        pn_min = cd(s.n, ncap) if ncap > 0 else h.cores + 1
-        pn = divisor_up(h.cores, pn_min)
+        # CopyBL1 uses ``srcDValue=useN`` for a non-transposed B panel.
+        # Consequently a sub-panel would use the wrong GM row stride: only
+        # the complete N axis has useN equal to the physical leading stride.
+        # A transposed B is [N, K], so splitting its outer N rows remains
+        # contiguous and its K stride is unchanged.
+        if s.trans_b:
+            pn_min = cd(s.n, ncap) if ncap > 0 else h.cores + 1
+            pn = divisor_up(h.cores, pn_min)
+        else:
+            pn_min = 1 if s.n <= ncap else h.cores + 1
+            pn = 1 if s.n <= ncap else None
         inner_a = s.m if s.trans_a else s.k
         outer_a = s.k if s.trans_a else s.m
         a_vnchw_bl1 = (s.dtype == 'fp32' and outer_a >= 72368 and
@@ -562,9 +580,10 @@ def _solve_unique_theoretical(
                      (native_nd or a_vnchw_bl1))
         if bl1_legal:
             pm = h.cores // pn
-            parent_n = up(cd(s.n, pn))
+            parent_n = up(cd(s.n, pn)) if s.trans_b else s.n
             parent_m = up(cd(s.m, pm))
-            bl1_legal = (parent_n <= ncap and s.m > pm * bm and
+            bl1_legal = (parent_n <= ncap and parent_n % 16 == 0 and
+                         s.m > pm * bm and
                          cd(s.m, parent_m) == pm and cd(s.n, parent_n) == pn)
         state['B_resident_N_capacity'] = ncap
         state['B_resident_required_n_cores'] = pn_min
@@ -592,6 +611,11 @@ def _solve_unique_theoretical(
             state['resident_bytes'] = resident
             state['resident_opposite_step_cap'] = cap
             state['projected_core_grid'] = [pm, pn]
+            state['BL1_GM_stride_contract'] = (
+                'TRANSPOSED_B_K_STRIDE_ALLOWS_N_PARTITION'
+                if s.trans_b else
+                'NON_TRANSPOSED_B_USE_N_STRIDE_REQUIRES_WHOLE_N'
+            )
         elif (s.format_a != 'NZ' or s.format_b != 'NZ') and state['primitive_mn_count'] < h.cores and cd(s.k, 256 // d) >= h.cores:
             family = 'DETERMINISTIC_SPLIT_K'
             # 這個現存實現的 static shape 固定 128/128/256/d；不把 BASE 的公式套進來。

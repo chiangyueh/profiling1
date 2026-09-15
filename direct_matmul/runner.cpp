@@ -781,6 +781,7 @@ int main(int argc, char **argv)
             Check(aclrtCreateContext(&context, options.device), "aclrtCreateContext");
             Check(aclrtCreateStream(&stream), "aclrtCreateStream");
 
+            std::vector<std::string> failedWorkloads;
             size_t index = 0;
             while (index < candidates.size()) {
                 const Candidate &workload = candidates[index];
@@ -844,8 +845,8 @@ int main(int argc, char **argv)
                 }
                 if (!options.allowPartial &&
                     successful != workload.requiredSuccessfulTilings) {
-                    throw std::runtime_error(
-                        "workload failed workload_id=" + workload.workloadId +
+                    failedWorkloads.push_back(
+                        "workload_id=" + workload.workloadId +
                         " suffix=" + std::to_string(workload.suffix) +
                         " shape=M" + std::to_string(workload.m) +
                         "xN" + std::to_string(workload.n) +
@@ -855,6 +856,14 @@ int main(int argc, char **argv)
                         " last_error=" + lastFailure);
                 }
                 index = end;
+            }
+            if (!failedWorkloads.empty()) {
+                std::ostringstream summary;
+                summary << "workloads failed count=" << failedWorkloads.size();
+                for (const auto &failure : failedWorkloads) {
+                    summary << " [" << failure << "]";
+                }
+                throw std::runtime_error(summary.str());
             }
             (void)aclrtDestroyStream(stream);
             stream = nullptr;
