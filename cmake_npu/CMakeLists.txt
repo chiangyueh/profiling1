@@ -232,8 +232,8 @@ register_c220_direct_matmul(fp32 float 51 00051)
 register_c220_direct_matmul(fp16 half 60 00060)
 register_c220_direct_matmul(fp16 half 61 00061)
 register_c220_direct_matmul(fp32 float 202 00202)
-register_c220_direct_matmul(bf16 bfloat16_t 20030 20030)
-register_c220_direct_matmul(bf16 bfloat16_t 20031 20031)
+register_c220_direct_matmul(fp32 float 20030 20030)
+register_c220_direct_matmul(fp32 float 20031 20031)
 register_c220_direct_matmul(fp16 half 100001 10001)
 
 # Repository experimental derivatives of official Split-K/Stream-K scheduling.

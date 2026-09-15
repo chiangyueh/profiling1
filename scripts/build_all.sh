@@ -184,7 +184,7 @@ DIRECT_KERNEL_TARGETS=(
     direct_matmul_kernel_fp32_41 direct_matmul_kernel_fp32_51
     direct_matmul_kernel_fp16_60 direct_matmul_kernel_fp16_61
     direct_matmul_kernel_fp32_202
-    direct_matmul_kernel_bf16_20030 direct_matmul_kernel_bf16_20031
+    direct_matmul_kernel_fp32_20030 direct_matmul_kernel_fp32_20031
     direct_matmul_kernel_fp16_100001
     direct_matmul_kernel_fp32_90001 direct_matmul_kernel_fp32_90002
 )
@@ -293,7 +293,7 @@ target_include="${NPU_BUILD}/include/${target}"
 target_header="${target_include}/${target_symbol}.h"
 target_is_c220=0
 case "_${target_dtype}_${target_suffix}_" in
-    _fp16_60_|_fp16_61_|_fp16_121_|_bf16_121_|_fp32_202_|_fp32_41_|_fp32_51_|_bf16_20030_|_bf16_20031_|_fp16_100001_|_fp32_90001_|_fp32_90002_)
+    _fp16_60_|_fp16_61_|_fp16_121_|_bf16_121_|_fp32_202_|_fp32_41_|_fp32_51_|_fp32_20030_|_fp32_20031_|_fp16_100001_|_fp32_90001_|_fp32_90002_)
         target_is_c220=1
         ;;
 esac

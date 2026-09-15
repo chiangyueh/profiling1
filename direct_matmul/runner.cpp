@@ -252,6 +252,8 @@ std::vector<Candidate> LoadManifest(const std::string &path)
              row.role != "independent_branch_probe" &&
              row.role != "independent_experimental_family" &&
              row.role != "independent_formula_tiling" &&
+             row.role != "experimental_derivative_schedule" &&
+             row.role != "bundled_later_official_source_route" &&
              row.role != "unique_theoretical_improvement" &&
              row.role != "certified_instruction_deletion" &&
              row.role != "family_core_baseline" &&

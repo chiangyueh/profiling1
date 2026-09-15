@@ -73,20 +73,20 @@
 #define DTYPE_X2 float
 #define DTYPE_Y float
 #define DTYPE_BIAS float
-#elif !defined(MATMUL_C220_SUFFIX_VALUE) && defined(direct_matmul_bf16_k20030)
+#elif !defined(MATMUL_C220_SUFFIX_VALUE) && defined(direct_matmul_fp32_k20030)
 #define MATMUL_C220_SUFFIX_VALUE 20030
-#define MATMUL_DIRECT_KERNEL direct_matmul_bf16_k20030
-#define DTYPE_X1 bfloat16_t
-#define DTYPE_X2 bfloat16_t
-#define DTYPE_Y bfloat16_t
-#define DTYPE_BIAS bfloat16_t
-#elif !defined(MATMUL_C220_SUFFIX_VALUE) && defined(direct_matmul_bf16_k20031)
+#define MATMUL_DIRECT_KERNEL direct_matmul_fp32_k20030
+#define DTYPE_X1 float
+#define DTYPE_X2 float
+#define DTYPE_Y float
+#define DTYPE_BIAS float
+#elif !defined(MATMUL_C220_SUFFIX_VALUE) && defined(direct_matmul_fp32_k20031)
 #define MATMUL_C220_SUFFIX_VALUE 20031
-#define MATMUL_DIRECT_KERNEL direct_matmul_bf16_k20031
-#define DTYPE_X1 bfloat16_t
-#define DTYPE_X2 bfloat16_t
-#define DTYPE_Y bfloat16_t
-#define DTYPE_BIAS bfloat16_t
+#define MATMUL_DIRECT_KERNEL direct_matmul_fp32_k20031
+#define DTYPE_X1 float
+#define DTYPE_X2 float
+#define DTYPE_Y float
+#define DTYPE_BIAS float
 #elif !defined(MATMUL_C220_SUFFIX_VALUE) && defined(direct_matmul_fp32_k90001)
 #define MATMUL_C220_SUFFIX_VALUE 90001
 #define MATMUL_DIRECT_KERNEL direct_matmul_fp32_k90001
@@ -243,13 +243,13 @@ extern "C" __global__ __aicore__ void MATMUL_DIRECT_KERNEL(
     TPipe pipe;
     if (tilingData.matmulRunInfo.transB == 0) {
         MATMUL_DIRECT_DECLARE_TYPES(false);
-        MatmulCvpBaseKernel<aType, bType, cType, biasType,
+        MatmulV3::MatmulCvpBaseKernel<aType, bType, cType, biasType,
             MatmulBaseBlock, MM_CFG_NO_PRELOAD> op;
         op.Init(aGM, bGM, cGM, biasGM, offsetWGM, user, &tilingData, &pipe);
         op.Process();
     } else {
         MATMUL_DIRECT_DECLARE_TYPES(true);
-        MatmulCvpBaseKernel<aType, bType, cType, biasType,
+        MatmulV3::MatmulCvpBaseKernel<aType, bType, cType, biasType,
             MatmulBaseBlock, MM_CFG_NO_PRELOAD> op;
         op.Init(aGM, bGM, cGM, biasGM, offsetWGM, user, &tilingData, &pipe);
         op.Process();

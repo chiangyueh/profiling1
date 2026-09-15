@@ -199,6 +199,7 @@ official_runner="${ROOT}/build/official_matmul_runner"
 
 variant_index=0
 route_preflight_failures=()
+route_preflight_details=()
 for variant_manifest in "${VARIANT_DIR}"/*.csv; do
     variant="$(basename "${variant_manifest}" .csv)"
     dtype="${variant%%_k*}"
@@ -211,14 +212,27 @@ for variant_manifest in "${VARIANT_DIR}"/*.csv; do
     else
         variant_rc=$?
         route_preflight_failures+=("variant=${variant} stage=build rc=${variant_rc}")
+        variant_detail="$(
+            awk '/error:|fatal:|undefined reference|CMake Error|make.*Error|ninja.*failed/ { print }' \
+                "${ROOT}/build/kernel_build.log" 2>/dev/null | tail -5 | tr '\n' ' '
+        )"
+        if [[ -z "${variant_detail}" ]]; then
+            variant_detail="$(tail -5 "${ROOT}/build/kernel_build.log" 2>/dev/null | tr '\n' ' ')"
+        fi
+        route_preflight_details+=("variant=${variant} ${variant_detail:-compiler diagnostic unavailable}")
         continue
     fi
     runner="${ROOT}/build/direct_runners/direct_matmul_${variant}"
-    if "${runner}" --manifest "${variant_manifest}" --validate-input >/dev/null; then
+    if validation_output="$(
+        "${runner}" --manifest "${variant_manifest}" --validate-input 2>&1
+    )"; then
         :
     else
         variant_rc=$?
         route_preflight_failures+=("variant=${variant} stage=input_validation rc=${variant_rc}")
+        route_preflight_details+=(
+            "variant=${variant} ${validation_output:-runner validation diagnostic unavailable}"
+        )
         continue
     fi
     canary="${CAMPAIGN_DIR}/canary_${variant}.csv"
@@ -252,6 +266,9 @@ if ((${#route_preflight_failures[@]})); then
     announce "ROUTE_PREFLIGHT_FAILURES_BEGIN count=${#route_preflight_failures[@]} attempted=${variant_index}"
     for failure in "${route_preflight_failures[@]}"; do
         announce "ROUTE_PREFLIGHT_FAILURE ${failure}"
+    done
+    for detail in "${route_preflight_details[@]}"; do
+        announce "ROUTE_PREFLIGHT_BUILD_DETAIL ${detail}"
     done
     announce "ROUTE_PREFLIGHT_FAILURES_END"
     false
