@@ -1,75 +1,27 @@
-  void MatmulV3BaseTiling::ShrinkIdleAlignedBaseCores()
-  {
-      // 只處理使用 MN tile ownership 的對齊 BASE 系列。
-      if (tilingEnable_.tilingEnableSplitCore != TilingEnableSplitCore::BASE ||
-          tilingEnable_.tilingEnableFixOpti != TilingEnableFixOpti::BASE ||
-          GetMixNd2nzType() != MixNd2NzType::NO_ND2NZ) {
-          return;
-      }
+const uint32_t coresBefore =
+    tilingData_.matmulTiling.usedCoreNum;
+const char *shrinkMode =
+    std::getenv("MATMUL_V3_SHRINK_IDLE_CORES");
 
-      const auto fullLoad = tilingEnable_.tilingEnableFullLoad;
-      if (fullLoad != TilingEnableFullLoad::BASE &&
-          fullLoad != TilingEnableFullLoad::AL1_FULL_LOAD &&
-          fullLoad != TilingEnableFullLoad::BL1_FULL_LOAD) {
-          return;
-      }
+const bool shrinkEnabled =
+    shrinkMode != nullptr &&
+    shrinkMode[0] == '1' &&
+    shrinkMode[1] == '\0';
 
-      auto &matmul = tilingData_.matmulTiling;
-      const auto &l2 = tilingData_.tileL2cacheTiling;
+if (shrinkEnabled) {
+    ShrinkIdleAlignedBaseCores();
+}
 
-      const uint64_t oldUsedCoreNum =
-          static_cast<uint64_t>(matmul.usedCoreNum);
-      const uint64_t singleCoreM =
-          static_cast<uint64_t>(matmul.singleCoreM);
-      const uint64_t singleCoreN =
-          static_cast<uint64_t>(matmul.singleCoreN);
+const uint32_t coresAfter =
+    tilingData_.matmulTiling.usedCoreNum;
 
-      if (oldUsedCoreNum == 0 || singleCoreM == 0 || singleCoreN == 0) {
-          return;
-      }
-
-      const uint64_t mTotal =
-          ops::CeilDiv(static_cast<uint64_t>(matmul.M), singleCoreM);
-      const uint64_t nTotal =
-          ops::CeilDiv(static_cast<uint64_t>(matmul.N), singleCoreN);
-
-      uint64_t mCnt = 0;
-      uint64_t nCnt = 0;
-
-      if (l2.mTileBlock > 0 && l2.nTileBlock > 0) {
-          mCnt = std::min(
-              mTotal, static_cast<uint64_t>(l2.mTileBlock));
-          nCnt = std::min(
-              nTotal, static_cast<uint64_t>(l2.nTileBlock));
-      } else {
-          if (l2.mTileCntL2 == 0 || l2.nTileCntL2 == 0) {
-              return;
-          }
-
-          mCnt = ops::CeilDiv(
-              mTotal, static_cast<uint64_t>(l2.mTileCntL2));
-          nCnt = ops::CeilDiv(
-              nTotal, static_cast<uint64_t>(l2.nTileCntL2));
-      }
-
-      const uint64_t maxWindowTasks = mCnt * nCnt;
-      const uint64_t newUsedCoreNum = std::max<uint64_t>(
-          1, std::min(oldUsedCoreNum, maxWindowTasks));
-
-      if (newUsedCoreNum >= oldUsedCoreNum) {
-          return;
-      }
-
-      OP_LOGI(
-          args_.opName,
-          "Shrink idle aligned BASE cores: old=%lu new=%lu "
-          "mTotal=%lu nTotal=%lu maxWindowTasks=%lu",
-          oldUsedCoreNum,
-          newUsedCoreNum,
-          mTotal,
-          nTotal,
-          maxWindowTasks);
-
-      // 真正替換 tiling packet 裡的核心數。
-      matmul.usedCoreNum = static_cast<uint32_t>(newUsedCoreNum);
-  }
+OP_LOGI(
+    args_.opName,
+    "CORE_SHRINK_AB enabled=%u before=%u after=%u "
+    "M=%u N=%u K=%u",
+    static_cast<uint32_t>(shrinkEnabled),
+    coresBefore,
+    coresAfter,
+    tilingData_.matmulTiling.M,
+    tilingData_.matmulTiling.N,
+    tilingData_.matmulTiling.Ka);
