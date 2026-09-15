@@ -198,16 +198,29 @@ official_runner="${ROOT}/build/official_matmul_runner"
 "${official_runner}" --candidates "${MANIFEST}" --validate-input >/dev/null
 
 variant_index=0
+route_preflight_failures=()
 for variant_manifest in "${VARIANT_DIR}"/*.csv; do
     variant="$(basename "${variant_manifest}" .csv)"
     dtype="${variant%%_k*}"
     suffix="${variant##*_k}"
     variant_index=$((variant_index + 1))
-    BUILD_COMPONENTS=variant BUILD_JOBS=1 \
+    if BUILD_COMPONENTS=variant BUILD_JOBS=1 \
         DIRECT_KERNEL_TARGET="direct_matmul_kernel_${dtype}_${suffix}" \
-        scripts/build_all.sh
+        scripts/build_all.sh; then
+        :
+    else
+        variant_rc=$?
+        route_preflight_failures+=("variant=${variant} stage=build rc=${variant_rc}")
+        continue
+    fi
     runner="${ROOT}/build/direct_runners/direct_matmul_${variant}"
-    "${runner}" --manifest "${variant_manifest}" --validate-input >/dev/null
+    if "${runner}" --manifest "${variant_manifest}" --validate-input >/dev/null; then
+        :
+    else
+        variant_rc=$?
+        route_preflight_failures+=("variant=${variant} stage=input_validation rc=${variant_rc}")
+        continue
+    fi
     canary="${CAMPAIGN_DIR}/canary_${variant}.csv"
     python3 - "${variant_manifest}" "${canary}" <<'PY'
 import csv
@@ -222,13 +235,26 @@ with open(output, "w", newline="", encoding="utf-8") as stream:
     writer.writeheader()
     writer.writerow(row)
 PY
-    "${runner}" --manifest "${canary}" --device "${DEVICE_ID}" \
-        --warmup 0 --repeat 1 --samples 1
+    if "${runner}" --manifest "${canary}" --device "${DEVICE_ID}" \
+        --warmup 0 --repeat 1 --samples 1; then
+        :
+    else
+        variant_rc=$?
+        route_preflight_failures+=("variant=${variant} stage=npu_canary rc=${variant_rc}")
+    fi
 done
 [[ "${variant_index}" -eq "${EXPECTED_VARIANTS}" ]] || {
     echo "fatal: variant build loop covered ${variant_index}/${EXPECTED_VARIANTS}" >&2
     exit 1
 }
+if ((${#route_preflight_failures[@]})); then
+    announce "ROUTE_PREFLIGHT_FAILURES_BEGIN count=${#route_preflight_failures[@]} attempted=${variant_index}"
+    for failure in "${route_preflight_failures[@]}"; do
+        announce "ROUTE_PREFLIGHT_FAILURE ${failure}"
+    done
+    announce "ROUTE_PREFLIGHT_FAILURES_END"
+    false
+fi
 announce "BUILD passed official_runner=1 suffix_kernels=${variant_index} canaries=${variant_index}"
 
 announce "MEASUREMENT begin shapes=${NPU_SHAPES}"
