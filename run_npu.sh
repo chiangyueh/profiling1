@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$#" -ne 1 || "$1" != "full" ]]; then
-    echo "usage: bash run_npu.sh full" >&2
+# original begin: require the redundant "full" argument
+# if [[ "$#" -ne 1 || "$1" != "full" ]]; then
+#     echo "usage: bash run_npu.sh full" >&2
+#     exit 2
+# fi
+# original end: require the redundant "full" argument
+
+# new begin: the script has one complete execution mode and takes no arguments
+if [[ "$#" -ne 0 ]]; then
+    echo "usage: bash run_npu.sh" >&2
     exit 2
 fi
+# new end: the script has one complete execution mode and takes no arguments
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
