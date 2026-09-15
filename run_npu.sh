@@ -1,23 +1,55 @@
-#!/usr/bin/env bash
+ret = aclnnMatmulGetWorkspaceSize(self, mat2, out, cubeMathType, &workspaceSize, &executor);
+    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMatmulGetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
 
-set -euo pipefail
+    ret = aclSetAclOpExecutorRepeatable(executor);
+    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclSetAclOpExecutorRepeatable failed. ERROR: %d\n", ret); return ret);
 
-if [[ "$#" -ne 1 || "$1" != "full" ]]; then
-    echo "usage: bash run_npu.sh full" >&2
-    exit 2
-fi
 
-cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
-source /usr/local/Ascend/cann-8.5.0/set_env.sh
-export ASCEND_RT_VISIBLE_DEVICES=2
 
-for shrink_mode in 0 1; do
-    echo "CORE_SHRINK_RUN_BEGIN enabled=${shrink_mode}"
 
-    MATMUL_V3_SHRINK_IDLE_CORES="${shrink_mode}" \
-        bash build.sh \
-        --run_example mat_mul_v3 eager \
-        --example_name=matmul
 
-    echo "CORE_SHRINK_RUN_END enabled=${shrink_mode}"
-done
+constexpr int warmup = 10;
+    constexpr int repeat = 100;
+
+    for (int i = 0; i < warmup; ++i) {
+      ret = aclnnMatmul(workspaceAddr, workspaceSize, executor, stream);
+      CHECK_RET(ret == ACL_SUCCESS, return ret);
+    }
+
+    ret = aclrtSynchronizeStream(stream);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+
+    aclrtEvent startEvent = nullptr;
+    aclrtEvent endEvent = nullptr;
+
+    ret = aclrtCreateEvent(&startEvent);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+
+    ret = aclrtCreateEvent(&endEvent);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+
+    ret = aclrtRecordEvent(startEvent, stream);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+
+    for (int i = 0; i < repeat; ++i) {
+      ret = aclnnMatmul(workspaceAddr, workspaceSize, executor, stream);
+      CHECK_RET(ret == ACL_SUCCESS, return ret);
+    }
+
+    ret = aclrtRecordEvent(endEvent, stream);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+
+    ret = aclrtSynchronizeEvent(endEvent);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+
+    float totalMs = 0.0F;
+    ret = aclrtEventElapsedTime(&totalMs, startEvent, endEvent);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+
+    LOG_PRINT(
+        "MATMUL_LATENCY average_ms=%.9f repeat=%d\n",
+        totalMs / repeat,
+        repeat);
+
+    aclrtDestroyEvent(endEvent);
+    aclrtDestroyEvent(startEvent);
