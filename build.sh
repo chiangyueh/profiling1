@@ -1,460 +1,1353 @@
 #!/bin/bash
-# Copyright (c) 2024-2025 Huawei Technologies Co., Ltd.
-# This file is a part of the CANN Open Software.
-# Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
-# ======================================================================================================================
+# ============================================================================
 
 set -e
+RELEASE_TARGETS=("ophost" "opapi" "onnxplugin")
 
-########################################################################################################################
-# 预定义变量
-########################################################################################################################
+SUPPORT_COMPUTE_UNIT_SHORT=("ascend031" "ascend035" "ascend310b" "ascend310p" "ascend910_93" "ascend910_95" "ascend910b" "ascend910" "kirinx90")
+TRIGER_UTS=()
 
-CURRENT_DIR=$(dirname $(readlink -f ${BASH_SOURCE[0]}))
-BUILD_DIR=${CURRENT_DIR}/build
-OUTPUT_DIR=${CURRENT_DIR}/output
-THIRD_LIB_PATH=${CURRENT_DIR}/third_party
-USER_ID=$(id -u)
-PARENT_JOB="false"
-CHECK_COMPATIBLE="false"
-ASAN="false"
-UBSAN="false"
-COV="false"
-CLANG="false"
-VERBOSE="false"
+# 所有支持的短选项
+SUPPORTED_SHORT_OPTS="hj:vO:uf:-:"
 
-PR_CHANGED_FILES=""  # PR场景, 修改文件清单, 可用于标识是否PR场景
+# 所有支持的长选项
+SUPPORTED_LONG_OPTS=(
+  "help" "ops=" "soc=" "vendor_name=" "build-type=" "cov" "noexec" "opkernel" "opkernel_aicpu" "opkernel_aicpu_test" "static"
+   "jit" "pkg" "asan" "make_clean_all" "make_clean" "no_force"
+  "ophost" "opapi" "run_example" "example_name=" "genop=" "genop_aicpu=" "experimental" "cann_3rd_lib_path=" "oom" "onnxplugin"
+)
 
-if [ "${USER_ID}" != "0" ]; then
-    DEFAULT_TOOLKIT_INSTALL_DIR="${HOME}/Ascend/ascend-toolkit/latest"
-    DEFAULT_INSTALL_DIR="${HOME}/Ascend/latest"
-else
-    DEFAULT_TOOLKIT_INSTALL_DIR="/usr/local/Ascend/ascend-toolkit/latest"
-    DEFAULT_INSTALL_DIR="/usr/local/Ascend/latest"
-fi
-
-CUSTOM_OPTION="-DBUILD_OPEN_PROJECT=ON"
-
-########################################################################################################################
-# 预定义函数
-########################################################################################################################
-
-function help_info() {
-    echo "Usage: $0 [options]"
-    echo "Options:"
-    echo
-    echo "-h|--help            Displays help message."
-    echo
-    echo "-n|--op-name         Specifies the compiled operator. If there are multiple values, separate them with semicolons and use quotation marks. The default is all."
-    echo "                     For example: -n \"flash_attention_score\" or -n \"flash_attention_score;flash_attention_score_grad\""
-    echo
-    echo "-c|--compute-unit    Specifies the chip type. If there are multiple values, separate them with semicolons and use quotation marks. The default is ascend910b."
-    echo "                     For example: -c \"ascend910b\" or -c \"ascend910b;ascend310p\""
-    echo
-    echo "-t|--test            Executes a unit test (UT). If there are multiple values, separate them with semicolons and use quotation marks."
-    echo "                     For example: -t \"flash_attention_score\" or -t \"flash_attention_score;flash_attention_score_grad\" or -t \"all\""
-    echo
-    echo "-e|--example         Executes example."
-    echo
-    echo "--tiling_key         Sets the tiling key list for operators. If there are multiple values, separate them with semicolons and use quotation marks. The default is all."
-    echo "                     For example: --tiling_key \"1\" or --tiling_key \"1;2;3;4\""
-    echo
-    echo "--third_lib_path     Set third_party package install path, default ./third_party."
-    echo
-    echo "--asan               Compiles with AddressSanitizer, only supported in UTest."
-    echo
-    echo "--ubsan              Compiles with UndefinedBehaviorSanitizer, only supported in UTest."
-    echo
-    echo "--cov                Compiles with cov."
-    echo
-    echo "--verbose            Displays more compilation information."
-    echo
-}
-
-function log() {
-    local current_time=`date +"%Y-%m-%d %H:%M:%S"`
-    echo "[$current_time] "$1
-}
-
-function set_env()
-{
-    source $ASCEND_CANN_PACKAGE_PATH/bin/setenv.bash || echo "0"
-
-    export BISHENG_REAL_PATH=$(which bisheng || true)
-
-    if [ -z "${BISHENG_REAL_PATH}" ];then
-        log "Error: bisheng compilation tool not found, Please check whether the cann package or environment variables are set."
-        exit 1
+in_array() {
+  local needle="$1"
+  shift
+  local haystack=("$@")
+  for item in "${haystack[@]}"; do
+    if [[ "$item" == "$needle" ]]; then
+      return 0
     fi
+  done
+  return 1
 }
 
-function clean()
-{
-    if [ -n "${BUILD_DIR}" ];then
-        rm -rf ${BUILD_DIR}
-    fi
+# 检查参数是否合法
+check_option_validity() {
+  local arg="$1"
 
-    if [ -z "${TEST}" ] && [ -z "${EXAMPLE}" ];then
-        if [ -n "${OUTPUT_DIR}" ];then
-            rm -rf ${OUTPUT_DIR}
+  # 检查短选项
+  if [[ "$arg" =~ ^-[^-] ]]; then
+    local opt_chars=${arg:1}
+
+    # 获取需要参数的短选项列表
+    local needs_arg_opts=$(echo "$SUPPORTED_SHORT_OPTS" | grep -o "[a-zA-Z]:" | tr -d ':')
+
+    # 逐个检查短选项字符
+    local i=0
+    while [ $i -lt ${#opt_chars} ]; do
+      local char="${opt_chars:$i:1}"
+
+      # 检查是否为支持的短选项
+      if [[ ! "$SUPPORTED_SHORT_OPTS" =~ "$char" ]]; then
+        print_error "Invalid short option: -$char"
+        return 1
+      fi
+
+      # 如果这个选项需要参数，跳过参数部分
+      if [[ "$needs_arg_opts" =~ "$char" ]]; then
+        # 跳过参数部分（可能是数字或其他字符）
+        while [ $i -lt ${#opt_chars} ] && [[ "${opt_chars:$i:1}" =~ [0-9a-zA-Z] ]]; do
+          i=$((i + 1))
+        done
+      else
+        i=$((i + 1))
+      fi
+    done
+    return 0
+  fi
+
+  # 检查长选项
+  if [[ "$arg" =~ ^-- ]]; then
+    local long_opt="${arg:2}"
+    local opt_name="${long_opt%%=*}"
+
+    # 检查是否在支持的长选项列表中
+    for supported_opt in "${SUPPORTED_LONG_OPTS[@]}"; do
+      # 处理带=的长选项
+      if [[ "$supported_opt" =~ =$ ]]; then
+        local base_opt="${supported_opt%=}"
+        if [[ "$opt_name" == "$base_opt" ]]; then
+          return 0
         fi
+      else
+        # 处理不带=的长选项
+        if [[ "$opt_name" == "$supported_opt" ]]; then
+          return 0
+        fi
+      fi
+    done
+
+    print_error "Invalid long option: --$opt_name"
+    return 1
+  fi
+
+  # 如果不是选项，可能是其他参数
+  return 0
+}
+
+dotted_line="----------------------------------------------------------------"
+export BASE_PATH=$(
+  cd "$(dirname $0)"
+  pwd
+)
+export BUILD_PATH="${BASE_PATH}/build"
+export BUILD_OUT_PATH="${BASE_PATH}/build_out"
+REPOSITORY_NAME="nn"
+
+CORE_NUMS=$(cat /proc/cpuinfo | grep "processor" | wc -l)
+ARCH_INFO=$(uname -m)
+
+
+export INCLUDE_PATH="${ASCEND_HOME_PATH}/include"
+export ACLNN_INCLUDE_PATH="${INCLUDE_PATH}/aclnn"
+export COMPILER_INCLUDE_PATH="${ASCEND_HOME_PATH}/include"
+export GRAPH_INCLUDE_PATH="${COMPILER_INCLUDE_PATH}/graph"
+export EXTERNAL_INCLUDE_PATH="${COMPILER_INCLUDE_PATH}/external"
+export GE_INCLUDE_PATH="${COMPILER_INCLUDE_PATH}/ge"
+export INC_INCLUDE_PATH="${ASCEND_OPP_PATH}/built-in/op_proto/inc"
+export LINUX_INCLUDE_PATH="${ASCEND_HOME_PATH}/${ARCH_INFO}-linux/include"
+export EAGER_LIBRARY_OPP_PATH="${ASCEND_OPP_PATH}/lib64"
+export EAGER_LIBRARY_PATH="${ASCEND_HOME_PATH}/lib64"
+export GRAPH_LIBRARY_STUB_PATH="${ASCEND_HOME_PATH}/lib64/stub"
+export GRAPH_LIBRARY_PATH="${ASCEND_HOME_PATH}/lib64"
+CANN_3RD_LIB_PATH="${BASE_PATH}/third_party"
+# print usage message
+usage() {
+  local specific_help="$1"
+
+  if [[ -n "$specific_help" ]]; then
+    case "$specific_help" in
+      pkg)
+        echo "pkg Build Options:"
+        echo $dotted_line
+        echo "    --pkg                  Build run pkg with kernel bin"
+        echo "    --jit                  Build run pkg without kernel bin"
+        echo "    --soc=soc_version      Compile for specified Ascend SoC (comma-separated for multiple)"
+        echo "    --vendor_name=name     Specify custom operator pkg vendor name"
+        echo "    --ops=op1,op2,...      Compile specified operators (comma-separated for multiple)"
+        echo "    -j[n]                  Compile thread nums, default is 8"
+        echo "    -O[n]                  Compile optimization options, support [O0 O1 O2 O3]"
+        echo "    --asan                 Enable ASAN (Address Sanitizer) on the host side"
+        echo "    --build-type=<TYPE>    Specify build type (TYPE options: Release/Debug), Default: Release"
+        echo "    --experimental         Build experimental version"
+        echo "    --cann_3rd_lib_path=<PATH>"
+        echo "                           Set ascend third_party package install path, default ./third_party"
+        echo "    --oom                  Build with oom mode on the kernel side, with options: '-g --cce-enable-oom'"
+        echo $dotted_line
+        echo "Examples:"
+        echo "    bash build.sh --pkg --soc=ascend910b --vendor_name=customize -j16 -O3"
+        echo "    bash build.sh --pkg --ops=transpose_batch_mat_mul,fatrelu_mul --build-type=Debug"
+        echo "    bash build.sh --pkg --soc=ascend910b --ops=transpose_batch_mat_mul --oom"
+        echo "    bash build.sh --pkg --experimental --soc=ascend910b --ops=\${experimental_op}"
+        return
+        ;;
+      opkernel)
+        echo "Opkernel Build Options:"
+        echo $dotted_line
+        echo "    --opkernel             Build binary kernel"
+        echo "    --soc=soc_version      Compile for specified Ascend SoC (comma-separated for multiple)"
+        echo "    --ops=op1,op2,...      Compile specified operators (comma-separated for multiple)"
+        echo "    --build-type=<Type>    Specify build-type (Type options: Release/Debug), Default:Release"
+        echo "    --oom                  Build with oom mode on the kernel side, with options: '-g --cce-enable-oom'"
+        echo "    --no_force             Don't force dependency installation"
+        echo $dotted_line
+        echo "Examples:"
+        echo "    bash build.sh --opkernel --soc=ascend310p --ops=transpose_batch_mat_mul,fatrelu_mul"
+        echo "    bash build.sh --opkernel --soc=ascend310p --ops=transpose_batch_mat_mul,fatrelu_mul --build-type=Debug"
+        echo "    bash build.sh --opkernel --soc=ascend310p --ops=transpose_batch_mat_mul,fatrelu_mul --oom"
+        return
+        ;;
+      opkernel_aicpu)
+        echo "AICPU Opkernel Build Options:"
+        echo $dotted_line
+        echo "    --opkernel_aicpu       Build AICPU kernel"
+        echo "    --soc=soc_version      Compile for specified Ascend SoC (comma-separated for multiple)"
+        echo "    --ops=op1,op2,...      Compile specified operators (comma-separated for multiple)"
+        echo "    --build-type=<Type>    Specify build-type (Type options: Release/Debug), Default:Release"
+        echo "    --oom                  Build with oom mode on the kernel side, with options: '-g --cce-enable-oom'"
+        echo $dotted_line
+        echo "Examples:"
+        echo "    bash build.sh --opkernel_aicpu --soc=ascend910b --ops=transpose_batch_mat_mul,fatrelu_mul"
+        echo "    bash build.sh --opkernel_aicpu --soc=ascend910b --ops=transpose_batch_mat_mul,fatrelu_mul --build-type=Debug"
+        echo "    bash build.sh --opkernel_aicpu --soc=ascend910b --ops=transpose_batch_mat_mul,fatrelu_mul --oom"
+        return
+        ;;
+      test)
+        echo "Test Options:"
+        echo $dotted_line
+        echo "    -u                     Build and run all unit tests"
+        echo "    --noexec               Only compile ut, do not execute"
+        echo "    --asan                 Enable ASAN (Address Sanitizer) on the host side"
+        echo "    --ophost -u            Same as ophost test"
+        echo "    --opapi -u             Same as opapi test"
+        echo "    --opkernel -u          Same as opkernel test"
+        echo $dotted_line
+        echo "Examples:"
+        echo "    bash build.sh -u"
+        echo "    bash build.sh -u --ophost"
+        return
+        ;;
+      clean)
+        echo "Clean Options:"
+        echo $dotted_line
+        echo "    --make_clean_all       Clean all build artifacts and related files"
+        echo "    --make_clean           Clean build artifacts"
+        echo $dotted_line
+        return
+        ;;
+      ophost)
+        echo "Ophost Build Options:"
+        echo $dotted_line
+        echo "    --ophost               Build ophost library"
+        echo "    -j[n]                  Compile thread nums, default is 8"
+        echo "    -O[n]                  Compile optimization options, support [O0 O1 O2 O3]"
+        echo "    --build-type=<TYPE>    Specify build type (TYPE options: Release/Debug), Default: Release"
+        echo $dotted_line
+        echo "Examples:"
+        echo "    bash build.sh --ophost -j16 -O3"
+        echo "    bash build.sh --ophost --build-type=Debug"
+        return
+        ;;
+      onnxplugin)
+        echo "ONNXPlugin Build Options:"
+        echo $dotted_line
+        echo "    --onnxplugin           Build onnxplugin library"
+        echo "    -j[n]                  Compile thread nums, default is 8, eg: -j8"
+        echo "    -O[n]                  Compile optimization options, support [O0 O1 O2 O3], eg:-O3"
+        echo "    --debug                Build with debug mode"
+        echo $dotted_line
+        echo "Examples:"
+        echo "    bash build.sh --onnxplugin -j16 -O3"
+        echo "    bash build.sh --onnxplugin --debug"
+        return
+        ;;
+      opapi)
+        echo "Opapi Build Options:"
+        echo $dotted_line
+        echo "    --opapi                Build opapi library"
+        echo "    -j[n]                  Compile thread nums, default is 8"
+        echo "    -O[n]                  Compile optimization options, support [O0 O1 O2 O3]"
+        echo "    --build-type=<TYPE>    Specify build type (TYPE options: Release/Debug), Default: Release"
+        echo $dotted_line
+        echo "Examples:"
+        echo "    bash build.sh --opapi -j16 -O3"
+        echo "    bash build.sh --opapi --build-type=Debug"
+        return
+        ;;
+      run_example)
+        echo "Run example Options:"
+        echo $dotted_line
+        echo "    --run_example op_name  mode[eager:graph] [pkg_mode --vendor_name=name --example_name=name --soc=soc_version]      Compile and execute the test_aclnn_xxx.cpp/test_geir_xxx.cpp"
+        echo $dotted_line
+        echo "Examples:"
+        echo "    bash build.sh --run_example mat_mul_v3 eager"
+        echo "    bash build.sh --run_example mat_mul_v3 eager --soc=ascend910_95"
+        echo "    bash build.sh --run_example mat_mul_v3 graph"
+        echo "    bash build.sh --run_example mat_mul_v3 eager --example_name=mm"
+        echo "    bash build.sh --run_example mat_mul_v3 eager cust"
+        echo "    bash build.sh --run_example mat_mul_v3 eager cust --vendor_name=custom"
+        return
+        ;;
+      genop)
+        echo "Gen Op Directory Options:"
+        echo $dotted_line
+        echo "    --genop=op_class/op_name      Create the initial directory for op_name undef op_class"
+        echo $dotted_line
+        echo "Examples:"
+        echo "    bash build.sh --genop=op_class/op_name"
+        return
+        ;;
+      genop_aicpu)
+        echo "Gen Op Directory Options:"
+        echo $dotted_line
+        echo "    --genop_aicpu=op_class/op_name      Create the initial directory for op_name undef op_class"
+        echo $dotted_line
+        echo "Examples:"
+        echo "    bash build.sh --genop_aicpu=op_class/op_name"
+        return
+        ;;
+    esac
+  fi
+  echo "build script for ops-nn repository"
+  echo "Usage:"
+  echo "    bash build.sh [-h] [-j[n]] [-v] [-O[n]] [-u] "
+  echo ""
+  echo ""
+  echo "Options:"
+  echo $dotted_line
+  echo "    Build parameters "
+  echo $dotted_line
+  echo "    --help, -h Print usage"
+  echo "    -j[n] Compile thread nums, default is 8"
+  echo "    -v Cmake compile verbose"
+  echo "    -O[n] Compile optimization options, support [O0 O1 O2 O3]"
+  echo "    -u Compile all ut, default run ophost opapi test"
+  echo $dotted_line
+  echo "    example, Build ophost test with O0 level compilation optimization and do not execute."
+  echo "    ./build.sh -u --ophost --noexec -O0 -j8"
+  echo $dotted_line
+  echo "    The following are all supported arguments:"
+  echo $dotted_line
+  echo "    --build-type=<TYPE> Specify build type (TYPE options: Release/Debug), Default: Release"
+  echo "    --noexec Only compile ut, do not execute the compiled executable file"
+  echo "    --make_clean make clean"
+  echo "    --make_clean_all make clean and delete related file"
+  echo "    --asan enable asan on the host side"
+  echo ""
+  echo "    --ops Compile specified operator, use snake name, like: --ops=add,add_lora, use ',' to separate different operator"
+  echo "    --soc Compile binary with specified Ascend SoC, like: --soc=ascend910b"
+  echo "    --vendor_name Specify the custom operator pkg vendor name, like: --vendor_name=customize, default to customize-nn"
+  echo "    --onnxplugin build op_nn_onnx_plugin.so"
+  echo "    --opapi build opapi_nn.so"
+  echo "    --ophost build ophost_nn.so"
+  echo "    --opkernel build binary kernel"
+  echo "    --opkernel_aicpu build aicpu kernel"
+  echo "    --opkernel_aicpu_test build and run aicpu opkernel unit tests"
+  echo "    --pkg build run pkg"
+  echo "    --jit build run pkg without kernel bin"
+  echo "    --experimental Build experimental version"
+  echo "    --run_example Compile and execute the example. use --run_example --help for more detail"
+  echo "    --genop Create the initial directory for op, like: --genop=op_class/op_name"
+  echo "    --genop_aicpu Create the initial directory for AI CPU op, like: --genop_aicpu=op_class/op_name"
+  echo "    --oom Build with oom mode on the kernel side, with options: '-g --cce-enable-oom'"
+  echo "to be continued ..."
+}
+
+# 检查--help 前的组合参数是否非法
+check_help_combinations() {
+  local args=("$@")
+  local has_u=false
+  local has_test_command=false
+  local has_build_command=false
+  local has_pkg=false
+  local has_opkernel=false
+  local has_opkernel_aicpu=false
+
+  for arg in "${args[@]}"; do
+    case "$arg" in
+      -u) has_u=true ;;
+      --ophost | --opapi | --onnxplugin)
+        has_test_command=true
+        has_build_command=true
+        ;;
+      --pkg) has_pkg=true ;;
+      --opkernel) has_opkernel=true ;;
+      --opkernel_aicpu) has_opkernel_aicpu=true ;;
+      --help | -h) ;;
+    esac
+  done
+
+  # 检查help中的无效命令组合
+  if [[ "$has_pkg" == "true" && ("$has_test_command" == "true" || "$has_u" == "true") ]]; then
+    print_error "--pkg cannot be used with test(-u, etc.), --ophost, --opapi"
+    return 1
+  fi
+
+  if [[ "$has_opkernel" == "true" && ("$has_test_command" == "true" || "$has_u" == "true") ]]; then
+    print_error "--opkernel cannot be used with test(-u, etc.), --ophost, --opapi"
+    return 1
+  fi
+
+  if [[ "$has_opkernel_aicpu" == "true" && ("$has_test_command" == "true" || "$has_u" == "true") ]]; then
+    echo "[ERROR] --opkernel_aicpu cannot be used with test(-u, --ophost_test, etc.), --ophost, --opapi, or --opgraph"
+    return 1
+  fi
+
+  return 0
+}
+
+check_param() {
+  # --ops不能与--ophost，--opapi同时存在，如果带U则可以
+  if [[ -n "$COMPILED_OPS" && "$ENABLE_TEST" == "FALSE" ]] && [[ "$OP_HOST" == "TRUE" || "$OP_API" == "TRUE" ]]; then
+    print_error "--ops cannot be used with --ophost, --opapi"
+    exit 1
+  fi
+
+  # --pkg不能与-u（UT模式，包含_test的参数）或者--ophost，--opapi同时存在
+  if [[ "$ENABLE_PACKAGE" == "TRUE" ]]; then
+    if [[ "$ENABLE_TEST" == "TRUE" ]]; then
+      print_error "--pkg cannot be used with test(-u, --ophost_test, etc.)"
+      exit 1
     fi
 
-    mkdir -p ${BUILD_DIR} ${OUTPUT_DIR}
-}
-
-function cmake_config()
-{
-    local extra_option="$1"
-    log "Info: cmake config ${CUSTOM_OPTION} ${extra_option} ."
-    opts=$(python3 $CURRENT_DIR/cmake/util/preset_parse.py $CURRENT_DIR/CMakePresets.json)
-    echo $opts
-    cmake .. $opts ${CUSTOM_OPTION} ${extra_option}
-}
-
-function build()
-{
-    local target="$1"
-    if [ "${VERBOSE}" == "true" ];then
-        local option="--verbose"
+    if [[ "$OP_HOST" == "TRUE" || "$OP_API" == "TRUE" ]]; then
+      print_error "--pkg cannot be used with --ophost, --opapi"
+      exit 1
     fi
-    cmake --build . --target ${target} ${JOB_NUM} ${option}
-}
+  fi
 
-function gen_bisheng(){
-    local ccache_program=$1
-    local gen_bisheng_dir=${BUILD_DIR}/gen_bisheng_dir
-
-    if [ ! -d "${gen_bisheng_dir}" ];then
-        mkdir -p ${gen_bisheng_dir}
+  if [[ -n "${BUILD_TYPE}" ]]; then
+    if [[ "${BUILD_TYPE}" != "Release" && "${BUILD_TYPE}" != "Debug" ]]; then
+      echo "[ERROR] --build-type only support Release/Debug Mode"
+      exit 1
     fi
+  fi
 
-    pushd ${gen_bisheng_dir}
-    $(> bisheng)
-    echo "#!/bin/bash" >> bisheng
-    echo "ccache_args=""\"""${ccache_program} ${BISHENG_REAL_PATH}""\"" >> bisheng
-    echo "args=""$""@" >> bisheng
-
-    if [ "${VERBOSE}" == "true" ];then
-        echo "echo ""\"""$""{ccache_args} ""$""args""\"" >> bisheng
+  if [[ "${BUILD_TYPE}" == "Debug" ]]; then
+    if [[ "$ENABLE_MSSANITIZER" == "TRUE" || "$ENABLE_OOM" == "TRUE" ]]; then
+      echo "[ERROR] --build-type=Debug cannot be used with --mssanitizer or --oom"
+      exit 1
     fi
+  fi
 
-    echo "eval ""\"""$""{ccache_args} ""$""args""\"" >> bisheng
-    chmod +x bisheng
+  if [[ "$ENABLE_MSSANITIZER" == "TRUE" && "$ENABLE_OOM" == "TRUE" ]]; then
+    echo "[ERROR] --mssanitizer cannot be used with --oom"
+    exit 1
+  fi
 
-    export PATH=${gen_bisheng_dir}:$PATH
-    popd
+  if $(echo ${USE_CMD} | grep -wq "opkernel") && $(echo ${USE_CMD} | grep -wq "jit"); then
+    print_error "--opkernel cannot be used with --jit"
+    exit 1
+  fi
+
+  if $(echo ${USE_CMD} | grep -wq "opkernel_aicpu") && $(echo ${USE_CMD} | grep -wq "jit"); then
+    echo "[ERROR] --opkernel_aicpu cannot be used with --jit"
+    exit 1
+  fi
 }
 
-function build_package(){
-    build package
+COLOR_RESET="\033[0m"
+COLOR_GREEN="\033[32m"
+COLOR_RED="\033[31m"
+print_success() {
+  echo
+  echo $dotted_line
+  local msg="$1"
+  echo -e "${COLOR_GREEN}[SUCCESS] ${msg}${COLOR_RESET}"
+  echo $dotted_line
+  echo
 }
 
-function build_host(){
-    build_package
+print_error() {
+  echo
+  echo $dotted_line
+  local msg="$1"
+  echo -e "${COLOR_RED}[ERROR] ${msg}${COLOR_RESET}"
+  echo $dotted_line
+  echo
 }
 
-function build_kernel(){
-    build ops_kernel
-}
-
-function install_json_pkg(){
-    if [ -d "${THIRD_LIB_PATH}/json" ]; then
-        log "Json directory exists: ${THIRD_LIB_PATH}/json"
-        return 0
+set_create_libs() {
+  if [[ "$ENABLE_TEST" == "TRUE" ]]; then
+    return
+  fi
+  if [[ "$ENABLE_PACKAGE" == "TRUE" && "$ENABLE_CUSTOM" != "TRUE" ]]; then
+    BUILD_LIBS=("ophost_${REPOSITORY_NAME}" "opapi_${REPOSITORY_NAME}" "op_${REPOSITORY_NAME}_onnx_plugin")
+    ENABLE_CREATE_LIB=TRUE
+  else
+    if [[ "$OP_HOST" == "TRUE" ]]; then
+      BUILD_LIBS+=("ophost_${REPOSITORY_NAME}")
+      ENABLE_CREATE_LIB=TRUE
     fi
+    if [[ "$OP_API" == "TRUE" ]]; then
+      BUILD_LIBS+=("opapi_${REPOSITORY_NAME}")
+      ENABLE_CREATE_LIB=TRUE
+    fi
+    if [[ "$ONNX_PLUGIN" == "TRUE" ]]; then
+      BUILD_LIBS+=("op_${REPOSITORY_NAME}_onnx_plugin")
+      ENABLE_CREATE_LIB=TRUE
+    fi
+  fi
+}
 
-    log "=========================== Start to install third party packages ==========================="
-    (
-        source ${CURRENT_DIR}/build_third_party.sh
-    )
-    if [ 0 -ne $? ]; then
-        log "=========================== Install third party packages failed! ==========================="
+set_ut_mode() {
+  if [[ "$ENABLE_TEST" != "TRUE" ]]; then
+    return
+  fi
+  ENABLE_CUSTOM=FALSE
+  UT_TEST_ALL=TRUE
+  if [[ "$OP_HOST" == "TRUE" ]]; then
+    OP_HOST_UT=TRUE
+    UT_TEST_ALL=FALSE
+  fi
+  if [[ "$OP_API" == "TRUE" ]]; then
+    OP_API_UT=TRUE
+    UT_TEST_ALL=FALSE
+  fi
+  if [[ "$OP_KERNEL" == "TRUE" ]]; then
+    OP_KERNEL_UT=TRUE
+    UT_TEST_ALL=FALSE
+  fi
+  if [[ "$OP_KERNEL_AICPU" == "TRUE" ]]; then
+    OP_KERNEL_AICPU_UT=TRUE
+    UT_TEST_ALL=FALSE
+  fi
+
+  if [[ "$OP_KERNEL_AICPU_UT" == "TRUE" ]]; then
+    UT_TEST_ALL=FALSE
+  fi
+
+  # 检查测试项，至少有一个
+  if [[ "$UT_TEST_ALL" == "FALSE" && "$OP_HOST_UT" == "FALSE" && "$OP_API_UT" == "FALSE" && "$OP_KERNEL_UT" == "FALSE" && "$OP_KERNEL_AICPU_UT" == "FALSE" ]]; then
+    print_error "At least one test target must be specified (ophost test, opapi test, opgraph test, opkernel test, opkernel_aicpu_test)"
+    usage
+    exit 1
+  fi
+
+  if [[ "$UT_TEST_ALL" == "TRUE" ]] || [[ "$OP_HOST_UT" == "TRUE" ]]; then
+    UT_TARGES+=("${REPOSITORY_NAME}_op_host_ut")
+  fi
+  if [[ "$UT_TEST_ALL" == "TRUE" ]] || [[ "$OP_API_UT" == "TRUE" ]]; then
+    UT_TARGES+=("${REPOSITORY_NAME}_op_api_ut")
+  fi
+  if [[ "$UT_TEST_ALL" == "TRUE" ]] || [[ "$OP_KERNEL_UT" == "TRUE" ]]; then
+    UT_TARGES+=("${REPOSITORY_NAME}_op_kernel_ut")
+  fi
+  if [[ "$UT_TEST_ALL" == "TRUE" ]] || [[ "$OP_KERNEL_AICPU_UT" == "TRUE" ]]; then
+    UT_TARGES+=("${REPOSITORY_NAME}_aicpu_op_kernel_ut")
+  fi
+}
+
+make_clean() {
+  if [ -d "$BUILD_PATH" ]; then
+    cd $BUILD_PATH
+    make clean
+    print_success "make clean success!"
+  fi
+}
+
+make_clean_all() {
+  if [ -d "$BUILD_PATH" ]; then
+    cd $BUILD_PATH
+    rm -rf ./*
+  fi
+  [ -d "$BUILD_OUT_PATH" ] && rm -rf $BUILD_OUT_PATH
+  THIRD_PARTY_PATH=${BASE_PATH}/third_party
+  if [ -d "${THIRD_PARTY_PATH}" ]; then
+    rm -rf ${THIRD_PARTY_PATH}/abseil-cpp
+    rm -rf ${THIRD_PARTY_PATH}/ascend_protobuf
+  fi
+  print_success "make clean all success!"
+}
+
+checkopts() {
+  THREAD_NUM=$(awk '/^processor/ {count++} END {print (count > 32) ? 32 : count}' /proc/cpuinfo)
+  VERBOSE=""
+  BUILD_MODE=""
+  COMPILED_OPS=""
+  UT_TEST_ALL=FALSE
+  CHANGED_FILES=""
+  CI_MODE=FALSE
+  COMPUTE_UNIT=""
+  VENDOR_NAME=""
+  SHOW_HELP=""
+  OP_NAME=""
+  EXAMPLE_NAME=""
+  EXAMPLE_MODE=""
+  USE_CMD="$*"
+
+  BUILD_TYPE="Release"
+  ENABLE_MSSANITIZER=FALSE
+  ENABLE_OOM=FALSE
+  ENABLE_COVERAGE=FALSE
+  ENABLE_UT_EXEC=TRUE
+  ENABLE_ASAN=FALSE
+  ENABLE_VALGRIND=FALSE
+  ENABLE_BINARY=FALSE
+  ENABLE_CUSTOM=FALSE
+  ENABLE_STATIC=FALSE
+  ENABLE_PACKAGE=FALSE
+  ENABLE_JIT=FALSE
+  ENABLE_TEST=FALSE
+  ENABLE_EXPERIMENTAL=FALSE
+  NO_FORCE=FALSE
+  AICPU_ONLY=FALSE
+  OP_API_UT=FALSE
+  OP_HOST_UT=FALSE
+  OP_GRAPH_UT=FALSE
+  ONNX_PLUGIN=FALSE
+  OP_KERNEL_UT=FALSE
+  OP_KERNEL_AICPU_UT=FALSE
+  OP_API=FALSE
+  OP_HOST=FALSE
+  OP_KERNEL=FALSE
+  OP_KERNEL_AICPU=FALSE
+  ENABLE_CREATE_LIB=FALSE
+  ENABLE_RUN_EXAMPLE=FALSE
+  BUILD_LIBS=()
+  UT_TARGES=()
+
+  ENABLE_GENOP=FALSE
+  ENABLE_GENOP_AICPU=FALSE
+  GENOP_TYPE=""
+  GENOP_NAME=""
+  GENOP_BASE=${BASE_PATH}
+
+  if [ $# -eq 0 ]; then
+    usage "$SHOW_HELP"
+    exit 0
+  fi
+
+  # 首先检查所有参数是否合法
+  for arg in "$@"; do
+    if [[ "$arg" =~ ^- ]]; then # 只检查以-开头的参数
+      if ! check_option_validity "$arg"; then
+        usage
         exit 1
+      fi
+    fi
+  done
+
+  # 检查并处理--help
+  for arg in "$@"; do
+    if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+      # 检查帮助信息中的组合参数
+      check_help_combinations "$@"
+      local comb_result=$?
+      if [ $comb_result -eq 1 ]; then
+        exit 1
+      fi
+      SHOW_HELP="general"
+
+      # 检查 --help 前面的命令
+      for prev_arg in "$@"; do
+        case "$prev_arg" in
+          --pkg) SHOW_HELP="pkg" ;;
+          --opkernel) SHOW_HELP="opkernel" ;;
+          --opkernel_aicpu) SHOW_HELP="opkernel_aicpu" ;;
+          -u) SHOW_HELP="test" ;;
+          --make_clean_all | --make_clean) SHOW_HELP="clean" ;;
+          --ophost) SHOW_HELP="ophost" ;;
+          --opapi) SHOW_HELP="opapi" ;;
+          --onnxplugin) SHOW_HELP="onnxplugin" ;;
+          --run_example) SHOW_HELP="run_example" ;;
+          --genop) SHOW_HELP="genop" ;;
+          --genop_aicpu) SHOW_HELP="genop_aicpu" ;;
+        esac
+      done
+
+      usage "$SHOW_HELP"
+      exit 0
+    fi
+  done
+
+  process_genop() {
+    local opt_name=$1
+    local genop_value=$2
+
+    if [[ "$opt_name" == "genop" ]]; then
+      ENABLE_GENOP=TRUE
+    elif [[ "$opt_name" == "genop_aicpu" ]]; then
+      ENABLE_GENOP_AICPU=TRUE
     else
-        log "=========================== Install third party packages success. ==========================="
+      usage "genop"
+      exit 1
     fi
-}
 
-########################################################################################################################
-# 参数解析处理
-########################################################################################################################
+    if [[ "$genop_value" != *"/"* ]] || [[ "$genop_value" == *"/" ]]; then
+      usage "$opt_name"
+      exit 1
+    fi
 
-while [[ $# -gt 0 ]]; do
-    case $1 in
-    -h|--help)
-        help_info
-        exit
+    GENOP_NAME=${genop_value##*/}
+    local remaining=${genop_value%/*}
+
+    if [[ "$remaining" != *"/"* ]]; then
+      GENOP_TYPE=$remaining
+      GENOP_BASE=${BASE_PATH}
+    else
+      GENOP_TYPE=${remaining##*/}
+      GENOP_BASE=${remaining%/*}
+      if [[ ! "$GENOP_BASE" =~ ^/ && ! "$GENOP_BASE" =~ ^[a-zA-Z]: ]]; then
+        GENOP_BASE="${BASE_PATH}/${GENOP_BASE}"
+      fi
+    fi
+  }
+
+  # Process the options
+  while getopts $SUPPORTED_SHORT_OPTS opt; do
+    case "${opt}" in
+      h)
+        usage
+        exit 0
         ;;
-    -n|--op-name)
-        ascend_op_name="$2"
-        shift 2
+      j) THREAD_NUM=$OPTARG ;;
+      v) VERBOSE="VERBOSE=1" ;;
+      O) BUILD_MODE="-O$OPTARG" ;;
+      u) ENABLE_TEST=TRUE ;;
+      f)
+        CHANGED_FILES=$OPTARG
+        CI_MODE=TRUE
         ;;
-    -c|--compute-unit)
-        ascend_compute_unit="$2"
-        shift 2
-        ;;
-    --ccache)
-        CCACHE_PROGRAM="$2"
-        shift 2
-        ;;
-    -p|--package-path)
-        ascend_package_path="$2"
-        shift 2
-        ;;
-    -b|--build)
-        BUILD="$2"
-        shift 2
-        ;;
-    -t|--test)
-        shift
-        if [ -n "$1" ];then
-            _parameter=$1
-            first_char=${_parameter:0:1}
-            if [ "${first_char}" == "-" ];then
-                TEST="all"
-            else
-                TEST="${_parameter}"
-                shift
-            fi
-        else
-            TEST="all"
-        fi
-        ;;
-    -e|--example)
-        shift
-        if [ -n "$1" ];then
-            _parameter=$1
-            first_char=${_parameter:0:1}
-            if [ "${first_char}" == "-" ];then
-                EXAMPLE="all"
-            else
-                EXAMPLE="${_parameter}"
-                shift
-            fi
-        else
-            EXAMPLE="all"
-        fi
-        ;;
-    -f|--changed_list)
-        PR_CHANGED_FILES="$2"
-        shift 2
-        ;;
-    --parent_job)
-        PARENT_JOB="true"
-        shift
-        ;;
-    --disable-check-compatible|--disable-check-compatiable)
-        CHECK_COMPATIBLE="false"
-        shift
-        ;;
-    --op_build_tool)
-        op_build_tool="$2"
-        shift 2
-        ;;
-    --ascend_cmake_dir)
-        ascend_cmake_dir="$2"
-        shift 2
-        ;;
-    --third_lib_path)
-        THIRD_LIB_PATH="$2"
-        shift 2
-        ;;
-    --verbose)
-        VERBOSE="true"
-        shift
-        ;;
-    --asan)
-        ASAN="true"
-        shift
-        ;;
-    --ubsan)
-        UBSAN="true"
-        shift
-        ;;
-    --cov)
-        COV="true"
-        shift
-        ;;
-    --clang)
-        CLANG="true"
-        shift
-        ;;
-    --tiling-key|--tiling_key)
-        TILING_KEY="$2"
-        shift 2
-        ;;
-    --op_debug_config)
-        OP_DEBUG_CONFIG="$2"
-        shift 2
-        ;;
-    --ops-compile-options)
-        OPS_COMPILE_OPTIONS="$2"
-        shift 2
-        ;;
-    *)
-        help_info
+      -) case $OPTARG in
+        help)
+          usage
+          exit 0
+          ;;
+        ops=*)
+          COMPILED_OPS=${OPTARG#*=}
+          ENABLE_CUSTOM=TRUE
+          ;;
+        genop=*)
+          process_genop "genop" "${OPTARG#*=}"
+          ;;
+        genop_aicpu=*)
+          process_genop "genop_aicpu" "${OPTARG#*=}"
+          ;;
+        soc=*)
+          COMPUTE_UNIT=${OPTARG#*=}
+          COMPUTE_UNIT=$(echo "$COMPUTE_UNIT" | sed 's/ascend950/ascend910_95/g')
+          ;;
+        vendor_name=*)
+          VENDOR_NAME=${OPTARG#*=}
+          ENABLE_CUSTOM=TRUE
+          ;;
+        cann_3rd_lib_path=*)
+          CANN_3RD_LIB_PATH="$(realpath ${OPTARG#*=})"
+          ;;
+        example_name=*) EXAMPLE_NAME=${OPTARG#*=} ;;
+        build-type=*)
+          BUILD_TYPE=${OPTARG#*=}
+          ;;
+        mssanitizer) ENABLE_MSSANITIZER=FALSE ;;
+        oom) ENABLE_OOM=TRUE ;;
+        noexec) ENABLE_UT_EXEC=FALSE ;;
+        cov) ENABLE_COVERAGE=TRUE;;
+        opkernel)
+          ENABLE_BINARY=TRUE
+          OP_KERNEL=TRUE
+          ;;
+        opkernel_aicpu)
+          OP_KERNEL_AICPU=TRUE
+          ;;
+        opkernel_aicpu_test)
+          OP_KERNEL_AICPU_UT=TRUE
+          ENABLE_TEST=TRUE
+          ;;
+        static)
+          ENABLE_STATIC=TRUE
+          ENABLE_BINARY=TRUE
+          ;;
+        pkg)
+          ENABLE_PACKAGE=TRUE
+          ENABLE_BINARY=TRUE
+          ;;
+        jit)
+          ENABLE_JIT=TRUE
+          ;;
+        asan) ENABLE_ASAN=TRUE ;;
+        run_example) ENABLE_RUN_EXAMPLE=TRUE
+          step=0
+          set_example_opt $2 $3 $4
+          shift $step
+          ;;
+        experimental) ENABLE_EXPERIMENTAL=TRUE ;;
+        make_clean_all) make_clean_all
+                        exit 0 ;;
+        make_clean) make_clean
+                    exit 0 ;;
+        no_force) NO_FORCE=TRUE ;;
+        *)
+          ## 如果不在RELEASE_TARGETS，不做处理
+          if ! in_array "$OPTARG" "${RELEASE_TARGETS[@]}"; then
+            print_error "Invalid option: --$OPTARG"
+            usage
+            exit 1
+          fi
+
+          if [[ "$OPTARG" == "ophost" ]]; then
+            OP_HOST=TRUE
+          elif [[ "$OPTARG" == "opapi" ]]; then
+            OP_API=TRUE
+          elif [[ "$OPTARG" == "opkernel" ]]; then
+            OP_KERNEL=TRUE
+          elif [[ "$OPTARG" == "opkernel_aicpu" ]]; then
+            OP_KERNEL_AICPU=TRUE
+          elif [[ "$OPTARG" == "onnxplugin" ]]; then
+            ONNX_PLUGIN=TRUE
+          else
+            usage
+            exit 1
+          fi
+          ;;
+      esac ;;
+      *)
+        print_error "Undefined option: ${opt}"
+        usage
         exit 1
         ;;
     esac
-done
+  done
 
-if [ -n "${ascend_compute_unit}" ];then
-    CUSTOM_OPTION="${CUSTOM_OPTION} -DASCEND_COMPUTE_UNIT=${ascend_compute_unit}"
-fi
+  if [[ "$OP_KERNEL_AICPU_UT" != "TRUE" && "$ENABLE_TEST" == "TRUE" && "$OP_HOST" == "FALSE" && "$OP_API" == "FALSE" && "$OP_KERNEL" == "FALSE" ]]; then
+    OP_HOST=TRUE
+    OP_API=TRUE
+    OP_KERNEL=TRUE
+  fi
+  if [[ "$ENABLE_JIT" == "TRUE" ]]; then
+    ENABLE_PACKAGE=TRUE
+    ENABLE_BINARY=FALSE
+  fi
+  check_param
+  set_create_libs
+  set_ut_mode
+}
 
-if [ -n "${ascend_op_name}" ];then
-    CUSTOM_OPTION="${CUSTOM_OPTION} -DASCEND_OP_NAME=${ascend_op_name}"
-fi
+set_example_opt() {
+  if [[ -n $1 && $1 != -* ]]; then
+    OP_NAME=$1
+    step=$((step + 1))
+  fi
+  if [[ -n $2 && $2 != -* ]]; then
+    EXAMPLE_MODE=$2
+    step=$((step + 1))
+  fi
+  if [[ -n $3 && $3 != -* ]]; then
+    PKG_MODE=$3
+    step=$((step + 1))
+  fi
+}
 
-if [ -n "${op_build_tool}" ];then
-    CUSTOM_OPTION="${CUSTOM_OPTION} -DOP_BUILD_TOOL=${op_build_tool}"
-fi
+custom_cmake_args() {
+  if [[ -n $COMPILED_OPS ]]; then
+    COMPILED_OPS="${COMPILED_OPS//,/;}"
+    CMAKE_ARGS="$CMAKE_ARGS -DASCEND_OP_NAME=${COMPILED_OPS}"
+  else
+    CMAKE_ARGS="$CMAKE_ARGS -UASCEND_OP_NAME"
+  fi
+  if [[ -n $VENDOR_NAME ]]; then
+    CMAKE_ARGS="$CMAKE_ARGS -DVENDOR_NAME=${VENDOR_NAME}"
+  else
+    CMAKE_ARGS="$CMAKE_ARGS -UVENDOR_NAME"
+  fi
+}
 
-if [ -n "${ascend_cmake_dir}" ];then
-    CUSTOM_OPTION="${CUSTOM_OPTION} -DASCEND_CMAKE_DIR=${ascend_cmake_dir}"
-fi
-
-if [ -n "${THIRD_LIB_PATH}" ];then
-    CUSTOM_OPTION="${CUSTOM_OPTION} -DASCEND_THIRD_LIB_PATH=${THIRD_LIB_PATH}"
-fi
-
-if [ -n "${TEST}" ];then
-    if [ -n "${PR_CHANGED_FILES}" ];then
-        TEST=$(python3 "$CURRENT_DIR"/cmake/scripts/parse_changed_files.py -c "$CURRENT_DIR"/classify_rule.yaml -f "$PR_CHANGED_FILES" get_related_ut)
-        if [ -z "${TEST}" ]; then
-            log "Info: This PR didn't trigger any UTest."
-            exit 200
+assemble_cmake_args() {
+  CMAKE_ARGS="-DBUILD_PATH=${BUILD_PATH}"
+  CMAKE_ARGS="$CMAKE_ARGS -DENABLE_VALGRIND=${ENABLE_VALGRIND}"
+  CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_BUILD_TYPE=${BUILD_TYPE}"
+  CMAKE_ARGS="$CMAKE_ARGS -DENABLE_MSSANITIZER=${ENABLE_MSSANITIZER}"
+  CMAKE_ARGS="$CMAKE_ARGS -DENABLE_OOM=${ENABLE_OOM}"
+  CMAKE_ARGS="$CMAKE_ARGS -DENABLE_COVERAGE=${ENABLE_COVERAGE}"
+  CMAKE_ARGS="$CMAKE_ARGS -DENABLE_TEST=${ENABLE_TEST}"
+  CMAKE_ARGS="$CMAKE_ARGS -DENABLE_UT_EXEC=${ENABLE_UT_EXEC}"
+  CMAKE_ARGS="$CMAKE_ARGS -DENABLE_CUSTOM=${ENABLE_CUSTOM}"
+  CMAKE_ARGS="$CMAKE_ARGS -DENABLE_STATIC=${ENABLE_STATIC}"
+  custom_cmake_args
+  if [[ "$ENABLE_ASAN" == "TRUE" ]]; then
+    set +e
+    echo 'int main() {return 0;}' | gcc -x c -fsanitize=address - -o asan_test >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+      echo "This environment does not have the ASAN library, no need enable ASAN"
+      ENABLE_ASAN=FALSE
+    else
+      $(rm -f asan_test)
+      CMAKE_ARGS="$CMAKE_ARGS -DENABLE_ASAN=TRUE"
+    fi
+    set -e
+  fi
+  if [[ "$ENABLE_CUSTOM" == "TRUE" ]]; then
+    ENABLE_BINARY=TRUE
+  fi
+  CMAKE_ARGS="$CMAKE_ARGS -DENABLE_BINARY=${ENABLE_BINARY}"
+  CMAKE_ARGS="$CMAKE_ARGS -DENABLE_PACKAGE=${ENABLE_PACKAGE}"
+  CMAKE_ARGS="$CMAKE_ARGS -DENABLE_EXPERIMENTAL=${ENABLE_EXPERIMENTAL}"
+  CMAKE_ARGS="$CMAKE_ARGS -DNO_FORCE=${NO_FORCE}"
+  CMAKE_ARGS="$CMAKE_ARGS -DBUILD_MODE=${BUILD_MODE}"
+  CMAKE_ARGS="$CMAKE_ARGS -DOP_HOST_UT=${OP_HOST_UT}"
+  CMAKE_ARGS="$CMAKE_ARGS -DOP_API_UT=${OP_API_UT}"
+  CMAKE_ARGS="$CMAKE_ARGS -DOP_KERNEL_UT=${OP_KERNEL_UT}"
+  CMAKE_ARGS="$CMAKE_ARGS -DOP_KERNEL_AICPU_UT=${OP_KERNEL_AICPU_UT}"
+  CMAKE_ARGS="$CMAKE_ARGS -DUT_TEST_ALL=${UT_TEST_ALL}"
+  if [[ -n $COMPUTE_UNIT ]]; then
+    IFS=',' read -ra COMPUTE_UNIT <<<"$COMPUTE_UNIT"
+    COMPUTE_UNIT_SHORT=""
+    for unit in "${COMPUTE_UNIT[@]}"; do
+      for support_unit in "${SUPPORT_COMPUTE_UNIT_SHORT[@]}"; do
+        lowercase_word=$(echo "$unit" | tr '[:upper:]' '[:lower:]')
+        if [[ "$lowercase_word" == *"$support_unit"* ]]; then
+          COMPUTE_UNIT_SHORT="$COMPUTE_UNIT_SHORT$support_unit;"
+          break
         fi
-        CUSTOM_OPTION="${CUSTOM_OPTION} -DTESTS_UT_OPS_TEST_CI_PR=ON"
-    fi
-    CUSTOM_OPTION="${CUSTOM_OPTION} -DTESTS_UT_OPS_TEST=${TEST}"
+      done
+    done
 
-    if [ "${CLANG}" == "true" ];then
-        CLANG_C_COMPILER="$(which clang)"
-        if [ ! -f "${CLANG_C_COMPILER}" ];then
-            log "Error: Can't find clang path ${CLANG_C_COMPILER}"
-            exit 1
-        fi
-
-        CLANG_PATH=$(dirname "${CLANG_C_COMPILER}")
-        CLANG_CXX_COMPILER="${CLANG_PATH}/clang++"
-        CLANG_LINKER="${CLANG_PATH}/lld"
-        CLANG_AR="${CLANG_PATH}/llvm-ar"
-        CLANG_STRIP="${CLANG_PATH}/llvm-strip"
-        CLANG_OBJCOPY="${CLANG_PATH}/llvm-objcopy"
-
-        CUSTOM_OPTION="${CUSTOM_OPTION} -DCMAKE_C_COMPILER=${CLANG_C_COMPILER} -DCMAKE_CXX_COMPILER=${CLANG_CXX_COMPILER}"
-        CUSTOM_OPTION="${CUSTOM_OPTION} -DCMAKE_LINKER=${CLANG_LINKER} -DCMAKE_AR=${CLANG_AR} -DCMAKE_STRIP=${CLANG_STRIP}"
-        CUSTOM_OPTION="${CUSTOM_OPTION} -DCMAKE_OBJCOPY=${CLANG_OBJCOPY}"
+    if [[ -z $COMPUTE_UNIT_SHORT ]]; then
+      print_error "The soc [${COMPUTE_UNIT}] is not support."
+      usage
+      exit 1
     fi
 
-    if [ "${ASAN}" == "true" ];then
-        CUSTOM_OPTION="${CUSTOM_OPTION} -DENABLE_ASAN=true"
+    echo "COMPUTE_UNIT: ${COMPUTE_UNIT_SHORT}"
+    CMAKE_ARGS="$CMAKE_ARGS -DASCEND_COMPUTE_UNIT=$COMPUTE_UNIT_SHORT"
+  else
+    CMAKE_ARGS="$CMAKE_ARGS -UASCEND_COMPUTE_UNIT"
+  fi
+  CMAKE_ARGS="$CMAKE_ARGS -DCANN_3RD_LIB_PATH=${CANN_3RD_LIB_PATH}"
+}
+
+build_static_lib() {
+  echo $dotted_line
+  echo "Start to build static lib."
+
+  git submodule init && git submodule update
+  cd "${BUILD_PATH}" && cmake ${CMAKE_ARGS} ..
+  local all_targets=$(cmake --build . --target help)
+  rm -fr ${BUILD_PATH}/bin_tmp
+  mkdir -p ${BUILD_PATH}/bin_tmp
+  if grep -wq "ophost_nn_static" <<< "${all_targets}"; then
+    cmake --build . --target ophost_nn_static -- ${VERBOSE} -j $THREAD_NUM
+  fi
+
+  local UNITS=(${COMPUTE_UNIT_SHORT//;/ })
+  if [[ ${#UNITS[@]} -eq 0 ]]; then
+    UNITS+=("ascend910b")
+  fi
+  cmake --build . --target opapi_nn_static -- ${VERBOSE} -j $THREAD_NUM
+  local jit_command=""
+  if [[ "$ENABLE_JIT" == "TRUE" ]]; then
+    jit_command="-j"
+  fi
+  for unit in "${UNITS[@]}"; do
+    rm -fr ${BUILD_PATH}/autogen/${unit}
+    mkdir -p ${BUILD_PATH}/bin_tmp/${unit}
+    python3 "${BASE_PATH}/scripts/util/build_opp_kernel_static.py" GenStaticOpResourceIni -s ${unit} -b ${BUILD_PATH} ${jit_command}
+    python3 "${BASE_PATH}/scripts/util/build_opp_kernel_static.py" StaticCompile -s ${unit} -b ${BUILD_PATH} -n=0 -a=${ARCH_INFO} ${jit_command}
+  done
+  cmake --build . --target cann_nn_static -- ${VERBOSE} -j $THREAD_NUM
+  print_success "Build static lib success!"
+}
+
+build_lib() {
+  echo $dotted_line
+  echo "Start to build libs ${BUILD_LIBS[@]}"
+
+  git submodule init && git submodule update
+  cd "${BUILD_PATH}" && cmake ${CMAKE_ARGS} -UENABLE_STATIC ..
+  local all_targets=$(cmake --build . --target help)
+  for lib in "${BUILD_LIBS[@]}"; do
+    if grep -wq "$lib" <<< "${all_targets}"; then
+      echo "Building target ${lib}"
+      cmake --build . --target ${lib} -- ${VERBOSE} -j $THREAD_NUM
+    else
+      echo "No need to build target ${lib}"
     fi
+  done
 
-    if [ "${UBSAN}" == "true" ];then
-        CUSTOM_OPTION="${CUSTOM_OPTION} -DENABLE_UBSAN=true"
+  print_success "Build libs ${BUILD_LIBS[@]} success!"
+}
+
+build_binary() {
+  echo $dotted_line
+  echo "Start to build binary"
+
+  mkdir -p "${BUILD_PATH}"
+  echo "--------------- build tiling start ---------------"
+  local tilingLib="ophost_${REPOSITORY_NAME}"
+  local tilingSo="${BUILD_PATH}/lib${tilingLib}.so"
+  rm -f ${tilingSo}  # 临时方案，简单实现，强制先删再编，tiling代码不变时仅浪费链接时间
+  local TMP_BUILD_LIBS=${BUILD_LIBS}
+  local TMP_CMAKE_ARGS=${CMAKE_ARGS}
+  CMAKE_ARGS="-DBUILD_PATH=$BUILD_PATH -DENABLE_CUSTOM=FALSE -DENABLE_PACKAGE=FALSE"
+  BUILD_LIBS+=("${tilingLib}")
+  build_lib
+  BUILD_LIBS=${TMP_BUILD_LIBS}
+  CMAKE_ARGS=${TMP_CMAKE_ARGS}
+
+  export ASCEND_OPP_PATH=${BUILD_PATH}/opp
+  export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${BUILD_PATH}/common/stub/op_tiling
+  local fakeTilingSoPath=${BUILD_PATH}/opp/op_impl/built-in/ai_core/tbe/op_tiling/lib/linux/$(arch)
+  mkdir -p ${fakeTilingSoPath}
+  ln -sf ${tilingSo} ${fakeTilingSoPath}/liboptiling.so
+  ln -sf ${tilingSo} ${fakeTilingSoPath}/libopmaster_ct.so
+  rm -f ${BUILD_PATH}/opp/scene.info
+  echo "os=linux"     >> ${BUILD_PATH}/opp/scene.info
+  echo "os_version="  >> ${BUILD_PATH}/opp/scene.info
+  echo "arch=$(arch)" >> ${BUILD_PATH}/opp/scene.info
+  echo "--------------- build tiling end ---------------"
+
+  cd "${BUILD_PATH}" && cmake .. ${CMAKE_ARGS}
+
+  echo "--------------- prepare build start ---------------"
+  local all_targets=$(cmake --build . --target help)
+  if grep -wq "ascendc_impl_gen" <<< "${all_targets}"; then
+    cmake --build . --target ascendc_impl_gen -- ${VERBOSE} -j $THREAD_NUM
+    if [ $? -ne 0 ]; then exit 1; fi
+  fi
+  if grep -wq "gen_bin_scripts" <<< "${all_targets}"; then
+    cmake --build . --target gen_bin_scripts -- ${VERBOSE} -j $THREAD_NUM
+    if [ $? -ne 0 ]; then exit 1; fi
+  fi
+  echo "--------------- prepare build end ---------------"
+
+  echo "--------------- binary build start ---------------"
+  if grep -wq "binary" <<< "${all_targets}"; then
+    export ASCENDC_PER_COMPILE_JOB_THREAD=$THREAD_NUM
+    cmake --build . --target binary -- ${VERBOSE} -j1
+    if [ $? -ne 0 ]; then
+      print_error "Kernel compile failed!" && exit 1
     fi
+  fi
+  if grep -wq "gen_bin_info_config" <<< "${all_targets}"; then
+    cmake --build . --target gen_bin_info_config -- ${VERBOSE} -j $THREAD_NUM
+    if [ $? -ne 0 ]; then exit 1; fi
+  fi
 
-    if [ "${COV}" == "true" ];then
-        if [ "${CLANG}" == "true" ];then
-            log "Warning: GCOV only supported in gnu compiler."
-        else
-            CUSTOM_OPTION="${CUSTOM_OPTION} -DENABLE_GCOV=true"
-        fi
+  print_success "Build binary success!"
+}
+
+build_pkg() {
+  echo "--------------- build pkg start ---------------"
+  if [[ "$ENABLE_BINARY" == "FALSE" ]]; then # for jit need dynamic py
+    local all_targets=$(cmake --build . --target help)
+    if grep -wq "ascendc_impl_gen" <<< "${all_targets}"; then
+      cmake --build . --target ascendc_impl_gen -- ${VERBOSE} -j $THREAD_NUM
+      if [ $? -ne 0 ]; then exit 1; fi
     fi
+  fi
+  cd "${BUILD_PATH}" && cmake ${CMAKE_ARGS} ..
+  cmake --build . --target package -- ${VERBOSE} -j $THREAD_NUM
 
-    BUILD=ops_test_utest
-fi
+  print_success "Build package success!"
+}
 
-if [ -n "${EXAMPLE}" ];then
-    CUSTOM_OPTION="${CUSTOM_OPTION} -DTESTS_EXAMPLE_OPS_TEST=${EXAMPLE}"
+parse_op_dependencies() {
+  echo $dotted_line
+  echo "Start to parse op dependencies for ${COMPILED_OPS}"
 
-    BUILD=ops_test_example
-fi
+  cd "${BUILD_PATH}"
+  python3 ${BASE_PATH}/scripts/util/dependency_parser.py --ops ${COMPILED_OPS} -p ${BUILD_PATH}
+  echo $dotted_line
+  echo "End to parse op dependencies"
+}
 
-if [ -n "${TILING_KEY}" ];then
-    CUSTOM_OPTION="${CUSTOM_OPTION} -DTILING_KEY=${TILING_KEY}"
-fi
+set_ci_mode() {
+  cd ${BASE_PATH}
+  if [[ "$ENABLE_TEST" == "TRUE" ]]; then
+    {
+      result=$(python3 ${BASE_PATH}/scripts/util/parse_changed_files.py ${CHANGED_FILES} ${ENABLE_EXPERIMENTAL})
+    } || {
+      echo $result && exit 1
+    }
+    for line in $result; do
+      if [[ $line == op_* ]]; then
+        TRIGER_UTS+=($line)
+      fi
+    done
+  else
+    {
+      result=$(python3 ${BASE_PATH}/scripts/util/parse_compile_changed_files.py ${CHANGED_FILES} ${ENABLE_EXPERIMENTAL})
+    } || {
+      echo $result && exit 1
+    }
+    args=(${result//:/ })
+    CMAKE_ARGS="$CMAKE_ARGS -DASCEND_OP_NAME=${args[0]} -DASCEND_COMPILE_OPS=${args[1]}"
+  fi
+}
 
-if [ -n "${OP_DEBUG_CONFIG}" ];then
-    CUSTOM_OPTION="${CUSTOM_OPTION} -DOP_DEBUG_CONFIG=${OP_DEBUG_CONFIG}"
-fi
+build_ut() {
+  echo $dotted_line
+  echo "Start to build ut"
 
-if [ -n "${OPS_COMPILE_OPTIONS}" ];then
-    CUSTOM_OPTION="${CUSTOM_OPTION} -DOPS_COMPILE_OPTIONS=${OPS_COMPILE_OPTIONS}"
-fi
+  git submodule init && git submodule update
+  if [ ! -d "${BUILD_PATH}" ]; then
+    mkdir -p "${BUILD_PATH}"
+  fi
+  cd "${BUILD_PATH}" && cmake ${CMAKE_ARGS} ..
+  local enable_cov=FALSE
+  if [[ "$CI_MODE" == "TRUE" ]]; then
+    # ci 模式
+    for triger_option in "${TRIGER_UTS[@]}"; do
+      ut_args=(${triger_option//:/ })
+      if [[ "${UT_TARGES[@]}" =~ "${ut_args[0]}" ]]; then
+        enable_cov=TRUE
+        echo "Triger Ut: ${ut_args[0]} for ops: ${ut_args[1]}"
+        cmake ${CMAKE_ARGS} -DASCEND_OP_NAME=${ut_args[1]} -DASCEND_COMPILE_OPS=${ut_args[2]} ..
+        cmake --build . --target ${REPOSITORY_NAME}_${ut_args[0]} -- ${VERBOSE} -j $THREAD_NUM
+      else
+        echo "Not need triger Ut: ${ut_args[0]}"
+      fi
+    done
+  else
+    enable_cov=TRUE
+    local all_targets=$(cmake --build . --target help)
+    if echo "${UT_TARGES[@]}" | grep -q "op_kernel"; then
+      if grep -wq "pre_op_kernel_ut" <<< "${all_targets}"; then
+        echo "exec pre_op_kernel_ut..."
+        cmake --build . --target pre_op_kernel_ut -- ${VERBOSE} -j $THREAD_NUM
+        cmake ${CMAKE_ARGS} ..
+      fi
+    fi
+    cmake --build . --target ${UT_TARGES[@]} -- ${VERBOSE} -j $THREAD_NUM
+  fi
 
-if [ -n "${ascend_package_path}" ];then
-    ASCEND_CANN_PACKAGE_PATH=${ascend_package_path}
-elif [ -n "${ASCEND_HOME_PATH}" ];then
-    ASCEND_CANN_PACKAGE_PATH=${ASCEND_HOME_PATH}
-elif [ -n "${ASCEND_OPP_PATH}" ];then
-    ASCEND_CANN_PACKAGE_PATH=$(dirname ${ASCEND_OPP_PATH})
-elif [ -d "${DEFAULT_TOOLKIT_INSTALL_DIR}" ];then
-    ASCEND_CANN_PACKAGE_PATH=${DEFAULT_TOOLKIT_INSTALL_DIR}
-elif [ -d "${DEFAULT_INSTALL_DIR}" ];then
-    ASCEND_CANN_PACKAGE_PATH=${DEFAULT_INSTALL_DIR}
-else
-    log "Error: Please set the toolkit package installation directory through parameter -p|--package-path."
+  if [[ "$ENABLE_COVERAGE" =~ "TRUE" && "$enable_cov" == "TRUE" ]]; then
+    cmake --build . --target generate_ops_cpp_cov -- ${VERBOSE} -j $THREAD_NUM
+  fi
+}
+
+build_single_example() {
+  echo "Start to run example,op_name:${OP_NAME} example_name:${example} mode:${EXAMPLE_MODE}."
+
+  if [[ "${EXAMPLE_MODE}" == "eager" ]]; then
+    if [[ "${PKG_MODE}" == "cust" ]]; then
+      if [[ "${VENDOR_NAME}" == "" ]]; then
+        VENDOR_NAME="custom"
+      fi
+      export CUST_LIBRARY_PATH="${ASCEND_HOME_PATH}/opp/vendors/${VENDOR_NAME}_nn/op_api/lib"     # 仅自定义算子需要
+      export CUST_INCLUDE_PATH="${ASCEND_HOME_PATH}/opp/vendors/${VENDOR_NAME}_nn/op_api/include" # 仅自定义算子需要
+      if [ -f ${EAGER_LIBRARY_PATH}/libascendcl.so ]; then
+        g++ ${file} -I ${CUST_INCLUDE_PATH} -I ${INCLUDE_PATH} -I ${INCLUDE_PATH}/aclnnop -L ${CUST_LIBRARY_PATH} -L ${EAGER_LIBRARY_PATH} -lcust_opapi -lopapi_math -lascendcl -lnnopbase -o test_aclnn_${example} -Wl,-rpath=${CUST_LIBRARY_PATH}
+      else
+        g++ ${file} -I ${CUST_INCLUDE_PATH} -I ${INCLUDE_PATH} -I ${INCLUDE_PATH}/aclnnop -L ${CUST_LIBRARY_PATH} -L ${EAGER_LIBRARY_PATH} -lcust_opapi -lopapi_math -lacl_rt -lnnopbase -o test_aclnn_${example} -Wl,-rpath=${CUST_LIBRARY_PATH}
+      fi
+    elif [[ "${PKG_MODE}" == "" ]]; then
+      if [ -f ${EAGER_LIBRARY_PATH}/libascendcl.so ] || [ -f ${EAGER_LIBRARY_OPP_PATH}/libascendcl.so]; then
+        g++ ${file} -I ${INCLUDE_PATH} -I ${INCLUDE_PATH}/aclnnop -I ${ACLNN_INCLUDE_PATH} -L ${EAGER_LIBRARY_OPP_PATH} -L ${EAGER_LIBRARY_PATH} -lopapi_nn -lopapi_math -lascendcl -lnnopbase -o test_aclnn_${example}
+      else
+        g++ ${file} -I ${INCLUDE_PATH} -I ${INCLUDE_PATH}/aclnnop -I ${ACLNN_INCLUDE_PATH} -L ${EAGER_LIBRARY_OPP_PATH} -L ${EAGER_LIBRARY_PATH} -lopapi_nn -lopapi_math -lacl_rt -lnnopbase -o test_aclnn_${example}
+      fi
+    else
+      usage "run_example"
+      exit 1
+    fi
+  elif [[ "${EXAMPLE_MODE}" == "graph" ]]; then
+    g++ ${file} -I ${GRAPH_INCLUDE_PATH} -I ${GE_INCLUDE_PATH} -I ${INCLUDE_PATH} -I ${EXTERNAL_INCLUDE_PATH} -I ${LINUX_INCLUDE_PATH} -I ${INC_INCLUDE_PATH} \
+                -L ${GRAPH_LIBRARY_STUB_PATH} -L ${GRAPH_LIBRARY_PATH} \
+                -lgraph -lge_runner -lgraph_base -lge_compiler -o test_geir_${example}
+  fi
+  ${BUILD_PATH}/"${pattern}${example}" && success_example+=(${example}) && echo -e "\n$dotted_line\nRun ${pattern}${example} success.\n$dotted_line\n"
+}
+
+build_example() {
+  echo $dotted_line
+
+  if [ ! -d "${BUILD_PATH}" ]; then
+    mkdir -p "${BUILD_PATH}"
+  fi
+  cd "${BUILD_PATH}"
+  if [[ "${EXAMPLE_MODE}" == "eager" ]]; then
+    pattern="test_aclnn_"
+  elif [[ "${EXAMPLE_MODE}" == "graph" ]]; then
+    pattern="test_geir_"
+  else
+    usage "run_example"
     exit 1
-fi
+  fi
 
-if [ "${PARENT_JOB}" == "false" ];then
-    CPU_NUM=$(($(cat /proc/cpuinfo | grep "^processor" | wc -l)*2))
-    JOB_NUM="-j${CPU_NUM}"
-fi
+  local grep_word="-v"
 
-CUSTOM_OPTION="${CUSTOM_OPTION} -DCUSTOM_ASCEND_CANN_PACKAGE_PATH=${ASCEND_CANN_PACKAGE_PATH} -DCHECK_COMPATIBLE=${CHECK_COMPATIBLE}"
+  if [[ "${ENABLE_EXPERIMENTAL}" == "TRUE" ]]; then
+    grep_word=""
+  fi
 
-########################################################################################################################
-# 处理流程
-########################################################################################################################
+  OLDIFS=$IFS
+  IFS=$'\n'
+  files=($(find ../ -path "*/${OP_NAME}/examples/${pattern}*.cpp" | grep ${grep_word} "experimental"))
+  if [[ "$COMPUTE_UNIT" == "ascend910_95" ]]; then
+    files=($(find ../ -path "*/${OP_NAME}/examples/arch35/${pattern}*.cpp" | grep ${grep_word} "experimental"))
+  fi
+  IFS=$OLDIFS
 
-set_env
-
-clean
-
-# 安装nlohmann_json第三方库
-install_json_pkg
-
-if [ -n "${CCACHE_PROGRAM}" ]; then
-    if [ "${CCACHE_PROGRAM}" == "false" ] || [ "${CCACHE_PROGRAM}" == "off" ]; then
-        CUSTOM_OPTION="${CUSTOM_OPTION} -DENABLE_CCACHE=OFF"
-    elif [ -f "${CCACHE_PROGRAM}" ];then
-        CUSTOM_OPTION="${CUSTOM_OPTION} -DENABLE_CCACHE=ON -DCUSTOM_CCACHE=${CCACHE_PROGRAM}"
-        gen_bisheng ${CCACHE_PROGRAM}
+  failed_example=()
+  success_example=()
+  examples=()
+  for file in "${files[@]}"; do
+    example=${file#*"${pattern}"}
+    example=${example%.*}
+    examples+=($example)
+    if [[ $EXAMPLE_NAME == "" || $EXAMPLE_NAME == $example ]]; then
+      build_single_example || {
+        echo -e "\n$dotted_line\nRun ${pattern}${example} failed. \n$dotted_line\n"
+        failed_example+=(${example})
+      }
     fi
-else
-    # 判断有无默认的ccache 如果有则使用
-    ccache_system=$(which ccache || true)
-    if [ -n "${ccache_system}" ];then
-        CUSTOM_OPTION="${CUSTOM_OPTION} -DENABLE_CCACHE=ON -DCUSTOM_CCACHE=${ccache_system}"
-        gen_bisheng ${ccache_system}
+  done
+
+  examples=$(IFS=,; echo "${examples[*]}")
+  failed_example=$(IFS=,; echo "${failed_example[*]}")
+  success_example=$(IFS=,; echo "${success_example[*]}")
+
+  if [[ ${#files[@]} -eq 0 ]]; then
+    echo "ERROR: ${OP_NAME} doesn't have ${EXAMPLE_MODE} examples."
+  elif [[ ${failed_example} != "" || ${success_example} == "" ]]; then
+    echo "Run ${EXAMPLE_MODE} example failed, op_name: ${OP_NAME}, \
+success examples: ${success_example}, failed_example: ${failed_example[@]}."
+    exit 1
+  fi
+}
+
+gen_op() {
+  if [[ -z "$GENOP_NAME" ]] || [[ -z "$GENOP_TYPE" ]]; then
+    print_error "op_class or op_name is not set."
+    usage "genop"
+    exit 1
+  fi
+
+  echo $dotted_line
+  echo "Start to create the initial directory for ${GENOP_NAME} under ${GENOP_TYPE}"
+
+  # 检查 python 或 python3 是否存在
+  local python_cmd=""
+  if command -v python3 &>/dev/null; then
+    python_cmd="python3"
+  elif command -v python &>/dev/null; then
+    python_cmd="python"
+  fi
+
+  if [ -n "${python_cmd}" ]; then
+    ${python_cmd} "${BASE_PATH}/scripts/opgen/opgen_standalone.py" -t ${GENOP_TYPE} -n ${GENOP_NAME} -p ${GENOP_BASE}
+    return $?
+  fi
+}
+
+gen_aicpu_op() {
+if [[ -z "$GENOP_NAME" ]] || [[ -z "$GENOP_TYPE" ]]; then
+    print_error "op_class or op_name is not set."
+    usage "genop"
+    exit 1
+  fi
+
+  echo $dotted_line
+  echo "Start to create the AI CPU initial directory for ${GENOP_NAME} under ${GENOP_TYPE}"
+
+  # 检查 python 或 python3 是否存在
+  local python_cmd=""
+  if command -v python3 &> /dev/null; then
+      python_cmd="python3"
+  elif command -v python &> /dev/null; then
+      python_cmd="python"
+  fi
+
+  if [ -n "${python_cmd}" ]; then
+    ${python_cmd} "${BASE_PATH}/scripts/opgen/opgen_standalone.py" -t ${GENOP_TYPE} -n ${GENOP_NAME} -p ${GENOP_BASE} -v aicpu
+    echo "Create the AI CPU initial directory for ${GENOP_NAME} under ${GENOP_TYPE} success"
+    return $?
+  else
+    echo "Please install Python to generate op project framework."
+  fi
+}
+
+package_static() {
+    # Check weather BUILD_OUT_PATH directory exists
+    if [ ! -d "$BUILD_OUT_PATH" ]; then
+        echo "Error: Directory $BUILD_OUT_PATH does not exist."
+        return 1
     fi
-fi
 
-cd ${BUILD_DIR}
+    # Check weather *.run is exists and verify the file numbers
+    local run_files=("$BUILD_OUT_PATH"/*.run)
+    if [ ${#run_files[@]} -eq 0 ]; then
+        echo "Error: No .run files found in $BUILD_OUT_PATH directory."
+        return 1
+    fi
+    if [ ${#run_files[@]} -gt 1 ]; then
+        echo "Error: Multiple .run files found in $BUILD_OUT_PATH directory."
+        printf '%s\n' "${run_files[@]}"
+        return 1
+    fi
 
-if [ "${BUILD}" == "host" ];then
-    cmake_config -DENABLE_OPS_KERNEL=OFF
-    build_host
-    # TO DO
-    rm -rf ${CURRENT_DIR}/output
-    mkdir -p ${CURRENT_DIR}/output
-    cp ${BUILD_DIR}/*.run ${CURRENT_DIR}/output
-elif [ "${BUILD}" == "kernel" ];then
-    cmake_config -DENABLE_OPS_HOST=OFF
-    build_kernel
-elif [ -n "${BUILD}" ];then
-    cmake_config
-    build ${BUILD}
-else
-    cmake_config
-    build_package
-fi
+    # Get filename of *.run file and set new directory name
+    local run_file=$(basename "${run_files[0]}")
+    echo "Found .run file: $run_file"
+    if [[ "$run_file" != *"ops-nn"* ]]; then
+        echo "Error: Filename '$run_file' does not contain 'ops-nn'."
+        return 1
+    fi
+    local new_name="${run_file/ops-nn/ops-nn-static}"
+    new_name="${new_name%.run}"
+
+    # Check weather $BUILD_PATH/static_library_files directory exists and not empty
+    local static_files_dir="$BUILD_PATH/static_library_files"
+    if [ ! -d "$static_files_dir" ]; then
+        echo "Error: Directory $static_files_dir does not exist."
+        return 1
+    fi
+    if [ -z "$(ls -A "$static_files_dir")" ]; then
+        echo "Error: Directory $static_files_dir is empty."
+        return 1
+    fi
+
+    # Rename directory
+    local new_dir_path="$BUILD_PATH/$new_name"
+    if mv "$static_files_dir" "$new_dir_path"; then
+        echo "Preparing for packaging: renamed $static_files_dir to $new_dir_path"
+    else
+        echo "Packaging preparation failed: directory rename failed ($static_files_dir -> $new_dir_path)"
+        return 1
+    fi
+
+    # Create compressed package and restore directory name
+    local new_filename="${new_name}.tar.gz"
+    if tar -czf "$BUILD_OUT_PATH/$new_filename" -C "$BUILD_PATH" "$new_name"; then
+        echo "Successfully created compressed package: $BUILD_OUT_PATH/$new_filename"
+        # Restore original directory name
+        echo "Restoring original directory name: $new_dir_path -> $static_files_dir"
+        mv "$new_dir_path" "$static_files_dir"
+        return 0
+    else
+        echo "Error: Failed to create compressed package."
+        # Attempt to restore original directory name
+        mv "$new_dir_path" "$static_files_dir"
+        return 1
+    fi
+}
+
+
+main() {
+  checkopts "$@"
+  if [[ "$ENABLE_GENOP" == "TRUE" ]]; then
+    gen_op
+    exit $?
+  fi
+  if [[ "$ENABLE_GENOP_AICPU" == "TRUE" ]]; then
+    gen_aicpu_op
+    exit $?
+  fi
+  assemble_cmake_args
+  echo "CMAKE_ARGS: ${CMAKE_ARGS}"
+  
+  if [[ "$ENABLE_RUN_EXAMPLE" == "TRUE" ]]; then
+    build_example
+    exit $?
+  fi
+  mkdir -p "${BUILD_PATH}"
+  cd "${BUILD_PATH}" && rm -f CMakeCache.txt && cmake -DENABLE_EXPERIMENTAL=${ENABLE_EXPERIMENTAL} -DPREPROCESS_ONLY=ON ..
+
+  if [[ "$CI_MODE" == "TRUE" ]]; then
+    set_ci_mode
+  elif [[ -n $COMPILED_OPS ]]; then
+    parse_op_dependencies
+  fi
+
+  cd "${BUILD_PATH}" && cmake ${CMAKE_ARGS} -DPREPROCESS_ONLY=OFF ..
+
+  if [[ "$ENABLE_TEST" == "TRUE" ]]; then
+    build_ut
+    exit $?
+  fi
+
+  if [ "$ENABLE_CREATE_LIB" == "TRUE" ]; then
+    build_lib
+  fi
+  if [[ ("$ENABLE_BINARY" == "TRUE" || "$ENABLE_CUSTOM" == "TRUE") && "$ENABLE_JIT" == "FALSE" ]]; then
+    build_binary
+  fi
+  if [[ "$ENABLE_STATIC" == "TRUE" ]]; then
+    build_static_lib
+  fi
+  if [[ "$ENABLE_PACKAGE" == "TRUE" || "$ENABLE_JIT" == "TRUE" ]]; then
+    build_pkg
+    if [[ "$ENABLE_STATIC" == "TRUE" ]]; then
+      package_static
+    fi
+  fi
+}
+
+set -o pipefail
+main "$@" | gawk '{print strftime("[%Y-%m-%d %H:%M:%S]"), $0}'

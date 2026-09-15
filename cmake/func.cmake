@@ -1,694 +1,719 @@
-# Copyright (c) 2024 Huawei Technologies Co., Ltd.
+# ----------------------------------------------------------------------------
+# This program is free software, you can redistribute it and/or modify.
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
 # This file is a part of the CANN Open Software.
-# Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
+# Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
-# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
-# ======================================================================================================================
+# ----------------------------------------------------------------------------
 
-function(add_target_source)
-    cmake_parse_arguments(ADD "" "BASE_TARGET;SRC_DIR" "TARGET_NAME" ${ARGN})
+# 为target link依赖库 useage: add_modules(MODE SUB_LIBS EXTERNAL_LIBS) SUB_LIBS 为内部创建的target, EXTERNAL_LIBS为外部依赖的target
+function(add_modules)
+  set(oneValueArgs MODE)
+  set(multiValueArgs TARGETS SUB_LIBS EXTERNAL_LIBS)
 
-    get_target_property(all_srcs ${ADD_BASE_TARGET} SOURCES)
-    set(add_srcs)
-    foreach(_src ${all_srcs})
-        string(REGEX MATCH "^${ADD_SRC_DIR}" is_match "${_src}")
-        if (is_match)
-            list(APPEND add_srcs ${_src})
-        endif ()
-    endforeach()
+  cmake_parse_arguments(ARGS "" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
-    get_target_property(all_includes ${ADD_BASE_TARGET} INCLUDE_DIRECTORIES)
-    set(add_includes)
-    foreach(_include ${all_includes})
-        string(REGEX MATCH "^${ADD_SRC_DIR}" is_match "${_include}")
-        if (is_match)
-            list(APPEND add_includes ${_include})
-        endif ()
-    endforeach()
-
-    foreach(_target_name ${ADD_TARGET_NAME})
-        target_sources(${_target_name} PRIVATE
-                ${add_srcs}
-        )
-
-        target_include_directories(${_target_name} PRIVATE
-                ${add_includes}
-        )
-    endforeach()
+  foreach(target ${ARGS_TARGETS})
+    if(TARGET ${target} AND TARGET ${ARGS_SUB_LIBS})
+      target_link_libraries(${target} ${ARGS_MODE} ${ARGS_SUB_LIBS})
+    endif()
+    if(TARGET ${target} AND ARGS_EXTERNAL_LIBS)
+      target_link_libraries(${target} ${ARGS_MODE} ${ARGS_EXTERNAL_LIBS})
+    endif()
+  endforeach()
 endfunction()
 
-# function(op_add_subdirectory OP_LIST OP_DIR_LIST)
-#     set(_OP_LIST)
-#     set(_OP_DIR_LIST)
-
-#     file(GLOB OP_HOST_CMAKE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/**/**/op_host/CMakeLists.txt")
-
-#     foreach(OP_CMAKE_FILE ${OP_HOST_CMAKE_FILES})
-#         get_filename_component(OP_HOST_DIR "${OP_CMAKE_FILE}" DIRECTORY)
-#         get_filename_component(OP_DIR "${OP_HOST_DIR}" DIRECTORY)
-#         get_filename_component(OP_NAME "${OP_DIR}" NAME)
-
-#         if (DEFINED ASCEND_OP_NAME AND NOT "${ASCEND_OP_NAME}" STREQUAL "")
-#             if (NOT "${ASCEND_OP_NAME}" STREQUAL "all" AND NOT "${ASCEND_OP_NAME}" STREQUAL "ALL")
-#                 if (NOT ${OP_NAME} IN_LIST ASCEND_OP_NAME)
-#                     continue()
-#                 endif ()
-#             endif ()
-#         endif ()
-
-#         list(APPEND _OP_LIST ${OP_NAME})
-#         list(APPEND _OP_DIR_LIST ${OP_DIR})
-#     endforeach()
-
-#     list(REMOVE_DUPLICATES _OP_LIST)
-#     list(REMOVE_DUPLICATES _OP_DIR_LIST)
-#     list(SORT _OP_LIST)
-#     list(SORT _OP_DIR_LIST)
-#     set(${OP_LIST} ${_OP_LIST} PARENT_SCOPE)
-#     set(${OP_DIR_LIST} ${_OP_DIR_LIST} PARENT_SCOPE)
-# endfunction()
-
-function(op_add_subdirectory OP_LIST OP_DIR_LIST)
-    set(_OP_LIST)
-    set(_OP_DIR_LIST)
-    # 定义待扫描的目录列表
-    set(SCAN_DIRS
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/math
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/foreach
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/image
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/rnn
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/quant
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/objdetect
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/pooling
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/activation
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/matmul
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/conv
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/random
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/loss
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/index
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/optim
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/conversion
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/norm
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/contrib/activation
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/contrib/conv
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/contrib/conversion
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/contrib/foreach
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/contrib/image
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/contrib/index
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/contrib/loss
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/contrib/math
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/contrib/matmul
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/contrib/norm
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/contrib/objdetect
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/contrib/optim
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/contrib/pooling
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/contrib/quant
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/contrib/random
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/contrib/rnn
-    )
-    # 遍历每个待扫描的目录
-    foreach(scan_dir ${SCAN_DIRS})
-        file(GLOB CHILD_DIRS_LIST RELATIVE ${scan_dir} "${scan_dir}/*")
-
-        # 遍历子目录
-        foreach(child_dir ${CHILD_DIRS_LIST})
-            set(child_full_path "${scan_dir}/${child_dir}")
-            if(IS_DIRECTORY ${child_full_path})
-                if (EXISTS ${child_full_path}/op_host)
-                    # 检查 ASCEND_OP_NAME 条件
-                    if (DEFINED ASCEND_OP_NAME AND NOT "${ASCEND_OP_NAME}" STREQUAL "")
-                        if (NOT "${ASCEND_OP_NAME}" STREQUAL "all" AND NOT "${ASCEND_OP_NAME}" STREQUAL "ALL")
-                            if (NOT ${child_dir} IN_LIST ASCEND_OP_NAME)
-                                continue()
-                            endif ()
-                        endif ()
-                    endif ()
-                    # 添加到结果列表
-                    list(APPEND _OP_LIST ${child_dir})
-                    list(APPEND _OP_DIR_LIST ${child_full_path})
-                endif()
-            endif()
-        endforeach()
-    endforeach()
-
-    # 去重和排序
-    list(REMOVE_DUPLICATES _OP_LIST)
-    list(REMOVE_DUPLICATES _OP_DIR_LIST)
-    list(SORT _OP_LIST)
-    list(SORT _OP_DIR_LIST)
-
-    # 返回结果
-    set(${OP_LIST} ${_OP_LIST} PARENT_SCOPE)
-    set(${OP_DIR_LIST} ${_OP_DIR_LIST} PARENT_SCOPE)
-endfunction()
-
-function(op_add_depend_directory)
-    cmake_parse_arguments(DEP "" "OP_DIR_LIST" "OP_LIST" ${ARGN})
-    set(_OP_DEPEND_DIR_LIST)
-    foreach(op_name ${DEP_OP_LIST})
-        if (DEFINED ${op_name}_depends)
-            foreach(depend_info ${${op_name}_depends})
-                if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/${depend_info}/op_host)
-                    continue()
-                endif ()
-
-                get_filename_component(_depend_op_name "${depend_info}" NAME)
-
-                if (NOT ${_depend_op_name} IN_LIST DEP_OP_LIST)
-                    list(APPEND _OP_DEPEND_DIR_LIST ${CMAKE_CURRENT_SOURCE_DIR}/src/${depend_info})
-                endif ()
-            endforeach()
-        endif()
-    endforeach()
-
-    list(SORT _OP_DEPEND_DIR_LIST)
-    set(${DEP_OP_DIR_LIST} ${_OP_DEPEND_DIR_LIST} PARENT_SCOPE)
-endfunction()
-
-function(add_compile_cmd_target)
-    cmake_parse_arguments(CMD "" "COMPUTE_UNIT" "" ${ARGN})
-
-    if(ADD_OPS_COMPILE_OPTION_V2)
-            set(OP_DEBUG_CONFIG_OPTION --opc-config-file ${ASCEND_CUSTOM_OPC_OPTIONS})
+# 添加infer object
+function(add_infer_modules)
+  if(NOT TARGET ${OPHOST_NAME}_infer_obj)
+    if(BUILD_WITH_INSTALLED_DEPENDENCY_CANN_PKG)
+      npu_op_library(${OPHOST_NAME}_infer_obj GRAPH)
     else()
-        if(OP_DEBUG_CONFIG)
-            set(OP_DEBUG_CONFIG_OPTION --op-debug-config ${OP_DEBUG_CONFIG})
-        endif()
-        set(OP_TILING_KEY_OPTION --tiling-keys ${ASCEND_CUSTOM_TILING_KEYS})
+      add_library(${OPHOST_NAME}_infer_obj OBJECT)
     endif()
-
-    set(_OUT_DIR           ${ASCEND_BINARY_OUT_DIR}/${CMD_COMPUTE_UNIT})
-    set(GEN_OUT_DIR        ${_OUT_DIR}/gen)
-    set(COMPILE_CMD_TARGET generate_compile_cmd_${CMD_COMPUTE_UNIT})
-    add_custom_target(${COMPILE_CMD_TARGET} ALL
-            COMMAND mkdir -p ${GEN_OUT_DIR}
-            COMMAND ${HI_PYTHON} ${ASCENDC_CMAKE_UTIL_DIR}/ascendc_bin_param_build.py
-            ${base_aclnn_binary_dir}/aic-${CMD_COMPUTE_UNIT}-ops-info.ini
-            ${GEN_OUT_DIR}
-            ${CMD_COMPUTE_UNIT}
-            ${OP_TILING_KEY_OPTION}
-            ${OP_DEBUG_CONFIG_OPTION}
-            COMMAND ${HI_PYTHON} ${ASCENDC_CMAKE_UTIL_DIR}/ascendc_bin_param_build.py
-            ${base_aclnn_binary_dir}/inner/aic-${CMD_COMPUTE_UNIT}-ops-info.ini
-            ${GEN_OUT_DIR}
-            ${CMD_COMPUTE_UNIT}
-            ${OP_TILING_KEY_OPTION}
-            ${OP_DEBUG_CONFIG_OPTION}
-            COMMAND ${HI_PYTHON} ${ASCENDC_CMAKE_UTIL_DIR}/ascendc_bin_param_build.py
-            ${base_aclnn_binary_dir}/exc/aic-${CMD_COMPUTE_UNIT}-ops-info.ini
-            ${GEN_OUT_DIR}
-            ${CMD_COMPUTE_UNIT}
-            ${OP_TILING_KEY_OPTION}
-            ${OP_DEBUG_CONFIG_OPTION}
-    )
-
-    add_dependencies(${COMPILE_CMD_TARGET} opbuild_gen_default opbuild_gen_inner opbuild_gen_exc)
-    add_dependencies(generate_compile_cmd ${COMPILE_CMD_TARGET})
+    target_include_directories(${OPHOST_NAME}_infer_obj PRIVATE ${OP_PROTO_INCLUDE})
+    target_compile_definitions(
+      ${OPHOST_NAME}_infer_obj PRIVATE OPS_UTILS_LOG_SUB_MOD_NAME="OP_PROTO" OP_SUBMOD_NAME="OPS_NN"
+                                       $<$<BOOL:${ENABLE_TEST}>:ASCEND_OPSPROTO_UT> LOG_CPP
+      )
+    target_compile_options(
+      ${OPHOST_NAME}_infer_obj PRIVATE $<$<NOT:$<BOOL:${ENABLE_TEST}>>:-DDISABLE_COMPILE_V1> -Dgoogle=ascend_private
+                                       -fvisibility=hidden
+      )
+    target_link_libraries(
+      ${OPHOST_NAME}_infer_obj
+      PRIVATE $<BUILD_INTERFACE:$<IF:$<BOOL:${ENABLE_TEST}>,intf_llt_pub_asan_cxx17,intf_pub_cxx17>>
+              $<BUILD_INTERFACE:dlog_headers>
+              $<$<TARGET_EXISTS:ops_base_util_objs>:$<TARGET_OBJECTS:ops_base_util_objs>>
+              $<$<TARGET_EXISTS:ops_base_infer_objs>:$<TARGET_OBJECTS:ops_base_infer_objs>>
+      )
+  endif()
 endfunction()
 
-function(add_ops_info_target)
-    cmake_parse_arguments(OPINFO "" "COMPUTE_UNIT" "" ${ARGN})
-
-    set(OPS_INFO_TARGET generate_ops_info_${OPINFO_COMPUTE_UNIT})
-    set(OPS_INFO_JSON ${ASCEND_AUTOGEN_DIR}/aic-${OPINFO_COMPUTE_UNIT}-ops-info.json)
-    set(CUSTOM_OPS_INFO_DIR ${CUSTOM_DIR}/op_impl/ai_core/tbe/config/${OPINFO_COMPUTE_UNIT})
-
-    set(OPS_INFO_INI          ${base_aclnn_binary_dir}/aic-${OPINFO_COMPUTE_UNIT}-ops-info.ini)
-    set(OPS_INFO_INNER_INI    ${base_aclnn_binary_dir}/inner/aic-${OPINFO_COMPUTE_UNIT}-ops-info.ini)
-    set(OPS_INFO_EXCLUDE_INI  ${base_aclnn_binary_dir}/exc/aic-${OPINFO_COMPUTE_UNIT}-ops-info.ini)
-
-    add_custom_command(OUTPUT ${OPS_INFO_JSON}
-            COMMAND ${HI_PYTHON} ${ASCENDC_CMAKE_UTIL_DIR}/parse_ini_to_json.py
-            ${OPS_INFO_INI}
-            ${OPS_INFO_INNER_INI}
-            ${OPS_INFO_EXCLUDE_INI}
-            ${OPS_INFO_JSON}
-            COMMAND mkdir -p ${CUSTOM_OPS_INFO_DIR}
-            COMMAND cp -f ${OPS_INFO_JSON} ${CUSTOM_OPS_INFO_DIR} || true
-    )
-
-    add_custom_target(${OPS_INFO_TARGET} ALL
-            DEPENDS ${OPS_INFO_JSON}
-    )
-
-    add_dependencies(${OPS_INFO_TARGET} opbuild_gen_default opbuild_gen_inner opbuild_gen_exc)
-    add_dependencies(generate_ops_info ${OPS_INFO_TARGET})
-
-    install(FILES ${OPS_INFO_JSON}
-            DESTINATION packages/vendors/${VENDOR_NAME}/op_impl/ai_core/tbe/config/${OPINFO_COMPUTE_UNIT} OPTIONAL
-    )
-endfunction()
-
-function(add_ops_compile_options)
-    cmake_parse_arguments(OP_COMPILE "" "OP_NAME" "COMPUTE_UNIT;OPTIONS" ${ARGN})
-
-    if(NOT OP_COMPILE_OPTIONS)
-        return()
-    endif()
-
-    if(ADD_OPS_COMPILE_OPTION_V2)
-        execute_process(COMMAND ${HI_PYTHON} ${ASCENDC_CMAKE_UTIL_DIR}/ascendc_gen_options.py
-                ${ASCEND_CUSTOM_OPTIONS} ${OP_COMPILE_OP_NAME}
-                ${OP_COMPILE_COMPUTE_UNIT} ${OP_COMPILE_OPTIONS}
-                RESULT_VARIABLE EXEC_RESULT
-                OUTPUT_VARIABLE EXEC_INFO
-                ERROR_VARIABLE EXEC_ERROR)
-        if (EXEC_RESULT)
-            message("add ops compile options info: ${EXEC_INFO}")
-            message("add ops compile options error: ${EXEC_ERROR}")
-            message(FATAL_ERROR "Error: add ops compile options failed!")
-        endif ()
+# 添加tiling object
+function(add_tiling_modules)
+  if(NOT TARGET ${OPHOST_NAME}_tiling_obj)
+    if(BUILD_WITH_INSTALLED_DEPENDENCY_CANN_PKG)
+      npu_op_library(${OPHOST_NAME}_tiling_obj TILING)
+      add_dependencies(${OPHOST_NAME}_tiling_obj json)
     else()
-        file(APPEND ${ASCEND_CUSTOM_OPTIONS}
-                "${OP_COMPILE_OP_NAME},${OP_COMPILE_COMPUTE_UNIT},${OP_COMPILE_OPTIONS}\n"
-        )
+      add_library(${OPHOST_NAME}_tiling_obj OBJECT)
+      add_dependencies(${OPHOST_NAME}_tiling_obj json)
     endif()
+    target_include_directories(${OPHOST_NAME}_tiling_obj PRIVATE ${OP_TILING_INCLUDE})
+    set(ENABLE_DLOPEN_LEGACY OFF)
+    if (BUILD_WITH_INSTALLED_DEPENDENCY_CANN_PKG AND NOT ENABLE_STATIC)
+      file(GLOB COMMON_SRC ${OPS_NN_DIR}/common/src/*.cpp ${OPS_NN_DIR}/common/src/op_host/*.cpp)
+      if(UT_TEST_ALL OR OP_HOST_UT)  # ut场景下LegacyCommonMgr要打桩，通过环境变量查找legacy so
+        file(GLOB COMMON_SRC ${OPS_NN_DIR}/common/src/op_host/*.cpp)
+      endif()
+      target_sources(${OPHOST_NAME}_tiling_obj PRIVATE ${COMMON_SRC})
+      set(ENABLE_DLOPEN_LEGACY ON)
+    endif()
+
+    target_compile_definitions(
+      ${OPHOST_NAME}_tiling_obj PRIVATE OPS_UTILS_LOG_SUB_MOD_NAME="OP_TILING" OP_SUBMOD_NAME="OPS_NN"
+                                        $<$<BOOL:${ENABLE_TEST}>:ASCEND_OPTILING_UT> LOG_CPP
+                                        $<$<BOOL:${ENABLE_DLOPEN_LEGACY}>:NN_ENABLE_DLOPEN_LEGACY>
+      )
+    target_compile_options(
+      ${OPHOST_NAME}_tiling_obj PRIVATE $<$<NOT:$<BOOL:${ENABLE_TEST}>>:-DDISABLE_COMPILE_V1> -Dgoogle=ascend_private
+                                        -fvisibility=hidden -fno-strict-aliasing
+      )
+    target_link_libraries(
+      ${OPHOST_NAME}_tiling_obj
+      PRIVATE $<BUILD_INTERFACE:$<IF:$<BOOL:${ENABLE_TEST}>,intf_llt_pub_asan_cxx17,intf_pub_cxx17>>
+              $<BUILD_INTERFACE:dlog_headers>
+              $<$<TARGET_EXISTS:${COMMON_NAME}_obj>:$<TARGET_OBJECTS:${COMMON_NAME}_obj>>
+              $<$<TARGET_EXISTS:ops_base_util_objs>:$<TARGET_OBJECTS:ops_base_util_objs>>
+              $<$<TARGET_EXISTS:ops_base_tiling_objs>:$<TARGET_OBJECTS:ops_base_tiling_objs>>
+              tiling_api
+      )
+  endif()
 endfunction()
 
-function(add_ops_tiling_keys)
-    cmake_parse_arguments(OP_COMPILE "" "OP_NAME" "COMPUTE_UNIT;TILING_KEYS" ${ARGN})
-
-    if(NOT OP_COMPILE_TILING_KEYS)
-        return()
-    endif()
-
-    if(ADD_OPS_COMPILE_OPTION_V2)
-        list(JOIN OP_COMPILE_TILING_KEYS "," STRING_TILING_KEYS)
-        add_ops_compile_options(
-                OP_NAME ${OP_COMPILE_OP_NAME}
-                OPTIONS --tiling_key=${STRING_TILING_KEYS}
-        )
+# 添加opapi object
+function(add_opapi_modules)
+  if(NOT TARGET ${OPHOST_NAME}_opapi_obj)
+    if(BUILD_WITH_INSTALLED_DEPENDENCY_CANN_PKG)
+      npu_op_library(${OPHOST_NAME}_opapi_obj ACLNN)
     else()
-        file(APPEND ${ASCEND_CUSTOM_TILING_KEYS}
-                "${OP_COMPILE_OP_NAME},${OP_COMPILE_COMPUTE_UNIT},${OP_COMPILE_TILING_KEYS}\n"
-        )
+      add_library(${OPHOST_NAME}_opapi_obj OBJECT)
     endif()
+
+    set(ENABLE_DLOPEN_LEGACY OFF)
+    if (BUILD_WITH_INSTALLED_DEPENDENCY_CANN_PKG AND NOT ENABLE_STATIC)
+      if(NOT UT_TEST_ALL AND NOT OP_API_UT)  # ut场景下LegacyCommonMgr要打桩，通过环境变量查找legacy so
+        target_sources(${OPHOST_NAME}_opapi_obj PRIVATE ${OPS_NN_DIR}/common/src/legacy_common_manager.cpp)
+      endif()
+      set(ENABLE_DLOPEN_LEGACY ON)
+    endif()
+
+    if(ENABLE_TEST)
+      set(opapi_ut_depends_inc ${UT_PATH}/op_api/stub)
+    endif()
+    target_include_directories(${OPHOST_NAME}_opapi_obj PRIVATE
+            ${opapi_ut_depends_inc}
+            ${OPAPI_INCLUDE})
+    target_include_directories(${OPHOST_NAME}_opapi_obj PRIVATE ${OPAPI_INCLUDE})
+    target_compile_options(${OPHOST_NAME}_opapi_obj PRIVATE -Dgoogle=ascend_private -DACLNN_LOG_FMT_CHECK)
+    target_compile_definitions(${OPHOST_NAME}_opapi_obj PRIVATE
+                               LOG_CPP
+                               $<$<BOOL:${ENABLE_DLOPEN_LEGACY}>:NN_ENABLE_DLOPEN_LEGACY>
+    )
+    target_link_libraries(
+      ${OPHOST_NAME}_opapi_obj
+      PUBLIC $<BUILD_INTERFACE:$<IF:$<BOOL:${ENABLE_TEST}>,intf_llt_pub_asan_cxx17,intf_pub_cxx17>>
+      PRIVATE $<BUILD_INTERFACE:adump_headers> $<BUILD_INTERFACE:dlog_headers>
+      )
+  endif()
 endfunction()
 
-function(add_opc_config)
-    cmake_parse_arguments(OP_COMPILE "" "OP_NAME" "COMPUTE_UNIT;CONFIG" ${ARGN})
+function(add_aicpu_kernel_modules)
+  message(STATUS "add_aicpu_kernel_modules")
+  if(NOT TARGET ${OPHOST_NAME}_aicpu_obj)
+    add_library(${OPHOST_NAME}_aicpu_obj OBJECT)
+    target_include_directories(${OPHOST_NAME}_aicpu_obj PRIVATE ${AICPU_INCLUDE})
+    target_compile_definitions(
+      ${OPHOST_NAME}_aicpu_obj PRIVATE _FORTIFY_SOURCE=2 google=ascend_private
+                                       $<$<BOOL:${ENABLE_TEST}>:ASCEND_AICPU_UT>
+      )
+    target_compile_options(
+      ${OPHOST_NAME}_aicpu_obj PRIVATE $<$<NOT:$<BOOL:${ENABLE_TEST}>>:-DDISABLE_COMPILE_V1> -Dgoogle=ascend_private
+                                       -fvisibility=hidden ${AICPU_DEFINITIONS}
+      )
+    target_link_libraries(
+      ${OPHOST_NAME}_aicpu_obj
+      PRIVATE $<BUILD_INTERFACE:$<IF:$<BOOL:${ENABLE_TEST}>,intf_llt_pub_asan_cxx17,intf_pub_cxx17>>
+              $<BUILD_INTERFACE:dlog_headers>
+      )
+  endif()
+endfunction()
 
-    if(NOT ADD_OPS_COMPILE_OPTION_V2)
-        return()
+option(PREPROCESS_ONLY "preprocess only, no cache aicpu targets" OFF)
+function(add_aicpu_cust_kernel_modules target_name)
+  message(STATUS "add_aicpu_cust_kernel_modules for ${target_name}")
+  if(NOT TARGET ${target_name})
+    add_library(${target_name} OBJECT)
+    target_include_directories(${target_name} PRIVATE ${AICPU_INCLUDE})
+    target_compile_definitions(
+      ${target_name} PRIVATE
+                    _FORTIFY_SOURCE=2 _GLIBCXX_USE_CXX11_ABI=1
+                    google=ascend_private
+                    $<$<BOOL:${ENABLE_TEST}>:ASCEND_AICPU_UT>
+      )
+    target_compile_options(
+      ${target_name} PRIVATE
+                    $<$<NOT:$<BOOL:${ENABLE_TEST}>>:-DDISABLE_COMPILE_V1> -Dgoogle=ascend_private
+                    -fvisibility=hidden ${AICPU_DEFINITIONS}
+      )
+    target_link_libraries(
+      ${target_name}
+      PRIVATE $<BUILD_INTERFACE:$<IF:$<BOOL:${ENABLE_TEST}>,intf_llt_pub_asan_cxx17,intf_pub_cxx17>>
+              $<BUILD_INTERFACE:dlog_headers>
+              -Wl,--no-whole-archive
+              Eigen3::EigenNn
+      )
+    if(NOT PREPROCESS_ONLY)
+      if (NOT ${target_name} IN_LIST AICPU_CUST_OBJ_TARGETS)
+        set(AICPU_CUST_OBJ_TARGETS ${AICPU_CUST_OBJ_TARGETS} ${target_name} CACHE INTERNAL "All aicpu cust obj targets")
+      endif()
     endif()
+  endif()
+endfunction()
 
-    if(NOT OP_COMPILE_CONFIG)
-        return()
+function(add_graph_plugin_modules)
+  if(NOT TARGET ${GRAPH_PLUGIN_NAME}_obj)
+    if(BUILD_WITH_INSTALLED_DEPENDENCY_CANN_PKG)
+      npu_op_library(${GRAPH_PLUGIN_NAME}_obj GRAPH)
+    else()
+      add_library(${GRAPH_PLUGIN_NAME}_obj OBJECT)
     endif()
+    target_include_directories(${GRAPH_PLUGIN_NAME}_obj PRIVATE ${OP_PROTO_INCLUDE})
+    target_compile_definitions(${GRAPH_PLUGIN_NAME}_obj PRIVATE OPS_UTILS_LOG_SUB_MOD_NAME="GRAPH_PLUGIN" LOG_CPP)
+    if(BUILD_WITH_INSTALLED_DEPENDENCY_CANN_PKG)
+      target_compile_options(
+        ${GRAPH_PLUGIN_NAME}_obj PRIVATE -Dgoogle=ascend_private -fvisibility=hidden
+      )
+    else()
+      target_compile_options(
+        ${GRAPH_PLUGIN_NAME}_obj PRIVATE $<$<NOT:$<BOOL:${ENABLE_TEST}>>:-DDISABLE_COMPILE_V1> -Dgoogle=ascend_private
+                                        -fvisibility=hidden
+      )
+    endif()
+    target_link_libraries(
+      ${GRAPH_PLUGIN_NAME}_obj
+      PRIVATE $<BUILD_INTERFACE:$<IF:$<BOOL:${ENABLE_TEST}>,intf_llt_pub_asan_cxx17,intf_pub_cxx17>>
+              $<BUILD_INTERFACE:dlog_headers>
+              $<$<TARGET_EXISTS:ops_base_util_objs>:$<TARGET_OBJECTS:ops_base_util_objs>>
+              $<$<TARGET_EXISTS:ops_base_infer_objs>:$<TARGET_OBJECTS:ops_base_infer_objs>>
+      )
+  endif()
+endfunction()
 
-    string(REPLACE "," ";" OP_COMPILE_CONFIG_LIST "${OP_COMPILE_CONFIG}")
+macro(add_op_subdirectory)
+  file(GLOB CURRENT_DIRS RELATIVE ${OP_DIR} ${OP_DIR}/*)
+  list(FIND ASCEND_OP_NAME ${OP_NAME} INDEX)
+  if(NOT "${ASCEND_OP_NAME}" STREQUAL "" AND INDEX EQUAL -1)
+    # 非指定算子，只编译不测试
+    set(OP_ONLY_COMPILE on)
+  else()
+    set(OP_ONLY_COMPILE off)
+  endif()
+  if((NOT ENABLE_TEST AND NOT BENCHMARK) OR OP_ONLY_COMPILE)
+      list(REMOVE_ITEM CURRENT_DIRS tests)
+  endif()
+  # op_api目录已移出的算子，add_modules_sources在算子根路径CMakeLists中，且CMakeLists旧实现已删除
+  if(NOT EXISTS "${OP_DIR}/op_host/CMakeLists.txt")
+    add_subdirectory(${OP_DIR})
+  endif()
+  foreach(SUB_DIR ${CURRENT_DIRS})
+      if(EXISTS "${OP_DIR}/${SUB_DIR}/CMakeLists.txt")
+          add_subdirectory(${OP_DIR}/${SUB_DIR})
+      endif()
+  endforeach()
+endmacro()
 
-    set(_OPC_CONFIG)
-
-    foreach(_option ${OP_COMPILE_CONFIG_LIST})
-        if("${_option}" STREQUAL "ccec_g")
-            list(APPEND _OPC_CONFIG "-g")
-        elseif("${_option}" STREQUAL "ccec_O0")
-            list(APPEND _OPC_CONFIG "-O0")
-        elseif("${_option}" STREQUAL "oom")
-            list(APPEND _OPC_CONFIG "--oom")
-        elseif("${_option}" STREQUAL "sanitizer")
-            list(APPEND _OPC_CONFIG "-sanitizer")
-        elseif("${_option}" STREQUAL "dump_cce")
-            list(APPEND _OPC_CONFIG "--save-temp-files")
+# useage: add_category_subdirectory 根据ASCEND_OP_NAME和ASCEND_COMPILE_OPS添加指定算子工程
+# ASCEND_OP_NAME 指定的算子 ASCEND_COMPILE_OPS  编译需要的算子
+macro(add_category_subdirectory)
+  foreach(op_category ${OP_CATEGORY_LIST})
+    if(ENABLE_EXPERIMENTAL)
+      set(op_category_dir ${CMAKE_CURRENT_SOURCE_DIR}/experimental/${op_category})
+    else()
+      set(op_category_dir ${CMAKE_CURRENT_SOURCE_DIR}/${op_category})
+    endif()
+    if (IS_DIRECTORY ${op_category_dir})
+      file(GLOB CURRENT_DIRS RELATIVE ${op_category_dir} ${op_category_dir}/*)
+      foreach(SUB_DIR ${CURRENT_DIRS})
+        set(OP_DIR ${op_category_dir}/${SUB_DIR})
+        set(OP_NAME "${SUB_DIR}")
+        if(${OP_NAME} STREQUAL "common")
+          set(OP_NAME "${op_category}.common")
         endif()
-    endforeach()
-
-    if(_OPC_CONFIG)
-        add_ops_compile_options(
-                OP_NAME ${OP_COMPILE_OP_NAME}
-                OPTIONS ${_OPC_CONFIG}
-        )
-    endif()
-endfunction()
-
-function(add_ops_src_copy)
-    cmake_parse_arguments(SRC_COPY "" "TARGET_NAME;SRC;DST;BE_RELIED;COMPUTE_UNIT" "" ${ARGN})
-
-    set(OPS_UTILS_INC_KERNEL_TARGET ops_utils_inc_kernel_${SRC_COPY_COMPUTE_UNIT})
-    if (EXISTS ${OPS_ADV_UTILS_KERNEL_INC})
-        if (NOT TARGET ${OPS_UTILS_INC_KERNEL_TARGET})
-            get_filename_component(_ROOT_OPS_SRC_DIR    "${SRC_COPY_DST}" DIRECTORY)
-            set(OPS_UTILS_INC_KERNEL_DIR ${_ROOT_OPS_SRC_DIR}/ascendc/common)
-            add_custom_command(OUTPUT ${OPS_UTILS_INC_KERNEL_DIR}
-                    COMMAND mkdir -p ${OPS_UTILS_INC_KERNEL_DIR}
-                    COMMAND cp -rf ${OPS_ADV_UTILS_KERNEL_INC}/*.* ${OPS_UTILS_INC_KERNEL_DIR}
-            )
-
-            add_custom_target(${OPS_UTILS_INC_KERNEL_TARGET}
-                    DEPENDS ${OPS_UTILS_INC_KERNEL_DIR}
-            )
-        endif ()
-    endif ()
-
-    file(GLOB SRC_FILES ${SRC_COPY_SRC}/*)
-    list(FILTER SRC_FILES EXCLUDE REGEX "op_host")
-    if (NOT TARGET ${SRC_COPY_TARGET_NAME})
-        set(_BUILD_FLAG ${SRC_COPY_DST}/${SRC_COPY_TARGET_NAME}.done)
-        add_custom_command(OUTPUT ${_BUILD_FLAG}
-                COMMAND mkdir -p ${SRC_COPY_DST}
-                COMMAND cp -rf ${SRC_FILES} ${SRC_COPY_DST}
-                COMMAND touch ${_BUILD_FLAG}
-        )
-
-        add_custom_target(${SRC_COPY_TARGET_NAME}
-                DEPENDS ${_BUILD_FLAG}
-        )
-    endif ()
-
-    if (TARGET ${OPS_UTILS_INC_KERNEL_TARGET})
-        add_dependencies(${SRC_COPY_TARGET_NAME} ${OPS_UTILS_INC_KERNEL_TARGET})
-    endif ()
-
-    if (DEFINED SRC_COPY_BE_RELIED)
-        add_dependencies(${SRC_COPY_BE_RELIED} ${SRC_COPY_TARGET_NAME})
-    endif ()
-
-endfunction()
-
-function(add_bin_compile_target)
-    cmake_parse_arguments(BINARY "" "COMPUTE_UNIT" "OP_INFO" ${ARGN})
-
-    set(_INSTALL_DIR packages/vendors/${VENDOR_NAME}/op_impl/ai_core/tbe/kernel)
-    set(_OUT_DIR ${ASCEND_BINARY_OUT_DIR}/${BINARY_COMPUTE_UNIT})
-
-    set(BIN_OUT_DIR      ${_OUT_DIR}/bin)
-    set(GEN_OUT_DIR      ${_OUT_DIR}/gen)
-    set(SRC_OUT_DIR      ${_OUT_DIR}/src)
-    file(MAKE_DIRECTORY  ${BIN_OUT_DIR})
-    foreach(_op_info ${BINARY_OP_INFO})
-        get_filename_component(OP_PARENT_DIR "${_op_info}" DIRECTORY)
-        get_filename_component(_op_name ${_op_info} NAME)
-        set(${_op_name}_dir ${_op_info}/op_kernel)
-        
-    endforeach()
-
-    set(_ops_target_list)
-    set(compile_scripts)
-    file(GLOB scripts_list ${GEN_OUT_DIR}/*.sh)
-    list(APPEND compile_scripts ${scripts_list})
-    
-    foreach(bin_script ${compile_scripts})
-        get_filename_component(bin_file ${bin_script} NAME_WE)
-        string(REPLACE "-" ";" bin_sep ${bin_file})
-        list(GET bin_sep 0 op_type)
-        list(GET bin_sep 1 op_file)
-        list(GET bin_sep 2 op_index)
-
-        if (NOT DEFINED ${op_file}_dir)
-            continue()
-        endif ()
-
-        if (NOT TARGET ${op_file})
-            add_custom_target(${op_file})
-            add_dependencies(ops_kernel ${op_file})
-        endif ()
-
-        set(OP_TARGET_NAME ${op_file}_${BINARY_COMPUTE_UNIT})
-
-        if (NOT TARGET ${OP_TARGET_NAME})
-            add_custom_target(${OP_TARGET_NAME})
-            add_dependencies(${op_file} ${OP_TARGET_NAME})
-            list(APPEND _ops_target_list ${OP_TARGET_NAME})
-
-            set(OP_SRC_OUT_DIR  ${SRC_OUT_DIR}/${op_file})
-            set(OP_BIN_OUT_DIR  ${BIN_OUT_DIR}/${op_file})
-            file(MAKE_DIRECTORY ${OP_SRC_OUT_DIR})
-
-            add_ops_src_copy(
-                    TARGET_NAME
-                    ${OP_TARGET_NAME}_src_copy
-                    SRC
-                    ${${op_file}_dir}
-                    DST
-                    ${OP_SRC_OUT_DIR}
-                    COMPUTE_UNIT
-                    ${BINARY_COMPUTE_UNIT}
-            )
-
-            if (DEFINED ${op_file}_depends)
-                foreach(depend_info ${${op_file}_depends})
-                    get_filename_component(_depend_op_name "${depend_info}" NAME)
-                    set(_depend_op_target ${_depend_op_name}_${BINARY_COMPUTE_UNIT}_src_copy)
-                    add_ops_src_copy(
-                            TARGET_NAME
-                            ${_depend_op_target}
-                            SRC
-                            ${CMAKE_SOURCE_DIR}/src/${depend_info}
-                            DST
-                            ${SRC_OUT_DIR}/${_depend_op_name}
-                            COMPUTE_UNIT
-                            ${BINARY_COMPUTE_UNIT}
-                            BE_RELIED
-                            ${OP_TARGET_NAME}_src_copy
-                    )
-                endforeach()
-            endif ()
-
-            set(DYNAMIC_PY_FILE ${OP_SRC_OUT_DIR}/${op_type}.py)
-            add_custom_command(OUTPUT ${DYNAMIC_PY_FILE}
-                    COMMAND cp -rf ${ASCEND_IMPL_OUT_DIR}/dynamic/${op_file}.py ${DYNAMIC_PY_FILE}
-            )
-
-            add_custom_target(${OP_TARGET_NAME}_py_copy
-                    DEPENDS ${DYNAMIC_PY_FILE}
-            )
-
-            add_custom_command(OUTPUT ${OP_BIN_OUT_DIR}
-                    COMMAND mkdir -p ${OP_BIN_OUT_DIR}
-            )
-
-            add_custom_target(${OP_TARGET_NAME}_mkdir
-                    DEPENDS ${OP_BIN_OUT_DIR}
-            )
-
-            install(DIRECTORY ${OP_BIN_OUT_DIR}
-                    DESTINATION ${_INSTALL_DIR}/${BINARY_COMPUTE_UNIT} OPTIONAL
-            )
-
-            install(FILES ${BIN_OUT_DIR}/${op_file}.json
-                    DESTINATION ${_INSTALL_DIR}/config/${BINARY_COMPUTE_UNIT} OPTIONAL
-            )
-        endif ()
-
-        set(_group "1-0")
-        if (DEFINED ASCEND_OP_NAME AND NOT "${ASCEND_OP_NAME}" STREQUAL "")
-            if (NOT "${ASCEND_OP_NAME}" STREQUAL "all" AND NOT "${ASCEND_OP_NAME}" STREQUAL "ALL")
-                if (${op_file} IN_LIST ASCEND_OP_NAME)
-                    list(LENGTH ASCEND_OP_NAME _len)
-                    list(FIND ASCEND_OP_NAME ${op_file} _index)
-                    math(EXPR _next_index "${_index} + 1")
-                    if (${_next_index} LESS ${_len})
-                        list(GET ASCEND_OP_NAME ${_next_index} _group_str)
-                        set(_regex "^[0-9]+-[0-9]+$")
-                        string(REGEX MATCH "${_regex}" match "${_group_str}")
-                        if (match)
-                            set(_group   ${_group_str})
-                        endif ()
-                    endif ()
-                endif ()
-            endif ()
-        endif ()
-
-        string(REPLACE "-" ";" _group_sep ${_group})
-
-        list(GET _group_sep 1 start_index)
-        set(end_index         ${op_index})
-        list(GET _group_sep 0 step)
-
-        set(_compile_flag false)
-        if (${start_index} LESS ${end_index})
-            foreach(i RANGE ${start_index} ${end_index} ${step})
-                if (${i} EQUAL ${end_index})
-                    set(_compile_flag true)
-                    break()
-                endif ()
-            endforeach()
-        elseif (${start_index} EQUAL ${end_index})
-            set(_compile_flag true)
+        list(FIND ASCEND_COMPILE_OPS ${OP_NAME} INDEX)
+        if(NOT "${ASCEND_OP_NAME}" STREQUAL "" AND INDEX EQUAL -1)
+          # ASCEND_OP_NAME 为空表示全部编译
+          continue()
+        endif()
+        if(EXISTS "${OP_DIR}/CMakeLists.txt")
+            add_op_subdirectory()
         else()
-            set(_compile_flag false)
-        endif ()
-
-        if (_compile_flag)
-            set(_BUILD_COMMAND)
-            set(_BUILD_FLAG ${GEN_OUT_DIR}/${OP_TARGET_NAME}_${op_index}.done)
-            if (ENABLE_OPS_HOST)
-                list(APPEND _BUILD_COMMAND export ASCEND_CUSTOM_OPP_PATH=${CUSTOM_DIR} &&)
-            endif ()
-            list(APPEND _BUILD_COMMAND export HI_PYTHON="python3" &&)
-            list(APPEND _BUILD_COMMAND export TILINGKEY_PAR_COMPILE=1 &&)
-            list(APPEND _BUILD_COMMAND export BIN_FILENAME_HASHED=1 &&)
-            list(APPEND _BUILD_COMMAND bash ${bin_script} ${OP_SRC_OUT_DIR}/${op_type}.py ${OP_BIN_OUT_DIR})
-            if(CMAKE_GENERATOR MATCHES "Unix Makefiles")
-                list(APPEND _BUILD_COMMAND && echo $(MAKE))
+            if (EXISTS "${OP_DIR}/op_host/CMakeLists.txt")
+                add_subdirectory(${OP_DIR}/op_host)
             endif()
+        endif()
+      endforeach()
+    endif()
+  endforeach()
 
-            add_custom_command(OUTPUT ${_BUILD_FLAG}
-                    COMMAND ${_BUILD_COMMAND}
-                    COMMAND touch ${_BUILD_FLAG}
-                    WORKING_DIRECTORY ${GEN_OUT_DIR}
-            )
+  if("${ASCEND_OP_NAME}" STREQUAL "add_example" OR "${ASCEND_OP_NAME}" STREQUAL "add_example_aicpu")
+    add_subdirectory(examples)
+  endif()
+endmacro()
 
-            add_custom_target(${OP_TARGET_NAME}_${op_index}
-                DEPENDS ${_BUILD_FLAG}
-            )
+function(concat_op_names)
+  set(multiValueArgs OPTYPE ACLNNTYPE ACLNN_EXTRA_VERSION)
+  cmake_parse_arguments(ARG "" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
-            if (ENABLE_OPS_HOST)
-                add_dependencies(${OP_TARGET_NAME}_${op_index} optiling generate_ops_info)
-            endif ()
-            add_dependencies(${OP_TARGET_NAME}_${op_index} ${OP_TARGET_NAME}_src_copy ${OP_TARGET_NAME}_py_copy ${OP_TARGET_NAME}_mkdir)
-            add_dependencies(${OP_TARGET_NAME} ${OP_TARGET_NAME}_${op_index})
-        endif ()
-    endforeach()
+  if(${ARG_ACLNNTYPE} STREQUAL "aclnn")
+    set(ACLNN_PREFIX aclnn_${ARG_OPTYPE})
+    set(ACLNN_EXTRA_HEADER "")
+    set(ACLNN_EXTRA_SRC "")
 
-    if (_ops_target_list)
-        set(OPS_CONFIG_TARGET ops_config_${BINARY_COMPUTE_UNIT})
-        set(BINARY_INFO_CONFIG_FILE ${BIN_OUT_DIR}/binary_info_config.json)
+    list(LENGTH ARG_ACLNN_EXTRA_VERSION AclnnExtraVersionLen)
+    math(EXPR index "${AclnnExtraVersionLen} - 1")
+    if (index GREATER_EQUAL 0)
+      foreach(i RANGE ${index})
+        list(GET ARG_ACLNN_EXTRA_VERSION ${i} version)
+        list(APPEND ACLNN_EXTRA_HEADER ${ACLNN_PREFIX}_${version}.h)
+        list(APPEND ACLNN_EXTRA_SRC ${ACLNN_PREFIX}_${version}.cpp)
+      endforeach()
+    endif()
 
-        add_custom_command(OUTPUT ${BINARY_INFO_CONFIG_FILE}
-                COMMAND ${HI_PYTHON} ${ASCENDC_CMAKE_UTIL_DIR}/ascendc_ops_config.py -p ${BIN_OUT_DIR} -s ${BINARY_COMPUTE_UNIT}
-        )
+    list(APPEND ACLNN_EXTRA_HEADERS ${ACLNN_EXTRA_HEADER})
+    list(REMOVE_DUPLICATES ACLNN_EXTRA_HEADERS)
+    list(APPEND ACLNN_EXTRA_SRCS ${ACLNN_EXTRA_SRC})
+    list(REMOVE_DUPLICATES ACLNN_EXTRA_SRCS)
 
-        add_custom_target(${OPS_CONFIG_TARGET}
-                DEPENDS ${BINARY_INFO_CONFIG_FILE}
-        )
+    set(ACLNN_EXTRA_HEADERS
+      ${ACLNN_EXTRA_HEADERS}
+      CACHE STRING "Aclnn Extra Headers" FORCE
+    )
+    set(ACLNN_EXTRA_SRCS
+      ${ACLNN_EXTRA_SRCS}
+      CACHE STRING "Aclnn Extra Sources" FORCE
+    )
 
-        add_dependencies(ops_config ${OPS_CONFIG_TARGET})
+  elseif(${ARG_ACLNNTYPE} STREQUAL "aclnn_inner")
+    set(ACLNNINNER_PREFIX aclnnInner_${ARG_OPTYPE})
+    set(ACLNNINNER_EXTRA_HEADER "")
+    set(ACLNNINNER_EXTRA_SRC "")
 
-        foreach(_op_target ${_ops_target_list})
-            add_dependencies(${OPS_CONFIG_TARGET} ${_op_target})
-        endforeach()
+    list(LENGTH ARG_ACLNN_EXTRA_VERSION AclnnExtraVersionLen)
+    math(EXPR index "${AclnnExtraVersionLen} - 1")
+    if (index GREATER_EQUAL 0)
+      foreach(i RANGE ${index})
+        list(GET ARG_ACLNN_EXTRA_VERSION ${i} version)
+        list(APPEND ACLNNINNER_EXTRA_HEADER ${ACLNNINNER_PREFIX}_${version}.h)
+        list(APPEND ACLNNINNER_EXTRA_SRC ${ACLNNINNER_PREFIX}_${version}.cpp)
+      endforeach()
+    endif()
 
-        install(FILES ${BINARY_INFO_CONFIG_FILE}
-                DESTINATION ${_INSTALL_DIR}/config/${BINARY_COMPUTE_UNIT} OPTIONAL
-        )
-    endif ()
+    list(APPEND ACLNNINNER_EXTRA_HEADERS ${ACLNNINNER_EXTRA_HEADER})
+    list(REMOVE_DUPLICATES ACLNNINNER_EXTRA_HEADERS)
+    list(APPEND ACLNNINNER_EXTRA_SRCS ${ACLNNINNER_EXTRA_SRC})
+    list(REMOVE_DUPLICATES ACLNNINNER_EXTRA_SRCS)
+
+    set(ACLNNINNER_EXTRA_HEADERS
+      ${ACLNNINNER_EXTRA_HEADERS}
+      CACHE STRING "AclnnInner Extra Headers" FORCE
+    )
+    set(ACLNNINNER_EXTRA_SRCS
+      ${ACLNNINNER_EXTRA_SRCS}
+      CACHE STRING "AclnnInner Extra Sources" FORCE
+    )
+
+  endif()
 endfunction()
 
-function(redefine_file_macro)
-    cmake_parse_arguments(_FILE "" "" "TARGET_NAME" ${ARGN})
-
-    foreach(_target_name ${_FILE_TARGET_NAME})
-        target_compile_options(${_target_name} PRIVATE
-                -Wno-builtin-macro-redefined
-        )
-
-        get_target_property(_srcs ${_target_name} SOURCES)
-
-        foreach(_src ${_srcs})
-            get_filename_component(_src_name "${_src}" NAME)
-            set_source_files_properties(${_src}
-                    PROPERTIES COMPILE_DEFINITIONS __FILE__="${_src_name}"
-            )
-        endforeach()
-    endforeach()
+# 从两个长度一致的列表中查找相同位置的元素
+function(find_value_by_key key_list value_list search_key result)
+  list(LENGTH key_list key_list_length)
+  list(LENGTH value_list value_list_length)
+  if(NOT ${key_list_length} EQUAL ${value_list_length})
+    message(FATAL_ERROR "key_list length is ${key_list_length}, value_list length is ${value_list_length}, not equal")
+  endif()
+  set(found_value "")
+  if(key_list_length GREATER 0)
+    list(FIND key_list ${search_key} index)
+    if(NOT ${index} EQUAL -1)
+      list(GET value_list ${index} found_value)
+    endif()
+  endif()
+  set(${result} ${found_value} PARENT_SCOPE)
 endfunction()
 
-function(add_static_ops)
-    cmake_parse_arguments(STATIC "" "SRC_DIR" "ACLNN_SRC;ACLNN_INNER_SRC" ${ARGN})
-    set(prepare_ops_adv_static_target prepare_ops_adv_static)
-    set(static_src_temp_dir ${CMAKE_CURRENT_BINARY_DIR}/static_src_temp_dir)
-    set(modified_files)
-    foreach(ops_type ${OPS_STATIC_TYPES})
-        get_target_property(all_srcs aclnn_ops_${ops_type} SOURCES)
-        set(add_srcs)
-        set(generate_aclnn_srcs)
-        foreach(_src ${all_srcs})
-            string(REGEX MATCH "^${STATIC_SRC_DIR}" is_match "${_src}")
-            if (is_match)
-                list(APPEND add_srcs ${_src})
-            endif ()
-        endforeach()
+function(add_tiling_sources source_dir tiling_dir disable_in_opp)
+  if(NOT disable_in_opp)
+    set(disable_in_opp FALSE)
+  endif()
+  if(NOT BUILD_WITH_INSTALLED_DEPENDENCY_CANN_PKG AND disable_in_opp)
+    message(STATUS "don't need add tiling sources")
+    return()
+  endif()
 
-        foreach(_src ${add_srcs})
-            get_filename_component(name_without_ext ${_src} NAME_WE)
-            string(REGEX REPLACE "^aclnn_" "" _op_name ${name_without_ext})
+  if("${tiling_dir}" STREQUAL "")
+    file(GLOB OPTILING_SRCS ${source_dir}/*_tiling*.cpp)
+  else()
+    file(GLOB OPTILING_SRCS ${source_dir}/*_tiling*.cpp ${source_dir}/${tiling_dir}/*_tiling*.cpp)
+  endif()
+  file(GLOB_RECURSE SUB_OPTILING_SRC ${source_dir}/op_tiling/*.cpp)
 
-            foreach(_aclnn_src ${STATIC_ACLNN_SRC})
-                get_filename_component(aclnn_name ${_aclnn_src} NAME_WE)
-                if("aclnn_${_op_name}" STREQUAL "${aclnn_name}")
-                    list(APPEND generate_aclnn_srcs ${_aclnn_src})
-                    break()
-                endif()
-            endforeach()
+  if (OPTILING_SRCS OR SUB_OPTILING_SRC)
+    add_tiling_modules()
+    target_sources(${OPHOST_NAME}_tiling_obj PRIVATE ${OPTILING_SRCS} ${SUB_OPTILING_SRC})
+    target_include_directories(${OPHOST_NAME}_tiling_obj PRIVATE ${source_dir}/../../ ${source_dir})
+  endif()
+endfunction()
 
-            foreach(_aclnn_inner_src ${STATIC_ACLNN_INNER_SRC})
-                get_filename_component(aclnn_inner_name ${_aclnn_inner_src} NAME_WE)
-                if("aclnnInner_${_op_name}" STREQUAL "${aclnn_inner_name}")
-                    list(APPEND generate_aclnn_srcs ${_aclnn_inner_src})
-                    break()
-                endif()
-            endforeach()
-        endforeach()
+# useage: add_modules_sources(DIR OPTYPE ACLNNTYPE ACLNN_EXTRA_VERSION DEPENDENCIES COMPUTE_UNIT TILING_DIR DISABLE_IN_OPP) ACLNNTYPE 支持类型aclnn/aclnn_inner/aclnn_exclude OPTYPE 和 ACLNNTYPE
+# DEPENDENCIES 算子依赖
+# ACLNNEXTRAVERSION 算子版本(ex., v2, v3, 5, etc.)
+# COMPUTE_UNIT 设置支持芯片版本号，必须与TILING_DIR一一对应，示例：ascend910b ascend910_95
+# TILING_DIR 设置所支持芯片类型对应的tiling文件目录，必须与COMPUTE_UNIT一一对应，示例：arch32 arch35
+# DISABLE_IN_OPP 设置是否在opp包中编译tiling文件，布尔类型：TRUE，FALSE
+# 需一一对应
+function(add_modules_sources)
+  set(multiValueArgs OPTYPE ACLNNTYPE ACLNN_EXTRA_VERSION DEPENDENCIES COMPUTE_UNIT TILING_DIR)
+  set(oneValueArgs DIR DISABLE_IN_OPP)
 
-        if(add_srcs)
-            list(TRANSFORM add_srcs REPLACE "${STATIC_SRC_DIR}" "${static_src_temp_dir}" OUTPUT_VARIABLE add_static_srcs)
-            list(APPEND modified_files ${add_static_srcs})
-            set(aclnn_ops_static_target aclnn_ops_${ops_type}_static)
-            set_source_files_properties(${add_static_srcs}
-                    TARGET_DIRECTORY ${aclnn_ops_static_target}
-                    PROPERTIES GENERATED TRUE
-            )
+  cmake_parse_arguments(MODULE "" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+  set(SOURCE_DIR ${MODULE_DIR})
 
-            target_sources(${aclnn_ops_static_target} PRIVATE
-                    ${add_static_srcs}
-            )
-            add_dependencies(${aclnn_ops_static_target} ${prepare_ops_adv_static_target})
+  list(LENGTH MODULE_OPTYPE OpTypeLen)
+  list(LENGTH MODULE_ACLNN_EXTRA_VERSION AclnnExtraVersionLen)
+  if((AclnnExtraVersionLen GREATER 1) AND (OpTypeLen GREATER 1))
+    message(FATAL_ERROR "There should be only 1 optype if there are more than 1 aclnn extra versions!")
+  endif()
+
+  # opapi 默认全部编译
+  file(GLOB OPAPI_SRCS ${SOURCE_DIR}/op_api/*.cpp)
+  if(OPAPI_SRCS)
+    add_opapi_modules()
+    target_sources(${OPHOST_NAME}_opapi_obj PRIVATE ${OPAPI_SRCS})
+  endif()
+
+  file(GLOB OPAPI_HEADERS ${SOURCE_DIR}/op_api/aclnn_*.h)
+  if(OPAPI_HEADERS)
+    target_sources(${OPHOST_NAME}_aclnn_exclude_headers INTERFACE ${OPAPI_HEADERS})
+    target_include_directories(${OPHOST_NAME}_opapi_obj PRIVATE ${SOURCE_DIR}/op_api)
+  endif()
+
+  # op_api目录已移出的算子，SOURCE_DIR为算子根目录路径，路径不以op_host结尾；移出前SOURCE_DIR为算子op_host目录路径
+  if(NOT "${SOURCE_DIR}" MATCHES "/op_host$")
+    set(SOURCE_DIR ${SOURCE_DIR}/op_host)
+  endif()
+
+  # 获取算子层级目录名称
+  get_filename_component(PARENT_DIR ${SOURCE_DIR} DIRECTORY)
+  get_filename_component(OP_NAME ${PARENT_DIR} NAME)
+  file(APPEND ${ASCEND_SUB_CONFIG_PATH} "OP_CATEGORY;${op_category};OP_NAME;${OP_NAME};${ARGN}\n")
+  # 记录全局的COMPILED_OPS和COMPILED_OP_DIRS，其中COMPILED_OP_DIRS只记录到算子名，例如math/abs，common不记录
+  if (NOT ${OP_NAME} STREQUAL "common")
+    set(COMPILED_OPS
+        ${COMPILED_OPS} ${OP_NAME}
+        CACHE STRING "Compiled Ops" FORCE
+      )
+    set(COMPILED_OP_DIRS
+        ${COMPILED_OP_DIRS} ${PARENT_DIR}
+        CACHE STRING "Compiled Ops Dirs" FORCE
+      )
+  endif()
+
+  file(GLOB OPINFER_SRCS ${SOURCE_DIR}/*_infershape*.cpp)
+  if(OPINFER_SRCS)
+    add_infer_modules()
+    target_sources(${OPHOST_NAME}_infer_obj PRIVATE ${OPINFER_SRCS})
+  endif()
+
+  # 添加tiling文件
+  find_value_by_key("${MODULE_COMPUTE_UNIT}" "${MODULE_TILING_DIR}" "${ASCEND_COMPUTE_UNIT}" tiling_dir)
+  add_tiling_sources("${SOURCE_DIR}" "${tiling_dir}" "${MODULE_DISABLE_IN_OPP}")
+
+  file(GLOB AICPU_SRCS ${SOURCE_DIR}/*_aicpu*.cpp)
+  if(AICPU_SRCS)
+    add_aicpu_kernel_modules()
+    target_sources(${OPHOST_NAME}_aicpu_obj PRIVATE ${AICPU_SRCS})
+  endif()
+
+  if(MODULE_OPTYPE)
+    list(LENGTH MODULE_OPTYPE OpTypeLen)
+    list(LENGTH MODULE_ACLNNTYPE AclnnTypeLen)
+    if(NOT ${OpTypeLen} EQUAL ${AclnnTypeLen})
+      message(FATAL_ERROR "OPTYPE AND ACLNNTYPE Should be One-to-One")
+    endif()
+    math(EXPR index "${OpTypeLen} - 1")
+    foreach(i RANGE ${index})
+      list(GET MODULE_OPTYPE ${i} OpType)
+      list(GET MODULE_ACLNNTYPE ${i} AclnnType)
+      if(${AclnnType} STREQUAL "aclnn"
+         OR ${AclnnType} STREQUAL "aclnn_inner"
+         OR ${AclnnType} STREQUAL "aclnn_exclude"
+        )
+        file(GLOB OPDEF_SRCS ${SOURCE_DIR}/${OpType}_def*.cpp)
+        if(OPDEF_SRCS)
+          target_sources(${OPHOST_NAME}_opdef_${AclnnType}_obj INTERFACE ${OPDEF_SRCS})
         endif()
-
-        if(generate_aclnn_srcs)
-            list(REMOVE_DUPLICATES generate_aclnn_srcs)
-            set(aclnn_op_target acl_op_${ops_type}_builtin)
-            set_source_files_properties(${generate_aclnn_srcs}
-                    TARGET_DIRECTORY ${aclnn_op_target}
-                    PROPERTIES GENERATED TRUE
-            )
-
-            target_sources(${aclnn_op_target} PRIVATE
-                    ${generate_aclnn_srcs}
-            )
+        if(AclnnExtraVersionLen GREATER 0)
+          concat_op_names(OPTYPE ${OpType} ACLNNTYPE ${AclnnType} ACLNN_EXTRA_VERSION ${MODULE_ACLNN_EXTRA_VERSION})
         endif()
+      elseif(${AclnnType} STREQUAL "no_need_aclnn")
+        message(STATUS "aicpu or host aicpu no need aclnn.")
+      else()
+        message(FATAL_ERROR "ACLNN TYPE UNSPPORTED, ONLY SUPPORT aclnn/aclnn_inner/aclnn_exclude")
+      endif()
     endforeach()
-
-    if(NOT TARGET ${prepare_ops_adv_static_target})
-        list(REMOVE_DUPLICATES modified_files)
-        add_custom_command(OUTPUT ${static_src_temp_dir}
-                COMMAND mkdir -p ${static_src_temp_dir}
-                COMMAND cp -rf ${STATIC_SRC_DIR}/src ${static_src_temp_dir}
-                COMMAND ${HI_PYTHON} -B ${OPS_STATIC_SCRIPT} InsertIni -p ${static_src_temp_dir} -f ${modified_files}
+  else()
+    file(GLOB OPDEF_SRCS ${SOURCE_DIR}/*_def*.cpp)
+    if(OPDEF_SRCS)
+      message(
+        FATAL_ERROR
+          "Should Manually specify aclnn/aclnn_inner/aclnn_exclude\n"
+          "usage: add_modules_sources(OPTYPE optypes ACLNNTYPE aclnntypes)\n"
+          "example: add_modules_sources(OPTYPE add ACLNNTYPE aclnn_exclude)"
         )
+    endif()
+  endif()
+endfunction()
 
-        add_custom_target(${prepare_ops_adv_static_target}
-                DEPENDS ${static_src_temp_dir}
-        )
+# useage: add_graph_plugin_sources()
+macro(add_graph_plugin_sources)
+  set(SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+
+  # 获取算子层级目录名称，判断是否编译该算子
+  get_filename_component(PARENT_DIR ${SOURCE_DIR} DIRECTORY)
+  get_filename_component(OP_NAME ${PARENT_DIR} NAME)
+  if(DEFINED ASCEND_OP_NAME
+     AND NOT "${ASCEND_OP_NAME}" STREQUAL ""
+     AND NOT "${ASCEND_OP_NAME}" STREQUAL "all"
+     AND NOT "${ASCEND_OP_NAME}" STREQUAL "ALL"
+    )
+    if(NOT ${OP_NAME} IN_LIST ASCEND_OP_NAME)
+      return()
+    endif()
+  endif()
+
+  file(GLOB GRAPH_PLUGIN_SRCS ${SOURCE_DIR}/*_graph*.cpp)
+  if(GRAPH_PLUGIN_SRCS)
+    add_graph_plugin_modules()
+    target_sources(${GRAPH_PLUGIN_NAME}_obj PRIVATE ${GRAPH_PLUGIN_SRCS})
+  endif()
+
+  file(GLOB GRAPH_PLUGIN_PROTO_HEADERS ${SOURCE_DIR}/*_proto*.h)
+  if(GRAPH_PLUGIN_PROTO_HEADERS)
+    target_sources(${GRAPH_PLUGIN_NAME}_proto_headers INTERFACE ${GRAPH_PLUGIN_PROTO_HEADERS})
+  endif()
+endmacro()
+
+# ######################################################################################################################
+# get operating system info
+# ######################################################################################################################
+function(get_system_info SYSTEM_INFO)
+  if(UNIX)
+    execute_process(
+      COMMAND
+        grep -i ^id= /etc/os-release
+      OUTPUT_VARIABLE TEMP
+      )
+    string(REGEX REPLACE "\n|id=|ID=|\"" "" SYSTEM_NAME ${TEMP})
+    set(${SYSTEM_INFO}
+        ${SYSTEM_NAME}_${CMAKE_SYSTEM_PROCESSOR}
+        PARENT_SCOPE
+      )
+  elseif(WIN32)
+    message(STATUS "System is Windows. Only for pre-build.")
+  else()
+    message(FATAL_ERROR "${CMAKE_SYSTEM_NAME} not support.")
+  endif()
+endfunction()
+
+# ######################################################################################################################
+# add compile options, e.g.: -g -O0
+# ######################################################################################################################
+function(add_ops_compile_options OP_TYPE)
+  cmake_parse_arguments(OP_COMPILE "" "OP_TYPE" "COMPUTE_UNIT;OPTIONS" ${ARGN})
+  execute_process(
+    COMMAND
+      ${ASCEND_PYTHON_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/util/ascendc_gen_options.py
+      ${ASCEND_AUTOGEN_PATH}/${CUSTOM_COMPILE_OPTIONS} ${OP_TYPE} ${OP_COMPILE_COMPUTE_UNIT} ${OP_COMPILE_OPTIONS}
+    RESULT_VARIABLE EXEC_RESULT
+    OUTPUT_VARIABLE EXEC_INFO
+    ERROR_VARIABLE EXEC_ERROR
+    )
+  if(${EXEC_RESULT})
+    message("add ops compile options info: ${EXEC_INFO}")
+    message("add ops compile options error: ${EXEC_ERROR}")
+    message(FATAL_ERROR "add ops compile options failed!")
+  endif()
+endfunction()
+
+###################################################################################################
+# get op_type from *_binary.json
+###################################################################################################
+function(get_op_type_from_binary_json BINARY_JSON OP_TYPE)
+  execute_process(COMMAND grep -w op_type ${BINARY_JSON} OUTPUT_VARIABLE op_type)
+  string(REGEX REPLACE "\"op_type\"" "" op_type ${op_type})
+  string(REGEX MATCH "\".+\"" op_type ${op_type})
+  string(REGEX REPLACE "\"" "" op_type ${op_type})
+
+  set(${OP_TYPE} ${op_type} PARENT_SCOPE)
+endfunction()
+
+###################################################################################################
+# convert short socVersion to long socVersion
+###################################################################################################
+function(map_compute_unit compute_unit compute_unit_long)
+    set(compute_unit_keys "ascend910b" "ascend310p" "ascend910_93" "ascend910_95")
+    set(compute_unit_values "ascend910b1" "ascend310p1" "ascend910_9391" "ascend910_9599")
+    list(FIND compute_unit_keys ${compute_unit} index)
+    if(NOT index EQUAL -1)
+        list(GET compute_unit_values ${index} mapped_value)
+        set(${compute_unit_long} ${mapped_value} PARENT_SCOPE)
+    else()
+        set(${compute_unit_long} ${compute_unit} PARENT_SCOPE)
     endif()
 endfunction()
 
-if (BUILD_OPEN_PROJECT)
-    if (TESTS_UT_OPS_TEST)
-        include(${OPS_ADV_CMAKE_DIR}/func_utest.cmake)
-    endif ()
-    if (TESTS_EXAMPLE_OPS_TEST)
-        include(${OPS_ADV_CMAKE_DIR}/func_examples.cmake)
-    endif ()
-endif ()
-
-function(add_npu_support_target)
-    cmake_parse_arguments(NPUSUP "" "TARGET;OPS_INFO_DIR;OUT_DIR;INSTALL_DIR" "" ${ARGN})
-    get_filename_component(npu_sup_file_path "${NPUSUP_OUT_DIR}" DIRECTORY)
-    add_custom_command(OUTPUT ${NPUSUP_OUT_DIR}/npu_supported_ops.json
-        COMMAND mkdir -p ${NPUSUP_OUT_DIR}
-        COMMAND ${CMAKE_SOURCE_DIR}/cmake/util/gen_ops_filter.sh
-                ${NPUSUP_OPS_INFO_DIR}
-                ${NPUSUP_OUT_DIR}
-    )
-    add_custom_target(npu_supported_ops ALL
-        DEPENDS ${NPUSUP_OUT_DIR}/npu_supported_ops.json
-    )
-    install(FILES ${NPUSUP_OUT_DIR}/npu_supported_ops.json
-        DESTINATION ${NPUSUP_INSTALL_DIR}
-    )
+###################################################################################################
+# get target dir of different socVersions
+###################################################################################################
+function(get_target_dir compute_unit_long target_dir)
+  set(compute_unit_long_values "ascend910b1" "ascend310p1" "ascend910_9391" "ascend910_9599")
+  set(target_dir_values "arch22" "" "" "arch35")
+  list(FIND compute_unit_long_values ${compute_unit_long} index)
+  if(NOT index EQUAL -1)
+        list(GET target_dir_values ${index} mapped_value)
+        set(${target_dir} ${mapped_value} PARENT_SCOPE)
+    else()
+        set(${target_dir} "" PARENT_SCOPE)
+    endif()
 endfunction()
+
+function(protobuf_generate_external comp c_var h_var)
+  if (NOT ARGN)
+    message(SEND_ERROR "Error: protobuf_generate_external() called without any proto files")
+    return()
+  endif()
+
+  set(${c_var})
+  set(${h_var})
+  set(_add_target FALSE)
+
+  set(extra_option "")
+  foreach(arg ${ARGN})
+    if ("${arg}" MATCHES "--proto_path")
+      set(extra_option ${arg})
+    endif()
+  endforeach()
+
+  foreach(file ${ARGN})
+    if ("${file}" STREQUAL "TARGET")
+      set(_add_target TRUE)
+      continue()
+    endif()
+
+    if ("${file}" MATCHES "--proto_path")
+      continue()
+    endif()
+
+    get_filename_component(abs_file ${file} ABSOLUTE)
+    get_filename_component(file_name ${file} NAME_WE)
+    get_filename_component(file_dir ${abs_file} PATH)
+    get_filename_component(parent_subdir ${file_dir} NAME)
+
+    if ("${parent_subdir}" STREQUAL "proto")
+      set(proto_output_path ${CMAKE_BINARY_DIR}/proto/${comp}/proto)
+    else()
+      set(proto_output_path ${CMAKE_BINARY_DIR}/proto/${comp}/proto/${parent_subdir})
+    endif()
+    list(APPEND ${c_var} "${proto_output_path}/${file_name}.pb.cc")
+    list(APPEND ${h_var} "${proto_output_path}/${file_name}.pb.h")
+
+    add_custom_command(
+      OUTPUT "${proto_output_path}/${file_name}.pb.cc" "${proto_output_path}/${file_name}.pb.h"
+      WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${proto_output_path}"
+      COMMAND ${CMAKE_COMMAND} -E echo "generate proto cpp_out ${comp} by ${abs_file}"
+      COMMAND ${Protobuf_PROTOC_EXECUTABLE} -I${file_dir} ${extra_option} --cpp_out=${proto_output_path} ${abs_file}
+      DEPENDS ${abs_file} ascend_protobuf_build_nn json
+      COMMENT "Running C++ protocol buffer compiler on ${file}" VERBATIM)
+
+  endforeach()
+
+    if (_add_target)
+      add_custom_target(
+        ${comp} DEPENDS ${${c_var}} ${${h_var}}) 
+    endif()
+
+    set_source_files_properties(${${c_var}} ${${h_var}} PROPERTIES GENERATED TRUE)
+    set(${c_var} ${${c_var}} PARENT_SCOPE)
+    set(${h_var} ${${h_var}} PARENT_SCOPE)
+
+endfunction()
+
+function(add_onnx_plugin_modules)
+  if (NOT TARGET ${ONNX_PLUGIN_NAME}_obj)
+    set(ge_onnx_proto_srcs
+      ${ASCEND_DIR}/include/proto/ge_onnx.proto)
+    
+    protobuf_generate_external(onnx ge_onnx_proto_cc ge_onnx_proto_h ${ge_onnx_proto_srcs})
+
+    if(BUILD_WITH_INSTALLED_DEPENDENCY_CANN_PKG)
+      npu_op_library(${ONNX_PLUGIN_NAME}_obj GRAPH ${ge_onnx_proto_h} )
+    else()
+      add_library(${ONNX_PLUGIN_NAME}_obj OBJECT ${ge_onnx_proto_h})
+    endif()
+    # 为特定目标设置C++14标准
+    set_target_properties(${ONNX_PLUGIN_NAME}_obj PROPERTIES
+      CXX_STANDARD 14
+      CXX_STANDARD_REQUIRED ON
+      CXX_EXTENSIONS OFF
+    )
+    target_include_directories(${ONNX_PLUGIN_NAME}_obj PRIVATE ${OP_PROTO_INCLUDE} ${Protobuf_INCLUDE} ${Protobuf_PATH} ${CMAKE_BINARY_DIR}/proto ${ONNX_PLUGIN_COMMON_INCLUDE} ${JSON_INCLUDE} ${ABSL_SOURCE_DIR})
+    target_compile_definitions(${ONNX_PLUGIN_NAME}_obj PRIVATE OPS_UTILS_LOG_SUB_MOD_NAME="ONNX_PLUGIN" LOG_CPP)
+
+    if(BUILD_WITH_INSTALLED_DEPENDENCY_CANN_PKG)
+      target_compile_options(
+        ${ONNX_PLUGIN_NAME}_obj PRIVATE -Dgoogle=ascend_private -fvisibility=hidden -Wno-shadow -Wno-unused-parameter
+      )
+    else()
+      target_compile_options(
+        ${ONNX_PLUGIN_NAME}_obj PRIVATE $<$<NOT:$<BOOL:${ENABLE_TEST}>>:-DDISABLE_COMPILE_V1> -Dgoogle=ascend_private
+                                       -fvisibility=hidden -Wno-shadow -Wno-unused-parameter
+      )
+    endif()
+
+    target_link_libraries(
+      ${ONNX_PLUGIN_NAME}_obj
+      PRIVATE $<BUILD_INTERFACE:$<IF:$<BOOL:${ENABLE_TEST}>,intf_llt_pub_asan_cxx17,intf_pub_cxx14>>
+              $<BUILD_INTERFACE:dlog_headers>
+              $<$<TARGET_EXISTS:ops_base_util_objs>:$<TARGET_OBJECTS:ops_base_util_objs>>
+              $<$<TARGET_EXISTS:ops_base_infer_objs>:$<TARGET_OBJECTS:ops_base_infer_objs>>
+      )
+  endif()
+endfunction()
+
+macro(add_onnx_plugin_sources)
+  set(SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+
+  file(GLOB ONNX_PLUGIN_SRCS ${SOURCE_DIR}/*_onnx_plugin.cpp)
+  if(ONNX_PLUGIN_SRCS)
+    add_onnx_plugin_modules()
+    target_sources(${ONNX_PLUGIN_NAME}_obj PRIVATE ${ONNX_PLUGIN_SRCS})
+  else()
+    message(STATUS "ONNX_PLUGIN_SRCS is empty")
+  endif()
+endmacro()
