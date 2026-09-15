@@ -131,9 +131,8 @@ CAMPAIGN_ID="$({
         direct_matmul/mat_mul_v3_tiling_data_280.h \
         direct_matmul/runner.cpp \
         novel_matmul/direct_init_split_k_kernel.h
-    sha256sum \
-        colleague_matmul_v3/op_kernel/mat_mul_v3.cpp \
-        colleague_matmul_v3/op_kernel/mat_mul_v3_tiling_key.h
+    find colleague_matmul_v3/op_kernel -type f -print0 | \
+        sort -z | xargs -0 sha256sum
 } | sha256sum | cut -c1-20)"
 CAMPAIGN_ROOT="${ROOT}/results/matmul_complete_formula_v1"
 CAMPAIGN_DIR="${CAMPAIGN_ROOT}/${CAMPAIGN_ID}"

@@ -31,7 +31,10 @@ constexpr uint64_t SINGLE_COPY_SIZE = 256;
 
 constexpr uint32_t M_BLOCK_NUM_ELE_LIST[16] = {1, 16, 8, 16, 4, 16, 8, 16, 2, 16, 8, 16, 4, 16, 8, 16};
 constexpr uint32_t GCD_LIST[16] = {16, 1, 2, 1, 4, 1, 2, 1, 8, 1, 2, 1, 4, 1, 2, 1};
-constexpr TransDataTo5HDParams PARA_ONE(false, false, 1, 0, 0);
+// CANN 8.1's TransDataTo5HDParams constructor is __aicore__, but not
+// constexpr.  Keep the exact parameter values used by the later source route
+// while using the storage form from the installed 8.1 MatMulV3 implementation.
+const TransDataTo5HDParams PARA_ONE(false, false, 1, 0, 0);
 
 enum class ND2NZ_DB_TYPE : int32_t { IN_OUTPUT, OUTPUT, NO_DB_REUSE_OUTPUT };
 

@@ -677,9 +677,11 @@ __aicore__ inline void MatMulMultiCoreSplitKDivide(GM_ADDR aGM, GM_ADDR bGM, GM_
         mmStaticConfigMK);
     constexpr static MatmulApiStaticTiling staticTilingNK = GetMatmulApiTiling<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE>(
         mmStaticConfigNK);
-    MatmulImpl<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, staticTilingMK, MatmulCallBackFunc<nullptr, nullptr, nullptr>,
-               AscendC::Impl::Detail::NBuffer33MatmulPolicy>
-        mmmk_33;
+    // NBuffer33MatmulPolicy was introduced after CANN 8.1.  On 8.1 the
+    // corresponding deterministic Split-K MK path uses the default policy for
+    // this same static tiling.  Keep a separate instance so the 3x3 branch and
+    // its workspace ownership remain independent from the normal MK branch.
+    MatmulImpl<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, staticTilingMK> mmmk_33;
     MatmulImpl<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, staticTilingMK> mmmk;
     MatmulImpl<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, staticTilingNK> mmnk;
 #endif
