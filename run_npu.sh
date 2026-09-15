@@ -40,6 +40,55 @@ announce() {
     printf '%s\n' "$*" >&3
 }
 
+extract_build_diagnostic() {
+    local log_file="$1"
+    python3 - "${log_file}" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+if not path.is_file():
+    print("compiler diagnostic log is missing")
+    raise SystemExit(0)
+
+lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+make_failure = re.compile(
+    r"(?:^|\s)(?:g?make)(?:\[\d+\])?:.*(?:\*\*\*|error\s+\d+)",
+    re.IGNORECASE,
+)
+semantic_error = re.compile(
+    r"(?:fatal\s+)?error\s*:|undefined reference|undeclared identifier|"
+    r"not declared in this scope|no member named|has no member|"
+    r"no matching (?:function|member)|static assertion failed|"
+    r"too (?:few|many) arguments|cannot (?:convert|initialize)",
+    re.IGNORECASE,
+)
+error_indexes = [
+    index for index, line in enumerate(lines)
+    if semantic_error.search(line) and not make_failure.search(line)
+]
+if error_indexes:
+    first = error_indexes[0]
+    selected = lines[max(0, first - 6):min(len(lines), first + 15)]
+else:
+    selected = [
+        line for line in lines[-100:]
+        if line.strip() and not make_failure.search(line)
+    ][-24:]
+
+compact = []
+for line in selected:
+    normalized = " ".join(line.strip().split())
+    if normalized and (not compact or normalized != compact[-1]):
+        compact.append(normalized)
+diagnostic = " | ".join(compact)
+if not diagnostic:
+    diagnostic = "compiler diagnostic unavailable"
+print(diagnostic[:6000])
+PY
+}
+
 export CANN_ROOT=/usr/local/Ascend/ascend-toolkit/8.1
 export ASCEND_MATMUL_MANUAL_ENV=1
 export ASCENDC_SOC_VERSION=Ascend910B3
@@ -212,13 +261,7 @@ for variant_manifest in "${VARIANT_DIR}"/*.csv; do
     else
         variant_rc=$?
         route_preflight_failures+=("variant=${variant} stage=build rc=${variant_rc}")
-        variant_detail="$(
-            awk '/error:|fatal:|undefined reference|CMake Error|make.*Error|ninja.*failed/ { print }' \
-                "${ROOT}/build/kernel_build.log" 2>/dev/null | tail -5 | tr '\n' ' '
-        )"
-        if [[ -z "${variant_detail}" ]]; then
-            variant_detail="$(tail -5 "${ROOT}/build/kernel_build.log" 2>/dev/null | tr '\n' ' ')"
-        fi
+        variant_detail="$(extract_build_diagnostic "${ROOT}/build/kernel_build.log")"
         route_preflight_details+=("variant=${variant} ${variant_detail:-compiler diagnostic unavailable}")
         continue
     fi
