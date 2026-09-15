@@ -12,6 +12,9 @@
 #include <memory>
 #include <vector>
 #include "acl/acl.h"
+// new begin: repeatable executor for device-event latency measurement
+#include "aclnn/acl_meta.h"
+// new end: repeatable executor for device-event latency measurement
 #include "aclnnop/aclnn_matmul.h"
 
 #define CHECK_RET(cond, return_expr) \
@@ -113,6 +116,11 @@ int main() {
   // 调用aclnnMatmul第一段接口
   ret = aclnnMatmulGetWorkspaceSize(self, mat2, out, cubeMathType, &workspaceSize, &executor);
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMatmulGetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
+  // new begin: allow warmup and repeated timed launches with the same executor
+  ret = aclSetAclOpExecutorRepeatable(executor);
+  CHECK_RET(ret == ACL_SUCCESS,
+            LOG_PRINT("aclSetAclOpExecutorRepeatable failed. ERROR: %d\n", ret); return ret);
+  // new end: allow warmup and repeated timed launches with the same executor
   // 根据第一段接口计算出的workspaceSize申请device内存
   void* workspaceAddr = nullptr;
   if (workspaceSize > 0) {
@@ -120,13 +128,53 @@ int main() {
     CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("allocate workspace failed. ERROR: %d\n", ret); return ret);
     executorAddrPtr.reset(workspaceAddr);
   }
-  // 调用aclnnMatmul第二段接口
-  ret = aclnnMatmul(workspaceAddr, workspaceSize, executor, stream);
-  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMatmul failed. ERROR: %d\n", ret); return ret);
+  // original begin: single untimed launch
+  // // 调用aclnnMatmul第二段接口
+  // ret = aclnnMatmul(workspaceAddr, workspaceSize, executor, stream);
+  // CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMatmul failed. ERROR: %d\n", ret); return ret);
+  //
+  // // 4. （固定写法）同步等待任务执行结束
+  // ret = aclrtSynchronizeStream(stream);
+  // CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSynchronizeStream failed. ERROR: %d\n", ret); return ret);
+  // original end: single untimed launch
 
-  // 4. （固定写法）同步等待任务执行结束
+  // new begin: minimal warmup plus one device-event batch average
+  constexpr int warmup = 10;
+  constexpr int repeat = 100;
+
+  for (int i = 0; i < warmup; ++i) {
+    ret = aclnnMatmul(workspaceAddr, workspaceSize, executor, stream);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+  }
   ret = aclrtSynchronizeStream(stream);
-  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSynchronizeStream failed. ERROR: %d\n", ret); return ret);
+  CHECK_RET(ret == ACL_SUCCESS, return ret);
+
+  aclrtEvent startEvent = nullptr;
+  aclrtEvent endEvent = nullptr;
+  ret = aclrtCreateEvent(&startEvent);
+  CHECK_RET(ret == ACL_SUCCESS, return ret);
+  ret = aclrtCreateEvent(&endEvent);
+  CHECK_RET(ret == ACL_SUCCESS, return ret);
+
+  ret = aclrtRecordEvent(startEvent, stream);
+  CHECK_RET(ret == ACL_SUCCESS, return ret);
+  for (int i = 0; i < repeat; ++i) {
+    ret = aclnnMatmul(workspaceAddr, workspaceSize, executor, stream);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+  }
+  ret = aclrtRecordEvent(endEvent, stream);
+  CHECK_RET(ret == ACL_SUCCESS, return ret);
+  ret = aclrtSynchronizeEvent(endEvent);
+  CHECK_RET(ret == ACL_SUCCESS, return ret);
+
+  float totalMs = 0.0F;
+  ret = aclrtEventElapsedTime(&totalMs, startEvent, endEvent);
+  CHECK_RET(ret == ACL_SUCCESS, return ret);
+  LOG_PRINT("MATMUL_LATENCY average_ms=%.9f repeat=%d\n", totalMs / repeat, repeat);
+
+  aclrtDestroyEvent(endEvent);
+  aclrtDestroyEvent(startEvent);
+  // new end: minimal warmup plus one device-event batch average
 
   // 5. 获取输出的值，将device侧内存上的结果拷贝至host侧，需要根据具体API的接口定义修改
   auto size = GetShapeSize(outShape);
@@ -134,9 +182,22 @@ int main() {
   ret = aclrtMemcpy(resultData.data(), resultData.size() * sizeof(resultData[0]), outDeviceAddr,
                     size * sizeof(resultData[0]), ACL_MEMCPY_DEVICE_TO_HOST);
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("copy result from device to host failed. ERROR: %d\n", ret); return ret);
-  for (int64_t i = 0; i < size; i++) {
-    LOG_PRINT("result[%ld] is: %f\n", i, resultData[i]);
+  // original begin: print every output element
+  // for (int64_t i = 0; i < size; i++) {
+  //   LOG_PRINT("result[%ld] is: %f\n", i, resultData[i]);
+  // }
+  // original end: print every output element
+
+  // new begin: one compact correctness line instead of hundreds of result lines
+  int64_t mismatches = 0;
+  const float expected = static_cast<float>(mat2Shape[0]);
+  for (const float value : resultData) {
+    if (value != expected) {
+      ++mismatches;
+    }
   }
+  LOG_PRINT("MATMUL_CORRECTNESS mismatches=%ld elements=%ld expected=%f\n", mismatches, size, expected);
+  // new end: one compact correctness line instead of hundreds of result lines
 
   // 6. 释放device资源，需要根据具体API的接口定义修改
   aclrtDestroyStream(stream);
