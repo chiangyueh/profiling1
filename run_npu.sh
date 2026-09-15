@@ -235,11 +235,12 @@ with open(output, "w", newline="", encoding="utf-8") as stream:
     writer.writeheader()
     writer.writerow(row)
 PY
-    if "${runner}" --manifest "${canary}" --device "${DEVICE_ID}" \
-        --warmup 0 --repeat 1 --samples 1; then
-        :
+    if canary_output="$("${runner}" --manifest "${canary}" --device "${DEVICE_ID}" \
+        --warmup 0 --repeat 1 --samples 1 2>&1)"; then
+        announce "ROUTE_CANARY_PASS variant=${variant}"
     else
         variant_rc=$?
+        printf '%s\n' "${canary_output}"
         route_preflight_failures+=("variant=${variant} stage=npu_canary rc=${variant_rc}")
     fi
 done
@@ -268,6 +269,7 @@ announce "MEASUREMENT begin shapes=${NPU_SHAPES}"
     --structured-full-preflight --validate-after-measurement
 
 measurement_failures=()
+announce "DIRECT_FORMAL_MEASUREMENT_RESULTS_BEGIN shapes=${NPU_SHAPES} variants=${EXPECTED_VARIANTS}"
 for variant_manifest in "${VARIANT_DIR}"/*.csv; do
     variant="$(basename "${variant_manifest}" .csv)"
     runner="${ROOT}/build/direct_runners/direct_matmul_${variant}"
@@ -281,6 +283,7 @@ for variant_manifest in "${VARIANT_DIR}"/*.csv; do
         measurement_failures+=("variant=${variant} rc=${variant_rc} ${fatal_line}")
     fi
 done
+announce "DIRECT_FORMAL_MEASUREMENT_RESULTS_END"
 
 if ((${#measurement_failures[@]})); then
     announce "DIRECT_MEASUREMENT_FAILURES_BEGIN count=${#measurement_failures[@]}"

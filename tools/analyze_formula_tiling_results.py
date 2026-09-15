@@ -11,10 +11,17 @@ from pathlib import Path
 import statistics
 
 
-EXPECTED_SHAPES = 240
+EXPECTED_SHAPES = 285
 EXPECTED_SAMPLES = 5
 EXPECTED_WARMUP = 1
 EXPECTED_REPEAT = 3
+FORMAL_RESULTS_BEGIN = "DIRECT_FORMAL_MEASUREMENT_RESULTS_BEGIN"
+FORMAL_RESULTS_END = "DIRECT_FORMAL_MEASUREMENT_RESULTS_END"
+ALLOWED_CANDIDATE_ROLES = {
+    "independent_formula_tiling",
+    "experimental_derivative_schedule",
+    "bundled_later_official_source_route",
+}
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
@@ -24,14 +31,36 @@ def read_csv(path: Path) -> list[dict[str, str]]:
 
 def direct_results(path: Path) -> dict[str, dict]:
     output = {}
+    in_formal_results = False
+    begin_count = 0
+    end_count = 0
     for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith(FORMAL_RESULTS_BEGIN):
+            begin_count += 1
+            if begin_count != 1 or in_formal_results or end_count:
+                raise RuntimeError("invalid formal direct-result section begin marker")
+            in_formal_results = True
+            continue
+        if line.startswith(FORMAL_RESULTS_END):
+            end_count += 1
+            if not in_formal_results or end_count != 1:
+                raise RuntimeError("invalid formal direct-result section end marker")
+            in_formal_results = False
+            continue
+        if not in_formal_results:
+            continue
         if not line.startswith("DIRECT_MATMUL_RESULT "):
             continue
         row = json.loads(line.split(" ", 1)[1])
         workload_id = row["workload_id"]
         if workload_id in output:
-            raise RuntimeError(f"duplicate direct result for {workload_id}")
+            raise RuntimeError(f"duplicate formal direct result for {workload_id}")
         output[workload_id] = row
+    if begin_count != 1 or end_count != 1 or in_formal_results:
+        raise RuntimeError(
+            "formal direct-result section missing or incomplete: "
+            f"begin={begin_count} end={end_count} active={int(in_formal_results)}"
+        )
     return output
 
 
@@ -100,9 +129,8 @@ def main() -> None:
         candidate_samples = [float(value) for value in measured.get("samples_ms", [])]
         if not (
             measured.get("status") == "success"
-            and measured.get("candidate_role") in (
-                "independent_formula_tiling", "independent_experimental_family"
-            )
+            and measured.get("candidate_role") in ALLOWED_CANDIDATE_ROLES
+            and measured.get("candidate_role") == expected["candidate_role"]
             and measured.get("measurement_source") == "direct_tiling_buffer"
             and measured.get("tiling_applied") == 1
             and measured.get("full_output_validated") == 1
@@ -167,7 +195,10 @@ def main() -> None:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]), lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
-    print("FORMULA_RESULT_ANALYSIS passed shapes=240 outputs_validated=240")
+    print(
+        f"FORMULA_RESULT_ANALYSIS passed shapes={len(rows)} "
+        f"outputs_validated={len(rows)}"
+    )
 
 
 if __name__ == "__main__":
