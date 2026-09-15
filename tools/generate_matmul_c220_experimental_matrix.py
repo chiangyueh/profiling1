@@ -27,7 +27,7 @@ FIELDS = (
     "nd2nz_b", "required_successful_tilings",
 )
 EXPECTED_ROWS = 228
-EXPECTED_NPU_ROWS = 224
+EXPECTED_NPU_ROWS = 226
 EXPECTED_FAMILIES = {
     "MULTI_CORE_SPLIT_K", "SINGLE_CORE_NKM_SPLIT_K",
     "SINGLE_CORE_SPLIT_K_GM_TO_L1",
@@ -37,6 +37,7 @@ EXPECTED_FAMILIES = {
 EXPECTED_VARIANTS = {
     ("fp32", 41), ("fp32", 51),
     ("fp16", 121), ("bf16", 121),
+    ("fp16", 60), ("fp16", 61),
 }
 
 
@@ -81,9 +82,11 @@ def main() -> None:
         "SINGLE_CORE_SPLIT_K_GM_TO_L1_UNALIGNED": 60,
         "SINGLE_CORE_SPLIT_K_AL1_FULL_LOAD": 121,
     }[row["required_family"]])) for row in contract
-        if row["required_family"] not in (
-            "SINGLE_CORE_SPLIT_K_GM_TO_L1",
-            "SINGLE_CORE_SPLIT_K_GM_TO_L1_UNALIGNED",
+        if not (
+            row["required_family"] in (
+                "SINGLE_CORE_SPLIT_K_GM_TO_L1",
+                "SINGLE_CORE_SPLIT_K_GM_TO_L1_UNALIGNED",
+            ) and row["dtype"] == "bf16"
         )}
     if len(contract) != EXPECTED_ROWS or len(ids) != EXPECTED_ROWS:
         raise RuntimeError(f"C220 contract must contain {EXPECTED_ROWS} unique workloads")

@@ -50,8 +50,7 @@ FAMILY_REGISTRY = {
     "GM_TO_L1_SINGLE_CORE_SPLIT_K": {
         "bundled_suffixes": (60, 61),
         "ownership": "MN_WITH_EXPLICIT_GM_L1_PIPELINE",
-        "cann81_build": False,
-        "blocker": "requires CANN 8.5 Iterate(bool,LocalTensor<L0C>)",
+        "cann81_build": True,
         "origin": "LATER_OFFICIAL_SOURCE_BACKPORT",
         "repository_owned_kernel": False,
     },

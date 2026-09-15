@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Closed-form tiler for repository-owned C220 execution families."""
+"""Closed-form tiler for repository experimental C220 schedule derivatives."""
 from __future__ import annotations
 
 import hashlib
@@ -142,7 +142,7 @@ def select_family(req: dict, required_family: str | None = None) -> tuple[str, s
             raise ValueError(f"shape is not applicable to required family={required_family}")
         return required[0]
     if len(matches) != 1:
-        raise ValueError(f"novel family rule must have exactly one match, got {matches}")
+        raise ValueError(f"experimental derivative rule must have exactly one match, got {matches}")
     return matches[0]
 
 
@@ -363,7 +363,7 @@ def validate_cube(cube: dict, family: str) -> dict:
             "full_k_parent_tile": cube["singleCoreK"] == cube["Ka"],
         })
     if not all(checks.values()):
-        raise ValueError(f"illegal novel candidate: {checks}")
+        raise ValueError(f"illegal experimental derivative: {checks}")
     return checks
 
 
@@ -400,8 +400,9 @@ def generate(m: int, k: int, n: int, dtype: str,
     if len(blob) != 280 or unpack_packet(blob) != packet:
         raise RuntimeError("custom 280-byte packet roundtrip mismatch")
     return {
-        "status": "NOVEL_EXECUTABLE_FAMILY_TILING",
-        "origin": "REPOSITORY_OWNED_NOT_OFFICIAL_BACKPORT",
+        "status": "EXPERIMENTAL_DERIVATIVE_SCHEDULE_TILING",
+        "origin": "REPOSITORY_EXPERIMENTAL_DERIVATIVE_OF_OFFICIAL_SPLIT_K_AND_STREAM_K",
+        "original_family_claim": False,
         "npu_eligible": True,
         "formula_family": family,
         "kernel_suffix": CUSTOM_SUFFIX[family],

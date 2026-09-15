@@ -764,7 +764,12 @@ MatMulBaseKernelSingleCoreSplitKGmToL1<A_TYPE, B_TYPE, L0C_TYPE, OUTPUT_TYPE, BI
         WaitFlag<HardEvent::MTE2_MTE1>(static_cast<event_t>(eidMte2Mte1));
     }
     WaitFlag<HardEvent::FIX_M>(static_cast<event_t>(l0cFixMAndMFIX));
-    mm_.Iterate(false, l0c_);
+    // CANN 8.1 exposes the same operation as the pre-8.5 two-call API:
+    // schedule the Cube iteration, then materialize C into the selected CO1
+    // ping/pong tensor.  The 8.5 convenience overload Iterate(false, l0c_)
+    // is not present in the 8.1 Matmul interface.
+    mm_.Iterate(false);
+    mm_.GetTensorC(l0c_);
     SetFlag<HardEvent::M_FIX>(static_cast<event_t>(l0cFixMAndMFIX));
     WaitFlag<HardEvent::M_FIX>(static_cast<event_t>(l0cFixMAndMFIX));
     {

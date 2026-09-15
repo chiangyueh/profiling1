@@ -146,7 +146,7 @@ def audit_case(case: dict) -> dict:
     require(result["npu_eligible"], f"{case['workload_id']}: not NPU eligible")
     require(not any(result["runtime_dependencies"].values()),
             f"{case['workload_id']}: forbidden runtime dependency")
-    require(result["origin"] == "REPOSITORY_OWNED_NOT_OFFICIAL_BACKPORT",
+    require(result["origin"] == "REPOSITORY_EXPERIMENTAL_DERIVATIVE_OF_OFFICIAL_SPLIT_K_AND_STREAM_K",
             f"{case['workload_id']}: provenance drift")
     cube = result["cube"]
     k_quantum = int(cube["baseK"])
@@ -201,12 +201,12 @@ def main() -> None:
     }, "validation family coverage changed")
     require(len(packet_hashes) == 200, "every validation shape must produce a distinct packet")
     print(
-        "NOVEL_FAMILY_AUDIT passed "
+        "EXPERIMENTAL_DERIVATIVE_AUDIT passed "
         f"official_family_records={provenance['official_family_records']} "
         f"official_source_files={provenance['official_source_files']} "
         f"official_host_strategies=8 "
         f"official_host_source_files={provenance['official_host_source_files']} "
-        "repository_owned_families=2 shapes=200 distinct_packets=200 "
+        "experimental_derivative_schedules=2 original_family_claims=0 shapes=200 distinct_packets=200 "
         "ownership_mismatches=0 resource_failures=0 forbidden_dependencies=0 "
         "device_build_targets=fp32_k90001,fp32_k90002"
     )

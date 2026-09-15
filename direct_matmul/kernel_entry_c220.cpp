@@ -59,6 +59,34 @@
 #define DTYPE_X2 bfloat16_t
 #define DTYPE_Y bfloat16_t
 #define DTYPE_BIAS bfloat16_t
+#elif !defined(MATMUL_C220_SUFFIX_VALUE) && defined(direct_matmul_fp16_k100001)
+#define MATMUL_C220_SUFFIX_VALUE 100001
+#define MATMUL_DIRECT_KERNEL direct_matmul_fp16_k100001
+#define DTYPE_X1 half
+#define DTYPE_X2 half
+#define DTYPE_Y half
+#define DTYPE_BIAS half
+#elif !defined(MATMUL_C220_SUFFIX_VALUE) && defined(direct_matmul_fp32_k202)
+#define MATMUL_C220_SUFFIX_VALUE 202
+#define MATMUL_DIRECT_KERNEL direct_matmul_fp32_k202
+#define DTYPE_X1 float
+#define DTYPE_X2 float
+#define DTYPE_Y float
+#define DTYPE_BIAS float
+#elif !defined(MATMUL_C220_SUFFIX_VALUE) && defined(direct_matmul_bf16_k20030)
+#define MATMUL_C220_SUFFIX_VALUE 20030
+#define MATMUL_DIRECT_KERNEL direct_matmul_bf16_k20030
+#define DTYPE_X1 bfloat16_t
+#define DTYPE_X2 bfloat16_t
+#define DTYPE_Y bfloat16_t
+#define DTYPE_BIAS bfloat16_t
+#elif !defined(MATMUL_C220_SUFFIX_VALUE) && defined(direct_matmul_bf16_k20031)
+#define MATMUL_C220_SUFFIX_VALUE 20031
+#define MATMUL_DIRECT_KERNEL direct_matmul_bf16_k20031
+#define DTYPE_X1 bfloat16_t
+#define DTYPE_X2 bfloat16_t
+#define DTYPE_Y bfloat16_t
+#define DTYPE_BIAS bfloat16_t
 #elif !defined(MATMUL_C220_SUFFIX_VALUE) && defined(direct_matmul_fp32_k90001)
 #define MATMUL_C220_SUFFIX_VALUE 90001
 #define MATMUL_DIRECT_KERNEL direct_matmul_fp32_k90001
@@ -99,6 +127,14 @@
 #include "mat_mul_sc_splitk_kernel_gm_to_l1.h"
 #elif MATMUL_C220_SUFFIX_VALUE == 121
 #include "mat_mul_sc_splitk_al1_fullload_kernel.h"
+#elif MATMUL_C220_SUFFIX_VALUE == 100001
+#include "mat_mul_base_kernel.h"
+#elif MATMUL_C220_SUFFIX_VALUE == 202
+#include "mat_mul_cvp_base_kernel.h"
+#elif MATMUL_C220_SUFFIX_VALUE == 20030
+#include "mat_mul_unaligned_deterministic_splitk_kernel.h"
+#elif MATMUL_C220_SUFFIX_VALUE == 20031
+#include "mat_mul_deterministic_splitk_kernel.h"
 #elif MATMUL_C220_SUFFIX_VALUE == 90001 || MATMUL_C220_SUFFIX_VALUE == 90002
 #include "direct_init_split_k_kernel.h"
 #else
@@ -124,6 +160,12 @@ __aicore__ inline void DirectReadMatmulTiling280(
     using aType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_X1, false>;         \
     using bType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_X2, trans_b_value>; \
     using cType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_Y>;                  \
+    using biasType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_BIAS>
+
+#define MATMUL_DIRECT_DECLARE_NZ_C_TYPES(trans_b_value)                               \
+    using aType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_X1, false>;         \
+    using bType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_X2, trans_b_value>; \
+    using cType = MatmulType<TPosition::GM, CubeFormat::NZ, DTYPE_Y>;                  \
     using biasType = MatmulType<TPosition::GM, CubeFormat::ND, DTYPE_BIAS>
 
 extern "C" __global__ __aicore__ void MATMUL_DIRECT_KERNEL(
@@ -180,12 +222,57 @@ extern "C" __global__ __aicore__ void MATMUL_DIRECT_KERNEL(
         op.Init(aGM, bGM, cGM, biasGM, offsetWGM, user, &tilingData, &pipe);
         op.Process();
     }
+#elif MATMUL_C220_SUFFIX_VALUE == 100001
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
+    TPipe pipe;
+    if (tilingData.matmulRunInfo.transB == 0) {
+        MATMUL_DIRECT_DECLARE_TYPES(false);
+        MatmulBaseKernel<aType, bType, cType, biasType,
+            MatmulBaseBlock, MM_CFG_K_SHIFT> op;
+        op.Init(aGM, bGM, cGM, biasGM, offsetWGM, user, &tilingData, &pipe);
+        op.Process();
+    } else {
+        MATMUL_DIRECT_DECLARE_TYPES(true);
+        MatmulBaseKernel<aType, bType, cType, biasType,
+            MatmulBaseBlock, MM_CFG_K_SHIFT> op;
+        op.Init(aGM, bGM, cGM, biasGM, offsetWGM, user, &tilingData, &pipe);
+        op.Process();
+    }
+#elif MATMUL_C220_SUFFIX_VALUE == 202
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    TPipe pipe;
+    if (tilingData.matmulRunInfo.transB == 0) {
+        MATMUL_DIRECT_DECLARE_TYPES(false);
+        MatmulCvpBaseKernel<aType, bType, cType, biasType,
+            MatmulBaseBlock, MM_CFG_NO_PRELOAD> op;
+        op.Init(aGM, bGM, cGM, biasGM, offsetWGM, user, &tilingData, &pipe);
+        op.Process();
+    } else {
+        MATMUL_DIRECT_DECLARE_TYPES(true);
+        MatmulCvpBaseKernel<aType, bType, cType, biasType,
+            MatmulBaseBlock, MM_CFG_NO_PRELOAD> op;
+        op.Init(aGM, bGM, cGM, biasGM, offsetWGM, user, &tilingData, &pipe);
+        op.Process();
+    }
+#elif MATMUL_C220_SUFFIX_VALUE == 20030
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    MATMUL_DIRECT_DECLARE_NZ_C_TYPES(false);
+    MatMulUnAlignedKernelDeterministicSplitK<aType, bType, cType, biasType,
+        FIXPIPE_OPT_SELECT::VEC_NZ2ND_UNALIGNOUT>(
+        aGM, bGM, cGM, biasGM, tilingData, user);
+#elif MATMUL_C220_SUFFIX_VALUE == 20031
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    MATMUL_DIRECT_DECLARE_NZ_C_TYPES(false);
+    MatMulKernelDeterministicSplitK<aType, bType, cType, biasType,
+        FIXPIPE_OPT_SELECT::VEC_NZ2ND_UNALIGNOUT>(
+        aGM, bGM, cGM, biasGM, tilingData, user);
 #elif MATMUL_C220_SUFFIX_VALUE == 90001 || MATMUL_C220_SUFFIX_VALUE == 90002
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_0);
     MATMUL_DIRECT_DECLARE_TYPES(true);
-    NovelMatmul::RunDirectInitSplitK<aType, bType, cType, biasType>(
+    ExperimentalDerivativeMatmul::RunDirectInitSplitK<aType, bType, cType, biasType>(
         aGM, bGM, cGM, tilingData);
 #endif
 }
 
 #undef MATMUL_DIRECT_DECLARE_TYPES
+#undef MATMUL_DIRECT_DECLARE_NZ_C_TYPES

@@ -7,8 +7,8 @@ PHYSICAL_DEVICE="${PHYSICAL_NPU_ID:-2}"
 WARMUP=1
 REPEAT=3
 SAMPLES=5
-NPU_SHAPES=240
-EXPECTED_VARIANTS=14
+NPU_SHAPES=285
+EXPECTED_VARIANTS=23
 MAX_FOOTPRINT_MIB=300
 
 usage() {
@@ -69,8 +69,11 @@ CAMPAIGN_ID="$({
         matmul_rule_selector/complete_formula_selector.py \
         matmul_rule_selector/novel_family_selector.py \
         matmul_rule_selector/novel_validation_cases.py \
+        matmul_rule_selector/c220_source_route_selector.py \
+        matmul_rule_selector/c220_source_route_cases.py \
         matmul_rule_selector/tiling_selector.py \
         tools/audit_novel_matmul_families.py \
+        tools/audit_c220_dispatch_source.py \
         scripts/build_all.sh \
         cmake_npu/CMakeLists.txt \
         direct_matmul/kernel_entry.cpp \
@@ -79,6 +82,9 @@ CAMPAIGN_ID="$({
         direct_matmul/mat_mul_v3_tiling_data_280.h \
         direct_matmul/runner.cpp \
         novel_matmul/direct_init_split_k_kernel.h
+    sha256sum \
+        colleague_matmul_v3/op_kernel/mat_mul_v3.cpp \
+        colleague_matmul_v3/op_kernel/mat_mul_v3_tiling_key.h
 } | sha256sum | cut -c1-20)"
 CAMPAIGN_ROOT="${ROOT}/results/matmul_complete_formula_v1"
 CAMPAIGN_DIR="${CAMPAIGN_ROOT}/${CAMPAIGN_ID}"
@@ -90,6 +96,7 @@ OFFICIAL_PROFILE="${CAMPAIGN_DIR}/official_profile.csv"
 OFFICIAL_SAMPLES="${CAMPAIGN_DIR}/official_samples.csv"
 ANALYSIS="${CAMPAIGN_DIR}/analysis.json"
 SUMMARY="${CAMPAIGN_DIR}/summary.csv"
+DISPATCH_AUDIT="${CAMPAIGN_DIR}/c220_dispatch_audit.json"
 
 cleanup_generated_state() {
     if [[ -d "${CAMPAIGN_ROOT}" ]]; then
@@ -121,7 +128,7 @@ cleanup_generated_state
 mkdir -p "${CAMPAIGN_DIR}"
 
 announce "RUN_LOG path=${RUN_LOG}"
-announce "FORMULA_TILING_READY shapes=${NPU_SHAPES} installed_suffixes=12 new_families=2 variants=${EXPECTED_VARIANTS} complete_tilings_per_shape=1"
+announce "FORMULA_TILING_READY shapes=${NPU_SHAPES} source_dispatch_routes=21 experimental_derivative_schedules=2 original_family_claims=0 variants=${EXPECTED_VARIANTS} complete_tilings_per_shape=1"
 announce "selector=shape_hardware_capacity_and_ownership_equations_only"
 announce "tiling_fields=family,baseM,baseN,baseK,singleCoreM,singleCoreN,singleCoreK,usedCoreNum,stepM,stepN,stepKa,stepKb,depthA1,depthB1,dbL0C,iterateOrder,L2,ND2NZ,new_K_ownership_scheduler"
 announce "forbidden=official_selector_input,official_tiling_seed,cost_model,latency_ranker,candidate_enumeration,history_lookup,repo_lookup,tiling_bank"
@@ -133,6 +140,9 @@ python3 tools/audit_formula_reference_separation.py \
     --manifest "${MANIFEST}" --selection "${SELECTION}" \
     --output "${REFERENCE_AUDIT}"
 python3 tools/audit_novel_matmul_families.py
+python3 tools/audit_c220_dispatch_source.py \
+    --manifest "${MANIFEST}" --output "${DISPATCH_AUDIT}" >/dev/null
+announce "C220_SOURCE_DISPATCH_AUDIT passed branches=21 kernel_classes=16 build_route_omissions=0 measurement_route_omissions=0"
 
 variant_count="$(find "${VARIANT_DIR}" -maxdepth 1 -type f -name '*.csv' | wc -l)"
 [[ "${variant_count}" -eq "${EXPECTED_VARIANTS}" ]] || {
@@ -182,7 +192,7 @@ finally:
         acl.aclFinalize()
 PY
 
-announce "BUILD begin official_runner_and_14_suffix_kernels jobs=1"
+announce "BUILD begin official_runner_and_23_route_kernels jobs=1"
 BUILD_COMPONENTS=official BUILD_JOBS=1 scripts/build_all.sh
 official_runner="${ROOT}/build/official_matmul_runner"
 "${official_runner}" --candidates "${MANIFEST}" --validate-input >/dev/null
@@ -264,7 +274,7 @@ python3 tools/analyze_formula_tiling_results.py \
     --output-json "${ANALYSIS}" \
     --output-csv "${SUMMARY}"
 
-FINAL_TEXT="$(python3 - "${REFERENCE_AUDIT}" "${SUMMARY}" "${SELECTION}" <<'PY'
+FINAL_TEXT="$(python3 - "${REFERENCE_AUDIT}" "${SUMMARY}" "${SELECTION}" "${DISPATCH_AUDIT}" <<'PY'
 import csv
 import json
 import statistics
@@ -282,11 +292,22 @@ selections = {
         if line.strip()
     )
 }
+dispatch = json.load(open(sys.argv[4], encoding="utf-8"))
 print("FINAL_RESULTS_BEGIN")
+print(
+    "C220_SOURCE_DISPATCH_AUDIT "
+    f"branches={dispatch['dispatch_branch_count']} "
+    f"kernel_classes={dispatch['kernel_class_count']} "
+    f"registered={len(dispatch['registered_suffixes'])} "
+    f"build_registered={len(dispatch['build_suffixes'])} "
+    f"measurement_registered={len(dispatch['manifest_suffixes'])} omissions=0 "
+    "source_derived=1"
+)
 print(
     "FORMULA_TILING_AUDIT "
     f"installed_shapes={audit['shape_count']} installed_suffixes={len(audit['suffixes'])} "
-    "new_family_shapes=40 new_families=2 "
+    "later_official_source_route_shapes=45 later_official_source_routes=9 "
+    "experimental_derivative_shapes=40 experimental_derivative_schedules=2 original_family_claims=0 "
     f"exact_reference_packets={audit['exact_reference_packets']} "
     f"core_only_changes={audit['core_only_changes']} "
     "complete_tilings_per_shape=1 official_seed=0 cost_model=0 candidate_search=0"
@@ -311,12 +332,15 @@ for row in rows:
 for suffix, group in sorted(groups.items()):
     deltas = [float(row["delta_pct"]) for row in group]
     branch = audit["suffixes"].get(str(suffix))
-    if branch is None:
+    if suffix in (90001, 90002):
         changed_fields = (
             "new_kernel_scheduler,baseM,baseN,baseK,singleCoreK,"
             "stepKa,stepKb,depthA1,depthB1,dbL0C,K_ownership"
         )
-        minimum_changed = "NEW_FAMILY"
+        minimum_changed = "EXPERIMENTAL_DERIVATIVE_SCHEDULE"
+    elif branch is None:
+        changed_fields = "bundled_later_official_kernel_route,complete_280_byte_packet"
+        minimum_changed = "LATER_OFFICIAL_SOURCE_ROUTE"
     else:
         changed_fields = ",".join(branch["changed_schedule_field_union"])
         minimum_changed = branch["minimum_changed_schedule_fields_per_shape"]

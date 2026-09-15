@@ -143,16 +143,18 @@
     {
       "family": "DIRECT_INIT_WHOLE_OUTPUT_SPLIT_K",
       "suffix": 90001,
-      "novel_component": "cross-core output initialization and accumulation protocol",
-      "known_lineage": "K partition and MatmulImpl are standard; deterministic and single-core paths already initialize then add within one AIC, but no supplied path assigns direct-initialization and atomic roles to different AIC owners without clear or workspace; no official kernel body is embedded",
+      "classification": "EXPERIMENTAL_DERIVATIVE_NOT_AN_ORIGINAL_FAMILY",
+      "derived_component": "cross-core output initialization and accumulation protocol",
+      "known_lineage": "direct derivative of the bundled C220 MULTI_CORE_SPLIT_K suffix-41 K ownership and MatmulImpl path; it changes the pre-clear/all-atomic output protocol into one direct initializer plus remaining atomic owners",
       "distinction": "one owner directly initializes C, a global AIC barrier follows, and only remaining owners atomic-add; there is no pre-clear",
       "source": "novel_matmul/direct_init_split_k_kernel.h"
     },
     {
       "family": "DIRECT_INIT_TAIL_WAVE_SPLIT_K",
       "suffix": 90002,
-      "novel_component": "workspace-free direct-initialization plus atomic-remainder tail reduction on C220",
-      "known_lineage": "tail-only K redistribution is known from later Arch35 Stream-K",
+      "classification": "EXPERIMENTAL_DERIVATIVE_NOT_AN_ORIGINAL_FAMILY",
+      "derived_component": "workspace-free direct-initialization plus atomic-remainder tail reduction on C220",
+      "known_lineage": "derives tail-only K redistribution from bundled later Arch35 Stream-K and reuses the C220 multi-core Split-K ownership model",
       "distinction": "full MN waves directly store C; each final-wave output group directly initializes C then atomically accumulates without workspace or AIV reducer",
       "source": "novel_matmul/direct_init_split_k_kernel.h"
     }

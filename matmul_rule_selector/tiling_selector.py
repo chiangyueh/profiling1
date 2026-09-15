@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single production entry point for installed and repository-owned tilings."""
+"""Single entry point for installed routes and experimental derivatives."""
 from __future__ import annotations
 
 import argparse
@@ -9,7 +9,7 @@ from complete_formula_selector import generate as generate_installed
 from novel_family_selector import applicable, generate as generate_novel
 
 
-NOVEL_ORDER = (
+DERIVATIVE_ORDER = (
     "DIRECT_INIT_WHOLE_OUTPUT_SPLIT_K",
     "DIRECT_INIT_TAIL_WAVE_SPLIT_K",
 )
@@ -25,12 +25,12 @@ def generate(
     }
     matches = []
     if dtype == "fp32":
-        for family in NOVEL_ORDER:
+        for family in DERIVATIVE_ORDER:
             ok, reason = applicable(request, family)
             if ok:
                 matches.append((family, reason))
     if len(matches) > 1:
-        raise RuntimeError(f"novel predicates overlap: {matches}")
+        raise RuntimeError(f"experimental derivative predicates overlap: {matches}")
     if matches:
         result = generate_novel(
             m, k, n, dtype, trans_a, trans_b,
@@ -40,7 +40,7 @@ def generate(
         result = generate_installed(m, k, n, dtype, trans_a, trans_b)
     result["production_selection"] = {
         "complete_tilings_constructed": 1,
-        "novel_predicate_matches": len(matches),
+        "experimental_derivative_predicate_matches": len(matches),
         "official_selector": False,
         "official_packet_seed": False,
         "cost_model": False,

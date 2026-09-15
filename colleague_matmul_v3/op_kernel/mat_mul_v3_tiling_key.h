@@ -16,7 +16,7 @@
 #ifndef MAT_MUL_V3_TILING_KEY_H
 #define MAT_MUL_V3_TILING_KEY_H
 
-#include "/usr/local/Ascend/ascend-toolkit/8.1.RC1/aarch64-linux/ascendc/include/highlevel_api/tiling/template_argument.h"
+#include "highlevel_api/tiling/template_argument.h"
 
 #define MAT_MUL_V3_BASE_FULLLOAD 0
 #define MAT_MUL_V3_AL1_FULLLOAD 1

@@ -1,9 +1,9 @@
-#ifndef NOVEL_MATMUL_DIRECT_INIT_SPLIT_K_KERNEL_H
-#define NOVEL_MATMUL_DIRECT_INIT_SPLIT_K_KERNEL_H
+#ifndef EXPERIMENTAL_DERIVATIVE_DIRECT_INIT_SPLIT_K_KERNEL_H
+#define EXPERIMENTAL_DERIVATIVE_DIRECT_INIT_SPLIT_K_KERNEL_H
 
 #include "mat_mul_v3_common.h"
 
-namespace NovelMatmul {
+namespace ExperimentalDerivativeMatmul {
 
 using namespace AscendC;
 using namespace matmul;
@@ -235,6 +235,6 @@ __aicore__ inline void RunDirectInitSplitK(
     }
 }
 
-} // namespace NovelMatmul
+} // namespace ExperimentalDerivativeMatmul
 
 #endif

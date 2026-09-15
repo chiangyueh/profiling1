@@ -24,6 +24,8 @@ from complete_formula_selector import (  # noqa: E402
     generate,
 )
 from novel_validation_cases import CASES as NOVEL_CASES  # noqa: E402
+from c220_source_route_cases import CASES as SOURCE_ROUTE_CASES  # noqa: E402
+from c220_source_route_selector import generate_for_suffix  # noqa: E402
 from tiling_selector import generate as generate_production  # noqa: E402
 
 
@@ -45,7 +47,12 @@ TARGET_COUNT = {
 }
 EXPECTED_INSTALLED_SHAPES = sum(TARGET_COUNT.values())
 NOVEL_PER_FAMILY = 20
-EXPECTED_SHAPES = EXPECTED_INSTALLED_SHAPES + 2 * NOVEL_PER_FAMILY
+SOURCE_ROUTE_SUFFIXES = {41, 51, 60, 61, 121, 202, 20030, 20031, 100001}
+SOURCE_ROUTE_PER_SUFFIX = 5
+EXPECTED_SOURCE_ROUTE_SHAPES = len(SOURCE_ROUTE_SUFFIXES) * SOURCE_ROUTE_PER_SUFFIX
+EXPECTED_SHAPES = (
+    EXPECTED_INSTALLED_SHAPES + 2 * NOVEL_PER_FAMILY + EXPECTED_SOURCE_ROUTE_SHAPES
+)
 MAX_FOOTPRINT = 300 * 1024 * 1024
 RANDOM_SEED = 20_260_914
 
@@ -399,7 +406,7 @@ def main() -> None:
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         manifest_rows.append({
             "workload_id": case["workload_id"], "rank": "0",
-            "candidate_role": "independent_experimental_family",
+            "candidate_role": "experimental_derivative_schedule",
             "m": str(case["m"]), "n": str(case["n"]), "k": str(case["k"]),
             "dtype": case["dtype"],
             "trans_a": str(int(case["trans_a"])),
@@ -438,9 +445,80 @@ def main() -> None:
         })
         novel_counts[result["kernel_suffix"]] += 1
 
-    if len(manifest_rows) != EXPECTED_SHAPES or novel_counts != Counter({90001: 20, 90002: 20}):
+    source_route_counts = Counter()
+    for case in SOURCE_ROUTE_CASES:
+        result = generate_for_suffix(
+            case["suffix"], case["m"], case["k"], case["n"], case["dtype"],
+            case["trans_a"], case["trans_b"],
+        )
+        if int(result["kernel_suffix"]) != int(case["suffix"]):
+            raise RuntimeError(f"{case['workload_id']}: source route suffix drift")
+        if any(result["runtime_dependencies"].values()):
+            raise RuntimeError(f"{case['workload_id']}: forbidden source-route dependency")
+        packet = bytes.fromhex(result["packet_hex"])
+        if len(packet) != 280 or hashlib.sha256(packet).hexdigest() != result["packet_sha256"]:
+            raise RuntimeError(f"{case['workload_id']}: invalid source-route packet")
+        width = 4 if case["dtype"] == "fp32" else 2
+        footprint = (
+            (case["m"] * case["k"] + case["k"] * case["n"]
+             + 2 * case["m"] * case["n"]) * width
+            + result["workspace_bytes"]
+        )
+        if footprint > MAX_FOOTPRINT:
+            raise RuntimeError(f"{case['workload_id']}: footprint exceeds campaign limit")
+        packet_path = packet_dir / f"{case['workload_id']}.bin"
+        packet_path.write_bytes(packet)
+        cube = result["cube"]
+        schedule_digest = hashlib.sha256(json.dumps({
+            "request": case, "family": result["formula_family"],
+            "suffix": result["kernel_suffix"], "cube": cube,
+            "derivation": result.get("derivation", {}),
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        words = struct.unpack("<70I", packet)
+        manifest_rows.append({
+            "workload_id": case["workload_id"], "rank": "0",
+            "candidate_role": "bundled_later_official_source_route",
+            "m": str(case["m"]), "n": str(case["n"]), "k": str(case["k"]),
+            "dtype": case["dtype"], "trans_a": str(int(case["trans_a"])),
+            "trans_b": str(int(case["trans_b"])),
+            "used_core_num": str(result["block_dim"]),
+            "kernel_suffix": str(result["kernel_suffix"]),
+            "workspace_bytes": str(result["workspace_bytes"]),
+            "tiling_path": str(packet_path.resolve()),
+            "tiling_sha256": result["packet_sha256"],
+            "tiling_fnv1a64": _fnv1a64(packet),
+            "model_schedule_sha256": schedule_digest,
+            "is_reserve": "0", "l2_cache_flag": str(words[64]),
+            "nd2nz_a": str(words[58]), "nd2nz_b": str(words[59]),
+            "required_successful_tilings": "1",
+        })
+        selections.append({
+            "workload_id": case["workload_id"],
+            "formula_family": result["formula_family"],
+            "kernel_suffix": result["kernel_suffix"],
+            "tiling_fields": {name: cube[name] for name in (
+                "usedCoreNum", "singleCoreM", "singleCoreN", "singleCoreK",
+                "baseM", "baseN", "baseK", "depthA1", "depthB1",
+                "stepM", "stepN", "stepKa", "stepKb", "dbL0C", "iterateOrder",
+            )},
+            "schedule_facts": result.get("derivation", {}),
+            "packet_sha256": result["packet_sha256"],
+            "selection_contract": result["runtime_dependencies"],
+            "origin": result["origin"],
+        })
+        source_route_counts[int(result["kernel_suffix"])] += 1
+
+    expected_source_counts = Counter({
+        suffix: SOURCE_ROUTE_PER_SUFFIX for suffix in SOURCE_ROUTE_SUFFIXES
+    })
+    if (
+        len(manifest_rows) != EXPECTED_SHAPES
+        or novel_counts != Counter({90001: 20, 90002: 20})
+        or source_route_counts != expected_source_counts
+    ):
         raise RuntimeError(
-            f"combined campaign coverage mismatch rows={len(manifest_rows)} novel={novel_counts}"
+            f"combined campaign coverage mismatch rows={len(manifest_rows)} "
+            f"derivatives={novel_counts} source_routes={source_route_counts}"
         )
 
     _write_csv(args.root / "manifest.csv", manifest_rows)
@@ -453,6 +531,7 @@ def main() -> None:
         for selection in selections:
             stream.write(json.dumps(selection, sort_keys=True, separators=(",", ":")) + "\n")
     audit["novel_suffix_counts"] = dict(novel_counts)
+    audit["later_official_source_route_counts"] = dict(source_route_counts)
     audit["total_shapes"] = len(manifest_rows)
     audit["total_variants"] = len(grouped)
     (args.root / "audit.json").write_text(
@@ -462,7 +541,8 @@ def main() -> None:
     print(
         "FORMULA_MATRIX_AUDIT passed "
         f"shapes={audit['total_shapes']} installed_packets={audit['packets']} "
-        f"suffixes={len(audit['suffix_counts']) + len(novel_counts)} variants={audit['total_variants']} "
+        f"source_dispatch_suffixes={len(audit['suffix_counts']) + len(source_route_counts)} "
+        f"experimental_derivatives={len(novel_counts)} variants={audit['total_variants']} "
         "complete_tilings_per_shape=1 field_diversity_min=8 "
         "official_seed=0 cost_model=0 candidate_search=0 history=0"
     )

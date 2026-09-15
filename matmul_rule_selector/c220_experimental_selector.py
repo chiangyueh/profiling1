@@ -29,10 +29,13 @@ FAMILIES = {
     "SINGLE_CORE_SPLIT_K_GM_TO_L1_UNALIGNED": {"fp16": 60, "bf16": 60},
     "SINGLE_CORE_SPLIT_K_AL1_FULL_LOAD": {"fp16": 121, "bf16": 121},
 }
-NPU_BUILDABLE_ON_CANN81 = {
-    "MULTI_CORE_SPLIT_K",
-    "SINGLE_CORE_NKM_SPLIT_K",
-    "SINGLE_CORE_SPLIT_K_AL1_FULL_LOAD",
+NPU_BUILDABLE_VARIANTS_ON_CANN81 = {
+    ("MULTI_CORE_SPLIT_K", "fp32"),
+    ("SINGLE_CORE_NKM_SPLIT_K", "fp32"),
+    ("SINGLE_CORE_SPLIT_K_GM_TO_L1", "fp16"),
+    ("SINGLE_CORE_SPLIT_K_GM_TO_L1_UNALIGNED", "fp16"),
+    ("SINGLE_CORE_SPLIT_K_AL1_FULL_LOAD", "fp16"),
+    ("SINGLE_CORE_SPLIT_K_AL1_FULL_LOAD", "bf16"),
 }
 
 
@@ -497,7 +500,7 @@ def generate(m: int, k: int, n: int, dtype: str, trans_a: bool, trans_b: bool,
     conversion_workspace = align_up(m * k * width, 512) + align_up(k * n * width, 512) if unaligned else 0
     workspace = SYSTEM_WORKSPACE + output_workspace + conversion_workspace
     suffix = FAMILIES[selected_family][dtype]
-    npu_eligible = selected_family in NPU_BUILDABLE_ON_CANN81
+    npu_eligible = (selected_family, dtype) in NPU_BUILDABLE_VARIANTS_ON_CANN81
     return {
         "status": "LATER_OFFICIAL_BACKPORT_TILING",
         "origin": "BUNDLED_LATER_OFFICIAL_SOURCE_BACKPORT",
@@ -518,7 +521,10 @@ def generate(m: int, k: int, n: int, dtype: str, trans_a: bool, trans_b: bool,
         "toolchain_contract": {
             "target": "C220",
             "host_packet": "COMPLETE_280_BYTE_PACKET",
-            "cann81_kernel_build": "PASS" if npu_eligible else "BLOCKED_8_5_L0C_ITERATE_API",
+            "cann81_kernel_build": (
+                "REGISTERED_WITH_EQUIVALENT_8_1_ITERATE_PLUS_GET_TENSOR_C_API"
+                if npu_eligible else "NO_REGISTERED_BF16_VALIDATION_TARGET"
+            ),
             "fallback_kernel": False,
         },
         "runtime_dependencies": {

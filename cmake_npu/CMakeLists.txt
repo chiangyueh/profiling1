@@ -154,7 +154,10 @@ function(add_c220_direct_matmul_kernel target kernel dtype suffix suffix_value)
         DTYPE_Y=${dtype}
         DTYPE_BIAS=${dtype}
         MATMUL_C220_SUFFIX_VALUE=${suffix_value}
-        MATMUL_DIRECT_TILING_KEY=100000000000000${suffix}UL
+        # The C220 wrapper dispatches on MATMUL_C220_SUFFIX_VALUE directly.
+        # Keep this otherwise-unused framework key inside uint64 even for the
+        # six-digit K-shift audit route.
+        MATMUL_DIRECT_TILING_KEY=10000000000000000000UL
     )
 endfunction()
 
@@ -219,15 +222,22 @@ register_direct_matmul(fp32 float 10200 10200)
 register_direct_matmul(fp32 float 10201 10201)
 register_direct_matmul(fp32 float 20201 20201)
 
-# Additional C220 execution families.  These use the bundled kernel bodies and
-# the 280-byte packet ABI; they never fall back to an installed 8.1 suffix.
+# Every generic C220 dispatch route that is absent from installed CANN 8.1.
+# The required set is extracted from colleague_matmul_v3/op_kernel/mat_mul_v3.cpp
+# by tools/audit_c220_dispatch_source.py; it is not a hand-maintained family list.
 register_c220_direct_matmul(fp16 half 121 00121)
 register_c220_direct_matmul(bf16 bfloat16_t 121 00121)
 register_c220_direct_matmul(fp32 float 41 00041)
 register_c220_direct_matmul(fp32 float 51 00051)
+register_c220_direct_matmul(fp16 half 60 00060)
+register_c220_direct_matmul(fp16 half 61 00061)
+register_c220_direct_matmul(fp32 float 202 00202)
+register_c220_direct_matmul(bf16 bfloat16_t 20030 20030)
+register_c220_direct_matmul(bf16 bfloat16_t 20031 20031)
+register_c220_direct_matmul(fp16 half 100001 10001)
 
-# Repository-owned execution protocols.  The high suffix range is kept
-# disjoint from every bundled official MatMulV3 tiling key.
+# Repository experimental derivatives of official Split-K/Stream-K scheduling.
+# These are intentionally outside the source-derived official-route audit.
 register_c220_direct_matmul(fp32 float 90001 90001)
 register_c220_direct_matmul(fp32 float 90002 90002)
 
