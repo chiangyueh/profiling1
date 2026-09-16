@@ -10,10 +10,11 @@
 
 #include <iostream>
 #include <memory>
-#include <string>
 #include <vector>
 //NEW
+#include <cstdio>
 #include <cstdlib>
+#include <string>
 #include "acl/acl.h"
 //NEW
 #include "aclnn/acl_meta.h"
@@ -87,6 +88,46 @@ int CreateTransposedAclTensor(const std::vector<T>& hostData, const std::vector<
   *tensor = aclCreateTensor(logicalShape.data(), logicalShape.size(), dataType, strides.data(), 0,
                             aclFormat::ACL_FORMAT_ND, storageShape.data(), storageShape.size(), *deviceAddr);
   return 0;
+}
+
+//NEW
+std::string ReadSelectedBranch() {
+  const char* selectedBranch = std::getenv("MATMUL_V3_SELECTED_BRANCH");
+  if (selectedBranch != nullptr && selectedBranch[0] != '\0') {
+    return selectedBranch;
+  }
+  const char* branchFile = std::getenv("MATMUL_V3_BRANCH_FILE");
+  if (branchFile == nullptr || branchFile[0] == '\0') {
+    return {};
+  }
+  FILE* file = std::fopen(branchFile, "r");
+  if (file == nullptr) {
+    return {};
+  }
+  char value[128] = {};
+  const bool readOk = std::fgets(value, sizeof(value), file) != nullptr;
+  (void)std::fclose(file);
+  if (!readOk) {
+    return {};
+  }
+  std::string branch(value);
+  while (!branch.empty() && (branch.back() == '\n' || branch.back() == '\r')) {
+    branch.pop_back();
+  }
+  return branch;
+}
+
+//NEW
+void ClearSelectedBranch() {
+  (void)::unsetenv("MATMUL_V3_SELECTED_BRANCH");
+  const char* branchFile = std::getenv("MATMUL_V3_BRANCH_FILE");
+  if (branchFile == nullptr || branchFile[0] == '\0') {
+    return;
+  }
+  FILE* file = std::fopen(branchFile, "w");
+  if (file != nullptr) {
+    (void)std::fclose(file);
+  }
 }
 
 //NEW
@@ -164,9 +205,8 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   ret = aclrtSynchronizeStream(stream);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
   //NEW
-  const char* selectedBranch = std::getenv("MATMUL_V3_SELECTED_BRANCH");
-  CHECK_RET(selectedBranch != nullptr && selectedBranch[0] != '\0', return 4);
-  *branch = selectedBranch;
+  *branch = ReadSelectedBranch();
+  CHECK_RET(!branch->empty(), return 4);
 
   aclrtEvent startEvent = nullptr;
   aclrtEvent endEvent = nullptr;
@@ -233,7 +273,7 @@ int main(int argc, char** argv) {
     //NEW
     (void)::unsetenv("MATMUL_V3_SHRINK_APPLIED");
     //NEW
-    (void)::unsetenv("MATMUL_V3_SELECTED_BRANCH");
+    ClearSelectedBranch();
     float averageMs = 0.0F;
     //NEW
     std::string branch;

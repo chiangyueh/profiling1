@@ -16,6 +16,7 @@
 #include <cinttypes>
 //NEW
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include "matmul_v3_base_tiling.h"
 #include "../../op_kernel/mat_mul_v3_tiling_key.h"
@@ -2807,7 +2808,16 @@ ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
     l2Cache.SetL2CacheFlag(tilingEnable_, compileInfo_.l2Size, l2CacheFlag_);
 
     //NEW
-    (void)::setenv("MATMUL_V3_SELECTED_BRANCH", GetSelectedBranchName(), 1);
+    const char *selectedBranch = GetSelectedBranchName();
+    (void)::setenv("MATMUL_V3_SELECTED_BRANCH", selectedBranch, 1);
+    const char *branchFile = std::getenv("MATMUL_V3_BRANCH_FILE");
+    if (branchFile != nullptr && branchFile[0] != '\0') {
+        FILE *file = std::fopen(branchFile, "w");
+        if (file != nullptr) {
+            (void)std::fprintf(file, "%s\n", selectedBranch);
+            (void)std::fclose(file);
+        }
+    }
 
     //NEW
     const char *shrinkMode = std::getenv("MATMUL_V3_SHRINK_IDLE_CORES");

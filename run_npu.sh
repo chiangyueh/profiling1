@@ -11,6 +11,7 @@ unset ASCEND_CUSTOM_OPP_PATH
 host_build="${PWD}/build"
 build_log="$(mktemp)"
 run_log="$(mktemp)"
+branch_file="$(mktemp)"
 installed_host=""
 host_backup=""
 host_replaced=0
@@ -19,9 +20,11 @@ cleanup() {
     if [[ "${host_replaced}" -eq 1 && -f "${host_backup}" && -n "${installed_host}" ]]; then
         cp "${host_backup}" "${installed_host}"
     fi
-    rm -f "${host_backup}" "${build_log}" "${run_log}"
+    rm -f "${host_backup}" "${build_log}" "${run_log}" "${branch_file}"
 }
 trap cleanup EXIT
+
+export MATMUL_V3_BRANCH_FILE="${branch_file}"
 
 if ! cmake -S . -B "${host_build}" \
     -DCMAKE_BUILD_TYPE=Release \
