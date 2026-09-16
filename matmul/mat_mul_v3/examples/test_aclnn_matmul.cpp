@@ -110,7 +110,9 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   auto ret = ACL_SUCCESS;
   std::vector<int64_t> selfShape = {m, k};
   std::vector<int64_t> mat2Shape = {k, n};
-  std::vector<int64_t> mat2StorageShape = {n, k};
+  // std::vector<int64_t> mat2StorageShape = {n, k};
+  //NEW
+  std::vector<int64_t> mat2StorageShape = mat2Shape;
   std::vector<int64_t> outShape = {m, n};
   void* selfDeviceAddr = nullptr;
   void* mat2DeviceAddr = nullptr;
@@ -129,8 +131,10 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   CHECK_RET(ret == ACL_SUCCESS, return ret);
   // 创建mat2 aclTensor
   //NEW
-  ret = CreateTransposedAclTensor(mat2HostData, mat2Shape, mat2StorageShape, &mat2DeviceAddr,
-                                  aclDataType::ACL_FLOAT, &mat2);
+  // ret = CreateTransposedAclTensor(mat2HostData, mat2Shape, mat2StorageShape, &mat2DeviceAddr,
+  //                                 aclDataType::ACL_FLOAT, &mat2);
+  //NEW
+  ret = CreateAclTensor(mat2HostData, mat2Shape, &mat2DeviceAddr, aclDataType::ACL_FLOAT, &mat2);
   std::unique_ptr<aclTensor, aclnnStatus (*)(const aclTensor*)> mat2TensorPtr(mat2, aclDestroyTensor);
   std::unique_ptr<void, aclError (*)(void*)> mat2DeviceAddrPtr(mat2DeviceAddr, aclrtFree);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
@@ -256,7 +260,7 @@ int main(int argc, char** argv) {
     ret = MeasureShape(m, n, k, stream, &averageMs, &branch);
     if (ret != ACL_SUCCESS) {
       //NEW
-      fprintf(stderr, "measurement failed: M%ld_N%ld_K%ld_NT rc=%d\n",
+      fprintf(stderr, "measurement failed: M%ld_N%ld_K%ld_NN rc=%d\n",
               static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), ret);
       aclrtDestroyStream(stream);
       aclrtResetDevice(deviceId);

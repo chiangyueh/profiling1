@@ -149,7 +149,7 @@ for ((chunk_start = 0; chunk_start < shape_count; chunk_start += chunk_size)); d
             echo "fatal: branch changed between shrinked and original runs for M${m}_N${n}_K${k}" >&2
             exit 1
         fi
-        printf '{"shape":"M%s_N%s_K%s_NT","branch":"%s","shrinked_latency":"%s","original_latency":"%s"}\n' \
+        printf '{"shape":"M%s_N%s_K%s_NN","branch":"%s","shrinked_latency":"%s","original_latency":"%s"}\n' \
             "${m}" "${n}" "${k}" "${branch}" "${shrinked_latency}" "${original_latency}"
     done
 done
