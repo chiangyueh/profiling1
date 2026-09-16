@@ -68,26 +68,30 @@ if ! g++ "${example_source}" \
     exit 1
 fi
 
-shape_args=(
-    4 128 5376
-    7 192 6400
-    8 256 6144
-    10 128 5120
-    12 192 4096
-    16 256 4096
-    256 256 1024
-    384 384 1024
-    384 512 1536
-    512 384 1536
-    640 640 1024
-    768 768 1024
-    768 1024 1536
-    1024 768 1536
-    768 1280 1024
-    1280 768 1024
-    768 1536 1024
-    1536 768 1024
-)
+shape_args=()
+default_m=(1024 1280 1536 1792 2048 2304 2560 3072 3584 4096 5120 6144)
+default_n=(1152 1408 1664 1920 2176 2432 2816 3200 3712 4352 4864 5632 6400)
+default_k=(4096 4608 5120 5632 6144 6656 7168 7680 8192 9216 10240)
+m_offset=(3 7 11 13 17 19 23)
+n_offset=(5 9 15 21 27 33 39)
+k_offset=(1 3 5 7 9 11 13)
+
+#NEW
+# 60 large aligned shapes followed by 60 large unaligned shapes.
+for ((shape_index = 0; shape_index < 60; ++shape_index)); do
+    shape_args+=(
+        "${default_m[shape_index % ${#default_m[@]}]}"
+        "${default_n[(shape_index * 5 + 3) % ${#default_n[@]}]}"
+        "${default_k[(shape_index * 7 + 1) % ${#default_k[@]}]}"
+    )
+done
+for ((shape_index = 0; shape_index < 60; ++shape_index)); do
+    shape_args+=(
+        "$((default_m[(shape_index * 7 + 2) % ${#default_m[@]}] + m_offset[shape_index % ${#m_offset[@]}]))"
+        "$((default_n[(shape_index * 3 + 4) % ${#default_n[@]}] + n_offset[(shape_index * 2 + 1) % ${#n_offset[@]}]))"
+        "$((default_k[(shape_index * 5 + 6) % ${#default_k[@]}] + k_offset[(shape_index * 3 + 2) % ${#k_offset[@]}]))"
+    )
+done
 if [[ "$#" -gt 0 ]]; then
     if (( $# % 3 != 0 )); then
         echo "fatal: shapes must be supplied as M N K triples" >&2
