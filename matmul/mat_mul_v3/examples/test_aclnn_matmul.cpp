@@ -89,22 +89,8 @@ int CreateTransposedAclTensor(const std::vector<T>& hostData, const std::vector<
 }
 
 //NEW
-int main(int argc, char** argv) {
-  CHECK_RET(argc == 4, return 2);
-  const int64_t m = std::strtoll(argv[1], nullptr, 10);
-  const int64_t n = std::strtoll(argv[2], nullptr, 10);
-  const int64_t k = std::strtoll(argv[3], nullptr, 10);
-  CHECK_RET(m > 0 && n > 0 && k > 0, return 2);
-
-  // 1. （固定写法）device/stream初始化，参考acl API手册
-  // 根据自己的实际device填写deviceId
-  int32_t deviceId = 0;
-  aclrtStream stream;
-  auto ret = Init(deviceId, &stream);
-  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("Init acl failed. ERROR: %d\n", ret); return ret);
-
-  // 2. 构造输入与输出，需要根据API的接口自定义构造
-  //NEW
+int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* averageMs) {
+  auto ret = ACL_SUCCESS;
   std::vector<int64_t> selfShape = {m, k};
   std::vector<int64_t> mat2Shape = {k, n};
   std::vector<int64_t> mat2StorageShape = {n, k};
@@ -197,7 +183,7 @@ int main(int argc, char** argv) {
   float totalMs = 0.0F;
   ret = aclrtEventElapsedTime(&totalMs, startEvent, endEvent);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
-  const float averageMs = totalMs / repeat;
+  *averageMs = totalMs / repeat;
 
   aclrtDestroyEvent(endEvent);
   aclrtDestroyEvent(startEvent);
@@ -213,7 +199,41 @@ int main(int argc, char** argv) {
     CHECK_RET(resultData[i] == static_cast<float>(k), return 3);
   }
 
-  LOG_PRINT("%.9f\n", averageMs);
+  return 0;
+}
+
+//NEW
+int main(int argc, char** argv) {
+  CHECK_RET(argc >= 4 && (argc - 1) % 3 == 0, return 2);
+
+  // 1. （固定写法）device/stream初始化，参考acl API手册
+  // 根据自己的实际device填写deviceId
+  int32_t deviceId = 0;
+  aclrtStream stream;
+  auto ret = Init(deviceId, &stream);
+  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("Init acl failed. ERROR: %d\n", ret); return ret);
+
+  for (int arg = 1; arg < argc; arg += 3) {
+    const int64_t m = std::strtoll(argv[arg], nullptr, 10);
+    const int64_t n = std::strtoll(argv[arg + 1], nullptr, 10);
+    const int64_t k = std::strtoll(argv[arg + 2], nullptr, 10);
+    if (m <= 0 || n <= 0 || k <= 0) {
+      aclrtDestroyStream(stream);
+      aclrtResetDevice(deviceId);
+      aclFinalize();
+      return 2;
+    }
+
+    float averageMs = 0.0F;
+    ret = MeasureShape(m, n, k, stream, &averageMs);
+    if (ret != ACL_SUCCESS) {
+      aclrtDestroyStream(stream);
+      aclrtResetDevice(deviceId);
+      aclFinalize();
+      return ret;
+    }
+    LOG_PRINT("%.9f\n", averageMs);
+  }
 
   // 6. 释放device资源，需要根据具体API的接口定义修改
   aclrtDestroyStream(stream);

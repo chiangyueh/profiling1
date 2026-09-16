@@ -68,37 +68,44 @@ if ! g++ "${example_source}" \
     exit 1
 fi
 
-shapes=(
-    "7 101 6400"
-    "7 121 5120"
-    "7 137 5760"
-    "16 107 6784"
-    "10 119 7168"
-    "4 134 7040"
-    "11 88 5632"
-    "4 77 6784"
-    "15 160 6400"
-    "13 110 5376"
+shape_args=(
+    7 101 6400
+    7 121 5120
+    7 137 5760
+    16 107 6784
+    10 119 7168
+    4 134 7040
+    11 88 5632
+    4 77 6784
+    15 160 6400
+    13 110 5376
 )
 
-for shape in "${shapes[@]}"; do
-    read -r m n k <<<"${shape}"
-    if ! original_raw="$(MATMUL_V3_SHRINK_IDLE_CORES=0 "${example_binary}" "${m}" "${n}" "${k}" 2>>"${run_log}")"; then
-        printf '%s\n' "${original_raw}" >&2
-        cat "${run_log}" >&2
-        exit 1
-    fi
-    if ! shrinked_raw="$(MATMUL_V3_SHRINK_IDLE_CORES=1 "${example_binary}" "${m}" "${n}" "${k}" 2>>"${run_log}")"; then
-        printf '%s\n' "${shrinked_raw}" >&2
-        cat "${run_log}" >&2
-        exit 1
-    fi
-    original_latency="$(printf '%s\n' "${original_raw}" | awk '/^[0-9]+([.][0-9]+)?$/{value=$0} END{print value}')"
-    shrinked_latency="$(printf '%s\n' "${shrinked_raw}" | awk '/^[0-9]+([.][0-9]+)?$/{value=$0} END{print value}')"
-    if [[ -z "${original_latency}" || -z "${shrinked_latency}" ]]; then
-        echo "fatal: latency output is missing for M=${m}, N=${n}, K=${k}" >&2
-        exit 1
-    fi
+if ! original_raw="$(MATMUL_V3_SHRINK_IDLE_CORES=0 "${example_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
+    printf '%s\n' "${original_raw}" >&2
+    cat "${run_log}" >&2
+    exit 1
+fi
+if ! shrinked_raw="$(MATMUL_V3_SHRINK_IDLE_CORES=1 "${example_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
+    printf '%s\n' "${shrinked_raw}" >&2
+    cat "${run_log}" >&2
+    exit 1
+fi
+
+mapfile -t original_latencies < <(printf '%s\n' "${original_raw}" | awk '/^[0-9]+([.][0-9]+)?$/')
+mapfile -t shrinked_latencies < <(printf '%s\n' "${shrinked_raw}" | awk '/^[0-9]+([.][0-9]+)?$/')
+shape_count=$((${#shape_args[@]} / 3))
+if [[ "${#original_latencies[@]}" -ne "${shape_count}" ||
+      "${#shrinked_latencies[@]}" -ne "${shape_count}" ]]; then
+    echo "fatal: latency output count does not match shape count" >&2
+    exit 1
+fi
+
+for ((shape_index = 0; shape_index < shape_count; ++shape_index)); do
+    arg_index=$((shape_index * 3))
+    m="${shape_args[arg_index]}"
+    n="${shape_args[arg_index + 1]}"
+    k="${shape_args[arg_index + 2]}"
     printf '{"shape":"M%s_N%s_K%s_NT","shrinked_latency":"%s","original_latency":"%s"}\n' \
-        "${m}" "${n}" "${k}" "${shrinked_latency}" "${original_latency}"
+        "${m}" "${n}" "${k}" "${shrinked_latencies[shape_index]}" "${original_latencies[shape_index]}"
 done
