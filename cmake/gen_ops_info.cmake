@@ -379,28 +379,12 @@ function(gen_ops_info_and_python)
     return()
   endif()
 
-  # new begin: the MatMul-only source package intentionally has no Conv common headers
-  set(optional_conv_common_copy)
-  if(EXISTS "${PROJECT_SOURCE_DIR}/conv/common/op_kernel")
-    set(optional_conv_common_copy
-      COMMAND ${CMAKE_COMMAND} -E copy_directory
-              ${PROJECT_SOURCE_DIR}/conv/common/op_kernel
-              ${CMAKE_BINARY_DIR}/tbe/ascendc/common
-    )
-  endif()
-  # new end: the MatMul-only source package intentionally has no Conv common headers
-
   add_custom_target(common_copy
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/tbe/ascendc/common/act
     COMMAND cp -r ${PROJECT_SOURCE_DIR}/common/act/* ${CMAKE_BINARY_DIR}/tbe/ascendc/common/act
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/tbe/ascendc/common/matmul_act
     COMMAND cp -r ${PROJECT_SOURCE_DIR}/matmul/common/matmul_act/* ${CMAKE_BINARY_DIR}/tbe/ascendc/common/matmul_act
-    # original begin: unconditional Conv copy failed in the MatMul-only source package
-    # COMMAND cp -r ${PROJECT_SOURCE_DIR}/conv/common/op_kernel/* ${CMAKE_BINARY_DIR}/tbe/ascendc/common
-    # original end: unconditional Conv copy failed in the MatMul-only source package
-    # new begin: copy Conv common headers only when that optional source tree exists
-    ${optional_conv_common_copy}
-    # new end: copy Conv common headers only when that optional source tree exists
+    COMMAND cp -r ${PROJECT_SOURCE_DIR}/conv/common/op_kernel/* ${CMAKE_BINARY_DIR}/tbe/ascendc/common
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/tbe/ascendc/inc
     COMMAND cp -r ${PROJECT_SOURCE_DIR}/common/inc/op_kernel/* ${CMAKE_BINARY_DIR}/tbe/ascendc/inc
   )

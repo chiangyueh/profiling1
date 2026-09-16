@@ -14,11 +14,10 @@
  */
 
 #include <cinttypes>
-// new begin: A/B-controlled idle-core shrinking
+//NEW
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
-// new end: A/B-controlled idle-core shrinking
 #include "matmul_v3_base_tiling.h"
 #include "../../op_kernel/mat_mul_v3_tiling_key.h"
 
@@ -2673,7 +2672,7 @@ bool MatmulV3BaseTiling::CheckMMTilingDataIsVaild()
         CheckNumberIsValid(runInfo_.l2Info.nTileBlock, args_.opName, "runInfo_.l2Info.nTileBlock"));
 }
 
-// new begin: exact aligned BASE-family AIC ownership bound
+//NEW
 void MatmulV3BaseTiling::ShrinkIdleAlignedBaseCores()
 {
     if (tilingEnable_.tilingEnableSplitCore != TilingEnableSplitCore::BASE ||
@@ -2718,7 +2717,6 @@ void MatmulV3BaseTiling::ShrinkIdleAlignedBaseCores()
         1, std::min(oldUsedCoreNum, maxWindowTasks));
     matmul.usedCoreNum = static_cast<uint32_t>(newUsedCoreNum);
 }
-// new end: exact aligned BASE-family AIC ownership bound
 
 ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
 {
@@ -2758,7 +2756,7 @@ ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
     L2Cache l2Cache(args_, tilingData_);
     l2Cache.SetL2CacheFlag(tilingEnable_, compileInfo_.l2Size, l2CacheFlag_);
 
-    // new begin: apply the same final tiling packet with shrink disabled/enabled
+    //NEW
     const uint32_t coresBeforeShrink = tilingData_.matmulTiling.usedCoreNum;
     const char *shrinkMode = std::getenv("MATMUL_V3_SHRINK_IDLE_CORES");
     const bool shrinkEnabled = shrinkMode != nullptr && shrinkMode[0] == '1' && shrinkMode[1] == '\0';
@@ -2766,10 +2764,12 @@ ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
         ShrinkIdleAlignedBaseCores();
     }
     std::printf("CORE_SHRINK_AB enabled=%u before=%u after=%u M=%u N=%u K=%u\n",
-        static_cast<uint32_t>(shrinkEnabled), coresBeforeShrink, tilingData_.matmulTiling.usedCoreNum,
-        tilingData_.matmulTiling.M, tilingData_.matmulTiling.N, tilingData_.matmulTiling.Ka);
+        static_cast<uint32_t>(shrinkEnabled), coresBeforeShrink,
+        static_cast<uint32_t>(tilingData_.matmulTiling.usedCoreNum),
+        static_cast<uint32_t>(tilingData_.matmulTiling.M),
+        static_cast<uint32_t>(tilingData_.matmulTiling.N),
+        static_cast<uint32_t>(tilingData_.matmulTiling.Ka));
     std::fflush(stdout);
-    // new end: apply the same final tiling packet with shrink disabled/enabled
 
     return ge::GRAPH_SUCCESS;
 }

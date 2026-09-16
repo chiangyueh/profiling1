@@ -1,149 +1,54 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# original begin: require the redundant "full" argument
-# if [[ "$#" -ne 1 || "$1" != "full" ]]; then
-#     echo "usage: bash run_npu.sh full" >&2
-#     exit 2
-# fi
-# original end: require the redundant "full" argument
-
-# new begin: the script has one complete execution mode and takes no arguments
-if [[ "$#" -ne 0 ]]; then
-    echo "usage: bash run_npu.sh" >&2
-    exit 2
-fi
-# new end: the script has one complete execution mode and takes no arguments
-
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
-
 source /usr/local/Ascend/cann-8.5.0/set_env.sh
 export ASCEND_RT_VISIBLE_DEVICES=2
+unset ASCEND_CUSTOM_OPP_PATH
 
-# original begin: this A/B loop only linked the installed built-in operator
-# for shrink_mode in 0 1; do
-#     echo "CORE_SHRINK_RUN_BEGIN enabled=${shrink_mode}"
-#     MATMUL_V3_SHRINK_IDLE_CORES="${shrink_mode}" \
-#         bash build.sh \
-#         --run_example mat_mul_v3 eager \
-#         --example_name=matmul
-#
-#     echo "CORE_SHRINK_RUN_END enabled=${shrink_mode}"
-# done
-# original end: this A/B loop only linked the installed built-in operator
-
-# original begin: rebuild the package and recompile the example on every A/B run
-# vendor_name="matmulab"
-#
-# bash build.sh \
-#     --pkg \
-#     --soc=ascend910b \
-#     --ops=mat_mul_v3 \
-#     --vendor_name="${vendor_name}" \
-#     -j1 \
-#     -O3
-#
-# shopt -s nullglob
-# run_packages=(build_out/cann-ops-nn-${vendor_name}-linux.*.run)
-# if [[ "${#run_packages[@]}" -ne 1 ]]; then
-#     echo "fatal: expected one custom operator package, found ${#run_packages[@]}" >&2
-#     exit 1
-# fi
-#
-# "${run_packages[0]}" --quiet --install-path="${ASCEND_OPP_PATH}"
-# source "${ASCEND_OPP_PATH}/vendors/${vendor_name}_nn/bin/set_env.bash"
-#
-# for shrink_mode in 0 1; do
-#     echo "CORE_SHRINK_RUN_BEGIN enabled=${shrink_mode}"
-#     MATMUL_V3_SHRINK_IDLE_CORES="${shrink_mode}" \
-#         bash build.sh \
-#         --run_example mat_mul_v3 eager cust \
-#         --vendor_name="${vendor_name}" \
-#         --example_name=matmul
-#     echo "CORE_SHRINK_RUN_END enabled=${shrink_mode}"
-# done
-# original end: rebuild the package and recompile the example on every A/B run
-
-# new begin: rebuild only when package-relevant source content changes
-vendor_name="matmulab"
-installed_root="${ASCEND_OPP_PATH}/vendors/${vendor_name}_nn"
-installed_env="${installed_root}/bin/set_env.bash"
-installed_api="${installed_root}/op_api/lib/libcust_opapi.so"
-installed_tiling="${installed_root}/op_impl/ai_core/tbe/op_tiling/lib/linux/$(uname -m)/libcust_opmaster.so"
-installed_marker="${installed_root}/bin/profiling1_matmul_v3.sha256"
-local_marker="build_out/${vendor_name}_matmul_v3.sha256"
-
-source_revision="$(git rev-parse HEAD)"
-source_fingerprint="${source_revision}-cann-8.5.0-ascend910b"
-
-cached_fingerprint=""
-if [[ -r "${installed_marker}" ]]; then
-    read -r cached_fingerprint < "${installed_marker}"
-elif [[ -r "${local_marker}" ]]; then
-    read -r cached_fingerprint < "${local_marker}"
-fi
-
-package_ready=0
-if [[ "${cached_fingerprint}" == "${source_fingerprint}" &&
-      -f "${installed_env}" &&
-      -f "${installed_api}" &&
-      -f "${installed_tiling}" &&
-      -d "${installed_root}/op_impl/ai_core/tbe/kernel" ]]; then
-    package_ready=1
-fi
-
-if [[ "${package_ready}" -eq 1 ]]; then
-    echo "CUSTOM_PACKAGE_CACHE hit fingerprint=${source_fingerprint}"
-else
-    echo "CUSTOM_PACKAGE_CACHE miss fingerprint=${source_fingerprint}"
-    bash build.sh \
-        --pkg \
-        --soc=ascend910b \
-        --ops=mat_mul_v3 \
-        --vendor_name="${vendor_name}" \
-        -j1 \
-        -O3
-
-    shopt -s nullglob
-    run_packages=(build_out/cann-ops-nn-${vendor_name}-linux.*.run)
-    if [[ "${#run_packages[@]}" -ne 1 ]]; then
-        echo "fatal: expected one custom operator package, found ${#run_packages[@]}" >&2
-        exit 1
-    fi
-
-    "${run_packages[0]}" --quiet --install-path="${ASCEND_OPP_PATH}"
-    mkdir -p -- "$(dirname -- "${local_marker}")"
-    printf '%s\n' "${source_fingerprint}" > "${local_marker}"
-    if ! printf '%s\n' "${source_fingerprint}" > "${installed_marker}"; then
-        echo "warning: installed cache marker is not writable; cache remains local to this checkout" >&2
-    fi
-fi
-
-source "${installed_env}"
+cmake -S . -B build \
+    -DBUILD_PATH="${PWD}/build" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DENABLE_CUSTOM=FALSE \
+    -DENABLE_BINARY=FALSE \
+    -DENABLE_PACKAGE=FALSE \
+    -DENABLE_TEST=FALSE \
+    -DASCEND_OP_NAME=mat_mul_v3 \
+    -DASCEND_COMPILE_OPS=mat_mul_v3
+cmake --build build --target ophost_nn -- -j1
 
 example_source="matmul/mat_mul_v3/examples/test_aclnn_matmul.cpp"
 example_binary="${PWD}/build/test_aclnn_matmul"
-
-echo "CORE_SHRINK_RUN_BEGIN enabled=0"
-if [[ ! -x "${example_binary}" || "${example_source}" -nt "${example_binary}" ]]; then
-    echo "EXAMPLE_BUILD cache=miss"
-    MATMUL_V3_SHRINK_IDLE_CORES=0 \
-        bash build.sh \
-        --run_example mat_mul_v3 eager cust \
-        --vendor_name="${vendor_name}" \
-        --example_name=matmul
-else
-    echo "EXAMPLE_BUILD cache=hit"
-    MATMUL_V3_SHRINK_IDLE_CORES=0 "${example_binary}"
+runtime_library="-lacl_rt"
+if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/lib64/libascendcl.so" ]]; then
+    runtime_library="-lascendcl"
 fi
-echo "CORE_SHRINK_RUN_END enabled=0"
 
-if [[ ! -x "${example_binary}" ]]; then
-    echo "fatal: example executable was not produced: ${example_binary}" >&2
+g++ "${example_source}" \
+    -I "${ASCEND_HOME_PATH}/include" \
+    -I "${ASCEND_HOME_PATH}/include/aclnnop" \
+    -I "${ASCEND_HOME_PATH}/include/aclnn" \
+    -L "${ASCEND_OPP_PATH}/lib64" \
+    -L "${ASCEND_HOME_PATH}/lib64" \
+    -lopapi_nn -lopapi_math "${runtime_library}" -lnnopbase \
+    -o "${example_binary}"
+
+tiling_library="${PWD}/build/libophost_nn.so"
+if [[ ! -f "${tiling_library}" ]]; then
+    echo "fatal: host tiling library was not produced: ${tiling_library}" >&2
     exit 1
 fi
+legacy_library="${ASCEND_OPP_PATH}/built-in/op_impl/ai_core/tbe/op_host/lib/linux/$(uname -m)/libophost_comm_legacy.so"
+if [[ ! -f "${legacy_library}" ]]; then
+    echo "fatal: installed MatMul host dependency was not found: ${legacy_library}" >&2
+    exit 1
+fi
+ln -sfn "${legacy_library}" "${PWD}/build/libophost_comm_legacy.so"
 
-echo "CORE_SHRINK_RUN_BEGIN enabled=1"
-MATMUL_V3_SHRINK_IDLE_CORES=1 "${example_binary}"
-echo "CORE_SHRINK_RUN_END enabled=1"
-# new end: rebuild only when package-relevant source content changes
+for shrink_mode in 0 1; do
+    echo "CORE_SHRINK_RUN_BEGIN enabled=${shrink_mode}"
+    MATMUL_V3_SHRINK_IDLE_CORES="${shrink_mode}" \
+        LD_PRELOAD="${tiling_library}${LD_PRELOAD:+:${LD_PRELOAD}}" \
+        "${example_binary}"
+    echo "CORE_SHRINK_RUN_END enabled=${shrink_mode}"
+done

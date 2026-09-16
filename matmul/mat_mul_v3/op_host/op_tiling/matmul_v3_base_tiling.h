@@ -77,9 +77,8 @@ protected:
     void DoTilingKey();
     uint64_t GetDeterministicSplitKWorkspaceSize(uint64_t alignedM, uint64_t alignedN);
     void DoBasicTiling();
-    // new begin: remove AIC workers with no aligned BASE-family tile ownership
+    //NEW
     void ShrinkIdleAlignedBaseCores();
-    // new end: remove AIC workers with no aligned BASE-family tile ownership
     void FormulaicBaseBlockTiling();
     void FormulaicTilingNoTrans();
     void CalL1TilingV200();
