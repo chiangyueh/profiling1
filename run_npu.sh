@@ -8,7 +8,7 @@ export ASCEND_GLOBAL_LOG_LEVEL=3
 export ASCEND_SLOG_PRINT_TO_STDOUT=0
 unset ASCEND_CUSTOM_OPP_PATH
 
-host_build="${PWD}/build_host"
+host_build="${PWD}/build"
 build_log="$(mktemp)"
 run_log="$(mktemp)"
 installed_host=""
