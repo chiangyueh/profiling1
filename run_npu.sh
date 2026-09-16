@@ -48,7 +48,7 @@ ln -sfn "${legacy_library}" "${PWD}/build/libophost_comm_legacy.so"
 for shrink_mode in 0 1; do
     echo "CORE_SHRINK_RUN_BEGIN enabled=${shrink_mode}"
     MATMUL_V3_SHRINK_IDLE_CORES="${shrink_mode}" \
-        LD_PRELOAD="${tiling_library}${LD_PRELOAD:+:${LD_PRELOAD}}" \
+        LD_PRELOAD="${legacy_library}:${tiling_library}${LD_PRELOAD:+:${LD_PRELOAD}}" \
         "${example_binary}"
     echo "CORE_SHRINK_RUN_END enabled=${shrink_mode}"
 done
