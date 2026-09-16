@@ -2672,6 +2672,51 @@ bool MatmulV3BaseTiling::CheckMMTilingDataIsVaild()
 }
 
 //NEW
+const char *MatmulV3BaseTiling::GetSelectedBranchName()
+{
+    const auto mix = GetMixNd2nzType();
+    switch (tilingEnable_.tilingEnableSplitCore) {
+        case TilingEnableSplitCore::SINGLE_CORE_SPLIT_K:
+            return mix == MixNd2NzType::V_HEAD_ND2NZ ?
+                "SINGLE_CORE_SPLIT_K_ND2NZ" : "SINGLE_CORE_SPLIT_K";
+        case TilingEnableSplitCore::DETERMINISTIC_SPLIT_K:
+            return mix == MixNd2NzType::V_HEAD_ND2NZ ?
+                "DETERMINISTIC_SPLIT_K_ND2NZ" : "DETERMINISTIC_SPLIT_K";
+        case TilingEnableSplitCore::MULTI_CORE_SPLIT_K:
+            return "MULTI_CORE_SPLIT_K";
+        case TilingEnableSplitCore::SINGLE_CORE_NKM_SPLIT_K:
+            return "SINGLE_CORE_NKM_SPLIT_K";
+        case TilingEnableSplitCore::SINGLE_CORE_SPLIT_K_GM_TO_L1:
+            return mix == MixNd2NzType::V_HEAD_ND2NZ ?
+                "SINGLE_CORE_SPLIT_K_GM_TO_L1_ND2NZ" : "SINGLE_CORE_SPLIT_K_GM_TO_L1";
+        case TilingEnableSplitCore::BASE:
+        default:
+            break;
+    }
+
+    if (tilingEnable_.tilingEnableFullLoad == TilingEnableFullLoad::AL1_FULL_LOAD) {
+        return "AL1_FULL_LOAD";
+    }
+    if (tilingEnable_.tilingEnableFullLoad == TilingEnableFullLoad::BL1_FULL_LOAD) {
+        if (tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::VEC_NZ2ND_UNALIGNOUT) {
+            return "BL1_FULL_LOAD_VEC_NZ2ND";
+        }
+        if (tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE_ENABLE_ALIGNOUT) {
+            return mix == MixNd2NzType::V_HEAD_ND2NZ ?
+                "BL1_FULL_LOAD_FIXPIPE_ND2NZ" : "BL1_FULL_LOAD_FIXPIPE";
+        }
+        if (mix == MixNd2NzType::V_PARALELL_ND2NZ) {
+            return "BL1_FULL_LOAD_CVP_PARALLEL";
+        }
+        return mix == MixNd2NzType::V_HEAD_ND2NZ ? "BL1_FULL_LOAD_ND2NZ" : "BL1_FULL_LOAD";
+    }
+    if (mix == MixNd2NzType::V_PARALELL_ND2NZ) {
+        return "BASE_CVP_PARALLEL";
+    }
+    return mix == MixNd2NzType::V_HEAD_ND2NZ ? "BASE_ND2NZ" : "BASE";
+}
+
+//NEW
 void MatmulV3BaseTiling::ShrinkIdleCores()
 {
     auto &matmul = tilingData_.matmulTiling;
@@ -2760,6 +2805,9 @@ ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
     DoTilingKey();
     L2Cache l2Cache(args_, tilingData_);
     l2Cache.SetL2CacheFlag(tilingEnable_, compileInfo_.l2Size, l2CacheFlag_);
+
+    //NEW
+    (void)::setenv("MATMUL_V3_SELECTED_BRANCH", GetSelectedBranchName(), 1);
 
     //NEW
     const char *shrinkMode = std::getenv("MATMUL_V3_SHRINK_IDLE_CORES");

@@ -79,6 +79,8 @@ protected:
     void DoBasicTiling();
     //NEW
     void ShrinkIdleCores();
+    //NEW
+    const char *GetSelectedBranchName();
     void FormulaicBaseBlockTiling();
     void FormulaicTilingNoTrans();
     void CalL1TilingV200();

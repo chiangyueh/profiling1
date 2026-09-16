@@ -10,6 +10,7 @@
 
 #include <iostream>
 #include <memory>
+#include <string>
 #include <vector>
 //NEW
 #include <cstdlib>
@@ -89,7 +90,8 @@ int CreateTransposedAclTensor(const std::vector<T>& hostData, const std::vector<
 }
 
 //NEW
-int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* averageMs) {
+int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* averageMs,
+                 std::string* branch) {
   auto ret = ACL_SUCCESS;
   std::vector<int64_t> selfShape = {m, k};
   std::vector<int64_t> mat2Shape = {k, n};
@@ -131,6 +133,10 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   // 调用aclnnMatmul第一段接口
   ret = aclnnMatmulGetWorkspaceSize(self, mat2, out, cubeMathType, &workspaceSize, &executor);
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMatmulGetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
+  //NEW
+  const char* selectedBranch = std::getenv("MATMUL_V3_SELECTED_BRANCH");
+  CHECK_RET(selectedBranch != nullptr && selectedBranch[0] != '\0', return 4);
+  *branch = selectedBranch;
   //NEW
   ret = aclSetAclOpExecutorRepeatable(executor);
   CHECK_RET(ret == ACL_SUCCESS,
@@ -226,15 +232,20 @@ int main(int argc, char** argv) {
 
     //NEW
     (void)::unsetenv("MATMUL_V3_SHRINK_APPLIED");
+    //NEW
+    (void)::unsetenv("MATMUL_V3_SELECTED_BRANCH");
     float averageMs = 0.0F;
-    ret = MeasureShape(m, n, k, stream, &averageMs);
+    //NEW
+    std::string branch;
+    ret = MeasureShape(m, n, k, stream, &averageMs, &branch);
     if (ret != ACL_SUCCESS) {
       aclrtDestroyStream(stream);
       aclrtResetDevice(deviceId);
       aclFinalize();
       return ret;
     }
-    LOG_PRINT("%.9f\n", averageMs);
+    //NEW
+    LOG_PRINT("%.9f|%s\n", averageMs, branch.c_str());
   }
 
   // 6. 释放device资源，需要根据具体API的接口定义修改

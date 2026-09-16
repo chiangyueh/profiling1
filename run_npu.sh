@@ -103,8 +103,8 @@ if ! shrinked_raw="$(MATMUL_V3_SHRINK_IDLE_CORES=1 "${example_binary}" "${shape_
 fi
 
 shape_count=$((${#shape_args[@]} / 3))
-mapfile -t shrinked_latencies < <(printf '%s\n' "${shrinked_raw}" | awk '/^[0-9]+([.][0-9]+)?$/')
-if [[ "${#shrinked_latencies[@]}" -ne "${shape_count}" ]]; then
+mapfile -t shrinked_results < <(printf '%s\n' "${shrinked_raw}" | awk -F'|' 'NF == 2 && $1 ~ /^[0-9]+([.][0-9]+)?$/')
+if [[ "${#shrinked_results[@]}" -ne "${shape_count}" ]]; then
     echo "fatal: shrink output count does not match shape count" >&2
     exit 1
 fi
@@ -114,8 +114,8 @@ if ! original_raw="$(MATMUL_V3_SHRINK_IDLE_CORES=0 "${example_binary}" "${shape_
     cat "${run_log}" >&2
     exit 1
 fi
-mapfile -t original_latencies < <(printf '%s\n' "${original_raw}" | awk '/^[0-9]+([.][0-9]+)?$/')
-if [[ "${#original_latencies[@]}" -ne "${shape_count}" ]]; then
+mapfile -t original_results < <(printf '%s\n' "${original_raw}" | awk -F'|' 'NF == 2 && $1 ~ /^[0-9]+([.][0-9]+)?$/')
+if [[ "${#original_results[@]}" -ne "${shape_count}" ]]; then
     echo "fatal: original output count does not match shape count" >&2
     exit 1
 fi
@@ -125,6 +125,12 @@ for ((shape_index = 0; shape_index < shape_count; ++shape_index)); do
     m="${shape_args[arg_index]}"
     n="${shape_args[arg_index + 1]}"
     k="${shape_args[arg_index + 2]}"
-    printf '{"shape":"M%s_N%s_K%s_NT","shrinked_latency":"%s","original_latency":"%s"}\n' \
-        "${m}" "${n}" "${k}" "${shrinked_latencies[shape_index]}" "${original_latencies[shape_index]}"
+    IFS='|' read -r shrinked_latency branch <<<"${shrinked_results[shape_index]}"
+    IFS='|' read -r original_latency original_branch <<<"${original_results[shape_index]}"
+    if [[ "${branch}" != "${original_branch}" ]]; then
+        echo "fatal: branch changed between shrinked and original runs for M${m}_N${n}_K${k}" >&2
+        exit 1
+    fi
+    printf '{"shape":"M%s_N%s_K%s_NT","branch":"%s","shrinked_latency":"%s","original_latency":"%s"}\n' \
+        "${m}" "${n}" "${k}" "${branch}" "${shrinked_latency}" "${original_latency}"
 done
