@@ -91,41 +91,17 @@ int CreateTransposedAclTensor(const std::vector<T>& hostData, const std::vector<
 }
 
 //NEW
-std::string BranchFilePath(int64_t m, int64_t n, int64_t k) {
-  return "/tmp/profiling1_matmul_v3_branch_" + std::to_string(m) + "_" +
-         std::to_string(n) + "_" + std::to_string(k);
-}
-
-//NEW
-std::string ReadSelectedBranch(int64_t m, int64_t n, int64_t k) {
+std::string ReadSelectedBranch() {
   const char* selectedBranch = std::getenv("MATMUL_V3_SELECTED_BRANCH");
   if (selectedBranch != nullptr && selectedBranch[0] != '\0') {
     return selectedBranch;
   }
-  const std::string branchFile = BranchFilePath(m, n, k);
-  FILE* file = std::fopen(branchFile.c_str(), "r");
-  if (file == nullptr) {
-    return {};
-  }
-  char value[128] = {};
-  const bool readOk = std::fgets(value, sizeof(value), file) != nullptr;
-  (void)std::fclose(file);
-  (void)std::remove(branchFile.c_str());
-  if (!readOk) {
-    return {};
-  }
-  std::string branch(value);
-  while (!branch.empty() && (branch.back() == '\n' || branch.back() == '\r')) {
-    branch.pop_back();
-  }
-  return branch;
+  return {};
 }
 
 //NEW
-void ClearSelectedBranch(int64_t m, int64_t n, int64_t k) {
+void ClearSelectedBranch() {
   (void)::unsetenv("MATMUL_V3_SELECTED_BRANCH");
-  const std::string branchFile = BranchFilePath(m, n, k);
-  (void)std::remove(branchFile.c_str());
 }
 
 //NEW
@@ -165,7 +141,9 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   CHECK_RET(ret == ACL_SUCCESS, return ret);
 
   // 3. 调用CANN算子库API，需要修改为具体的Api名称
-  int8_t cubeMathType = 1;
+  //NEW
+  // FORCE_GRP_ACC_FOR_FP32 makes the official 8.5 ACLNN dispatcher select MatMulV3 for K >= 2048.
+  int8_t cubeMathType = 4;
   uint64_t workspaceSize = 0;
   aclOpExecutor* executor = nullptr;
   std::unique_ptr<void, aclError (*)(void*)> executorAddrPtr(nullptr, aclrtFree);
@@ -203,7 +181,7 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   ret = aclrtSynchronizeStream(stream);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
   //NEW
-  *branch = ReadSelectedBranch(m, n, k);
+  *branch = ReadSelectedBranch();
   CHECK_RET(!branch->empty(), return 4);
 
   aclrtEvent startEvent = nullptr;
@@ -271,7 +249,7 @@ int main(int argc, char** argv) {
     //NEW
     (void)::unsetenv("MATMUL_V3_SHRINK_APPLIED");
     //NEW
-    ClearSelectedBranch(m, n, k);
+    ClearSelectedBranch();
     float averageMs = 0.0F;
     //NEW
     std::string branch;
