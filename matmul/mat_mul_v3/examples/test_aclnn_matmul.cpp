@@ -91,22 +91,26 @@ int CreateTransposedAclTensor(const std::vector<T>& hostData, const std::vector<
 }
 
 //NEW
-std::string ReadSelectedBranch() {
+std::string BranchFilePath(int64_t m, int64_t n, int64_t k) {
+  return "/tmp/profiling1_matmul_v3_branch_" + std::to_string(m) + "_" +
+         std::to_string(n) + "_" + std::to_string(k);
+}
+
+//NEW
+std::string ReadSelectedBranch(int64_t m, int64_t n, int64_t k) {
   const char* selectedBranch = std::getenv("MATMUL_V3_SELECTED_BRANCH");
   if (selectedBranch != nullptr && selectedBranch[0] != '\0') {
     return selectedBranch;
   }
-  const char* branchFile = std::getenv("MATMUL_V3_BRANCH_FILE");
-  if (branchFile == nullptr || branchFile[0] == '\0') {
-    return {};
-  }
-  FILE* file = std::fopen(branchFile, "r");
+  const std::string branchFile = BranchFilePath(m, n, k);
+  FILE* file = std::fopen(branchFile.c_str(), "r");
   if (file == nullptr) {
     return {};
   }
   char value[128] = {};
   const bool readOk = std::fgets(value, sizeof(value), file) != nullptr;
   (void)std::fclose(file);
+  (void)std::remove(branchFile.c_str());
   if (!readOk) {
     return {};
   }
@@ -118,16 +122,10 @@ std::string ReadSelectedBranch() {
 }
 
 //NEW
-void ClearSelectedBranch() {
+void ClearSelectedBranch(int64_t m, int64_t n, int64_t k) {
   (void)::unsetenv("MATMUL_V3_SELECTED_BRANCH");
-  const char* branchFile = std::getenv("MATMUL_V3_BRANCH_FILE");
-  if (branchFile == nullptr || branchFile[0] == '\0') {
-    return;
-  }
-  FILE* file = std::fopen(branchFile, "w");
-  if (file != nullptr) {
-    (void)std::fclose(file);
-  }
+  const std::string branchFile = BranchFilePath(m, n, k);
+  (void)std::remove(branchFile.c_str());
 }
 
 //NEW
@@ -205,7 +203,7 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   ret = aclrtSynchronizeStream(stream);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
   //NEW
-  *branch = ReadSelectedBranch();
+  *branch = ReadSelectedBranch(m, n, k);
   CHECK_RET(!branch->empty(), return 4);
 
   aclrtEvent startEvent = nullptr;
@@ -273,7 +271,7 @@ int main(int argc, char** argv) {
     //NEW
     (void)::unsetenv("MATMUL_V3_SHRINK_APPLIED");
     //NEW
-    ClearSelectedBranch();
+    ClearSelectedBranch(m, n, k);
     float averageMs = 0.0F;
     //NEW
     std::string branch;
