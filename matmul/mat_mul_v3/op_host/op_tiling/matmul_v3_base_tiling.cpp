@@ -16,7 +16,6 @@
 #include <cinttypes>
 //NEW
 #include <algorithm>
-#include <cstdio>
 #include <cstdlib>
 #include "matmul_v3_base_tiling.h"
 #include "../../op_kernel/mat_mul_v3_tiling_key.h"
@@ -2757,19 +2756,11 @@ ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
     l2Cache.SetL2CacheFlag(tilingEnable_, compileInfo_.l2Size, l2CacheFlag_);
 
     //NEW
-    const uint32_t coresBeforeShrink = tilingData_.matmulTiling.usedCoreNum;
     const char *shrinkMode = std::getenv("MATMUL_V3_SHRINK_IDLE_CORES");
     const bool shrinkEnabled = shrinkMode != nullptr && shrinkMode[0] == '1' && shrinkMode[1] == '\0';
     if (shrinkEnabled) {
         ShrinkIdleAlignedBaseCores();
     }
-    std::printf("CORE_SHRINK_AB enabled=%u before=%u after=%u M=%u N=%u K=%u\n",
-        static_cast<uint32_t>(shrinkEnabled), coresBeforeShrink,
-        static_cast<uint32_t>(tilingData_.matmulTiling.usedCoreNum),
-        static_cast<uint32_t>(tilingData_.matmulTiling.M),
-        static_cast<uint32_t>(tilingData_.matmulTiling.N),
-        static_cast<uint32_t>(tilingData_.matmulTiling.Ka));
-    std::fflush(stdout);
 
     return ge::GRAPH_SUCCESS;
 }
