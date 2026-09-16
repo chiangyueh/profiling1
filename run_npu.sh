@@ -100,41 +100,56 @@ if [[ "$#" -gt 0 ]]; then
     shape_args=("$@")
 fi
 
-if ! shrinked_raw="$(MATMUL_V3_SHRINK_IDLE_CORES=1 "${example_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
-    printf '%s\n' "${shrinked_raw}" >&2
-    cat "${run_log}" >&2
-    exit 1
-fi
-
 shape_count=$((${#shape_args[@]} / 3))
-mapfile -t shrinked_results < <(printf '%s\n' "${shrinked_raw}" | awk -F'|' 'NF == 2 && $1 ~ /^[0-9]+([.][0-9]+)?$/')
-if [[ "${#shrinked_results[@]}" -ne "${shape_count}" ]]; then
-    echo "fatal: shrink output count does not match shape count" >&2
-    exit 1
-fi
+chunk_size=10
+for ((chunk_start = 0; chunk_start < shape_count; chunk_start += chunk_size)); do
+    chunk_count=$((shape_count - chunk_start))
+    if ((chunk_count > chunk_size)); then
+        chunk_count=${chunk_size}
+    fi
+    chunk_args=("${shape_args[@]:chunk_start * 3:chunk_count * 3}")
 
-if ! original_raw="$(MATMUL_V3_SHRINK_IDLE_CORES=0 "${example_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
-    printf '%s\n' "${original_raw}" >&2
-    cat "${run_log}" >&2
-    exit 1
-fi
-mapfile -t original_results < <(printf '%s\n' "${original_raw}" | awk -F'|' 'NF == 2 && $1 ~ /^[0-9]+([.][0-9]+)?$/')
-if [[ "${#original_results[@]}" -ne "${shape_count}" ]]; then
-    echo "fatal: original output count does not match shape count" >&2
-    exit 1
-fi
-
-for ((shape_index = 0; shape_index < shape_count; ++shape_index)); do
-    arg_index=$((shape_index * 3))
-    m="${shape_args[arg_index]}"
-    n="${shape_args[arg_index + 1]}"
-    k="${shape_args[arg_index + 2]}"
-    IFS='|' read -r shrinked_latency branch <<<"${shrinked_results[shape_index]}"
-    IFS='|' read -r original_latency original_branch <<<"${original_results[shape_index]}"
-    if [[ "${branch}" != "${original_branch}" ]]; then
-        echo "fatal: branch changed between shrinked and original runs for M${m}_N${n}_K${k}" >&2
+    if ! shrinked_raw="$(MATMUL_V3_SHRINK_IDLE_CORES=1 "${example_binary}" "${chunk_args[@]}" 2>>"${run_log}")"; then
+        printf 'fatal: shrink measurement failed for shapes %d-%d\n' \
+            "$((chunk_start + 1))" "$((chunk_start + chunk_count))" >&2
+        cat "${run_log}" >&2
         exit 1
     fi
-    printf '{"shape":"M%s_N%s_K%s_NT","branch":"%s","shrinked_latency":"%s","original_latency":"%s"}\n' \
-        "${m}" "${n}" "${k}" "${branch}" "${shrinked_latency}" "${original_latency}"
+    mapfile -t shrinked_results < <(printf '%s\n' "${shrinked_raw}" | awk -F'|' 'NF == 2 && $1 ~ /^[0-9]+([.][0-9]+)?$/')
+    if [[ "${#shrinked_results[@]}" -ne "${chunk_count}" ]]; then
+        printf 'fatal: shrink output count mismatch for shapes %d-%d: expected=%d actual=%d\n' \
+            "$((chunk_start + 1))" "$((chunk_start + chunk_count))" \
+            "${chunk_count}" "${#shrinked_results[@]}" >&2
+        exit 1
+    fi
+
+    if ! original_raw="$(MATMUL_V3_SHRINK_IDLE_CORES=0 "${example_binary}" "${chunk_args[@]}" 2>>"${run_log}")"; then
+        printf 'fatal: original measurement failed for shapes %d-%d\n' \
+            "$((chunk_start + 1))" "$((chunk_start + chunk_count))" >&2
+        cat "${run_log}" >&2
+        exit 1
+    fi
+    mapfile -t original_results < <(printf '%s\n' "${original_raw}" | awk -F'|' 'NF == 2 && $1 ~ /^[0-9]+([.][0-9]+)?$/')
+    if [[ "${#original_results[@]}" -ne "${chunk_count}" ]]; then
+        printf 'fatal: original output count mismatch for shapes %d-%d: expected=%d actual=%d\n' \
+            "$((chunk_start + 1))" "$((chunk_start + chunk_count))" \
+            "${chunk_count}" "${#original_results[@]}" >&2
+        exit 1
+    fi
+
+    for ((chunk_index = 0; chunk_index < chunk_count; ++chunk_index)); do
+        shape_index=$((chunk_start + chunk_index))
+        arg_index=$((shape_index * 3))
+        m="${shape_args[arg_index]}"
+        n="${shape_args[arg_index + 1]}"
+        k="${shape_args[arg_index + 2]}"
+        IFS='|' read -r shrinked_latency branch <<<"${shrinked_results[chunk_index]}"
+        IFS='|' read -r original_latency original_branch <<<"${original_results[chunk_index]}"
+        if [[ "${branch}" != "${original_branch}" ]]; then
+            echo "fatal: branch changed between shrinked and original runs for M${m}_N${n}_K${k}" >&2
+            exit 1
+        fi
+        printf '{"shape":"M%s_N%s_K%s_NT","branch":"%s","shrinked_latency":"%s","original_latency":"%s"}\n' \
+            "${m}" "${n}" "${k}" "${branch}" "${shrinked_latency}" "${original_latency}"
+    done
 done

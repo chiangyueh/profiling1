@@ -134,10 +134,6 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   ret = aclnnMatmulGetWorkspaceSize(self, mat2, out, cubeMathType, &workspaceSize, &executor);
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMatmulGetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
   //NEW
-  const char* selectedBranch = std::getenv("MATMUL_V3_SELECTED_BRANCH");
-  CHECK_RET(selectedBranch != nullptr && selectedBranch[0] != '\0', return 4);
-  *branch = selectedBranch;
-  //NEW
   ret = aclSetAclOpExecutorRepeatable(executor);
   CHECK_RET(ret == ACL_SUCCESS,
             LOG_PRINT("aclSetAclOpExecutorRepeatable failed. ERROR: %d\n", ret); return ret);
@@ -167,6 +163,10 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   }
   ret = aclrtSynchronizeStream(stream);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
+  //NEW
+  const char* selectedBranch = std::getenv("MATMUL_V3_SELECTED_BRANCH");
+  CHECK_RET(selectedBranch != nullptr && selectedBranch[0] != '\0', return 4);
+  *branch = selectedBranch;
 
   aclrtEvent startEvent = nullptr;
   aclrtEvent endEvent = nullptr;
@@ -239,6 +239,9 @@ int main(int argc, char** argv) {
     std::string branch;
     ret = MeasureShape(m, n, k, stream, &averageMs, &branch);
     if (ret != ACL_SUCCESS) {
+      //NEW
+      fprintf(stderr, "measurement failed: M%ld_N%ld_K%ld_NT rc=%d\n",
+              static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), ret);
       aclrtDestroyStream(stream);
       aclrtResetDevice(deviceId);
       aclFinalize();
