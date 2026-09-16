@@ -252,9 +252,20 @@ function(gen_aicpu_kernel_symbol enable_built_in)
 endfunction()
 
 function(gen_onnx_plugin_symbol)
+  # new begin: a selected-op package may intentionally contain no ONNX plugin sources
+  if(NOT TARGET ${ONNX_PLUGIN_NAME}_obj)
+    return()
+  endif()
+  # new end: a selected-op package may intentionally contain no ONNX plugin sources
+
   add_library(
     ${ONNX_PLUGIN_NAME} SHARED
-    $<$<TARGET_EXISTS:${ONNX_PLUGIN_NAME}_obj>:$<TARGET_OBJECTS:${ONNX_PLUGIN_NAME}_obj>>
+    # original begin: optional object expression allowed an empty shared-library target
+    # $<$<TARGET_EXISTS:${ONNX_PLUGIN_NAME}_obj>:$<TARGET_OBJECTS:${ONNX_PLUGIN_NAME}_obj>>
+    # original end: optional object expression allowed an empty shared-library target
+    # new begin: the guard above proves this object target exists
+    $<TARGET_OBJECTS:${ONNX_PLUGIN_NAME}_obj>
+    # new end: the guard above proves this object target exists
   )
 
   target_link_libraries(

@@ -14,4 +14,12 @@ foreach(SUB_DIR ${CURRENT_DIRS})
     endif()
 endforeach()
 
-add_subdirectory(src/framework)
+# original begin: always build every common ONNX plugin from the full repository
+# add_subdirectory(src/framework)
+# original end: always build every common ONNX plugin from the full repository
+
+# new begin: the MatMul-only source package has no control/shape plugin dependency
+if(EXISTS "${PROJECT_SOURCE_DIR}/control/shape/op_graph/shape_proto.h")
+    add_subdirectory(src/framework)
+endif()
+# new end: the MatMul-only source package has no control/shape plugin dependency
