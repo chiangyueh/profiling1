@@ -89,7 +89,7 @@ int CreateTransposedAclTensor(const std::vector<T>& hostData, const std::vector<
 }
 
 //NEW
-int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* averageMs, bool* measured) {
+int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* averageMs) {
   auto ret = ACL_SUCCESS;
   std::vector<int64_t> selfShape = {m, k};
   std::vector<int64_t> mat2Shape = {k, n};
@@ -131,15 +131,6 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   // 调用aclnnMatmul第一段接口
   ret = aclnnMatmulGetWorkspaceSize(self, mat2, out, cubeMathType, &workspaceSize, &executor);
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMatmulGetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
-  //NEW
-  const char* shrinkMode = std::getenv("MATMUL_V3_SHRINK_IDLE_CORES");
-  const bool shrinkRequested = shrinkMode != nullptr && shrinkMode[0] == '1' && shrinkMode[1] == '\0';
-  const bool shrinkApplied = std::getenv("MATMUL_V3_SHRINK_APPLIED") != nullptr;
-  if (shrinkRequested && !shrinkApplied) {
-    *measured = false;
-    return 0;
-  }
-  *measured = true;
   //NEW
   ret = aclSetAclOpExecutorRepeatable(executor);
   CHECK_RET(ret == ACL_SUCCESS,
@@ -236,20 +227,14 @@ int main(int argc, char** argv) {
     //NEW
     (void)::unsetenv("MATMUL_V3_SHRINK_APPLIED");
     float averageMs = 0.0F;
-    bool measured = false;
-    ret = MeasureShape(m, n, k, stream, &averageMs, &measured);
+    ret = MeasureShape(m, n, k, stream, &averageMs);
     if (ret != ACL_SUCCESS) {
       aclrtDestroyStream(stream);
       aclrtResetDevice(deviceId);
       aclFinalize();
       return ret;
     }
-    //NEW
-    if (measured) {
-      LOG_PRINT("%.9f\n", averageMs);
-    } else {
-      LOG_PRINT("SKIP\n");
-    }
+    LOG_PRINT("%.9f\n", averageMs);
   }
 
   // 6. 释放device资源，需要根据具体API的接口定义修改

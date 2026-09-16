@@ -2672,21 +2672,8 @@ bool MatmulV3BaseTiling::CheckMMTilingDataIsVaild()
 }
 
 //NEW
-void MatmulV3BaseTiling::ShrinkIdleAlignedBaseCores()
+void MatmulV3BaseTiling::ShrinkIdleCores()
 {
-    if (tilingEnable_.tilingEnableSplitCore != TilingEnableSplitCore::BASE ||
-        tilingEnable_.tilingEnableFixOpti != TilingEnableFixOpti::BASE ||
-        GetMixNd2nzType() != MixNd2NzType::NO_ND2NZ) {
-        return;
-    }
-
-    const auto fullLoad = tilingEnable_.tilingEnableFullLoad;
-    if (fullLoad != TilingEnableFullLoad::BASE &&
-        fullLoad != TilingEnableFullLoad::AL1_FULL_LOAD &&
-        fullLoad != TilingEnableFullLoad::BL1_FULL_LOAD) {
-        return;
-    }
-
     auto &matmul = tilingData_.matmulTiling;
     const auto &l2 = tilingData_.tileL2cacheTiling;
     const uint64_t oldUsedCoreNum = static_cast<uint64_t>(matmul.usedCoreNum);
@@ -2698,22 +2685,37 @@ void MatmulV3BaseTiling::ShrinkIdleAlignedBaseCores()
 
     const uint64_t mTotal = ops::CeilDiv(static_cast<uint64_t>(matmul.M), singleCoreM);
     const uint64_t nTotal = ops::CeilDiv(static_cast<uint64_t>(matmul.N), singleCoreN);
-    uint64_t mCnt = 0;
-    uint64_t nCnt = 0;
-    if (l2.mTileBlock > 0 && l2.nTileBlock > 0) {
-        mCnt = std::min(mTotal, static_cast<uint64_t>(l2.mTileBlock));
-        nCnt = std::min(nTotal, static_cast<uint64_t>(l2.nTileBlock));
-    } else {
-        if (l2.mTileCntL2 == 0 || l2.nTileCntL2 == 0) {
-            return;
+    uint64_t activeCoreUpperBound = oldUsedCoreNum;
+    switch (tilingEnable_.tilingEnableSplitCore) {
+        case TilingEnableSplitCore::BASE: {
+            uint64_t mCnt = 0;
+            uint64_t nCnt = 0;
+            if (l2.mTileBlock > 0 && l2.nTileBlock > 0) {
+                mCnt = std::min(mTotal, static_cast<uint64_t>(l2.mTileBlock));
+                nCnt = std::min(nTotal, static_cast<uint64_t>(l2.nTileBlock));
+            } else {
+                if (l2.mTileCntL2 == 0 || l2.nTileCntL2 == 0) {
+                    return;
+                }
+                mCnt = ops::CeilDiv(mTotal, static_cast<uint64_t>(l2.mTileCntL2));
+                nCnt = ops::CeilDiv(nTotal, static_cast<uint64_t>(l2.nTileCntL2));
+            }
+            activeCoreUpperBound = mCnt * nCnt;
+            break;
         }
-        mCnt = ops::CeilDiv(mTotal, static_cast<uint64_t>(l2.mTileCntL2));
-        nCnt = ops::CeilDiv(nTotal, static_cast<uint64_t>(l2.nTileCntL2));
+        case TilingEnableSplitCore::SINGLE_CORE_SPLIT_K:
+        case TilingEnableSplitCore::SINGLE_CORE_NKM_SPLIT_K:
+        case TilingEnableSplitCore::SINGLE_CORE_SPLIT_K_GM_TO_L1:
+            activeCoreUpperBound = mTotal * nTotal;
+            break;
+        case TilingEnableSplitCore::DETERMINISTIC_SPLIT_K:
+        case TilingEnableSplitCore::MULTI_CORE_SPLIT_K:
+        default:
+            return;
     }
 
-    const uint64_t maxWindowTasks = mCnt * nCnt;
     const uint64_t newUsedCoreNum = std::max<uint64_t>(
-        1, std::min(oldUsedCoreNum, maxWindowTasks));
+        1, std::min(oldUsedCoreNum, activeCoreUpperBound));
     matmul.usedCoreNum = static_cast<uint32_t>(newUsedCoreNum);
     //NEW
     if (newUsedCoreNum < oldUsedCoreNum) {
@@ -2763,7 +2765,7 @@ ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
     const char *shrinkMode = std::getenv("MATMUL_V3_SHRINK_IDLE_CORES");
     const bool shrinkEnabled = shrinkMode != nullptr && shrinkMode[0] == '1' && shrinkMode[1] == '\0';
     if (shrinkEnabled) {
-        ShrinkIdleAlignedBaseCores();
+        ShrinkIdleCores();
     }
 
     return ge::GRAPH_SUCCESS;
