@@ -91,31 +91,51 @@ shape_args=(
     1024 4096 2048
 )
 
-if ! original_raw="$(MATMUL_V3_SHRINK_IDLE_CORES=0 "${example_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
-    printf '%s\n' "${original_raw}" >&2
-    cat "${run_log}" >&2
-    exit 1
-fi
 if ! shrinked_raw="$(MATMUL_V3_SHRINK_IDLE_CORES=1 "${example_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
     printf '%s\n' "${shrinked_raw}" >&2
     cat "${run_log}" >&2
     exit 1
 fi
 
-mapfile -t original_latencies < <(printf '%s\n' "${original_raw}" | awk '/^[0-9]+([.][0-9]+)?$/')
-mapfile -t shrinked_latencies < <(printf '%s\n' "${shrinked_raw}" | awk '/^[0-9]+([.][0-9]+)?$/')
 shape_count=$((${#shape_args[@]} / 3))
-if [[ "${#original_latencies[@]}" -ne "${shape_count}" ||
-      "${#shrinked_latencies[@]}" -ne "${shape_count}" ]]; then
-    echo "fatal: latency output count does not match shape count" >&2
+mapfile -t shrinked_records < <(printf '%s\n' "${shrinked_raw}" | awk '/^SKIP$|^[0-9]+([.][0-9]+)?$/')
+if [[ "${#shrinked_records[@]}" -ne "${shape_count}" ]]; then
+    echo "fatal: shrink output count does not match shape count" >&2
     exit 1
 fi
 
+eligible_indices=()
+original_args=()
 for ((shape_index = 0; shape_index < shape_count; ++shape_index)); do
+    if [[ "${shrinked_records[shape_index]}" == "SKIP" ]]; then
+        continue
+    fi
+    arg_index=$((shape_index * 3))
+    eligible_indices+=("${shape_index}")
+    original_args+=("${shape_args[arg_index]}" "${shape_args[arg_index + 1]}" "${shape_args[arg_index + 2]}")
+done
+if [[ "${#eligible_indices[@]}" -eq 0 ]]; then
+    echo "fatal: no candidate shape produced an actual core reduction" >&2
+    exit 1
+fi
+
+if ! original_raw="$(MATMUL_V3_SHRINK_IDLE_CORES=0 "${example_binary}" "${original_args[@]}" 2>>"${run_log}")"; then
+    printf '%s\n' "${original_raw}" >&2
+    cat "${run_log}" >&2
+    exit 1
+fi
+mapfile -t original_latencies < <(printf '%s\n' "${original_raw}" | awk '/^[0-9]+([.][0-9]+)?$/')
+if [[ "${#original_latencies[@]}" -ne "${#eligible_indices[@]}" ]]; then
+    echo "fatal: original output count does not match eligible shape count" >&2
+    exit 1
+fi
+
+for ((result_index = 0; result_index < ${#eligible_indices[@]}; ++result_index)); do
+    shape_index="${eligible_indices[result_index]}"
     arg_index=$((shape_index * 3))
     m="${shape_args[arg_index]}"
     n="${shape_args[arg_index + 1]}"
     k="${shape_args[arg_index + 2]}"
     printf '{"shape":"M%s_N%s_K%s_NT","shrinked_latency":"%s","original_latency":"%s"}\n' \
-        "${m}" "${n}" "${k}" "${shrinked_latencies[shape_index]}" "${original_latencies[shape_index]}"
+        "${m}" "${n}" "${k}" "${shrinked_records[shape_index]}" "${original_latencies[result_index]}"
 done
