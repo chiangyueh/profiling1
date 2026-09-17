@@ -51,10 +51,79 @@ def candidate_pool():
     seen = set()
     rng = random.Random(0x910B85)
 
-    # AL1 full-load: fp32, A=N, B=T, M<=16, 16<N<=320, aligned large K.
-    for i in range(900):
-        add(pool, seen, "fp32", "NT", 1 + i % 16,
-            32 + 16 * ((i * 7) % 19), 4096 + 128 * ((i * 11) % 29))
+    # These blocks mirror the narrow source predicates.  They intentionally
+    # precede the broad corpus: rare routes must not depend on random hits.
+
+    # AL1 full-load: fp32, A=N, B=T, M<=16, 16<N<=320, K aligned to
+    # 512/dtype bytes, and A resident in L1.  N starts at 80 so the
+    # deterministic M,N<=64 rule cannot mask AL1.
+    al1_k = (4096, 5120, 5760, 6144, 6400, 6656, 6784, 7040,
+              7168, 8192, 9216, 10240, 12288, 14336, 15360, 16384)
+    for index in range(4096):
+        add(pool, seen, "fp32", "NT",
+            1 + index % 16,
+            80 + 16 * ((index // 16) % 16),
+            al1_k[(index // 256) % len(al1_k)])
+
+    # Plain BL1 full-load needs M > 16*max(K,N), K<=256 and an on-the-fly
+    # supported B.  Values below avoid the earlier fixpipe predicate.  The
+    # first K set is also on-the-fly supported for A (plain BL1); the second
+    # deliberately makes A use head ND2NZ while B remains on-the-fly.
+    bl1_n = (32, 64, 128, 192, 256, 384)
+    bl1_plain_k = (8, 16, 24, 32, 40, 48, 56, 64, 96)
+    bl1_nd2nz_k = (17, 18, 19, 21, 25, 33, 41, 49, 57, 65, 73, 81)
+    for index in range(240):
+        m = 9216 + 128 * index
+        for layout in ("NN", "NT"):
+            add(pool, seen, "fp32", layout, m,
+                bl1_n[index % len(bl1_n)], bl1_plain_k[(index * 5) % len(bl1_plain_k)])
+            add(pool, seen, "fp32", layout, m + 64,
+                bl1_n[(index + 1) % len(bl1_n)], bl1_nd2nz_k[(index * 7) % len(bl1_nd2nz_k)])
+
+    # K=1536 is a dedicated 8.5 DeepSeek path.  It requires both M and N to
+    # be 128-aligned, one axis exactly 384 and the other at least 49152.
+    # The two orientations select MKN and NKM respectively.
+    for index in range(180):
+        long_axis = 49152 + 128 * index
+        for dtype in ("fp16", "bf16"):
+            for layout in ("NN", "NT", "TN", "TT"):
+                add(pool, seen, dtype, layout, 384, long_axis, 1536)
+                add(pool, seen, dtype, layout, long_axis, 384, 1536)
+
+    # Generic single-core Split-K, separated by the actual flags that decide
+    # the three kernels.  NT + aligned K has no input ND2NZ.  NN + unaligned
+    # N retains head ND2NZ.  N%128 selects GM-to-L1; a one-element K tail in
+    # NT retains ND2NZ for its GM-to-L1 companion.
+    for index in range(360):
+        dtype = "fp16" if index % 2 == 0 else "bf16"
+        m = 512 + 128 * (index % 17)
+        n_aligned = 512 + 128 * ((index * 5) % 25)
+        n_unaligned = n_aligned + 1 + 2 * (index % 31)
+        k_aligned = 27392 + 128 * ((index * 11) % 45)
+        k_unaligned = k_aligned + 1 + 2 * (index % 13)
+        add(pool, seen, dtype, "NT", m, n_unaligned, k_aligned)
+        add(pool, seen, dtype, "NN", m, n_unaligned, k_aligned)
+        add(pool, seen, dtype, "NT", m, n_aligned, k_aligned)
+        add(pool, seen, dtype, "NT", m + 64, n_aligned, k_unaligned)
+
+    # FP32 NKM has an explicit selector window.  Use dense multiples around
+    # the lower boundary instead of correlating M/N/K with one loop index.
+    for m in range(1920, 2817, 16):
+        for n in (8, 16, 24, 32, 40, 48, 56, 64):
+            for k in (27392, 28032, 28672, 29696, 30336, 31616, 32768):
+                add(pool, seen, "fp32", "NT", m, n, k)
+
+    # Deterministic Split-K + VEC_NZ2ND + head ND2NZ.  GetMoreMultiCore-
+    # SplitKArgs clears conversion for inner axes in [192,65535], hence the
+    # explicit 129..191 inner axes.  Odd N>128 selects vector NZ2ND output.
+    for index in range(420):
+        m = 129 + (index * 7) % 63
+        n = 129 + (index * 11 + index // 63) % 63
+        if n % 16 == 0:
+            n += 1
+        k = 9216 + 128 * ((index * 13) % 320)
+        for layout in ("NN", "TN", "TT"):
+            add(pool, seen, "fp32", layout, m, n, k)
 
     # BL1 and the three fixpipe output variants. Long M and small K/N are
     # deliberately sampled on both aligned and unaligned boundaries.
@@ -106,12 +175,6 @@ def candidate_pool():
         n = split_n[(i * 7 + i // len(split_m)) % len(split_n)]
         k = split_k[(i * 11) % len(split_k)] + (1 if layout != "NT" and i % 5 == 0 else 0)
         add(pool, seen, dtype, layout, m, n, k)
-
-    # FP32 NKM Split-K has a narrow explicit selector: M>=1920, N<=64,
-    # 27392<=K<65535, A=N/B=T.
-    for i in range(1800):
-        add(pool, seen, "fp32", "NT", 1920 + 64 * (i % 97),
-            8 + 8 * ((i * 5) % 8), 27392 + 128 * ((i * 13) % 250))
 
     # Randomized log-stratified tail. This is intentionally last: it expands
     # diversity and catches selector pockets not represented by the explicit
@@ -175,6 +238,8 @@ def discover(args):
     pool = candidate_pool()
     offsets = {key: 0 for key in pool}
     counts = collections.Counter()
+    observed = collections.Counter()
+    witnesses = collections.defaultdict(list)
     selected = []
     selected_mnk = set()
     keys = sorted(pool)
@@ -203,6 +268,11 @@ def discover(args):
                 if record is None:
                     continue
                 branch = record.get("branch")
+                if branch in TARGET_BRANCHES:
+                    observed[branch] += 1
+                    if len(witnesses[branch]) < 3:
+                        witnesses[branch].append({"dtype": dtype, "layout": layout,
+                                                  "m": m, "n": n, "k": k})
                 mnk = (m, n, k)
                 if branch not in TARGET_BRANCHES or counts[branch] >= args.quota or mnk in selected_mnk:
                     continue
@@ -215,6 +285,9 @@ def discover(args):
     if missing:
         print(json.dumps({"fatal": "branch_discovery_exhausted", "attempted": attempts,
                           "counts": {name: counts[name] for name in TARGET_BRANCHES},
+                          "observed": {name: observed[name] for name in TARGET_BRANCHES},
+                          "witnesses": {name: witnesses[name] for name in TARGET_BRANCHES
+                                        if witnesses[name]},
                           "missing": missing}, separators=(",", ":")), file=sys.stderr)
         return 3
     with open(args.selected, "w", encoding="utf-8") as stream:
