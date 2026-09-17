@@ -101,30 +101,49 @@ void ClearSelectedBranch() {
 
 //NEW
 extern "C" uint32_t TbeLoadSoAndSaveToRegistry(const char* soPath);
+//NEW
+extern "C" int InstallMatMulV2RetileHook();
+//NEW
+extern "C" int MatMulV2RetileHookReady();
 
 //NEW
-int EnableMatMulV3Shrink() {
+int EnableMatMulShrink() {
+  const char* v2HostLibraryPath = std::getenv("MATMUL_V2_OFFICIAL_HOST_LIBRARY");
+  const char* v2TilingLibraryPath = std::getenv("MATMUL_V2_OFFICIAL_TILING_LIBRARY");
   const char* v3LibraryPath = std::getenv("MATMUL_V3_HOST_LIBRARY");
-  if (v3LibraryPath == nullptr || v3LibraryPath[0] == '\0') {
-    fprintf(stderr, "tiling registration failed: MatMulV3 host library path is missing\n");
+  if (v2HostLibraryPath == nullptr || v2HostLibraryPath[0] == '\0' ||
+      v2TilingLibraryPath == nullptr || v2TilingLibraryPath[0] == '\0' ||
+      v3LibraryPath == nullptr || v3LibraryPath[0] == '\0') {
+    fprintf(stderr, "tiling registration failed: MatMulV2 host/tiling or MatMulV3 host library path is missing\n");
     return 4;
   }
 
+  //NEW
+  // Populate one registry with the complete official legacy MatMulV2 entry
+  // before adding the modified MatMulV3 entry. No aclnn lookup occurs before
+  // both callbacks are installed, so the runtime cannot cache an old callback.
+  const uint32_t v2HostStatus = TbeLoadSoAndSaveToRegistry(v2HostLibraryPath);
+  const uint32_t v2TilingStatus = TbeLoadSoAndSaveToRegistry(v2TilingLibraryPath);
+  if (v2HostStatus != 0U || v2TilingStatus != 0U) {
+    fprintf(stderr, "tiling registration failed: cannot register complete official MatMulV2 entry host_rc=%u tiling_rc=%u\n",
+            v2HostStatus, v2TilingStatus);
+    return 4;
+  }
   const uint32_t v3Status = TbeLoadSoAndSaveToRegistry(v3LibraryPath);
   if (v3Status != 0U) {
     fprintf(stderr, "tiling registration failed: cannot register MatMulV3 host library rc=%u\n", v3Status);
+    return 4;
+  }
+  if (InstallMatMulV2RetileHook() != 1 || MatMulV2RetileHookReady() != 1) {
+    fprintf(stderr, "tiling registration failed: complete official MatMulV2 entry was not patched\n");
     return 4;
   }
   return ACL_SUCCESS;
 }
 
 //NEW
-constexpr int kDeferredMatMulV3 = 10000;
-
-//NEW
 int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* averageMs,
-                 std::string* branch, std::string* failedStage, std::string* failureDetail,
-                 bool deferUninstrumentedV3) {
+                 std::string* branch, std::string* failedStage, std::string* failureDetail) {
   auto ret = ACL_SUCCESS;
   std::vector<int64_t> selfShape = {m, k};
   std::vector<int64_t> mat2Shape = {k, n};
@@ -182,10 +201,6 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
       branch->empty()) {
     (void)aclDestroyAclOpExecutor(executor);
     executor = nullptr;
-    if (deferUninstrumentedV3) {
-      *failedStage = "deferred_matmul_v3";
-      return kDeferredMatMulV3;
-    }
     *failedStage = "shrink_callback_invariant";
     return 4;
   }
@@ -318,7 +333,12 @@ int main(int argc, char** argv) {
   //NEW
   const char* shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
   const bool shrinkEnabled = shrinkMode != nullptr && shrinkMode[0] == '1' && shrinkMode[1] == '\0';
-  std::vector<size_t> deferredV3;
+  if (shrinkEnabled) {
+    ret = EnableMatMulShrink();
+    CHECK_RET(ret == ACL_SUCCESS,
+              LOG_PRINT("MatMul shrink setup failed. ERROR: %d\n", ret); return ret);
+  }
+
   for (size_t index = 0; index < results.size(); ++index) {
     auto& result = results[index];
 
@@ -327,11 +347,7 @@ int main(int argc, char** argv) {
     std::string failedStage;
     std::string failureDetail;
     ret = MeasureShape(result.m, result.n, result.k, stream, &result.averageMs, &result.branch,
-                       &failedStage, &failureDetail, shrinkEnabled);
-    if (ret == kDeferredMatMulV3) {
-      deferredV3.push_back(index);
-      continue;
-    }
+                       &failedStage, &failureDetail);
     if (ret != ACL_SUCCESS) {
       //NEW
       const char* tilingStage = std::getenv("MATMUL_TILING_STAGE");
@@ -346,35 +362,6 @@ int main(int argc, char** argv) {
       return ret;
     }
     result.complete = true;
-  }
-
-  //NEW
-  // Loading the custom MatMulV3 host switches the active registry space.  Do
-  // it only after every naturally selected MatMulV2 shape has completed.
-  if (!deferredV3.empty()) {
-    ret = EnableMatMulV3Shrink();
-    CHECK_RET(ret == ACL_SUCCESS,
-              LOG_PRINT("MatMulV3 shrink setup failed. ERROR: %d\n", ret); return ret);
-    for (size_t index : deferredV3) {
-      auto& result = results[index];
-      ClearSelectedBranch();
-      std::string failedStage;
-      std::string failureDetail;
-      ret = MeasureShape(result.m, result.n, result.k, stream, &result.averageMs, &result.branch,
-                         &failedStage, &failureDetail, false);
-      if (ret != ACL_SUCCESS) {
-        const char* tilingStage = std::getenv("MATMUL_TILING_STAGE");
-        fprintf(stderr, "measurement failed: M%ld_N%ld_K%ld_NN stage=%s rc=%d tiling_stage=%s detail=%s\n",
-                static_cast<long>(result.m), static_cast<long>(result.n), static_cast<long>(result.k),
-                failedStage.c_str(), ret, tilingStage == nullptr ? "not_reached" : tilingStage,
-                failureDetail.empty() ? "unavailable" : failureDetail.c_str());
-        aclrtDestroyStream(stream);
-        aclrtResetDevice(deviceId);
-        aclFinalize();
-        return ret;
-      }
-      result.complete = true;
-    }
   }
 
   //NEW

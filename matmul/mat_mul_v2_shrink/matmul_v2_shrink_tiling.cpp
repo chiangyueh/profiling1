@@ -11,16 +11,13 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
-#include <dlfcn.h>
 
+#include "base/registry/op_impl_space_registry_v2.h"
 #include "exe_graph/runtime/tiling_context.h"
-
-namespace gert {
-uint32_t TilingForMatMul(TilingContext *context);
-}
 
 namespace {
 using TilingFunc = uint32_t (*)(gert::TilingContext *);
+TilingFunc g_officialMatMulV2Tiling = nullptr;
 
 //NEW
 // Offsets of the hardware fields in the CANN 8.5 CubeCompileInfo base of
@@ -35,7 +32,6 @@ constexpr uint64_t kCubeBlock = 16;
 constexpr uint32_t kMaximumExpectedAicoreCount = 64;
 constexpr uint64_t kMinimumLocalMemory = 32 * 1024;
 constexpr uint64_t kMaximumLocalMemory = 16 * 1024 * 1024;
-constexpr const char *kOfficialSymbol = "_ZN4gert15TilingForMatMulEPNS_13TilingContextE";
 
 template <typename T>
 T ReadCompileInfoField(const void *compileInfo, size_t offset)
@@ -130,39 +126,18 @@ bool GetOutputMN(const gert::TilingContext &context, uint64_t &m, uint64_t &n)
     return true;
 }
 
-TilingFunc ResolveOfficialTiling()
-{
-    static TilingFunc official = []() {
-        (void)::dlerror();
-        void *symbol = ::dlsym(RTLD_NEXT, kOfficialSymbol);
-        if (::dlerror() != nullptr || symbol == nullptr ||
-            symbol == reinterpret_cast<void *>(&gert::TilingForMatMul)) {
-            return static_cast<TilingFunc>(nullptr);
-        }
-        return reinterpret_cast<TilingFunc>(symbol);
-    }();
-    return official;
-}
-} // namespace
-
 //NEW
-// The official liboptiling registration obtains this default-visible symbol
-// through a preemptable GLOB_DAT relocation. The executable exports this
-// definition with -rdynamic, so every naturally selected MatMulV2 call enters
-// here while all other official registration fields remain untouched.
-namespace gert {
-__attribute__((visibility("default"))) uint32_t TilingForMatMul(TilingContext *context)
+uint32_t MatMulV2RetiledTiling(gert::TilingContext *context)
 {
     SetTilingStage("v2_retile_entered");
-    TilingFunc official = ResolveOfficialTiling();
-    if (context == nullptr || official == nullptr) {
-        SetTilingStage("v2_official_symbol_missing");
+    if (context == nullptr || g_officialMatMulV2Tiling == nullptr) {
+        SetTilingStage("v2_official_callback_missing");
         return ge::GRAPH_FAILED;
     }
 
     const char *shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
     if (shrinkMode == nullptr || shrinkMode[0] != '1' || shrinkMode[1] != '\0') {
-        return official(context);
+        return g_officialMatMulV2Tiling(context);
     }
 
     void *compileInfo = const_cast<void *>(context->GetCompileInfo());
@@ -185,7 +160,7 @@ __attribute__((visibility("default"))) uint32_t TilingForMatMul(TilingContext *c
 
     WriteCompileInfoField<uint32_t>(compileInfo, kCoreNumOffset, retileCoreLimit);
     CoreLimitRestoreGuard restoreCoreLimit(compileInfo, originalCoreLimit);
-    const uint32_t status = official(context);
+    const uint32_t status = g_officialMatMulV2Tiling(context);
     if (status != ge::GRAPH_SUCCESS) {
         SetTilingStage("v2_official_retile_failed");
         return status;
@@ -203,4 +178,41 @@ __attribute__((visibility("default"))) uint32_t TilingForMatMul(TilingContext *c
     SetTilingStage(effective ? "v2_retile_applied" : "v2_retile_not_applicable");
     return ge::GRAPH_SUCCESS;
 }
-} // namespace gert
+} // namespace
+
+//NEW
+// The official legacy host library is loaded first. Replace only its tiling
+// function pointer; infer-shape, parser, compile-info and all other fields stay
+// in the same complete official MatMulV2 registry entry.
+extern "C" int InstallMatMulV2RetileHook()
+{
+    const auto registry = gert::DefaultOpImplSpaceRegistryV2::GetInstance().GetSpaceRegistry();
+    if (registry == nullptr) {
+        return 0;
+    }
+    const auto *registered = registry->GetOpImpl("MatMulV2");
+    if (registered == nullptr || registered->tiling == nullptr || registered->infer_shape == nullptr ||
+        registered->tiling_parse == nullptr || registered->compile_info_creator == nullptr ||
+        registered->compile_info_deleter == nullptr) {
+        return 0;
+    }
+    if (registered->tiling != MatMulV2RetiledTiling) {
+        g_officialMatMulV2Tiling = registered->tiling;
+        auto *mutableEntry = const_cast<gert::OpImplKernelRegistry::OpImplFunctionsV2 *>(registered);
+        mutableEntry->tiling = MatMulV2RetiledTiling;
+    }
+    return g_officialMatMulV2Tiling != nullptr && registered->tiling == MatMulV2RetiledTiling ? 1 : 0;
+}
+
+//NEW
+extern "C" int MatMulV2RetileHookReady()
+{
+    const auto registry = gert::DefaultOpImplSpaceRegistryV2::GetInstance().GetSpaceRegistry();
+    if (registry == nullptr || g_officialMatMulV2Tiling == nullptr) {
+        return 0;
+    }
+    const auto *registered = registry->GetOpImpl("MatMulV2");
+    return registered != nullptr && registered->tiling == MatMulV2RetiledTiling &&
+        registered->infer_shape != nullptr && registered->tiling_parse != nullptr &&
+        registered->compile_info_creator != nullptr && registered->compile_info_deleter != nullptr ? 1 : 0;
+}
