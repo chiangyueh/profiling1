@@ -14,6 +14,17 @@
 #include "exe_graph/runtime/tiling_context.h"
 #include "register/op_impl_registry.h"
 
+//NEW
+// MatMulV2's official registration includes this parser and these compile-info
+// lifetime functions in addition to TilingForMatMul. They are exported by the
+// official liboptiling.so loaded before this combined host library.
+namespace gert {
+class GemmCompileInfo;
+uint32_t GemmParseFunc(TilingParseContext *context);
+template <> void *OpImplRegisterV2::CreateCompileInfo<GemmCompileInfo, 0>();
+template <> void OpImplRegisterV2::DeleteCompileInfo<GemmCompileInfo>(void *object);
+} // namespace gert
+
 namespace {
 using TilingFunc = gert::OpImplRegisterV2::TilingKernelFunc;
 
@@ -102,7 +113,9 @@ uint32_t MatMulV2ShrinkTiling(gert::TilingContext *context)
 } // namespace
 
 //NEW
-IMPL_OP_OPTILING(MatMulV2).Tiling(MatMulV2ShrinkTiling, 2048);
+IMPL_OP_OPTILING(MatMulV2)
+    .Tiling(MatMulV2ShrinkTiling, 2048)
+    .TilingParse<gert::GemmCompileInfo>(gert::GemmParseFunc);
 
 //NEW
 extern "C" __attribute__((visibility("default"))) int ConfigureMatMulV2OfficialTiling(void *callback)
