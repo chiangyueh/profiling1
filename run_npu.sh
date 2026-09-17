@@ -122,6 +122,9 @@ if ! shrinked_raw="$(MATMUL_SHRINK_MODE=1 \
     MATMUL_V2_SHRINK_LIBRARY="${v2_shrink_library}" \
     "${example_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
     echo "fatal: shrink measurement failed" >&2
+    if [[ -n "${shrinked_raw}" ]]; then
+        printf '%s\n' "${shrinked_raw}" >&2
+    fi
     cat "${run_log}" >&2
     exit 1
 fi
@@ -145,6 +148,9 @@ if ! original_raw="$(MATMUL_SHRINK_MODE=0 MATMUL_V3_SHRINK_IDLE_CORES=0 \
     MATMUL_V2_OFFICIAL_LIBRARY="${v2_official_library}" \
     "${example_binary}" "${original_args[@]}" 2>>"${run_log}")"; then
     echo "fatal: original measurement failed" >&2
+    if [[ -n "${original_raw}" ]]; then
+        printf '%s\n' "${original_raw}" >&2
+    fi
     cat "${run_log}" >&2
     exit 1
 fi

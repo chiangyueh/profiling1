@@ -105,6 +105,7 @@ int EnableMatMulTilingVariants() {
   const char* v3LibraryPath = std::getenv("MATMUL_V3_HOST_LIBRARY");
   if (officialLibraryPath == nullptr || officialLibraryPath[0] == '\0' ||
       v3LibraryPath == nullptr || v3LibraryPath[0] == '\0') {
+    fprintf(stderr, "tiling registration failed: required library path is missing\n");
     return 4;
   }
   //NEW
@@ -112,6 +113,7 @@ int EnableMatMulTilingVariants() {
   TbeLoadSoAndSaveToRegistry(officialLibraryPath);
   TbeLoadSoAndSaveToRegistry(v3LibraryPath);
   if (dlopen(v3LibraryPath, RTLD_NOW | RTLD_GLOBAL) == nullptr) {
+    fprintf(stderr, "tiling registration failed: cannot load MatMulV3 host library: %s\n", dlerror());
     return 4;
   }
   if (shrinkMode == nullptr || shrinkMode[0] != '1' || shrinkMode[1] != '\0') {
@@ -120,16 +122,23 @@ int EnableMatMulTilingVariants() {
 
   const char* v2ShrinkLibraryPath = std::getenv("MATMUL_V2_SHRINK_LIBRARY");
   if (v2ShrinkLibraryPath == nullptr || v2ShrinkLibraryPath[0] == '\0') {
+    fprintf(stderr, "tiling registration failed: MatMulV2 shrink library path is missing\n");
     return 4;
   }
   TbeLoadSoAndSaveToRegistry(v2ShrinkLibraryPath);
   void* handle = dlopen(v2ShrinkLibraryPath, RTLD_NOW | RTLD_GLOBAL);
   if (handle == nullptr) {
+    fprintf(stderr, "tiling registration failed: cannot load MatMulV2 shrink library: %s\n", dlerror());
     return 4;
   }
   using ReadyFunction = int (*)();
   auto ready = reinterpret_cast<ReadyFunction>(dlsym(handle, "MatMulV2ShrinkRegistrationReady"));
-  if (ready == nullptr || ready() != 1) {
+  if (ready == nullptr) {
+    fprintf(stderr, "tiling registration failed: MatMulV2 readiness symbol is missing\n");
+    return 4;
+  }
+  if (ready() != 1) {
+    fprintf(stderr, "tiling registration failed: MatMulV2 official callback was not captured\n");
     return 4;
   }
   return ACL_SUCCESS;
