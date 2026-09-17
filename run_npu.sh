@@ -47,7 +47,6 @@ if [[ ! -f "${v2_shrink_library}" || "${v2_shrink_source}" -nt "${v2_shrink_libr
     if ! g++ -std=c++17 -O2 -fPIC -shared -D_GLIBCXX_USE_CXX11_ABI=0 "${v2_shrink_source}" \
         -I "${ASCEND_HOME_PATH}/include" \
         -I "${ASCEND_HOME_PATH}/x86_64-linux/include" \
-        -I "${ASCEND_HOME_PATH}/x86_64-linux/pkg_inc" \
         -L "${ASCEND_HOME_PATH}/lib64" \
         -L "${ASCEND_HOME_PATH}/x86_64-linux/lib64" \
         -lopp_registry -lregister \

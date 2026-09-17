@@ -10,10 +10,35 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <memory>
 
-#include "base/registry/op_impl_space_registry_v2.h"
 #include "exe_graph/runtime/tiling_context.h"
+#include "register/op_impl_kernel_registry.h"
 #include "register/op_impl_registry.h"
+
+//NEW
+// CANN 8.5 runtime packages export this registry ABI but do not all install the
+// internal pkg_inc declaration. Keep the narrow declaration needed by this
+// wrapper and use only types defined by the installed public registry headers.
+namespace gert {
+enum class OppImplVersionTag {
+    kOpp,
+    kOppKernel,
+    kVersionEnd = 20
+};
+
+class OpImplSpaceRegistryV2 {
+public:
+    const OpImplKernelRegistry::OpImplFunctionsV2 *GetOpImpl(const char *opType) const;
+};
+
+class DefaultOpImplSpaceRegistryV2 {
+public:
+    static DefaultOpImplSpaceRegistryV2 &GetInstance();
+    const std::shared_ptr<OpImplSpaceRegistryV2> GetSpaceRegistry(
+        OppImplVersionTag versionTag = OppImplVersionTag::kOpp) const;
+};
+} // namespace gert
 
 namespace {
 using TilingFunc = gert::OpImplRegisterV2::TilingKernelFunc;
