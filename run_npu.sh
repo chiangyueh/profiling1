@@ -57,9 +57,9 @@ if [[ ! -f "${v2_shrink_library}" || "${v2_shrink_source}" -nt "${v2_shrink_libr
 fi
 
 #NEW
-v2_official_library="${ASCEND_OPP_PATH}/built-in/op_impl/ai_core/tbe/op_host/lib/linux/$(uname -m)/libophost_legacy.so"
-if [[ ! -f "${v2_official_library}" ]]; then
-    echo "fatal: ${v2_official_library} does not exist" >&2
+official_host_directory="${ASCEND_OPP_PATH}/built-in/op_impl/ai_core/tbe/op_host/lib/linux/$(uname -m)"
+if [[ ! -d "${official_host_directory}" ]]; then
+    echo "fatal: ${official_host_directory} does not exist" >&2
     exit 1
 fi
 
@@ -118,7 +118,7 @@ fi
 if ! shrinked_raw="$(MATMUL_SHRINK_MODE=1 \
     MATMUL_V3_SHRINK_IDLE_CORES=1 \
     MATMUL_V3_HOST_LIBRARY="${v3_host_library}" \
-    MATMUL_V2_OFFICIAL_LIBRARY="${v2_official_library}" \
+    MATMUL_OFFICIAL_HOST_DIRECTORY="${official_host_directory}" \
     MATMUL_V2_SHRINK_LIBRARY="${v2_shrink_library}" \
     "${example_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
     echo "fatal: shrink measurement failed" >&2
@@ -145,7 +145,7 @@ done
 
 if ! original_raw="$(MATMUL_SHRINK_MODE=0 MATMUL_V3_SHRINK_IDLE_CORES=0 \
     MATMUL_V3_HOST_LIBRARY="${v3_host_library}" \
-    MATMUL_V2_OFFICIAL_LIBRARY="${v2_official_library}" \
+    MATMUL_OFFICIAL_HOST_DIRECTORY="${official_host_directory}" \
     "${example_binary}" "${original_args[@]}" 2>>"${run_log}")"; then
     echo "fatal: original measurement failed" >&2
     if [[ -n "${original_raw}" ]]; then

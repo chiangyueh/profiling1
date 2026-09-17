@@ -8,12 +8,15 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
+#include <algorithm>
 #include <iostream>
 #include <memory>
 #include <vector>
 //NEW
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <string>
 #include "acl/acl.h"
@@ -96,22 +99,71 @@ void ClearSelectedBranch() {
 }
 
 //NEW
-extern "C" void TbeLoadSoAndSaveToRegistry(const char* soPath);
+extern "C" uint32_t TbeLoadSoAndSaveToRegistry(const char* soPath);
+
+//NEW
+int LoadOfficialMatMulHostLibraries(const char* directoryPath) {
+  DIR* directory = opendir(directoryPath);
+  if (directory == nullptr) {
+    fprintf(stderr, "tiling registration failed: cannot open official op_host directory: %s\n", directoryPath);
+    return 4;
+  }
+
+  std::vector<std::string> libraries;
+  for (dirent* entry = readdir(directory); entry != nullptr; entry = readdir(directory)) {
+    const std::string name(entry->d_name);
+    if (name.size() >= 3 && name.compare(name.size() - 3, 3, ".so") == 0) {
+      libraries.emplace_back(std::string(directoryPath) + "/" + name);
+    }
+  }
+  closedir(directory);
+  std::sort(libraries.begin(), libraries.end());
+  if (libraries.empty()) {
+    fprintf(stderr, "tiling registration failed: official op_host directory contains no shared libraries: %s\n",
+            directoryPath);
+    return 4;
+  }
+
+  size_t loadedCount = 0;
+  uint32_t lastStatus = UINT32_MAX;
+  std::string lastFailedLibrary;
+  for (const auto& library : libraries) {
+    const uint32_t status = TbeLoadSoAndSaveToRegistry(library.c_str());
+    if (status == 0U) {
+      ++loadedCount;
+    } else {
+      lastStatus = status;
+      lastFailedLibrary = library;
+    }
+  }
+  if (loadedCount == 0) {
+    fprintf(stderr, "tiling registration failed: no official op_host library loaded rc=%u library=%s\n",
+            lastStatus, lastFailedLibrary.c_str());
+    return 4;
+  }
+  return ACL_SUCCESS;
+}
 
 //NEW
 int EnableMatMulTilingVariants() {
   const char* shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
-  const char* officialLibraryPath = std::getenv("MATMUL_V2_OFFICIAL_LIBRARY");
+  const char* officialHostDirectory = std::getenv("MATMUL_OFFICIAL_HOST_DIRECTORY");
   const char* v3LibraryPath = std::getenv("MATMUL_V3_HOST_LIBRARY");
-  if (officialLibraryPath == nullptr || officialLibraryPath[0] == '\0' ||
+  if (officialHostDirectory == nullptr || officialHostDirectory[0] == '\0' ||
       v3LibraryPath == nullptr || v3LibraryPath[0] == '\0') {
     fprintf(stderr, "tiling registration failed: required library path is missing\n");
     return 4;
   }
   //NEW
   // Preserve natural dispatch: only install the two implementations selected by that dispatcher.
-  TbeLoadSoAndSaveToRegistry(officialLibraryPath);
-  TbeLoadSoAndSaveToRegistry(v3LibraryPath);
+  if (LoadOfficialMatMulHostLibraries(officialHostDirectory) != ACL_SUCCESS) {
+    return 4;
+  }
+  const uint32_t v3Status = TbeLoadSoAndSaveToRegistry(v3LibraryPath);
+  if (v3Status != 0U) {
+    fprintf(stderr, "tiling registration failed: cannot register MatMulV3 host library rc=%u\n", v3Status);
+    return 4;
+  }
   if (dlopen(v3LibraryPath, RTLD_NOW | RTLD_GLOBAL) == nullptr) {
     fprintf(stderr, "tiling registration failed: cannot load MatMulV3 host library: %s\n", dlerror());
     return 4;
@@ -125,7 +177,11 @@ int EnableMatMulTilingVariants() {
     fprintf(stderr, "tiling registration failed: MatMulV2 shrink library path is missing\n");
     return 4;
   }
-  TbeLoadSoAndSaveToRegistry(v2ShrinkLibraryPath);
+  const uint32_t v2ShrinkStatus = TbeLoadSoAndSaveToRegistry(v2ShrinkLibraryPath);
+  if (v2ShrinkStatus != 0U) {
+    fprintf(stderr, "tiling registration failed: cannot register MatMulV2 shrink library rc=%u\n", v2ShrinkStatus);
+    return 4;
+  }
   void* handle = dlopen(v2ShrinkLibraryPath, RTLD_NOW | RTLD_GLOBAL);
   if (handle == nullptr) {
     fprintf(stderr, "tiling registration failed: cannot load MatMulV2 shrink library: %s\n", dlerror());
