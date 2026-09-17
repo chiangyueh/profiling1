@@ -111,27 +111,26 @@ int EnableMatMulTilingVariants() {
     return ACL_SUCCESS;
   }
 
-  const char* officialHostLibrary = std::getenv("MATMUL_OFFICIAL_HOST_LIBRARY");
   const char* officialTilingLibrary = std::getenv("MATMUL_V2_OFFICIAL_TILING_LIBRARY");
   const char* v3LibraryPath = std::getenv("MATMUL_V3_HOST_LIBRARY");
-  if (officialHostLibrary == nullptr || officialHostLibrary[0] == '\0' ||
-      officialTilingLibrary == nullptr || officialTilingLibrary[0] == '\0' ||
+  if (officialTilingLibrary == nullptr || officialTilingLibrary[0] == '\0' ||
       v3LibraryPath == nullptr || v3LibraryPath[0] == '\0') {
     fprintf(stderr, "tiling registration failed: required library path is missing\n");
     return 4;
   }
 
   //NEW
-  // Load the complete installed host registration first. liboptiling alone does
-  // not provide MatMulV2 infer-shape and cannot form a runnable registry.
-  void* officialHostHandle = dlopen(officialHostLibrary, RTLD_NOW | RTLD_GLOBAL);
-  if (officialHostHandle == nullptr) {
-    fprintf(stderr, "tiling registration failed: cannot load official host library: %s\n", dlerror());
-    return 4;
-  }
+  // MatMulV2 infer-shape and the V2 shrink wrapper are compiled into the same
+  // host library as MatMulV3. The installed liboptiling supplies the unchanged
+  // V2 tiling implementation that the wrapper calls first.
   void* officialHandle = dlopen(officialTilingLibrary, RTLD_NOW | RTLD_GLOBAL);
   if (officialHandle == nullptr) {
     fprintf(stderr, "tiling registration failed: cannot load official liboptiling: %s\n", dlerror());
+    return 4;
+  }
+  void* officialV2Tiling = dlsym(officialHandle, "_ZN4gert15TilingForMatMulEPNS_13TilingContextE");
+  if (officialV2Tiling == nullptr) {
+    fprintf(stderr, "tiling registration failed: official TilingForMatMul symbol is missing\n");
     return 4;
   }
   const uint32_t v3Status = TbeLoadSoAndSaveToRegistry(v3LibraryPath);
@@ -146,14 +145,14 @@ int EnableMatMulTilingVariants() {
     return 4;
   }
 
-  using ConfigureFunction = int (*)();
+  using ConfigureFunction = int (*)(void*);
   auto configure = reinterpret_cast<ConfigureFunction>(dlsym(hostHandle, "ConfigureMatMulV2OfficialTiling"));
   if (configure == nullptr) {
     fprintf(stderr, "tiling registration failed: combined MatMulV2 configuration symbol is missing\n");
     return 4;
   }
-  if (configure() != 1) {
-    fprintf(stderr, "tiling registration failed: official MatMulV2 registration is incomplete\n");
+  if (configure(officialV2Tiling) != 1) {
+    fprintf(stderr, "tiling registration failed: combined MatMulV2 registration is incomplete\n");
     return 4;
   }
 

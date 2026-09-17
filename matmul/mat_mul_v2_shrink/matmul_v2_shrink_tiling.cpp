@@ -17,10 +17,14 @@
 #include "register/op_impl_registry.h"
 
 //NEW
-// CANN does not install this internal declaration in every runtime package.
-// Use the exported ABI only to update the tiling pointer of the already loaded
-// official MatMulV2 registration; every other official field remains intact.
 namespace gert {
+class GemmCompileInfo;
+uint32_t GemmParseFunc(TilingParseContext *context);
+template <> void *OpImplRegisterV2::CreateCompileInfo<GemmCompileInfo, 0>();
+template <> void OpImplRegisterV2::DeleteCompileInfo<GemmCompileInfo>(void *object);
+
+// CANN does not install this internal declaration in every runtime package.
+// It is used read-only to verify the merged MatMulV2 registration.
 enum class OppImplVersionTag {
     kOpp,
     kOppKernel,
@@ -139,22 +143,25 @@ uint32_t MatMulV2ShrinkTiling(gert::TilingContext *context)
 } // namespace
 
 //NEW
-extern "C" __attribute__((visibility("default"))) int ConfigureMatMulV2OfficialTiling()
+IMPL_OP_OPTILING(MatMulV2)
+    .Tiling(MatMulV2ShrinkTiling, 2048)
+    .TilingParse<gert::GemmCompileInfo>(gert::GemmParseFunc);
+
+//NEW
+extern "C" __attribute__((visibility("default"))) int ConfigureMatMulV2OfficialTiling(void *callback)
 {
+    g_officialMatMulV2Tiling = reinterpret_cast<TilingFunc>(callback);
+    if (g_officialMatMulV2Tiling == nullptr) {
+        return 0;
+    }
     const auto registry = gert::DefaultOpImplSpaceRegistryV2::GetInstance().GetSpaceRegistry();
     if (registry == nullptr) {
         return 0;
     }
-    const auto *registered = registry->GetOpImpl("MatMulV2");
-    auto *official = const_cast<gert::OpImplKernelRegistry::OpImplFunctionsV2 *>(registered);
-    if (official == nullptr || official->infer_shape == nullptr || official->tiling == nullptr ||
-        official->tiling_parse == nullptr ||
-        official->compile_info_creator == nullptr || official->compile_info_deleter == nullptr) {
-        return 0;
-    }
-    g_officialMatMulV2Tiling = official->tiling;
-    official->tiling = MatMulV2ShrinkTiling;
-    return 1;
+    const auto *impl = registry->GetOpImpl("MatMulV2");
+    return impl != nullptr && impl->infer_shape != nullptr && impl->tiling == MatMulV2ShrinkTiling &&
+        impl->tiling_parse != nullptr && impl->compile_info_creator != nullptr &&
+        impl->compile_info_deleter != nullptr ? 1 : 0;
 }
 
 //NEW
