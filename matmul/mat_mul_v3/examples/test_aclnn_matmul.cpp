@@ -166,8 +166,10 @@ int SelectOfficialMatMulV3Route(int64_t m, int64_t n, int64_t k, std::string* fa
   selfTensor.SetDataType(ge::DT_FLOAT);
 
   gert::Tensor mat2Tensor;
-  mat2Tensor.MutableOriginShape() = gert::Shape({k, n});
   //NEW
+  // ContiguousAndCast swaps the non-contiguous {K,N} view to the contiguous
+  // {N,K} tensor before calling the V3 selector with transposeX2=true.
+  mat2Tensor.MutableOriginShape() = gert::Shape({n, k});
   mat2Tensor.MutableStorageShape() = gert::Shape({n, k});
   mat2Tensor.SetOriginFormat(ge::FORMAT_ND);
   mat2Tensor.SetStorageFormat(ge::FORMAT_ND);
@@ -436,7 +438,7 @@ int main(int argc, char** argv) {
     if (ret != ACL_SUCCESS) {
       //NEW
       const char* tilingStage = std::getenv("MATMUL_TILING_STAGE");
-      fprintf(stderr, "measurement failed: M%ld_N%ld_K%ld_NN stage=%s rc=%d tiling_stage=%s detail=%s\n",
+      fprintf(stderr, "measurement failed: M%ld_N%ld_K%ld_NT stage=%s rc=%d tiling_stage=%s detail=%s\n",
               static_cast<long>(result.m), static_cast<long>(result.n), static_cast<long>(result.k),
               failedStage.c_str(), ret,
               tilingStage == nullptr ? "not_reached" : tilingStage,
