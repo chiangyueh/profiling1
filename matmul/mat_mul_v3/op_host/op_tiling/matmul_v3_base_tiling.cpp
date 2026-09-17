@@ -2762,10 +2762,6 @@ void MatmulV3BaseTiling::ShrinkIdleCores()
     const uint64_t newUsedCoreNum = std::max<uint64_t>(
         1, std::min(oldUsedCoreNum, activeCoreUpperBound));
     matmul.usedCoreNum = static_cast<uint32_t>(newUsedCoreNum);
-    //NEW
-    if (newUsedCoreNum < oldUsedCoreNum) {
-        (void)::setenv("MATMUL_V3_SHRINK_APPLIED", "1", 1);
-    }
 }
 
 ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()

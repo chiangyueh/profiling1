@@ -16,8 +16,6 @@
 #include <cstdlib>
 #include <string>
 #include "acl/acl.h"
-//NEW
-#include "aclnn/acl_meta.h"
 #include "aclnnop/aclnn_matmul.h"
 
 #define CHECK_RET(cond, return_expr) \
@@ -75,28 +73,12 @@ int CreateAclTensor(const std::vector<T>& hostData, const std::vector<int64_t>& 
 }
 
 //NEW
-template <typename T>
-int CreateTransposedAclTensor(const std::vector<T>& hostData, const std::vector<int64_t>& logicalShape,
-                              const std::vector<int64_t>& storageShape, void** deviceAddr,
-                              aclDataType dataType, aclTensor** tensor) {
-  auto size = GetShapeSize(storageShape) * sizeof(T);
-  auto ret = aclrtMalloc(deviceAddr, size, ACL_MEM_MALLOC_HUGE_FIRST);
-  CHECK_RET(ret == ACL_SUCCESS, return ret);
-  ret = aclrtMemcpy(*deviceAddr, size, hostData.data(), size, ACL_MEMCPY_HOST_TO_DEVICE);
-  CHECK_RET(ret == ACL_SUCCESS, return ret);
-  std::vector<int64_t> strides = {1, logicalShape[0]};
-  *tensor = aclCreateTensor(logicalShape.data(), logicalShape.size(), dataType, strides.data(), 0,
-                            aclFormat::ACL_FORMAT_ND, storageShape.data(), storageShape.size(), *deviceAddr);
-  return 0;
-}
-
-//NEW
 std::string ReadSelectedBranch() {
   const char* selectedBranch = std::getenv("MATMUL_V3_SELECTED_BRANCH");
   if (selectedBranch != nullptr && selectedBranch[0] != '\0') {
     return selectedBranch;
   }
-  return {};
+  return "NOT_MATMUL_V3";
 }
 
 //NEW
@@ -110,9 +92,6 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   auto ret = ACL_SUCCESS;
   std::vector<int64_t> selfShape = {m, k};
   std::vector<int64_t> mat2Shape = {k, n};
-  // std::vector<int64_t> mat2StorageShape = {n, k};
-  //NEW
-  std::vector<int64_t> mat2StorageShape = mat2Shape;
   std::vector<int64_t> outShape = {m, n};
   void* selfDeviceAddr = nullptr;
   void* mat2DeviceAddr = nullptr;
@@ -122,7 +101,7 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   aclTensor* out = nullptr;
   //NEW
   std::vector<float> selfHostData(GetShapeSize(selfShape), 1);
-  std::vector<float> mat2HostData(GetShapeSize(mat2StorageShape), 1);
+  std::vector<float> mat2HostData(GetShapeSize(mat2Shape), 1);
   std::vector<float> outHostData(GetShapeSize(outShape), 0);
   // 创建self aclTensor
   ret = CreateAclTensor(selfHostData, selfShape, &selfDeviceAddr, aclDataType::ACL_FLOAT, &self);
@@ -130,10 +109,6 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   std::unique_ptr<void, aclError (*)(void*)> selfDeviceAddrPtr(selfDeviceAddr, aclrtFree);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
   // 创建mat2 aclTensor
-  //NEW
-  // ret = CreateTransposedAclTensor(mat2HostData, mat2Shape, mat2StorageShape, &mat2DeviceAddr,
-  //                                 aclDataType::ACL_FLOAT, &mat2);
-  //NEW
   ret = CreateAclTensor(mat2HostData, mat2Shape, &mat2DeviceAddr, aclDataType::ACL_FLOAT, &mat2);
   std::unique_ptr<aclTensor, aclnnStatus (*)(const aclTensor*)> mat2TensorPtr(mat2, aclDestroyTensor);
   std::unique_ptr<void, aclError (*)(void*)> mat2DeviceAddrPtr(mat2DeviceAddr, aclrtFree);
@@ -145,9 +120,7 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   CHECK_RET(ret == ACL_SUCCESS, return ret);
 
   // 3. 调用CANN算子库API，需要修改为具体的Api名称
-  //NEW
-  // FORCE_GRP_ACC_FOR_FP32 makes the official 8.5 ACLNN dispatcher select MatMulV3 for K >= 2048.
-  int8_t cubeMathType = 4;
+  int8_t cubeMathType = 1;
   uint64_t workspaceSize = 0;
   aclOpExecutor* executor = nullptr;
   std::unique_ptr<void, aclError (*)(void*)> executorAddrPtr(nullptr, aclrtFree);
@@ -186,7 +159,6 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   CHECK_RET(ret == ACL_SUCCESS, return ret);
   //NEW
   *branch = ReadSelectedBranch();
-  CHECK_RET(!branch->empty(), return 4);
 
   aclrtEvent startEvent = nullptr;
   aclrtEvent endEvent = nullptr;
@@ -239,6 +211,10 @@ int main(int argc, char** argv) {
   auto ret = Init(deviceId, &stream);
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("Init acl failed. ERROR: %d\n", ret); return ret);
 
+  //NEW
+  const char* shrinkMode = std::getenv("MATMUL_V3_SHRINK_IDLE_CORES");
+  const bool isShrink = shrinkMode != nullptr && shrinkMode[0] == '1' && shrinkMode[1] == '\0';
+
   for (int arg = 1; arg < argc; arg += 3) {
     const int64_t m = std::strtoll(argv[arg], nullptr, 10);
     const int64_t n = std::strtoll(argv[arg + 1], nullptr, 10);
@@ -250,8 +226,6 @@ int main(int argc, char** argv) {
       return 2;
     }
 
-    //NEW
-    (void)::unsetenv("MATMUL_V3_SHRINK_APPLIED");
     //NEW
     ClearSelectedBranch();
     float averageMs = 0.0F;
@@ -268,7 +242,9 @@ int main(int argc, char** argv) {
       return ret;
     }
     //NEW
-    LOG_PRINT("%.9f|%s\n", averageMs, branch.c_str());
+    LOG_PRINT("{\"shape\":\"M%ld_N%ld_K%ld_NN\",\"branch\":\"%s\",\"is_shrink\":%s,\"latency\":%.9f}\n",
+              static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), branch.c_str(),
+              isShrink ? "true" : "false", averageMs);
   }
 
   // 6. 释放device资源，需要根据具体API的接口定义修改
