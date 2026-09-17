@@ -86,7 +86,8 @@ std::string ReadSelectedBranch() {
   if (selectedBranch != nullptr && selectedBranch[0] != '\0') {
     return selectedBranch;
   }
-  return "UNINSTRUMENTED_OFFICIAL";
+  const char* shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
+  return shrinkMode != nullptr && shrinkMode[0] == '1' && shrinkMode[1] == '\0' ? "" : "OFFICIAL_BASELINE";
 }
 
 //NEW
@@ -145,9 +146,11 @@ int EnableMatMulTilingVariants() {
   }
   using InstallFunction = int (*)();
   auto install = reinterpret_cast<InstallFunction>(dlsym(hostHandle, "InstallMatMulV2RetileHook"));
-  auto ready = reinterpret_cast<InstallFunction>(dlsym(hostHandle, "MatMulV2RetileHookReady"));
-  if (install == nullptr || ready == nullptr || install() != 1 || ready() != 1) {
-    fprintf(stderr, "tiling registration failed: MatMulV2 retile hook is incomplete\n");
+  auto v2Ready = reinterpret_cast<InstallFunction>(dlsym(hostHandle, "MatMulV2RetileHookReady"));
+  auto v3Ready = reinterpret_cast<InstallFunction>(dlsym(hostHandle, "MatMulV3ShrinkRegistrationReady"));
+  if (install == nullptr || v2Ready == nullptr || v3Ready == nullptr ||
+      install() != 1 || v2Ready() != 1 || v3Ready() != 1) {
+    fprintf(stderr, "tiling registration failed: MatMulV2/MatMulV3 shrink registration is incomplete\n");
     return 4;
   }
   return ACL_SUCCESS;
@@ -207,17 +210,27 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
     return ret;
   }
   //NEW
-  std::unique_ptr<aclOpExecutor, aclnnStatus (*)(aclOpExecutor*)> executorPtr(
-      executor, aclDestroyAclOpExecutor);
-  //NEW
   *branch = ReadSelectedBranch();
   const char* shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
   if (shrinkMode != nullptr && shrinkMode[0] == '1' && shrinkMode[1] == '\0' &&
-      *branch == "UNINSTRUMENTED_OFFICIAL") {
-    *failedStage = "tiling_hook_not_reached";
-    *failureDetail = "neither MatMulV2 nor MatMulV3 shrink callback executed";
-    return 4;
+      branch->empty()) {
+    // A framework lazy-load may replace a registry entry during its first
+    // lookup.  Discard that untimed executor, restore both shrink entries, and
+    // build the real executor again.  No unmodified executor is ever launched.
+    (void)aclDestroyAclOpExecutor(executor);
+    executor = nullptr;
+    ret = EnableMatMulTilingVariants();
+    CHECK_RET(ret == ACL_SUCCESS, *failedStage = "restore_shrink_registration"; return ret);
+    ClearSelectedBranch();
+    workspaceSize = 0;
+    ret = aclnnMatmulGetWorkspaceSize(self, mat2, out, cubeMathType, &workspaceSize, &executor);
+    CHECK_RET(ret == ACL_SUCCESS, *failedStage = "get_workspace_after_registration_restore"; return ret);
+    *branch = ReadSelectedBranch();
+    CHECK_RET(!branch->empty(), *failedStage = "shrink_callback_invariant"; return 4);
   }
+  //NEW
+  std::unique_ptr<aclOpExecutor, aclnnStatus (*)(aclOpExecutor*)> executorPtr(
+      executor, aclDestroyAclOpExecutor);
   *failedStage = "make_executor_repeatable";
   ret = aclSetAclOpExecutorRepeatable(executor);
   CHECK_RET(ret == ACL_SUCCESS,
