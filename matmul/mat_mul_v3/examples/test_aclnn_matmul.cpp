@@ -103,14 +103,7 @@ void ClearSelectedBranch() {
 extern "C" uint32_t TbeLoadSoAndSaveToRegistry(const char* soPath);
 
 //NEW
-int EnableMatMulTilingVariants() {
-  //NEW
-  // Keep the baseline process completely outside the custom registry.
-  const char* shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
-  if (shrinkMode == nullptr || shrinkMode[0] != '1' || shrinkMode[1] != '\0') {
-    return ACL_SUCCESS;
-  }
-
+int EnableMatMulV3Shrink() {
   const char* v3LibraryPath = std::getenv("MATMUL_V3_HOST_LIBRARY");
   if (v3LibraryPath == nullptr || v3LibraryPath[0] == '\0') {
     fprintf(stderr, "tiling registration failed: MatMulV3 host library path is missing\n");
@@ -126,8 +119,12 @@ int EnableMatMulTilingVariants() {
 }
 
 //NEW
+constexpr int kDeferredMatMulV3 = 10000;
+
+//NEW
 int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* averageMs,
-                 std::string* branch, std::string* failedStage, std::string* failureDetail) {
+                 std::string* branch, std::string* failedStage, std::string* failureDetail,
+                 bool deferUninstrumentedV3) {
   auto ret = ACL_SUCCESS;
   std::vector<int64_t> selfShape = {m, k};
   std::vector<int64_t> mat2Shape = {k, n};
@@ -183,19 +180,14 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   const char* shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
   if (shrinkMode != nullptr && shrinkMode[0] == '1' && shrinkMode[1] == '\0' &&
       branch->empty()) {
-    // A framework lazy-load may replace a registry entry during its first
-    // lookup.  Discard that untimed executor, restore both shrink entries, and
-    // build the real executor again.  No unmodified executor is ever launched.
     (void)aclDestroyAclOpExecutor(executor);
     executor = nullptr;
-    ret = EnableMatMulTilingVariants();
-    CHECK_RET(ret == ACL_SUCCESS, *failedStage = "restore_shrink_registration"; return ret);
-    ClearSelectedBranch();
-    workspaceSize = 0;
-    ret = aclnnMatmulGetWorkspaceSize(self, mat2, out, cubeMathType, &workspaceSize, &executor);
-    CHECK_RET(ret == ACL_SUCCESS, *failedStage = "get_workspace_after_registration_restore"; return ret);
-    *branch = ReadSelectedBranch();
-    CHECK_RET(!branch->empty(), *failedStage = "shrink_callback_invariant"; return 4);
+    if (deferUninstrumentedV3) {
+      *failedStage = "deferred_matmul_v3";
+      return kDeferredMatMulV3;
+    }
+    *failedStage = "shrink_callback_invariant";
+    return 4;
   }
   //NEW
   std::unique_ptr<aclOpExecutor, aclnnStatus (*)(aclOpExecutor*)> executorPtr(
@@ -284,6 +276,16 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
 }
 
 //NEW
+struct MeasurementResult {
+  int64_t m = 0;
+  int64_t n = 0;
+  int64_t k = 0;
+  float averageMs = 0.0F;
+  std::string branch;
+  bool complete = false;
+};
+
+//NEW
 int main(int argc, char** argv) {
   CHECK_RET(argc >= 4 && (argc - 1) % 3 == 0, return 2);
 
@@ -293,11 +295,9 @@ int main(int argc, char** argv) {
   aclrtStream stream;
   auto ret = Init(deviceId, &stream);
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("Init acl failed. ERROR: %d\n", ret); return ret);
-  //NEW
-  ret = EnableMatMulTilingVariants();
-  CHECK_RET(ret == ACL_SUCCESS,
-            LOG_PRINT("MatMul tiling registration failed. ERROR: %d\n", ret); return ret);
 
+  //NEW
+  std::vector<MeasurementResult> results;
   for (int arg = 1; arg < argc; arg += 3) {
     const int64_t m = std::strtoll(argv[arg], nullptr, 10);
     const int64_t n = std::strtoll(argv[arg + 1], nullptr, 10);
@@ -308,20 +308,36 @@ int main(int argc, char** argv) {
       aclFinalize();
       return 2;
     }
+    MeasurementResult result;
+    result.m = m;
+    result.n = n;
+    result.k = k;
+    results.push_back(result);
+  }
+
+  //NEW
+  const char* shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
+  const bool shrinkEnabled = shrinkMode != nullptr && shrinkMode[0] == '1' && shrinkMode[1] == '\0';
+  std::vector<size_t> deferredV3;
+  for (size_t index = 0; index < results.size(); ++index) {
+    auto& result = results[index];
 
     //NEW
     ClearSelectedBranch();
-    float averageMs = 0.0F;
-    //NEW
-    std::string branch;
     std::string failedStage;
     std::string failureDetail;
-    ret = MeasureShape(m, n, k, stream, &averageMs, &branch, &failedStage, &failureDetail);
+    ret = MeasureShape(result.m, result.n, result.k, stream, &result.averageMs, &result.branch,
+                       &failedStage, &failureDetail, shrinkEnabled);
+    if (ret == kDeferredMatMulV3) {
+      deferredV3.push_back(index);
+      continue;
+    }
     if (ret != ACL_SUCCESS) {
       //NEW
       const char* tilingStage = std::getenv("MATMUL_TILING_STAGE");
       fprintf(stderr, "measurement failed: M%ld_N%ld_K%ld_NN stage=%s rc=%d tiling_stage=%s detail=%s\n",
-              static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), failedStage.c_str(), ret,
+              static_cast<long>(result.m), static_cast<long>(result.n), static_cast<long>(result.k),
+              failedStage.c_str(), ret,
               tilingStage == nullptr ? "not_reached" : tilingStage,
               failureDetail.empty() ? "unavailable" : failureDetail.c_str());
       aclrtDestroyStream(stream);
@@ -329,9 +345,43 @@ int main(int argc, char** argv) {
       aclFinalize();
       return ret;
     }
-    //NEW
-    LOG_PRINT("%ld|%ld|%ld|%.9f|%s\n", static_cast<long>(m), static_cast<long>(n),
-              static_cast<long>(k), averageMs, branch.c_str());
+    result.complete = true;
+  }
+
+  //NEW
+  // Loading the custom MatMulV3 host switches the active registry space.  Do
+  // it only after every naturally selected MatMulV2 shape has completed.
+  if (!deferredV3.empty()) {
+    ret = EnableMatMulV3Shrink();
+    CHECK_RET(ret == ACL_SUCCESS,
+              LOG_PRINT("MatMulV3 shrink setup failed. ERROR: %d\n", ret); return ret);
+    for (size_t index : deferredV3) {
+      auto& result = results[index];
+      ClearSelectedBranch();
+      std::string failedStage;
+      std::string failureDetail;
+      ret = MeasureShape(result.m, result.n, result.k, stream, &result.averageMs, &result.branch,
+                         &failedStage, &failureDetail, false);
+      if (ret != ACL_SUCCESS) {
+        const char* tilingStage = std::getenv("MATMUL_TILING_STAGE");
+        fprintf(stderr, "measurement failed: M%ld_N%ld_K%ld_NN stage=%s rc=%d tiling_stage=%s detail=%s\n",
+                static_cast<long>(result.m), static_cast<long>(result.n), static_cast<long>(result.k),
+                failedStage.c_str(), ret, tilingStage == nullptr ? "not_reached" : tilingStage,
+                failureDetail.empty() ? "unavailable" : failureDetail.c_str());
+        aclrtDestroyStream(stream);
+        aclrtResetDevice(deviceId);
+        aclFinalize();
+        return ret;
+      }
+      result.complete = true;
+    }
+  }
+
+  //NEW
+  for (const auto& result : results) {
+    CHECK_RET(result.complete && !result.branch.empty(), return 4);
+    LOG_PRINT("%ld|%ld|%ld|%.9f|%s\n", static_cast<long>(result.m), static_cast<long>(result.n),
+              static_cast<long>(result.k), result.averageMs, result.branch.c_str());
   }
 
   // 6. 释放device资源，需要根据具体API的接口定义修改
