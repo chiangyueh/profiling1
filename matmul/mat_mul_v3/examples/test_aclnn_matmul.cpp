@@ -16,7 +16,6 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
-#include <dlfcn.h>
 #include <string>
 #include "acl/acl.h"
 #include "aclnnop/aclnn_matmul.h"
@@ -113,44 +112,14 @@ int EnableMatMulTilingVariants() {
   }
 
   const char* v3LibraryPath = std::getenv("MATMUL_V3_HOST_LIBRARY");
-  const char* officialHostLibrary = std::getenv("MATMUL_OFFICIAL_HOST_LIBRARY");
-  const char* officialTilingLibrary = std::getenv("MATMUL_OFFICIAL_TILING_LIBRARY");
-  if (v3LibraryPath == nullptr || v3LibraryPath[0] == '\0' ||
-      officialHostLibrary == nullptr || officialHostLibrary[0] == '\0' ||
-      officialTilingLibrary == nullptr || officialTilingLibrary[0] == '\0') {
-    fprintf(stderr, "tiling registration failed: required host library path is missing\n");
-    return 4;
-  }
-
-  //NEW
-  // Import the complete official registration without executing an operator.
-  // This avoids both an incomplete V2 entry and the executor callback cache
-  // created by the previous warm-up approach.
-  const uint32_t officialHostStatus = TbeLoadSoAndSaveToRegistry(officialHostLibrary);
-  const uint32_t officialTilingStatus = TbeLoadSoAndSaveToRegistry(officialTilingLibrary);
-  if (officialHostStatus != 0U || officialTilingStatus != 0U) {
-    fprintf(stderr, "tiling registration failed: cannot import official MatMul registry host_rc=%u tiling_rc=%u\n",
-            officialHostStatus, officialTilingStatus);
+  if (v3LibraryPath == nullptr || v3LibraryPath[0] == '\0') {
+    fprintf(stderr, "tiling registration failed: MatMulV3 host library path is missing\n");
     return 4;
   }
 
   const uint32_t v3Status = TbeLoadSoAndSaveToRegistry(v3LibraryPath);
   if (v3Status != 0U) {
     fprintf(stderr, "tiling registration failed: cannot register MatMulV3 host library rc=%u\n", v3Status);
-    return 4;
-  }
-  void* hostHandle = dlopen(v3LibraryPath, RTLD_NOW | RTLD_GLOBAL);
-  if (hostHandle == nullptr) {
-    fprintf(stderr, "tiling registration failed: cannot load MatMulV3 host library: %s\n", dlerror());
-    return 4;
-  }
-  using InstallFunction = int (*)();
-  auto install = reinterpret_cast<InstallFunction>(dlsym(hostHandle, "InstallMatMulV2RetileHook"));
-  auto v2Ready = reinterpret_cast<InstallFunction>(dlsym(hostHandle, "MatMulV2RetileHookReady"));
-  auto v3Ready = reinterpret_cast<InstallFunction>(dlsym(hostHandle, "MatMulV3ShrinkRegistrationReady"));
-  if (install == nullptr || v2Ready == nullptr || v3Ready == nullptr ||
-      install() != 1 || v2Ready() != 1 || v3Ready() != 1) {
-    fprintf(stderr, "tiling registration failed: MatMulV2/MatMulV3 shrink registration is incomplete\n");
     return 4;
   }
   return ACL_SUCCESS;

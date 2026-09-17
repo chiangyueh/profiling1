@@ -14,7 +14,6 @@
  */
 #include "matmul_v3_tiling.h"
 
-#include <memory>
 #include <type_traits>
 
 #include "op_cache_tiling.h"
@@ -25,7 +24,6 @@
 #include "matmul_v3_simplifiedkey.h"
 #include "matmul_v3_platform_common.h"
 #include "register/op_def_registry.h"
-#include "register/op_impl_kernel_registry.h"
 #include "tiling_base/tiling_templates_registry.h"
 
 using namespace optiling::matmul_v3;
@@ -39,27 +37,6 @@ static const int32_t INPUT0_INDEX = 0;
 static const int32_t INPUT1_INDEX = 1;
 static const int32_t BIAS_INDEX = 2;
 }
-
-//NEW
-namespace gert {
-enum class OppImplVersionTag {
-    kOpp,
-    kOppKernel,
-    kVersionEnd = 20
-};
-
-class OpImplSpaceRegistryV2 {
-public:
-    const OpImplKernelRegistry::OpImplFunctionsV2 *GetOpImpl(const char *opType) const;
-};
-
-class DefaultOpImplSpaceRegistryV2 {
-public:
-    static DefaultOpImplSpaceRegistryV2 &GetInstance();
-    const std::shared_ptr<OpImplSpaceRegistryV2> GetSpaceRegistry(
-        OppImplVersionTag versionTag = OppImplVersionTag::kOpp) const;
-};
-} // namespace gert
 
 namespace optiling {
 
@@ -120,17 +97,4 @@ IMPL_OP_OPTILING(MatMulV3)
     .Tiling(MatmulV3TilingFunc)
     .TilingParse<MatmulV3CompileInfo>(TilingPrepareForMatmulV3)
     .GenSimplifiedKey(GenSimplifiedKey);
-}
-
-//NEW
-extern "C" __attribute__((visibility("default"))) int MatMulV3ShrinkRegistrationReady()
-{
-    const auto registry = gert::DefaultOpImplSpaceRegistryV2::GetInstance().GetSpaceRegistry();
-    if (registry == nullptr) {
-        return 0;
-    }
-    const auto *registered = registry->GetOpImpl("MatMulV3");
-    return registered != nullptr && registered->tiling == optiling::MatmulV3TilingFunc &&
-        registered->infer_shape != nullptr && registered->tiling_parse != nullptr &&
-        registered->compile_info_creator != nullptr && registered->compile_info_deleter != nullptr ? 1 : 0;
 }

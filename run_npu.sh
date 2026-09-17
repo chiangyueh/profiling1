@@ -40,29 +40,15 @@ if [[ ! -f "${v3_host_library}" ]]; then
     exit 1
 fi
 
-#NEW
-official_host_library="${ASCEND_OPP_PATH}/built-in/op_impl/ai_core/tbe/op_host/lib/linux/$(uname -m)/libophost_nn.so"
-official_tiling_library=""
-for candidate in \
-    "${ASCEND_OPP_PATH}/built-in/op_impl/ai_core/tbe/op_tiling/liboptiling.so" \
-    "${ASCEND_OPP_PATH}/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/$(uname -m)/liboptiling.so"; do
-    if [[ -f "${candidate}" ]]; then
-        official_tiling_library="${candidate}"
-        break
-    fi
-done
-if [[ ! -f "${official_host_library}" || -z "${official_tiling_library}" ]]; then
-    echo "fatal: official MatMul host libraries do not exist" >&2
-    exit 1
-fi
-
 example_source="matmul/mat_mul_v3/examples/test_aclnn_matmul.cpp"
+v2_shrink_source="matmul/mat_mul_v2_shrink/matmul_v2_shrink_tiling.cpp"
 example_binary="${host_build}/test_aclnn_matmul"
 runtime_library="-lacl_rt"
 if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/lib64/libascendcl.so" ]]; then
     runtime_library="-lascendcl"
 fi
-if ! g++ "${example_source}" \
+if ! g++ "${example_source}" "${v2_shrink_source}" \
+    -rdynamic \
     -I "${ASCEND_HOME_PATH}/include" \
     -I "${ASCEND_HOME_PATH}/include/aclnnop" \
     -I "${ASCEND_HOME_PATH}/include/aclnn" \
@@ -129,8 +115,6 @@ fi
 if ! shrinked_raw="$(MATMUL_SHRINK_MODE=1 \
     MATMUL_V3_SHRINK_IDLE_CORES=1 \
     MATMUL_V3_HOST_LIBRARY="${v3_host_library}" \
-    MATMUL_OFFICIAL_HOST_LIBRARY="${official_host_library}" \
-    MATMUL_OFFICIAL_TILING_LIBRARY="${official_tiling_library}" \
     "${example_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
     echo "fatal: shrink measurement failed" >&2
     if [[ -n "${shrinked_raw}" ]]; then
