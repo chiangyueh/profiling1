@@ -2681,6 +2681,11 @@ const char *MatmulV3BaseTiling::GetSelectedBranchName()
             return mix == MixNd2NzType::V_HEAD_ND2NZ ?
                 "SINGLE_CORE_SPLIT_K_ND2NZ" : "SINGLE_CORE_SPLIT_K";
         case TilingEnableSplitCore::DETERMINISTIC_SPLIT_K:
+            //NEW
+            if (tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::VEC_NZ2ND_UNALIGNOUT) {
+                return mix == MixNd2NzType::V_HEAD_ND2NZ ?
+                    "DETERMINISTIC_SPLIT_K_VEC_NZ2ND_ND2NZ" : "DETERMINISTIC_SPLIT_K_VEC_NZ2ND";
+            }
             return mix == MixNd2NzType::V_HEAD_ND2NZ ?
                 "DETERMINISTIC_SPLIT_K_ND2NZ" : "DETERMINISTIC_SPLIT_K";
         case TilingEnableSplitCore::MULTI_CORE_SPLIT_K:
@@ -2713,6 +2718,10 @@ const char *MatmulV3BaseTiling::GetSelectedBranchName()
     }
     if (mix == MixNd2NzType::V_PARALELL_ND2NZ) {
         return "BASE_CVP_PARALLEL";
+    }
+    //NEW
+    if (tilingEnable_.tilingEnableSpecialOpti == TilingEnableSpecialOpti::ENABLE_K_SHIFT) {
+        return "BASE_K_SHIFT";
     }
     return mix == MixNd2NzType::V_HEAD_ND2NZ ? "BASE_ND2NZ" : "BASE";
 }

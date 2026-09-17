@@ -13,9 +13,11 @@
 #include <vector>
 //NEW
 #include <algorithm>
+#include <cmath> //NEW
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring> //NEW
 #include <dlfcn.h> //NEW
 #include <string>
 #include "acl/acl.h"
@@ -45,6 +47,108 @@ int64_t GetShapeSize(const std::vector<int64_t>& shape) {
     shapeSize *= i;
   }
   return shapeSize;
+}
+
+//NEW
+aclDataType SelectedAclDataType() {
+  const char* value = std::getenv("MATMUL_DATA_TYPE");
+  if (value != nullptr && std::strcmp(value, "fp16") == 0) {
+    return aclDataType::ACL_FLOAT16;
+  }
+  if (value != nullptr && std::strcmp(value, "bf16") == 0) {
+    return aclDataType::ACL_BF16;
+  }
+  return aclDataType::ACL_FLOAT;
+}
+
+//NEW
+ge::DataType SelectedGeDataType() {
+  switch (SelectedAclDataType()) {
+    case aclDataType::ACL_FLOAT16:
+      return ge::DT_FLOAT16;
+    case aclDataType::ACL_BF16:
+      return ge::DT_BF16;
+    default:
+      return ge::DT_FLOAT;
+  }
+}
+
+//NEW
+const char* SelectedDataTypeName() {
+  switch (SelectedAclDataType()) {
+    case aclDataType::ACL_FLOAT16:
+      return "fp16";
+    case aclDataType::ACL_BF16:
+      return "bf16";
+    default:
+      return "fp32";
+  }
+}
+
+//NEW
+size_t SelectedElementSize() {
+  return SelectedAclDataType() == aclDataType::ACL_FLOAT ? sizeof(float) : sizeof(uint16_t);
+}
+
+//NEW
+void FillOnes(std::vector<uint8_t>* bytes) {
+  if (SelectedAclDataType() == aclDataType::ACL_FLOAT) {
+    const float one = 1.0F;
+    for (size_t offset = 0; offset < bytes->size(); offset += sizeof(one)) {
+      std::memcpy(bytes->data() + offset, &one, sizeof(one));
+    }
+    return;
+  }
+  const uint16_t one = SelectedAclDataType() == aclDataType::ACL_FLOAT16 ? 0x3c00U : 0x3f80U;
+  for (size_t offset = 0; offset < bytes->size(); offset += sizeof(one)) {
+    std::memcpy(bytes->data() + offset, &one, sizeof(one));
+  }
+}
+
+//NEW
+float HalfToFloat(uint16_t value) {
+  const uint32_t sign = static_cast<uint32_t>(value & 0x8000U) << 16U;
+  uint32_t exponent = (value >> 10U) & 0x1fU;
+  uint32_t mantissa = value & 0x03ffU;
+  uint32_t bits = 0;
+  if (exponent == 0) {
+    if (mantissa == 0) {
+      bits = sign;
+    } else {
+      int shift = 0;
+      while ((mantissa & 0x0400U) == 0U) {
+        mantissa <<= 1U;
+        ++shift;
+      }
+      mantissa &= 0x03ffU;
+      bits = sign | static_cast<uint32_t>(127 - 14 - shift) << 23U | mantissa << 13U;
+    }
+  } else if (exponent == 0x1fU) {
+    bits = sign | 0x7f800000U | mantissa << 13U;
+  } else {
+    bits = sign | (exponent + 112U) << 23U | mantissa << 13U;
+  }
+  float result = 0.0F;
+  std::memcpy(&result, &bits, sizeof(result));
+  return result;
+}
+
+//NEW
+float DecodeOutputValue(const uint8_t* bytes) {
+  if (SelectedAclDataType() == aclDataType::ACL_FLOAT) {
+    float value = 0.0F;
+    std::memcpy(&value, bytes, sizeof(value));
+    return value;
+  }
+  uint16_t value = 0;
+  std::memcpy(&value, bytes, sizeof(value));
+  if (SelectedAclDataType() == aclDataType::ACL_FLOAT16) {
+    return HalfToFloat(value);
+  }
+  const uint32_t bits = static_cast<uint32_t>(value) << 16U;
+  float result = 0.0F;
+  std::memcpy(&result, &bits, sizeof(result));
+  return result;
 }
 
 int Init(int32_t deviceId, aclrtStream* stream) {
@@ -100,6 +204,39 @@ int CreateTransposedAclTensor(const std::vector<T>& hostData, const std::vector<
 }
 
 //NEW
+std::vector<int64_t> TensorStrides(const std::vector<int64_t>& logicalShape, bool transposed) {
+  if (transposed) {
+    return {1, logicalShape[0]};
+  }
+  return {logicalShape[1], 1};
+}
+
+//NEW
+int CreateRawAclTensor(const std::vector<uint8_t>& hostData, const std::vector<int64_t>& logicalShape,
+                       const std::vector<int64_t>& storageShape, bool transposed, bool metadataOnly,
+                       void** deviceAddr, aclTensor** tensor) {
+  *deviceAddr = nullptr;
+  if (metadataOnly) {
+    //NEW
+    // Some ACL releases reject a tensor whose data address is null even when
+    // only shape inference and tiling are requested. One element is enough;
+    // discovery never launches a kernel or reads tensor contents.
+    auto ret = aclrtMalloc(deviceAddr, SelectedElementSize(), ACL_MEM_MALLOC_HUGE_FIRST);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+  } else {
+    auto ret = aclrtMalloc(deviceAddr, hostData.size(), ACL_MEM_MALLOC_HUGE_FIRST);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    ret = aclrtMemcpy(*deviceAddr, hostData.size(), hostData.data(), hostData.size(), ACL_MEMCPY_HOST_TO_DEVICE);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+  }
+  const auto strides = TensorStrides(logicalShape, transposed);
+  *tensor = aclCreateTensor(logicalShape.data(), logicalShape.size(), SelectedAclDataType(), strides.data(), 0,
+                            aclFormat::ACL_FORMAT_ND, storageShape.data(), storageShape.size(), *deviceAddr);
+  CHECK_RET(*tensor != nullptr, return ACL_ERROR_INVALID_PARAM);
+  return ACL_SUCCESS;
+}
+
+//NEW
 std::string ReadSelectedBranch() {
   const char* commonBranch = std::getenv("MATMUL_SELECTED_BRANCH");
   if (commonBranch != nullptr && commonBranch[0] != '\0') {
@@ -139,6 +276,18 @@ bool UseTransposedB() {
 }
 
 //NEW
+bool UseTransposedA() {
+  const char* value = std::getenv("MATMUL_A_TRANSPOSE");
+  return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+//NEW
+bool DiscoveryOnly() {
+  const char* value = std::getenv("MATMUL_V3_DISCOVERY_ONLY");
+  return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+//NEW
 void ClearSelectedBranch() {
   (void)::unsetenv("MATMUL_SELECTED_BRANCH");
   (void)::unsetenv("MATMUL_V3_SELECTED_BRANCH");
@@ -153,7 +302,7 @@ void ClearSelectedBranch() {
 }
 
 //NEW
-int SelectOfficialMatMulV3Route(int64_t m, int64_t n, int64_t k, bool transposeB,
+int SelectOfficialMatMulV3Route(int64_t m, int64_t n, int64_t k, bool transposeA, bool transposeB,
                                std::string* failureDetail) {
   const auto socVersion = op::GetCurrentPlatformInfo().GetSocVersion();
   if (socVersion == op::SocVersion::ASCEND910_95) {
@@ -185,11 +334,11 @@ int SelectOfficialMatMulV3Route(int64_t m, int64_t n, int64_t k, bool transposeB
   }
 
   gert::Tensor selfTensor;
-  selfTensor.MutableOriginShape() = gert::Shape({m, k});
-  selfTensor.MutableStorageShape() = gert::Shape({m, k});
+  selfTensor.MutableOriginShape() = transposeA ? gert::Shape({k, m}) : gert::Shape({m, k});
+  selfTensor.MutableStorageShape() = transposeA ? gert::Shape({k, m}) : gert::Shape({m, k});
   selfTensor.SetOriginFormat(ge::FORMAT_ND);
   selfTensor.SetStorageFormat(ge::FORMAT_ND);
-  selfTensor.SetDataType(ge::DT_FLOAT);
+  selfTensor.SetDataType(SelectedGeDataType());
 
   gert::Tensor mat2Tensor;
   //NEW
@@ -204,10 +353,10 @@ int SelectOfficialMatMulV3Route(int64_t m, int64_t n, int64_t k, bool transposeB
   }
   mat2Tensor.SetOriginFormat(ge::FORMAT_ND);
   mat2Tensor.SetStorageFormat(ge::FORMAT_ND);
-  mat2Tensor.SetDataType(ge::DT_FLOAT);
+  mat2Tensor.SetDataType(SelectedGeDataType());
 
   //NEW
-  return selector(&selfTensor, &mat2Tensor, nullptr, false, transposeB, ge::FORMAT_ND, false,
+  return selector(&selfTensor, &mat2Tensor, nullptr, transposeA, transposeB, ge::FORMAT_ND, false,
                   op::GetCurrentPlatformInfo().GetCubeCoreNum(),
                   op::GetCurrentPlatformInfo().GetSocLongVersion()) ? 1 : 0;
 }
@@ -240,12 +389,13 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
                  uint32_t* officialCore, uint32_t* requestedCore, uint32_t* actualCore,
                  bool* timingComplete, std::string* failedStage, std::string* failureDetail) {
   constexpr int kSkipNotMatMulV3 = 10001;
+  const bool transposeA = UseTransposedA();
   const bool transposeB = UseTransposedB();
   //NEW
   // Reject official MatMulV2 routes before allocating or copying any tensor.
   const char* v3Only = std::getenv("MATMUL_V3_ONLY");
   if (v3Only != nullptr && v3Only[0] == '1' && v3Only[1] == '\0') {
-    const int selectedRoute = SelectOfficialMatMulV3Route(m, n, k, transposeB, failureDetail);
+    const int selectedRoute = SelectOfficialMatMulV3Route(m, n, k, transposeA, transposeB, failureDetail);
     if (selectedRoute < 0) {
       *failedStage = "official_v3_route_selection";
       return 4;
@@ -258,6 +408,8 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
 
   auto ret = ACL_SUCCESS;
   std::vector<int64_t> selfShape = {m, k};
+  //NEW
+  std::vector<int64_t> selfStorageShape = transposeA ? std::vector<int64_t>{k, m} : selfShape;
   std::vector<int64_t> mat2Shape = {k, n};
   //NEW
   std::vector<int64_t> mat2StorageShape = transposeB ? std::vector<int64_t>{n, k} : mat2Shape;
@@ -269,30 +421,36 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   aclTensor* mat2 = nullptr;
   aclTensor* out = nullptr;
   //NEW
-  std::vector<float> selfHostData(GetShapeSize(selfShape), 1);
-  std::vector<float> mat2HostData(GetShapeSize(mat2StorageShape), 1);
-  std::vector<float> outHostData(GetShapeSize(outShape), 0);
+  const bool metadataOnly = DiscoveryOnly();
+  const size_t elementSize = SelectedElementSize();
+  std::vector<uint8_t> selfHostData;
+  std::vector<uint8_t> mat2HostData;
+  std::vector<uint8_t> outHostData;
+  if (!metadataOnly) {
+    selfHostData.resize(static_cast<size_t>(GetShapeSize(selfStorageShape)) * elementSize);
+    mat2HostData.resize(static_cast<size_t>(GetShapeSize(mat2StorageShape)) * elementSize);
+    outHostData.resize(static_cast<size_t>(GetShapeSize(outShape)) * elementSize, 0);
+    FillOnes(&selfHostData);
+    FillOnes(&mat2HostData);
+  }
   // 创建self aclTensor
   *failedStage = "create_self";
-  ret = CreateAclTensor(selfHostData, selfShape, &selfDeviceAddr, aclDataType::ACL_FLOAT, &self);
+  ret = CreateRawAclTensor(selfHostData, selfShape, selfStorageShape, transposeA, metadataOnly,
+                           &selfDeviceAddr, &self);
   std::unique_ptr<aclTensor, aclnnStatus (*)(const aclTensor*)> selfTensorPtr(self, aclDestroyTensor);
   std::unique_ptr<void, aclError (*)(void*)> selfDeviceAddrPtr(selfDeviceAddr, aclrtFree);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
   // 创建mat2 aclTensor
   *failedStage = "create_mat2";
   //NEW
-  if (transposeB) {
-    ret = CreateTransposedAclTensor(mat2HostData, mat2Shape, mat2StorageShape, &mat2DeviceAddr,
-                                    aclDataType::ACL_FLOAT, &mat2);
-  } else {
-    ret = CreateAclTensor(mat2HostData, mat2Shape, &mat2DeviceAddr, aclDataType::ACL_FLOAT, &mat2);
-  }
+  ret = CreateRawAclTensor(mat2HostData, mat2Shape, mat2StorageShape, transposeB, metadataOnly,
+                           &mat2DeviceAddr, &mat2);
   std::unique_ptr<aclTensor, aclnnStatus (*)(const aclTensor*)> mat2TensorPtr(mat2, aclDestroyTensor);
   std::unique_ptr<void, aclError (*)(void*)> mat2DeviceAddrPtr(mat2DeviceAddr, aclrtFree);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
   // 创建out aclTensor
   *failedStage = "create_out";
-  ret = CreateAclTensor(outHostData, outShape, &outDeviceAddr, aclDataType::ACL_FLOAT, &out);
+  ret = CreateRawAclTensor(outHostData, outShape, outShape, false, metadataOnly, &outDeviceAddr, &out);
   std::unique_ptr<aclTensor, aclnnStatus (*)(const aclTensor*)> outTensorPtr(out, aclDestroyTensor);
   std::unique_ptr<void, aclError (*)(void*)> outdeviceAddrPtr(outDeviceAddr, aclrtFree);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
@@ -327,6 +485,15 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
     *failedStage = "v3_tiling_callback_invariant";
     *failureDetail = "official dispatcher selected MatMulV3 but the local V3 tiler was not entered";
     return 4;
+  }
+  //NEW
+  // Discovery performs the real official dispatcher and local V3 tiling
+  // callback, but deliberately stops before allocating workspace or launching
+  // a kernel. This makes large candidate pools cheap and memory-safe.
+  if (metadataOnly) {
+    (void)aclDestroyAclOpExecutor(executor);
+    failedStage->clear();
+    return ACL_SUCCESS;
   }
   //NEW
   std::unique_ptr<aclOpExecutor, aclnnStatus (*)(aclOpExecutor*)> executorPtr(
@@ -400,15 +567,20 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
 
   // 5. 获取输出的值，将device侧内存上的结果拷贝至host侧，需要根据具体API的接口定义修改
   auto size = GetShapeSize(outShape);
-  std::vector<float> resultData(size, 0);
+  //NEW
+  std::vector<uint8_t> resultData(static_cast<size_t>(size) * elementSize, 0);
   *failedStage = "copy_output";
-  ret = aclrtMemcpy(resultData.data(), resultData.size() * sizeof(resultData[0]), outDeviceAddr,
-                    size * sizeof(resultData[0]), ACL_MEMCPY_DEVICE_TO_HOST);
+  ret = aclrtMemcpy(resultData.data(), resultData.size(), outDeviceAddr,
+                    resultData.size(), ACL_MEMCPY_DEVICE_TO_HOST);
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("copy result from device to host failed. ERROR: %d\n", ret); return ret);
   //NEW
   *failedStage = "validate_output";
   for (int64_t i = 0; i < size; i++) {
-    CHECK_RET(resultData[i] == static_cast<float>(k), return 3);
+    const float value = DecodeOutputValue(resultData.data() + static_cast<size_t>(i) * elementSize);
+    const float expected = static_cast<float>(k);
+    const float tolerance = SelectedAclDataType() == aclDataType::ACL_FLOAT ? 0.0F :
+        std::max(2.0F, std::fabs(expected) * 0.02F);
+    CHECK_RET(std::isfinite(value) && std::fabs(value - expected) <= tolerance, return 3);
   }
 
   failedStage->clear();
@@ -435,13 +607,16 @@ struct MeasurementResult {
 
 //NEW
 void PrintMeasurementResult(const MeasurementResult& result) {
+  const bool transposeA = UseTransposedA();
   const bool transposeB = UseTransposedB();
+  const std::string layout = std::string(transposeA ? "T" : "N") + (transposeB ? "T" : "N");
   const std::string mode = ReadEnvironment("MATMUL_V3_MEASUREMENT_MODE").empty() ?
       "official" : ReadEnvironment("MATMUL_V3_MEASUREMENT_MODE");
   const std::string soc = op::GetCurrentPlatformInfo().GetSocLongVersion();
-  const char* status = result.resultCode == ACL_SUCCESS ? "OK" :
+  const bool discovery = DiscoveryOnly();
+  const char* status = result.resultCode == ACL_SUCCESS ? (discovery ? "DISCOVERED" : "OK") :
       (result.resultCode == 3 ? "INVALID_OUTPUT" : "ERROR");
-  const char* correctness = result.resultCode == ACL_SUCCESS ? "PASS" :
+  const char* correctness = result.resultCode == ACL_SUCCESS ? (discovery ? "NOT_RUN" : "PASS") :
       (result.resultCode == 3 ? "FAIL" : "NOT_CHECKED");
   const std::string requestedCore = result.requestedCore == 0 ? "null" : std::to_string(result.requestedCore);
   char latencyText[64] = {};
@@ -453,17 +628,18 @@ void PrintMeasurementResult(const MeasurementResult& result) {
   const std::string failedStage = result.failedStage.empty() ? "null" : "\"" + result.failedStage + "\"";
   const std::string branch = result.branch.empty() ? "UNKNOWN" : result.branch;
   LOG_PRINT(
-      "{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"dtype\":\"fp32\",\"layout\":\"%s\","
+      "{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"dtype\":\"%s\",\"layout\":\"%s\","
       "\"soc\":\"%s\",\"branch\":\"%s\",\"mode\":\"%s\","
       "\"experiment\":\"fixed_tiling_core_sweep\","
       "\"override_scope\":\"used_core_num_block_dim_workspace\",\"requested_core\":%s,"
       "\"official_core\":%u,\"actual_core\":%u,\"latency_ms\":%s,"
-      "\"workspace_bytes\":%llu,\"warmup\":10,\"repeats\":100,"
+      "\"workspace_bytes\":%llu,\"warmup\":%d,\"repeats\":%d,"
       "\"status\":\"%s\",\"correctness\":\"%s\",\"failure_stage\":%s,\"tiling\":%s}\n",
       static_cast<long>(result.m), static_cast<long>(result.n), static_cast<long>(result.k),
-      transposeB ? "NT" : "NN", transposeB ? "NT" : "NN", soc.c_str(), branch.c_str(), mode.c_str(),
+      layout.c_str(), SelectedDataTypeName(), layout.c_str(), soc.c_str(), branch.c_str(), mode.c_str(),
       requestedCore.c_str(), result.officialCore, result.actualCore, latency.c_str(),
-      static_cast<unsigned long long>(result.workspaceBytes), status, correctness,
+      static_cast<unsigned long long>(result.workspaceBytes), discovery ? 0 : 10, discovery ? 0 : 100,
+      status, correctness,
       failedStage.c_str(), tiling.c_str());
 }
 
