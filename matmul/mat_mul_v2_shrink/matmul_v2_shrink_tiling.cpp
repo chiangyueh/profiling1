@@ -64,16 +64,25 @@ void SetShrinkResult(const char *effective, uint32_t oldCoreNum, uint32_t newCor
     (void)::setenv("MATMUL_SHRINK_NEW_CORES", newCoreText, 1);
 }
 
+void SetTilingStage(const char *stage)
+{
+    (void)::setenv("MATMUL_TILING_STAGE", stage, 1);
+}
+
 uint32_t MatMulV2ShrinkTiling(gert::TilingContext *context)
 {
+    SetTilingStage("v2_wrapper_entered");
     if (context == nullptr || g_officialMatMulV2Tiling == nullptr) {
+        SetTilingStage("v2_wrapper_missing_context_or_official_callback");
         return ge::GRAPH_FAILED;
     }
 
     const uint32_t status = g_officialMatMulV2Tiling(context);
     if (status != ge::GRAPH_SUCCESS) {
+        SetTilingStage("v2_official_callback_failed");
         return status;
     }
+    SetTilingStage("v2_official_callback_passed");
 
     const uint32_t oldCoreNum = context->GetBlockDim();
     const char *shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
@@ -120,9 +129,11 @@ uint32_t MatMulV2ShrinkTiling(gert::TilingContext *context)
     }
 
     if (context->SetBlockDim(newCoreNum) != ge::GRAPH_SUCCESS) {
+        SetTilingStage("v2_set_block_dim_failed");
         return ge::GRAPH_FAILED;
     }
     SetShrinkResult("1", oldCoreNum, newCoreNum);
+    SetTilingStage("v2_shrink_applied");
     return ge::GRAPH_SUCCESS;
 }
 } // namespace

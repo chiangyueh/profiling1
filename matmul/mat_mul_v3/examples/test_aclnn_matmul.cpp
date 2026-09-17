@@ -12,6 +12,7 @@
 #include <memory>
 #include <vector>
 //NEW
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -95,6 +96,7 @@ void ClearSelectedBranch() {
   (void)::unsetenv("MATMUL_SHRINK_EFFECTIVE");
   (void)::unsetenv("MATMUL_SHRINK_OLD_CORES");
   (void)::unsetenv("MATMUL_SHRINK_NEW_CORES");
+  (void)::unsetenv("MATMUL_TILING_STAGE");
 }
 
 //NEW
@@ -130,6 +132,14 @@ int EnableMatMulTilingVariants() {
     return 4;
   }
 
+  //NEW
+  // The original process uses the official MatMulV2 registration unchanged.
+  // Only the shrink process replaces its tiling function pointer.
+  const char* shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
+  if (shrinkMode == nullptr || shrinkMode[0] != '1' || shrinkMode[1] != '\0') {
+    return ACL_SUCCESS;
+  }
+
   using ConfigureFunction = int (*)();
   auto configure = reinterpret_cast<ConfigureFunction>(dlsym(hostHandle, "ConfigureMatMulV2OfficialTiling"));
   if (configure == nullptr) {
@@ -156,7 +166,7 @@ int EnableMatMulTilingVariants() {
 
 //NEW
 int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* averageMs,
-                 std::string* branch, std::string* failedStage) {
+                 std::string* branch, std::string* failedStage, std::string* failureDetail) {
   auto ret = ACL_SUCCESS;
   std::vector<int64_t> selfShape = {m, k};
   std::vector<int64_t> mat2Shape = {k, n};
@@ -198,7 +208,15 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   // 调用aclnnMatmul第一段接口
   *failedStage = "get_workspace";
   ret = aclnnMatmulGetWorkspaceSize(self, mat2, out, cubeMathType, &workspaceSize, &executor);
-  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMatmulGetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
+  if (ret != ACL_SUCCESS) {
+    const char* recentError = aclGetRecentErrMsg();
+    if (recentError != nullptr) {
+      *failureDetail = recentError;
+      std::replace(failureDetail->begin(), failureDetail->end(), '\n', ' ');
+      std::replace(failureDetail->begin(), failureDetail->end(), '\r', ' ');
+    }
+    return ret;
+  }
   //NEW
   *branch = ReadSelectedBranch();
   *failedStage = "make_executor_repeatable";
@@ -316,11 +334,15 @@ int main(int argc, char** argv) {
     //NEW
     std::string branch;
     std::string failedStage;
-    ret = MeasureShape(m, n, k, stream, &averageMs, &branch, &failedStage);
+    std::string failureDetail;
+    ret = MeasureShape(m, n, k, stream, &averageMs, &branch, &failedStage, &failureDetail);
     if (ret != ACL_SUCCESS) {
       //NEW
-      fprintf(stderr, "measurement failed: M%ld_N%ld_K%ld_NN stage=%s rc=%d\n",
-              static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), failedStage.c_str(), ret);
+      const char* tilingStage = std::getenv("MATMUL_TILING_STAGE");
+      fprintf(stderr, "measurement failed: M%ld_N%ld_K%ld_NN stage=%s rc=%d tiling_stage=%s detail=%s\n",
+              static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), failedStage.c_str(), ret,
+              tilingStage == nullptr ? "not_reached" : tilingStage,
+              failureDetail.empty() ? "unavailable" : failureDetail.c_str());
       aclrtDestroyStream(stream);
       aclrtResetDevice(deviceId);
       aclFinalize();

@@ -107,6 +107,26 @@ if [[ "$#" -gt 0 ]]; then
     shape_args=("$@")
 fi
 
+if ! original_raw="$(MATMUL_SHRINK_MODE=0 MATMUL_V3_SHRINK_IDLE_CORES=0 \
+    MATMUL_V3_HOST_LIBRARY="${v3_host_library}" \
+    MATMUL_V2_OFFICIAL_TILING_LIBRARY="${official_tiling_library}" \
+    "${example_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
+    echo "fatal: original measurement failed" >&2
+    if [[ -n "${original_raw}" ]]; then
+        printf '%s\n' "${original_raw}" >&2
+    fi
+    cat "${run_log}" >&2
+    exit 1
+fi
+mapfile -t original_results < <(printf '%s\n' "${original_raw}" | \
+    awk -F'|' 'NF == 5 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+([.][0-9]+)?$/')
+expected_result_count=$((${#shape_args[@]} / 3))
+if [[ "${#original_results[@]}" -ne "${expected_result_count}" ]]; then
+    printf 'fatal: original output count mismatch: expected=%d actual=%d\n' \
+        "${expected_result_count}" "${#original_results[@]}" >&2
+    exit 1
+fi
+
 if ! shrinked_raw="$(MATMUL_SHRINK_MODE=1 \
     MATMUL_V3_SHRINK_IDLE_CORES=1 \
     MATMUL_V3_HOST_LIBRARY="${v3_host_library}" \
@@ -121,35 +141,9 @@ if ! shrinked_raw="$(MATMUL_SHRINK_MODE=1 \
 fi
 mapfile -t shrinked_results < <(printf '%s\n' "${shrinked_raw}" | \
     awk -F'|' 'NF == 5 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+([.][0-9]+)?$/')
-expected_result_count=$((${#shape_args[@]} / 3))
-if [[ "${#shrinked_results[@]}" -ne "${expected_result_count}" ]]; then
+if [[ "${#shrinked_results[@]}" -ne "${#original_results[@]}" ]]; then
     printf 'fatal: shrink output count mismatch: expected=%d actual=%d\n' \
-        "${expected_result_count}" "${#shrinked_results[@]}" >&2
-    exit 1
-fi
-
-original_args=()
-for shrinked_result in "${shrinked_results[@]}"; do
-    IFS='|' read -r candidate_m candidate_n candidate_k _ _ <<<"${shrinked_result}"
-    original_args+=("${candidate_m}" "${candidate_n}" "${candidate_k}")
-done
-
-if ! original_raw="$(MATMUL_SHRINK_MODE=0 MATMUL_V3_SHRINK_IDLE_CORES=0 \
-    MATMUL_V3_HOST_LIBRARY="${v3_host_library}" \
-    MATMUL_V2_OFFICIAL_TILING_LIBRARY="${official_tiling_library}" \
-    "${example_binary}" "${original_args[@]}" 2>>"${run_log}")"; then
-    echo "fatal: original measurement failed" >&2
-    if [[ -n "${original_raw}" ]]; then
-        printf '%s\n' "${original_raw}" >&2
-    fi
-    cat "${run_log}" >&2
-    exit 1
-fi
-mapfile -t original_results < <(printf '%s\n' "${original_raw}" | \
-    awk -F'|' 'NF == 5 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+([.][0-9]+)?$/')
-if [[ "${#original_results[@]}" -ne "${#shrinked_results[@]}" ]]; then
-    printf 'fatal: original output count mismatch: expected=%d actual=%d\n' \
-        "${#shrinked_results[@]}" "${#original_results[@]}" >&2
+        "${#original_results[@]}" "${#shrinked_results[@]}" >&2
     exit 1
 fi
 
