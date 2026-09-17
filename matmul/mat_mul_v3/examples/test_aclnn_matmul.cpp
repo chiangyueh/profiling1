@@ -86,9 +86,7 @@ std::string ReadSelectedBranch() {
   if (selectedBranch != nullptr && selectedBranch[0] != '\0') {
     return selectedBranch;
   }
-  // MatMulV2 assigns every launched core a batch/N/M/K work item.  It has no
-  // idle launch suffix that can be removed by changing blockDim alone.
-  return "MATMUL_V2_UNCHANGED";
+  return "UNINSTRUMENTED_OFFICIAL";
 }
 
 //NEW
@@ -119,7 +117,6 @@ int EnableMatMulTilingVariants() {
     return 4;
   }
 
-  //NEW
   const uint32_t v3Status = TbeLoadSoAndSaveToRegistry(v3LibraryPath);
   if (v3Status != 0U) {
     fprintf(stderr, "tiling registration failed: cannot register MatMulV3 host library rc=%u\n", v3Status);
@@ -130,7 +127,58 @@ int EnableMatMulTilingVariants() {
     fprintf(stderr, "tiling registration failed: cannot load MatMulV3 host library: %s\n", dlerror());
     return 4;
   }
+  using InstallFunction = int (*)();
+  auto install = reinterpret_cast<InstallFunction>(dlsym(hostHandle, "InstallMatMulV2RetileHook"));
+  auto ready = reinterpret_cast<InstallFunction>(dlsym(hostHandle, "MatMulV2RetileHookReady"));
+  if (install == nullptr || ready == nullptr || install() != 1 || ready() != 1) {
+    fprintf(stderr, "tiling registration failed: MatMulV2 retile hook is incomplete\n");
+    return 4;
+  }
   return ACL_SUCCESS;
+}
+
+//NEW
+// Force the untouched runtime to load the complete official MatMulV2 entry
+// before the shrink process loads any custom host callback.  The probe performs
+// host tiling only; it does not launch a kernel and is not included in latency.
+int PrimeOfficialMatMulV2Registration() {
+  const char* shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
+  if (shrinkMode == nullptr || shrinkMode[0] != '1' || shrinkMode[1] != '\0') {
+    return ACL_SUCCESS;
+  }
+
+  const std::vector<int64_t> selfShape = {1, 768};
+  const std::vector<int64_t> mat2Shape = {768, 112};
+  const std::vector<int64_t> outShape = {1, 112};
+  std::vector<float> selfHostData(GetShapeSize(selfShape), 1);
+  std::vector<float> mat2HostData(GetShapeSize(mat2Shape), 1);
+  std::vector<float> outHostData(GetShapeSize(outShape), 0);
+  void* selfDeviceAddr = nullptr;
+  void* mat2DeviceAddr = nullptr;
+  void* outDeviceAddr = nullptr;
+  aclTensor* self = nullptr;
+  aclTensor* mat2 = nullptr;
+  aclTensor* out = nullptr;
+
+  auto ret = CreateAclTensor(selfHostData, selfShape, &selfDeviceAddr, aclDataType::ACL_FLOAT, &self);
+  std::unique_ptr<aclTensor, aclnnStatus (*)(const aclTensor*)> selfTensorPtr(self, aclDestroyTensor);
+  std::unique_ptr<void, aclError (*)(void*)> selfDeviceAddrPtr(selfDeviceAddr, aclrtFree);
+  CHECK_RET(ret == ACL_SUCCESS, return ret);
+  ret = CreateAclTensor(mat2HostData, mat2Shape, &mat2DeviceAddr, aclDataType::ACL_FLOAT, &mat2);
+  std::unique_ptr<aclTensor, aclnnStatus (*)(const aclTensor*)> mat2TensorPtr(mat2, aclDestroyTensor);
+  std::unique_ptr<void, aclError (*)(void*)> mat2DeviceAddrPtr(mat2DeviceAddr, aclrtFree);
+  CHECK_RET(ret == ACL_SUCCESS, return ret);
+  ret = CreateAclTensor(outHostData, outShape, &outDeviceAddr, aclDataType::ACL_FLOAT, &out);
+  std::unique_ptr<aclTensor, aclnnStatus (*)(const aclTensor*)> outTensorPtr(out, aclDestroyTensor);
+  std::unique_ptr<void, aclError (*)(void*)> outDeviceAddrPtr(outDeviceAddr, aclrtFree);
+  CHECK_RET(ret == ACL_SUCCESS, return ret);
+
+  uint64_t workspaceSize = 0;
+  aclOpExecutor* executor = nullptr;
+  ret = aclnnMatmulGetWorkspaceSize(self, mat2, out, 1, &workspaceSize, &executor);
+  std::unique_ptr<aclOpExecutor, aclnnStatus (*)(aclOpExecutor*)> executorPtr(
+      executor, aclDestroyAclOpExecutor);
+  return ret;
 }
 
 //NEW
@@ -186,6 +234,9 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
     }
     return ret;
   }
+  //NEW
+  std::unique_ptr<aclOpExecutor, aclnnStatus (*)(aclOpExecutor*)> executorPtr(
+      executor, aclDestroyAclOpExecutor);
   //NEW
   *branch = ReadSelectedBranch();
   *failedStage = "make_executor_repeatable";
@@ -281,6 +332,10 @@ int main(int argc, char** argv) {
   aclrtStream stream;
   auto ret = Init(deviceId, &stream);
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("Init acl failed. ERROR: %d\n", ret); return ret);
+  //NEW
+  ret = PrimeOfficialMatMulV2Registration();
+  CHECK_RET(ret == ACL_SUCCESS,
+            LOG_PRINT("official MatMulV2 priming failed. ERROR: %d\n", ret); return ret);
   //NEW
   ret = EnableMatMulTilingVariants();
   CHECK_RET(ret == ACL_SUCCESS,
