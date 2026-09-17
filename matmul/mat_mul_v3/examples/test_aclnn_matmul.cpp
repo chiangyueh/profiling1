@@ -14,6 +14,7 @@
 //NEW
 #include <cstdio>
 #include <cstdlib>
+#include <dlfcn.h>
 #include <string>
 #include "acl/acl.h"
 #include "aclnnop/aclnn_matmul.h"
@@ -74,21 +75,61 @@ int CreateAclTensor(const std::vector<T>& hostData, const std::vector<int64_t>& 
 
 //NEW
 std::string ReadSelectedBranch() {
+  const char* commonBranch = std::getenv("MATMUL_SELECTED_BRANCH");
+  if (commonBranch != nullptr && commonBranch[0] != '\0') {
+    return commonBranch;
+  }
   const char* selectedBranch = std::getenv("MATMUL_V3_SELECTED_BRANCH");
   if (selectedBranch != nullptr && selectedBranch[0] != '\0') {
     return selectedBranch;
   }
-  return "NOT_MATMUL_V3";
+  return "MATMUL_V2";
 }
 
 //NEW
 void ClearSelectedBranch() {
+  (void)::unsetenv("MATMUL_SELECTED_BRANCH");
   (void)::unsetenv("MATMUL_V3_SELECTED_BRANCH");
+  (void)::unsetenv("MATMUL_SHRINK_EFFECTIVE");
+  (void)::unsetenv("MATMUL_SHRINK_OLD_CORES");
+  (void)::unsetenv("MATMUL_SHRINK_NEW_CORES");
+}
+
+//NEW
+extern "C" void TbeLoadSoAndSaveToRegistry(const char* soPath);
+
+//NEW
+int EnableMatMulV2ShrinkIfRequested() {
+  const char* shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
+  if (shrinkMode == nullptr || shrinkMode[0] != '1' || shrinkMode[1] != '\0') {
+    return ACL_SUCCESS;
+  }
+  const char* libraryPath = std::getenv("MATMUL_V2_SHRINK_LIBRARY");
+  const char* officialLibraryPath = std::getenv("MATMUL_V2_OFFICIAL_LIBRARY");
+  if (libraryPath == nullptr || libraryPath[0] == '\0' ||
+      officialLibraryPath == nullptr || officialLibraryPath[0] == '\0') {
+    return 4;
+  }
+  //NEW
+  // Load the official implementation first so the independent wrapper can save its callback.
+  TbeLoadSoAndSaveToRegistry(officialLibraryPath);
+  TbeLoadSoAndSaveToRegistry(libraryPath);
+  void* handle = dlopen(libraryPath, RTLD_NOW | RTLD_GLOBAL);
+  if (handle == nullptr) {
+    return 4;
+  }
+  using ReadyFunction = int (*)();
+  auto ready = reinterpret_cast<ReadyFunction>(dlsym(handle, "MatMulV2ShrinkRegistrationReady"));
+  if (ready == nullptr || ready() != 1) {
+    return 4;
+  }
+  return ACL_SUCCESS;
 }
 
 //NEW
 int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* averageMs,
                  std::string* branch) {
+  constexpr int kNoEffectiveShrink = 10;
   auto ret = ACL_SUCCESS;
   std::vector<int64_t> selfShape = {m, k};
   std::vector<int64_t> mat2Shape = {k, n};
@@ -128,6 +169,15 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   ret = aclnnMatmulGetWorkspaceSize(self, mat2, out, cubeMathType, &workspaceSize, &executor);
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMatmulGetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
   //NEW
+  *branch = ReadSelectedBranch();
+  const char* shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
+  const bool shrinkRequested = shrinkMode != nullptr && shrinkMode[0] == '1' && shrinkMode[1] == '\0';
+  const char* shrinkEffective = std::getenv("MATMUL_SHRINK_EFFECTIVE");
+  if (shrinkRequested &&
+      (shrinkEffective == nullptr || shrinkEffective[0] != '1' || shrinkEffective[1] != '\0')) {
+    return kNoEffectiveShrink;
+  }
+  //NEW
   ret = aclSetAclOpExecutorRepeatable(executor);
   CHECK_RET(ret == ACL_SUCCESS,
             LOG_PRINT("aclSetAclOpExecutorRepeatable failed. ERROR: %d\n", ret); return ret);
@@ -157,9 +207,6 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   }
   ret = aclrtSynchronizeStream(stream);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
-  //NEW
-  *branch = ReadSelectedBranch();
-
   aclrtEvent startEvent = nullptr;
   aclrtEvent endEvent = nullptr;
   ret = aclrtCreateEvent(&startEvent);
@@ -210,6 +257,10 @@ int main(int argc, char** argv) {
   aclrtStream stream;
   auto ret = Init(deviceId, &stream);
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("Init acl failed. ERROR: %d\n", ret); return ret);
+  //NEW
+  ret = EnableMatMulV2ShrinkIfRequested();
+  CHECK_RET(ret == ACL_SUCCESS,
+            LOG_PRINT("MatMulV2 shrink registration failed. ERROR: %d\n", ret); return ret);
 
   for (int arg = 1; arg < argc; arg += 3) {
     const int64_t m = std::strtoll(argv[arg], nullptr, 10);
@@ -228,6 +279,10 @@ int main(int argc, char** argv) {
     //NEW
     std::string branch;
     ret = MeasureShape(m, n, k, stream, &averageMs, &branch);
+    //NEW
+    if (ret == 10) {
+      continue;
+    }
     if (ret != ACL_SUCCESS) {
       //NEW
       fprintf(stderr, "measurement failed: M%ld_N%ld_K%ld_NN rc=%d\n",
@@ -238,7 +293,8 @@ int main(int argc, char** argv) {
       return ret;
     }
     //NEW
-    LOG_PRINT("%.9f|%s\n", averageMs, branch.c_str());
+    LOG_PRINT("%ld|%ld|%ld|%.9f|%s\n", static_cast<long>(m), static_cast<long>(n),
+              static_cast<long>(k), averageMs, branch.c_str());
   }
 
   // 6. 释放device资源，需要根据具体API的接口定义修改

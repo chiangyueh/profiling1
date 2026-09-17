@@ -15,6 +15,8 @@
 
 #include "aclnn_matmul.h"
 
+//NEW
+#include <cstdlib>
 #include "aclnn_kernels/common/op_error_check.h"
 #include "opdev/common_types.h"
 #include "opdev/op_dfx.h"
@@ -501,6 +503,13 @@ static inline const aclTensor* BuildBatchMatmulGraph(
 
 static const aclTensor* MatmulProcess(const aclTensor* mat1, const aclTensor* mat2, const aclTensor* out, int8_t cubeMathType, MmOpInfo& mmOpInfo, aclOpExecutor* executor)
 {
+    //NEW
+    const char *forceV2Value = std::getenv("MATMUL_FORCE_V2_SHRINK_COMPARISON");
+    const bool forceV2 = forceV2Value != nullptr && forceV2Value[0] == '1' && forceV2Value[1] == '\0';
+    if (forceV2) {
+        return l0op::MatMulNd(
+            mat1, mat2, nullptr, nullptr, false, false, false, mmOpInfo.opImplModeEnum, executor);
+    }
     return MatmulCommonProcess(mat1, mat2, nullptr, out, cubeMathType, mmOpInfo, executor, false);
 }
 

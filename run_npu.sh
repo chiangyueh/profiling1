@@ -11,15 +11,9 @@ unset ASCEND_CUSTOM_OPP_PATH
 host_build="${PWD}/build"
 build_log="$(mktemp)"
 run_log="$(mktemp)"
-installed_host=""
-host_backup=""
-host_replaced=0
 
 cleanup() {
-    if [[ "${host_replaced}" -eq 1 && -f "${host_backup}" && -n "${installed_host}" ]]; then
-        cp "${host_backup}" "${installed_host}"
-    fi
-    rm -f "${host_backup}" "${build_log}" "${run_log}"
+    rm -f "${build_log}" "${run_log}"
 }
 trap cleanup EXIT
 
@@ -34,21 +28,34 @@ if ! cmake -S . -B "${host_build}" \
     cat "${build_log}" >&2
     exit 1
 fi
-if ! cmake --build "${host_build}" --target ophost_nn -- -j1 >>"${build_log}" 2>&1; then
+if ! cmake --build "${host_build}" --target opapi_nn -- -j1 >>"${build_log}" 2>&1; then
     cat "${build_log}" >&2
     exit 1
 fi
 
-installed_host_link="${ASCEND_OPP_PATH}/built-in/op_impl/ai_core/tbe/op_host/lib/linux/$(uname -m)/libophost_nn.so"
-if [[ ! -e "${installed_host_link}" ]]; then
-    echo "fatal: ${installed_host_link} does not exist" >&2
+#NEW
+v2_shrink_source="matmul/mat_mul_v2_shrink/matmul_v2_shrink_tiling.cpp"
+v2_shrink_library="${host_build}/libmatmul_v2_shrink_tiling.so"
+if [[ ! -f "${v2_shrink_library}" || "${v2_shrink_source}" -nt "${v2_shrink_library}" ]]; then
+    if ! g++ -std=c++17 -O2 -fPIC -shared -D_GLIBCXX_USE_CXX11_ABI=0 "${v2_shrink_source}" \
+        -I "${ASCEND_HOME_PATH}/include" \
+        -I "${ASCEND_HOME_PATH}/x86_64-linux/include" \
+        -I "${ASCEND_HOME_PATH}/x86_64-linux/pkg_inc" \
+        -L "${ASCEND_HOME_PATH}/lib64" \
+        -L "${ASCEND_HOME_PATH}/x86_64-linux/lib64" \
+        -lopp_registry -lregister \
+        -o "${v2_shrink_library}" >>"${build_log}" 2>&1; then
+        cat "${build_log}" >&2
+        exit 1
+    fi
+fi
+
+#NEW
+v2_official_library="${ASCEND_OPP_PATH}/built-in/op_impl/ai_core/tbe/op_host/lib/linux/$(uname -m)/libophost_legacy.so"
+if [[ ! -f "${v2_official_library}" ]]; then
+    echo "fatal: ${v2_official_library} does not exist" >&2
     exit 1
 fi
-installed_host="$(readlink -f "${installed_host_link}")"
-host_backup="${host_build}/libophost_nn.so.official"
-cp "${installed_host}" "${host_backup}"
-host_replaced=1
-cp "${host_build}/libophost_nn.so" "${installed_host}"
 
 example_source="matmul/mat_mul_v3/examples/test_aclnn_matmul.cpp"
 example_binary="${host_build}/test_aclnn_matmul"
@@ -60,34 +67,47 @@ if ! g++ "${example_source}" \
     -I "${ASCEND_HOME_PATH}/include" \
     -I "${ASCEND_HOME_PATH}/include/aclnnop" \
     -I "${ASCEND_HOME_PATH}/include/aclnn" \
+    -L "${host_build}" \
     -L "${ASCEND_OPP_PATH}/lib64" \
     -L "${ASCEND_HOME_PATH}/lib64" \
-    -lopapi_nn -lopapi_math "${runtime_library}" -lnnopbase \
+    -Wl,-rpath,"${host_build}" \
+    -lopapi_nn -lopapi_math "${runtime_library}" -lnnopbase -lregister -ldl \
     -o "${example_binary}" >>"${build_log}" 2>&1; then
     cat "${build_log}" >&2
     exit 1
 fi
 
+#NEW
+custom_library_path="${host_build}:${LD_LIBRARY_PATH:-}"
+linked_opapi="$(LD_LIBRARY_PATH="${custom_library_path}" ldd "${example_binary}" | \
+    awk '$1 == "libopapi_nn.so" {print $3; exit}')"
+if [[ -z "${linked_opapi}" || "$(readlink -f "${linked_opapi}")" != "$(readlink -f "${host_build}/libopapi_nn.so")" ]]; then
+    echo "fatal: benchmark is not linked to the independently built libopapi_nn.so" >&2
+    exit 1
+fi
+
 shape_args=()
-default_m=(1024 1280 1536 1792 2048 2304 2560 3072 3584 4096 5120 6144)
-default_n=(1152 1408 1664 1920 2176 2432 2816 3200 3712 4352 4864 5632 6400)
-default_k=(4096 4608 5120 5632 6144 6656 7168 7680 8192 9216 10240)
-m_offset=(3 7 11 13 17 19 23)
-n_offset=(5 9 15 21 27 33 39)
-k_offset=(1 3 5 7 9 11 13)
+default_m=(1 3 5 7 9 11 13 15 16 17 24 32 48 64 96 128 192 256 384 512)
+default_n=(65 80 96 112 128 160 192 256 320 384 512 640 768 1024 1280 1536 1792 2048)
+default_k=(512 768 1024 1536 2048 3072 4096 5120 5632 6144 6656 7168 8192 10240 12288 16384)
+m_offset=(0 2 4 6 8 10 12)
+n_offset=(0 3 5 7 9 11 13)
+k_offset=(0 1 3 5 7 9 11)
 
 #NEW
-# 60 large aligned shapes followed by 60 large unaligned shapes.
-for ((shape_index = 0; shape_index < 60; ++shape_index)); do
+# The first 100 shapes emphasize skinny matrices, where an idle-core reduction
+# can exist. The remaining 20 widen M/N so the same V2 path is not tested only
+# on one narrow shape class.
+for ((shape_index = 0; shape_index < 100; ++shape_index)); do
     shape_args+=(
         "${default_m[shape_index % ${#default_m[@]}]}"
         "${default_n[(shape_index * 5 + 3) % ${#default_n[@]}]}"
         "${default_k[(shape_index * 7 + 1) % ${#default_k[@]}]}"
     )
 done
-for ((shape_index = 0; shape_index < 60; ++shape_index)); do
+for ((shape_index = 0; shape_index < 20; ++shape_index)); do
     shape_args+=(
-        "$((default_m[(shape_index * 7 + 2) % ${#default_m[@]}] + m_offset[shape_index % ${#m_offset[@]}]))"
+        "$((default_m[(shape_index * 7 + 13) % ${#default_m[@]}] + m_offset[shape_index % ${#m_offset[@]}]))"
         "$((default_n[(shape_index * 3 + 4) % ${#default_n[@]}] + n_offset[(shape_index * 2 + 1) % ${#n_offset[@]}]))"
         "$((default_k[(shape_index * 5 + 6) % ${#default_k[@]}] + k_offset[(shape_index * 3 + 2) % ${#k_offset[@]}]))"
     )
@@ -100,56 +120,58 @@ if [[ "$#" -gt 0 ]]; then
     shape_args=("$@")
 fi
 
-shape_count=$((${#shape_args[@]} / 3))
-chunk_size=10
-for ((chunk_start = 0; chunk_start < shape_count; chunk_start += chunk_size)); do
-    chunk_count=$((shape_count - chunk_start))
-    if ((chunk_count > chunk_size)); then
-        chunk_count=${chunk_size}
-    fi
-    chunk_args=("${shape_args[@]:chunk_start * 3:chunk_count * 3}")
+if ! shrinked_raw="$(LD_LIBRARY_PATH="${custom_library_path}" \
+    MATMUL_FORCE_V2_SHRINK_COMPARISON=1 \
+    MATMUL_SHRINK_MODE=1 \
+    MATMUL_V3_SHRINK_IDLE_CORES=0 \
+    MATMUL_V2_OFFICIAL_LIBRARY="${v2_official_library}" \
+    MATMUL_V2_SHRINK_LIBRARY="${v2_shrink_library}" \
+    "${example_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
+    echo "fatal: shrink measurement failed" >&2
+    cat "${run_log}" >&2
+    exit 1
+fi
+mapfile -t shrinked_results < <(printf '%s\n' "${shrinked_raw}" | \
+    awk -F'|' 'NF == 5 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+([.][0-9]+)?$/')
+if [[ "${#shrinked_results[@]}" -eq 0 ]]; then
+    echo "fatal: no supplied shape produced an actual MatMulV2 core reduction" >&2
+    exit 1
+fi
 
-    if ! shrinked_raw="$(MATMUL_V3_SHRINK_IDLE_CORES=1 "${example_binary}" "${chunk_args[@]}" 2>>"${run_log}")"; then
-        printf 'fatal: shrink measurement failed for shapes %d-%d\n' \
-            "$((chunk_start + 1))" "$((chunk_start + chunk_count))" >&2
-        cat "${run_log}" >&2
-        exit 1
-    fi
-    mapfile -t shrinked_results < <(printf '%s\n' "${shrinked_raw}" | awk -F'|' 'NF == 2 && $1 ~ /^[0-9]+([.][0-9]+)?$/')
-    if [[ "${#shrinked_results[@]}" -ne "${chunk_count}" ]]; then
-        printf 'fatal: shrink output count mismatch for shapes %d-%d: expected=%d actual=%d\n' \
-            "$((chunk_start + 1))" "$((chunk_start + chunk_count))" \
-            "${chunk_count}" "${#shrinked_results[@]}" >&2
-        exit 1
-    fi
+original_args=()
+for shrinked_result in "${shrinked_results[@]}"; do
+    IFS='|' read -r candidate_m candidate_n candidate_k _ _ <<<"${shrinked_result}"
+    original_args+=("${candidate_m}" "${candidate_n}" "${candidate_k}")
+done
 
-    if ! original_raw="$(MATMUL_V3_SHRINK_IDLE_CORES=0 "${example_binary}" "${chunk_args[@]}" 2>>"${run_log}")"; then
-        printf 'fatal: original measurement failed for shapes %d-%d\n' \
-            "$((chunk_start + 1))" "$((chunk_start + chunk_count))" >&2
-        cat "${run_log}" >&2
-        exit 1
-    fi
-    mapfile -t original_results < <(printf '%s\n' "${original_raw}" | awk -F'|' 'NF == 2 && $1 ~ /^[0-9]+([.][0-9]+)?$/')
-    if [[ "${#original_results[@]}" -ne "${chunk_count}" ]]; then
-        printf 'fatal: original output count mismatch for shapes %d-%d: expected=%d actual=%d\n' \
-            "$((chunk_start + 1))" "$((chunk_start + chunk_count))" \
-            "${chunk_count}" "${#original_results[@]}" >&2
-        exit 1
-    fi
+if ! original_raw="$(LD_LIBRARY_PATH="${custom_library_path}" \
+    MATMUL_FORCE_V2_SHRINK_COMPARISON=1 \
+    MATMUL_SHRINK_MODE=0 MATMUL_V3_SHRINK_IDLE_CORES=0 \
+    "${example_binary}" "${original_args[@]}" 2>>"${run_log}")"; then
+    echo "fatal: original measurement failed" >&2
+    cat "${run_log}" >&2
+    exit 1
+fi
+mapfile -t original_results < <(printf '%s\n' "${original_raw}" | \
+    awk -F'|' 'NF == 5 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+([.][0-9]+)?$/')
+if [[ "${#original_results[@]}" -ne "${#shrinked_results[@]}" ]]; then
+    printf 'fatal: original output count mismatch: expected=%d actual=%d\n' \
+        "${#shrinked_results[@]}" "${#original_results[@]}" >&2
+    exit 1
+fi
 
-    for ((chunk_index = 0; chunk_index < chunk_count; ++chunk_index)); do
-        shape_index=$((chunk_start + chunk_index))
-        arg_index=$((shape_index * 3))
-        m="${shape_args[arg_index]}"
-        n="${shape_args[arg_index + 1]}"
-        k="${shape_args[arg_index + 2]}"
-        IFS='|' read -r shrinked_latency branch <<<"${shrinked_results[chunk_index]}"
-        IFS='|' read -r original_latency original_branch <<<"${original_results[chunk_index]}"
-        if [[ "${branch}" != "${original_branch}" ]]; then
-            echo "fatal: branch changed between shrinked and original runs for M${m}_N${n}_K${k}" >&2
-            exit 1
-        fi
-        printf '{"shape":"M%s_N%s_K%s_NN","branch":"%s","shrinked_latency":"%s","original_latency":"%s"}\n' \
-            "${m}" "${n}" "${k}" "${branch}" "${shrinked_latency}" "${original_latency}"
-    done
+for ((result_index = 0; result_index < ${#shrinked_results[@]}; ++result_index)); do
+    IFS='|' read -r m n k shrinked_latency branch <<<"${shrinked_results[result_index]}"
+    IFS='|' read -r original_m original_n original_k original_latency original_branch \
+        <<<"${original_results[result_index]}"
+    if [[ "${m}" != "${original_m}" || "${n}" != "${original_n}" || "${k}" != "${original_k}" ]]; then
+        echo "fatal: result shape order changed between shrinked and original runs" >&2
+        exit 1
+    fi
+    if [[ "${branch}" != "MATMUL_V2" || "${original_branch}" != "MATMUL_V2" ]]; then
+        echo "fatal: a measurement did not execute the independent MatMulV2 path" >&2
+        exit 1
+    fi
+    printf '{"shape":"M%s_N%s_K%s_NN","branch":"%s","shrinked_latency":"%s","original_latency":"%s"}\n' \
+        "${m}" "${n}" "${k}" "${branch}" "${shrinked_latency}" "${original_latency}"
 done
