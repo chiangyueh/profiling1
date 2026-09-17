@@ -195,6 +195,31 @@ def candidate_pool():
     return pool
 
 
+def expand_witness(pool, queued, item, branch):
+    """Add a bounded local stencil around a route proven by the real selector."""
+    dtype, layout, m, n, k = item
+    if branch == "AL1_FULL_LOAD":
+        m_delta = (-4, -2, -1, 1, 2, 4)
+        n_delta = (-64, -32, -16, 16, 32, 64)
+        k_delta = (-1024, -512, -128, 128, 512, 1024)
+    elif branch.startswith("BL1_FULL_LOAD"):
+        m_delta = (-2048, -1024, -512, -256, -128, 128, 256, 512, 1024, 2048)
+        n_delta = (-32, -16, 16, 32)
+        k_delta = (-16, -8, 8, 16)
+    elif "SPLIT_K" in branch:
+        m_delta = (-512, -256, -128, -64, -16, 16, 64, 128, 256, 512)
+        n_delta = (-512, -256, -128, -64, -16, 16, 64, 128, 256, 512)
+        k_delta = (-2048, -1024, -640, -512, -128, 128, 512, 640, 1024, 2048)
+    else:
+        return
+    for delta in m_delta:
+        add(pool, queued, dtype, layout, m + delta, n, k)
+    for delta in n_delta:
+        add(pool, queued, dtype, layout, m, n + delta, k)
+    for delta in k_delta:
+        add(pool, queued, dtype, layout, m, n, k + delta)
+
+
 def runner_env(base, dtype, layout, mode, requested_core=None, discovery=False):
     env = dict(base)
     env["MATMUL_DATA_TYPE"] = dtype
@@ -236,9 +261,11 @@ def invoke(runner, env, shapes, run_log):
 
 def discover(args):
     pool = candidate_pool()
+    queued = {item for values in pool.values() for item in values}
     offsets = {key: 0 for key in pool}
     counts = collections.Counter()
     observed = collections.Counter()
+    expanded = collections.Counter()
     witnesses = collections.defaultdict(list)
     selected = []
     selected_mnk = set()
@@ -273,6 +300,9 @@ def discover(args):
                     if len(witnesses[branch]) < 3:
                         witnesses[branch].append({"dtype": dtype, "layout": layout,
                                                   "m": m, "n": n, "k": k})
+                    if counts[branch] < args.quota and expanded[branch] < 12:
+                        expand_witness(pool, queued, item, branch)
+                        expanded[branch] += 1
                 mnk = (m, n, k)
                 if branch not in TARGET_BRANCHES or counts[branch] >= args.quota or mnk in selected_mnk:
                     continue
