@@ -10,57 +10,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
-#include <memory>
 
 #include "exe_graph/runtime/tiling_context.h"
-#include "register/op_impl_kernel_registry.h"
 #include "register/op_impl_registry.h"
-
-//NEW
-// CANN 8.5 runtime packages export this registry ABI but do not all install the
-// internal pkg_inc declaration. Keep the narrow declaration needed by this
-// wrapper and use only types defined by the installed public registry headers.
-namespace gert {
-enum class OppImplVersionTag {
-    kOpp,
-    kOppKernel,
-    kVersionEnd = 20
-};
-
-class OpImplSpaceRegistryV2 {
-public:
-    const OpImplKernelRegistry::OpImplFunctionsV2 *GetOpImpl(const char *opType) const;
-};
-
-class DefaultOpImplSpaceRegistryV2 {
-public:
-    static DefaultOpImplSpaceRegistryV2 &GetInstance();
-    const std::shared_ptr<OpImplSpaceRegistryV2> GetSpaceRegistry(
-        OppImplVersionTag versionTag = OppImplVersionTag::kOpp) const;
-};
-} // namespace gert
 
 namespace {
 using TilingFunc = gert::OpImplRegisterV2::TilingKernelFunc;
 
 TilingFunc g_officialMatMulV2Tiling = nullptr;
-
-struct CaptureOfficialMatMulV2Tiling {
-    CaptureOfficialMatMulV2Tiling()
-    {
-        const auto registry = gert::DefaultOpImplSpaceRegistryV2::GetInstance().GetSpaceRegistry();
-        if (registry == nullptr) {
-            return;
-        }
-        const auto *impl = registry->GetOpImpl("MatMulV2");
-        if (impl != nullptr) {
-            g_officialMatMulV2Tiling = impl->tiling;
-        }
-    }
-};
-
-// This object must be initialized before the replacement registration below.
-CaptureOfficialMatMulV2Tiling g_captureOfficialMatMulV2Tiling;
 
 constexpr size_t kEnablePadAttrIndex = 6;
 constexpr size_t kPaddedDimensionWordCount = 3;
@@ -93,6 +50,12 @@ uint32_t MatMulV2ShrinkTiling(gert::TilingContext *context)
     }
 
     const uint32_t oldCoreNum = context->GetBlockDim();
+    const char *shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
+    if (shrinkMode == nullptr || shrinkMode[0] != '1' || shrinkMode[1] != '\0') {
+        SetShrinkResult("0", oldCoreNum, oldCoreNum);
+        return ge::GRAPH_SUCCESS;
+    }
+
     const auto *raw = context->GetRawTilingData();
     const auto *attrs = context->GetAttrs();
     size_t dimensionOffset = 0;
@@ -142,15 +105,14 @@ uint32_t MatMulV2ShrinkTiling(gert::TilingContext *context)
 IMPL_OP_OPTILING(MatMulV2).Tiling(MatMulV2ShrinkTiling, 2048);
 
 //NEW
+extern "C" __attribute__((visibility("default"))) int ConfigureMatMulV2OfficialTiling(void *callback)
+{
+    g_officialMatMulV2Tiling = reinterpret_cast<TilingFunc>(callback);
+    return g_officialMatMulV2Tiling == nullptr ? 0 : 1;
+}
+
+//NEW
 extern "C" __attribute__((visibility("default"))) int MatMulV2ShrinkRegistrationReady()
 {
-    if (g_officialMatMulV2Tiling == nullptr) {
-        return 0;
-    }
-    const auto registry = gert::DefaultOpImplSpaceRegistryV2::GetInstance().GetSpaceRegistry();
-    if (registry == nullptr) {
-        return 0;
-    }
-    const auto *impl = registry->GetOpImpl("MatMulV2");
-    return impl != nullptr && impl->tiling == MatMulV2ShrinkTiling ? 1 : 0;
+    return g_officialMatMulV2Tiling == nullptr ? 0 : 1;
 }
