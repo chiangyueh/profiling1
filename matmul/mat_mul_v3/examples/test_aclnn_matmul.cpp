@@ -97,45 +97,26 @@ void ClearSelectedBranch() {
   (void)::unsetenv("MATMUL_SHRINK_OLD_CORES");
   (void)::unsetenv("MATMUL_SHRINK_NEW_CORES");
   (void)::unsetenv("MATMUL_TILING_STAGE");
+  (void)::unsetenv("MATMUL_SHRINK_API_ROUTE");
 }
 
 //NEW
 extern "C" uint32_t TbeLoadSoAndSaveToRegistry(const char* soPath);
-//NEW
-extern "C" int InstallMatMulV2RetileHook();
-//NEW
-extern "C" int MatMulV2RetileHookReady();
 
 //NEW
 int EnableMatMulShrink() {
-  const char* v2HostLibraryPath = std::getenv("MATMUL_V2_OFFICIAL_HOST_LIBRARY");
-  const char* v2TilingLibraryPath = std::getenv("MATMUL_V2_OFFICIAL_TILING_LIBRARY");
   const char* v3LibraryPath = std::getenv("MATMUL_V3_HOST_LIBRARY");
-  if (v2HostLibraryPath == nullptr || v2HostLibraryPath[0] == '\0' ||
-      v2TilingLibraryPath == nullptr || v2TilingLibraryPath[0] == '\0' ||
-      v3LibraryPath == nullptr || v3LibraryPath[0] == '\0') {
-    fprintf(stderr, "tiling registration failed: MatMulV2 host/tiling or MatMulV3 host library path is missing\n");
+  if (v3LibraryPath == nullptr || v3LibraryPath[0] == '\0') {
+    fprintf(stderr, "tiling registration failed: MatMulV3 host library path is missing\n");
     return 4;
   }
 
   //NEW
-  // Populate one registry with the complete official legacy MatMulV2 entry
-  // before adding the modified MatMulV3 entry. No aclnn lookup occurs before
-  // both callbacks are installed, so the runtime cannot cache an old callback.
-  const uint32_t v2HostStatus = TbeLoadSoAndSaveToRegistry(v2HostLibraryPath);
-  const uint32_t v2TilingStatus = TbeLoadSoAndSaveToRegistry(v2TilingLibraryPath);
-  if (v2HostStatus != 0U || v2TilingStatus != 0U) {
-    fprintf(stderr, "tiling registration failed: cannot register complete official MatMulV2 entry host_rc=%u tiling_rc=%u\n",
-            v2HostStatus, v2TilingStatus);
-    return 4;
-  }
+  // The shrink process creates only MatMulV3 nodes.  Load only the matching
+  // local MatMulV3 host library; there is no MatMulV2 hook or mixed registry.
   const uint32_t v3Status = TbeLoadSoAndSaveToRegistry(v3LibraryPath);
   if (v3Status != 0U) {
     fprintf(stderr, "tiling registration failed: cannot register MatMulV3 host library rc=%u\n", v3Status);
-    return 4;
-  }
-  if (InstallMatMulV2RetileHook() != 1 || MatMulV2RetileHookReady() != 1) {
-    fprintf(stderr, "tiling registration failed: complete official MatMulV2 entry was not patched\n");
     return 4;
   }
   return ACL_SUCCESS;
@@ -196,12 +177,15 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   }
   //NEW
   *branch = ReadSelectedBranch();
-  const char* shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
-  if (shrinkMode != nullptr && shrinkMode[0] == '1' && shrinkMode[1] == '\0' &&
-      branch->empty()) {
+  const char* singleV3Route = std::getenv("MATMUL_SHRINK_SINGLE_V3");
+  const char* apiRoute = std::getenv("MATMUL_SHRINK_API_ROUTE");
+  if (singleV3Route != nullptr && singleV3Route[0] == '1' && singleV3Route[1] == '\0' &&
+      (branch->empty() || apiRoute == nullptr || std::string(apiRoute) != "MATMUL_V3")) {
     (void)aclDestroyAclOpExecutor(executor);
     executor = nullptr;
-    *failedStage = "shrink_callback_invariant";
+    *failedStage = "single_v3_route_invariant";
+    *failureDetail = apiRoute == nullptr ? "MatMulV3 API route was not entered" :
+        "MatMulV3 tiling callback did not publish a branch";
     return 4;
   }
   //NEW
@@ -331,9 +315,10 @@ int main(int argc, char** argv) {
   }
 
   //NEW
-  const char* shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
-  const bool shrinkEnabled = shrinkMode != nullptr && shrinkMode[0] == '1' && shrinkMode[1] == '\0';
-  if (shrinkEnabled) {
+  const char* singleV3Route = std::getenv("MATMUL_SHRINK_SINGLE_V3");
+  const bool singleV3Enabled =
+      singleV3Route != nullptr && singleV3Route[0] == '1' && singleV3Route[1] == '\0';
+  if (singleV3Enabled) {
     ret = EnableMatMulShrink();
     CHECK_RET(ret == ACL_SUCCESS,
               LOG_PRINT("MatMul shrink setup failed. ERROR: %d\n", ret); return ret);

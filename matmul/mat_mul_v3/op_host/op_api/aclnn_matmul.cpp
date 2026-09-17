@@ -501,6 +501,18 @@ static inline const aclTensor* BuildBatchMatmulGraph(
 
 static const aclTensor* MatmulProcess(const aclTensor* mat1, const aclTensor* mat2, const aclTensor* out, int8_t cubeMathType, MmOpInfo& mmOpInfo, aclOpExecutor* executor)
 {
+    //NEW
+    // The shrink benchmark uses one explicit operator route.  Construct the
+    // MatMulV3 node here, before the installed MatMulV2/MatMulV3 dispatcher is
+    // entered, so this process never depends on a MatMulV2 registry callback.
+    const char* singleV3Route = std::getenv("MATMUL_SHRINK_SINGLE_V3");
+    if (singleV3Route != nullptr && singleV3Route[0] == '1' && singleV3Route[1] == '\0') {
+        (void)::setenv("MATMUL_SHRINK_API_ROUTE", "MATMUL_V3", 1);
+        (void)::setenv("MATMUL_TILING_STAGE", "v3_node_created", 1);
+        return l0op::MatMulV3Nd(
+            mat1, mat2, nullptr, mmOpInfo.shapeInfo.transposeX1, mmOpInfo.shapeInfo.transposeX2, false,
+            mmOpInfo.opImplModeEnum, executor);
+    }
     return MatmulCommonProcess(mat1, mat2, nullptr, out, cubeMathType, mmOpInfo, executor, false);
 }
 
