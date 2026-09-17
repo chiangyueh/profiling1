@@ -211,10 +211,6 @@ int main(int argc, char** argv) {
   auto ret = Init(deviceId, &stream);
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("Init acl failed. ERROR: %d\n", ret); return ret);
 
-  //NEW
-  const char* shrinkMode = std::getenv("MATMUL_V3_SHRINK_IDLE_CORES");
-  const bool isShrink = shrinkMode != nullptr && shrinkMode[0] == '1' && shrinkMode[1] == '\0';
-
   for (int arg = 1; arg < argc; arg += 3) {
     const int64_t m = std::strtoll(argv[arg], nullptr, 10);
     const int64_t n = std::strtoll(argv[arg + 1], nullptr, 10);
@@ -242,9 +238,7 @@ int main(int argc, char** argv) {
       return ret;
     }
     //NEW
-    LOG_PRINT("{\"shape\":\"M%ld_N%ld_K%ld_NN\",\"branch\":\"%s\",\"is_shrink\":%s,\"latency\":%.9f}\n",
-              static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), branch.c_str(),
-              isShrink ? "true" : "false", averageMs);
+    LOG_PRINT("%.9f|%s\n", averageMs, branch.c_str());
   }
 
   // 6. 释放device资源，需要根据具体API的接口定义修改
