@@ -86,7 +86,9 @@ std::string ReadSelectedBranch() {
   if (selectedBranch != nullptr && selectedBranch[0] != '\0') {
     return selectedBranch;
   }
-  return "UNINSTRUMENTED_OFFICIAL";
+  // MatMulV2 assigns every launched core a batch/N/M/K work item.  It has no
+  // idle launch suffix that can be removed by changing blockDim alone.
+  return "MATMUL_V2_UNCHANGED";
 }
 
 //NEW
@@ -111,59 +113,21 @@ int EnableMatMulTilingVariants() {
     return ACL_SUCCESS;
   }
 
-  const char* officialTilingLibrary = std::getenv("MATMUL_V2_OFFICIAL_TILING_LIBRARY");
   const char* v3LibraryPath = std::getenv("MATMUL_V3_HOST_LIBRARY");
-  if (officialTilingLibrary == nullptr || officialTilingLibrary[0] == '\0' ||
-      v3LibraryPath == nullptr || v3LibraryPath[0] == '\0') {
-    fprintf(stderr, "tiling registration failed: required library path is missing\n");
+  if (v3LibraryPath == nullptr || v3LibraryPath[0] == '\0') {
+    fprintf(stderr, "tiling registration failed: MatMulV3 host library path is missing\n");
     return 4;
   }
 
   //NEW
-  // MatMulV2 infer-shape and the V2 shrink wrapper are compiled into the same
-  // host library as MatMulV3. The installed liboptiling supplies the unchanged
-  // V2 tiling implementation that the wrapper calls first.
-  void* officialHandle = dlopen(officialTilingLibrary, RTLD_NOW | RTLD_GLOBAL);
-  if (officialHandle == nullptr) {
-    fprintf(stderr, "tiling registration failed: cannot load official liboptiling: %s\n", dlerror());
-    return 4;
-  }
-  void* officialV2Tiling = dlsym(officialHandle, "_ZN4gert15TilingForMatMulEPNS_13TilingContextE");
-  if (officialV2Tiling == nullptr) {
-    fprintf(stderr, "tiling registration failed: official TilingForMatMul symbol is missing\n");
-    return 4;
-  }
   const uint32_t v3Status = TbeLoadSoAndSaveToRegistry(v3LibraryPath);
   if (v3Status != 0U) {
-    fprintf(stderr, "tiling registration failed: cannot register combined MatMulV2/MatMulV3 host library rc=%u\n",
-            v3Status);
+    fprintf(stderr, "tiling registration failed: cannot register MatMulV3 host library rc=%u\n", v3Status);
     return 4;
   }
   void* hostHandle = dlopen(v3LibraryPath, RTLD_NOW | RTLD_GLOBAL);
   if (hostHandle == nullptr) {
     fprintf(stderr, "tiling registration failed: cannot load MatMulV3 host library: %s\n", dlerror());
-    return 4;
-  }
-
-  using ConfigureFunction = int (*)(void*);
-  auto configure = reinterpret_cast<ConfigureFunction>(dlsym(hostHandle, "ConfigureMatMulV2OfficialTiling"));
-  if (configure == nullptr) {
-    fprintf(stderr, "tiling registration failed: combined MatMulV2 configuration symbol is missing\n");
-    return 4;
-  }
-  if (configure(officialV2Tiling) != 1) {
-    fprintf(stderr, "tiling registration failed: combined MatMulV2 registration is incomplete\n");
-    return 4;
-  }
-
-  using ReadyFunction = int (*)();
-  auto ready = reinterpret_cast<ReadyFunction>(dlsym(hostHandle, "MatMulV2ShrinkRegistrationReady"));
-  if (ready == nullptr) {
-    fprintf(stderr, "tiling registration failed: MatMulV2 readiness symbol is missing\n");
-    return 4;
-  }
-  if (ready() != 1) {
-    fprintf(stderr, "tiling registration failed: MatMulV2 official entry point was not configured\n");
     return 4;
   }
   return ACL_SUCCESS;

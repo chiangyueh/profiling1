@@ -40,21 +40,6 @@ if [[ ! -f "${v3_host_library}" ]]; then
     exit 1
 fi
 
-#NEW
-official_tiling_library=""
-for candidate in \
-    "${ASCEND_OPP_PATH}/built-in/op_impl/ai_core/tbe/op_tiling/liboptiling.so" \
-    "${ASCEND_OPP_PATH}/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/$(uname -m)/liboptiling.so"; do
-    if [[ -f "${candidate}" ]]; then
-        official_tiling_library="${candidate}"
-        break
-    fi
-done
-if [[ -z "${official_tiling_library}" ]]; then
-    echo "fatal: official liboptiling.so does not exist" >&2
-    exit 1
-fi
-
 example_source="matmul/mat_mul_v3/examples/test_aclnn_matmul.cpp"
 example_binary="${host_build}/test_aclnn_matmul"
 runtime_library="-lacl_rt"
@@ -108,8 +93,6 @@ if [[ "$#" -gt 0 ]]; then
 fi
 
 if ! original_raw="$(MATMUL_SHRINK_MODE=0 MATMUL_V3_SHRINK_IDLE_CORES=0 \
-    MATMUL_V3_HOST_LIBRARY="${v3_host_library}" \
-    MATMUL_V2_OFFICIAL_TILING_LIBRARY="${official_tiling_library}" \
     "${example_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
     echo "fatal: original measurement failed" >&2
     if [[ -n "${original_raw}" ]]; then
@@ -130,7 +113,6 @@ fi
 if ! shrinked_raw="$(MATMUL_SHRINK_MODE=1 \
     MATMUL_V3_SHRINK_IDLE_CORES=1 \
     MATMUL_V3_HOST_LIBRARY="${v3_host_library}" \
-    MATMUL_V2_OFFICIAL_TILING_LIBRARY="${official_tiling_library}" \
     "${example_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
     echo "fatal: shrink measurement failed" >&2
     if [[ -n "${shrinked_raw}" ]]; then

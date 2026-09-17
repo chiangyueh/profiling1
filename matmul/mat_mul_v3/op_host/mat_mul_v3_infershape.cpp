@@ -205,9 +205,4 @@ static ge::graphStatus InferShapeForMatMulV3(InferShapeContext* context)
 } // namespace
 namespace ops {
     IMPL_OP_INFERSHAPE(MatMulV3).InferShape(InferShapeForMatMulV3);
-    //NEW
-    // MatMulV2 and MatMulV3 use the same input positions and the first two
-    // transpose attributes on this aclnnMatmul path. Keep the V2 infer-shape
-    // callback in the same host registry as the V2 tiling wrapper and V3.
-    IMPL_OP_INFERSHAPE(MatMulV2).InferShape(InferShapeForMatMulV3);
 }

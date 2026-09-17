@@ -12,5 +12,4 @@ add_modules_sources(HOSTNAME ${OPHOST_NAME} MODE PRIVATE DIR ${CMAKE_CURRENT_SOU
 #NEW
 # The scoped mat_mul_v3 build does not include matmul/common automatically.
 target_sources(${OPHOST_NAME}_tiling_obj PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../common/op_host/op_tiling/debug_tiling.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../mat_mul_v2_shrink/matmul_v2_shrink_tiling.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../common/op_host/op_tiling/debug_tiling.cpp)
