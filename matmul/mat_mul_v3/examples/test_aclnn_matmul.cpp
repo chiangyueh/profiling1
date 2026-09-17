@@ -71,6 +71,7 @@ int CreateAclTensor(const std::vector<T>& hostData, const std::vector<int64_t>& 
   // 调用aclCreateTensor接口创建aclTensor
   *tensor = aclCreateTensor(shape.data(), shape.size(), dataType, strides.data(), 0, aclFormat::ACL_FORMAT_ND,
                             shape.data(), shape.size(), *deviceAddr);
+  CHECK_RET(*tensor != nullptr, return ACL_ERROR_INVALID_PARAM);
   return 0;
 }
 
@@ -117,12 +118,6 @@ int EnableMatMulTilingVariants() {
     fprintf(stderr, "tiling registration failed: cannot load official liboptiling: %s\n", dlerror());
     return 4;
   }
-  void* officialV2Tiling = dlsym(officialHandle, "_ZN4gert15TilingForMatMulEPNS_13TilingContextE");
-  if (officialV2Tiling == nullptr) {
-    fprintf(stderr, "tiling registration failed: official TilingForMatMul symbol is missing\n");
-    return 4;
-  }
-
   const uint32_t v3Status = TbeLoadSoAndSaveToRegistry(v3LibraryPath);
   if (v3Status != 0U) {
     fprintf(stderr, "tiling registration failed: cannot register combined MatMulV2/MatMulV3 host library rc=%u\n",
@@ -135,14 +130,14 @@ int EnableMatMulTilingVariants() {
     return 4;
   }
 
-  using ConfigureFunction = int (*)(void*);
+  using ConfigureFunction = int (*)();
   auto configure = reinterpret_cast<ConfigureFunction>(dlsym(hostHandle, "ConfigureMatMulV2OfficialTiling"));
   if (configure == nullptr) {
     fprintf(stderr, "tiling registration failed: combined MatMulV2 configuration symbol is missing\n");
     return 4;
   }
-  if (configure(officialV2Tiling) != 1) {
-    fprintf(stderr, "tiling registration failed: cannot configure official MatMulV2 tiling entry point\n");
+  if (configure() != 1) {
+    fprintf(stderr, "tiling registration failed: official MatMulV2 registration is incomplete\n");
     return 4;
   }
 
@@ -161,7 +156,7 @@ int EnableMatMulTilingVariants() {
 
 //NEW
 int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* averageMs,
-                 std::string* branch) {
+                 std::string* branch, std::string* failedStage) {
   auto ret = ACL_SUCCESS;
   std::vector<int64_t> selfShape = {m, k};
   std::vector<int64_t> mat2Shape = {k, n};
@@ -177,16 +172,19 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   std::vector<float> mat2HostData(GetShapeSize(mat2Shape), 1);
   std::vector<float> outHostData(GetShapeSize(outShape), 0);
   // 创建self aclTensor
+  *failedStage = "create_self";
   ret = CreateAclTensor(selfHostData, selfShape, &selfDeviceAddr, aclDataType::ACL_FLOAT, &self);
   std::unique_ptr<aclTensor, aclnnStatus (*)(const aclTensor*)> selfTensorPtr(self, aclDestroyTensor);
   std::unique_ptr<void, aclError (*)(void*)> selfDeviceAddrPtr(selfDeviceAddr, aclrtFree);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
   // 创建mat2 aclTensor
+  *failedStage = "create_mat2";
   ret = CreateAclTensor(mat2HostData, mat2Shape, &mat2DeviceAddr, aclDataType::ACL_FLOAT, &mat2);
   std::unique_ptr<aclTensor, aclnnStatus (*)(const aclTensor*)> mat2TensorPtr(mat2, aclDestroyTensor);
   std::unique_ptr<void, aclError (*)(void*)> mat2DeviceAddrPtr(mat2DeviceAddr, aclrtFree);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
   // 创建out aclTensor
+  *failedStage = "create_out";
   ret = CreateAclTensor(outHostData, outShape, &outDeviceAddr, aclDataType::ACL_FLOAT, &out);
   std::unique_ptr<aclTensor, aclnnStatus (*)(const aclTensor*)> outTensorPtr(out, aclDestroyTensor);
   std::unique_ptr<void, aclError (*)(void*)> outdeviceAddrPtr(outDeviceAddr, aclrtFree);
@@ -198,16 +196,19 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   aclOpExecutor* executor = nullptr;
   std::unique_ptr<void, aclError (*)(void*)> executorAddrPtr(nullptr, aclrtFree);
   // 调用aclnnMatmul第一段接口
+  *failedStage = "get_workspace";
   ret = aclnnMatmulGetWorkspaceSize(self, mat2, out, cubeMathType, &workspaceSize, &executor);
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMatmulGetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
   //NEW
   *branch = ReadSelectedBranch();
+  *failedStage = "make_executor_repeatable";
   ret = aclSetAclOpExecutorRepeatable(executor);
   CHECK_RET(ret == ACL_SUCCESS,
             LOG_PRINT("aclSetAclOpExecutorRepeatable failed. ERROR: %d\n", ret); return ret);
   // 根据第一段接口计算出的workspaceSize申请device内存
   void* workspaceAddr = nullptr;
   if (workspaceSize > 0) {
+    *failedStage = "allocate_workspace";
     ret = aclrtMalloc(&workspaceAddr, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
     CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("allocate workspace failed. ERROR: %d\n", ret); return ret);
     executorAddrPtr.reset(workspaceAddr);
@@ -225,31 +226,40 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   constexpr int warmup = 10;
   constexpr int repeat = 100;
 
+  *failedStage = "warmup_submit";
   for (int i = 0; i < warmup; ++i) {
     ret = aclnnMatmul(workspaceAddr, workspaceSize, executor, stream);
     CHECK_RET(ret == ACL_SUCCESS, return ret);
   }
+  *failedStage = "warmup_sync";
   ret = aclrtSynchronizeStream(stream);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
   aclrtEvent startEvent = nullptr;
   aclrtEvent endEvent = nullptr;
+  *failedStage = "create_start_event";
   ret = aclrtCreateEvent(&startEvent);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
+  *failedStage = "create_end_event";
   ret = aclrtCreateEvent(&endEvent);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
 
+  *failedStage = "record_start_event";
   ret = aclrtRecordEvent(startEvent, stream);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
+  *failedStage = "timed_submit";
   for (int i = 0; i < repeat; ++i) {
     ret = aclnnMatmul(workspaceAddr, workspaceSize, executor, stream);
     CHECK_RET(ret == ACL_SUCCESS, return ret);
   }
+  *failedStage = "record_end_event";
   ret = aclrtRecordEvent(endEvent, stream);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
+  *failedStage = "timed_sync";
   ret = aclrtSynchronizeEvent(endEvent);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
 
   float totalMs = 0.0F;
+  *failedStage = "elapsed_time";
   ret = aclrtEventElapsedTime(&totalMs, startEvent, endEvent);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
   *averageMs = totalMs / repeat;
@@ -260,14 +270,17 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   // 5. 获取输出的值，将device侧内存上的结果拷贝至host侧，需要根据具体API的接口定义修改
   auto size = GetShapeSize(outShape);
   std::vector<float> resultData(size, 0);
+  *failedStage = "copy_output";
   ret = aclrtMemcpy(resultData.data(), resultData.size() * sizeof(resultData[0]), outDeviceAddr,
                     size * sizeof(resultData[0]), ACL_MEMCPY_DEVICE_TO_HOST);
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("copy result from device to host failed. ERROR: %d\n", ret); return ret);
   //NEW
+  *failedStage = "validate_output";
   for (int64_t i = 0; i < size; i++) {
     CHECK_RET(resultData[i] == static_cast<float>(k), return 3);
   }
 
+  failedStage->clear();
   return 0;
 }
 
@@ -302,11 +315,12 @@ int main(int argc, char** argv) {
     float averageMs = 0.0F;
     //NEW
     std::string branch;
-    ret = MeasureShape(m, n, k, stream, &averageMs, &branch);
+    std::string failedStage;
+    ret = MeasureShape(m, n, k, stream, &averageMs, &branch, &failedStage);
     if (ret != ACL_SUCCESS) {
       //NEW
-      fprintf(stderr, "measurement failed: M%ld_N%ld_K%ld_NN rc=%d\n",
-              static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), ret);
+      fprintf(stderr, "measurement failed: M%ld_N%ld_K%ld_NN stage=%s rc=%d\n",
+              static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), failedStage.c_str(), ret);
       aclrtDestroyStream(stream);
       aclrtResetDevice(deviceId);
       aclFinalize();

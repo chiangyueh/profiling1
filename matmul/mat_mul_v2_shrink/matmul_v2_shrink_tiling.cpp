@@ -10,19 +10,34 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <memory>
 
 #include "exe_graph/runtime/tiling_context.h"
+#include "register/op_impl_kernel_registry.h"
 #include "register/op_impl_registry.h"
 
 //NEW
-// MatMulV2's official registration includes this parser and these compile-info
-// lifetime functions in addition to TilingForMatMul. They are exported by the
-// official liboptiling.so loaded before this combined host library.
+// CANN does not install this internal declaration in every runtime package.
+// Use the exported ABI only to update the tiling pointer of the already loaded
+// official MatMulV2 registration; every other official field remains intact.
 namespace gert {
-class GemmCompileInfo;
-uint32_t GemmParseFunc(TilingParseContext *context);
-template <> void *OpImplRegisterV2::CreateCompileInfo<GemmCompileInfo, 0>();
-template <> void OpImplRegisterV2::DeleteCompileInfo<GemmCompileInfo>(void *object);
+enum class OppImplVersionTag {
+    kOpp,
+    kOppKernel,
+    kVersionEnd = 20
+};
+
+class OpImplSpaceRegistryV2 {
+public:
+    const OpImplKernelRegistry::OpImplFunctionsV2 *GetOpImpl(const char *opType) const;
+};
+
+class DefaultOpImplSpaceRegistryV2 {
+public:
+    static DefaultOpImplSpaceRegistryV2 &GetInstance();
+    const std::shared_ptr<OpImplSpaceRegistryV2> GetSpaceRegistry(
+        OppImplVersionTag versionTag = OppImplVersionTag::kOpp) const;
+};
 } // namespace gert
 
 namespace {
@@ -113,19 +128,34 @@ uint32_t MatMulV2ShrinkTiling(gert::TilingContext *context)
 } // namespace
 
 //NEW
-IMPL_OP_OPTILING(MatMulV2)
-    .Tiling(MatMulV2ShrinkTiling, 2048)
-    .TilingParse<gert::GemmCompileInfo>(gert::GemmParseFunc);
-
-//NEW
-extern "C" __attribute__((visibility("default"))) int ConfigureMatMulV2OfficialTiling(void *callback)
+extern "C" __attribute__((visibility("default"))) int ConfigureMatMulV2OfficialTiling()
 {
-    g_officialMatMulV2Tiling = reinterpret_cast<TilingFunc>(callback);
-    return g_officialMatMulV2Tiling == nullptr ? 0 : 1;
+    const auto registry = gert::DefaultOpImplSpaceRegistryV2::GetInstance().GetSpaceRegistry();
+    if (registry == nullptr) {
+        return 0;
+    }
+    const auto *registered = registry->GetOpImpl("MatMulV2");
+    auto *official = const_cast<gert::OpImplKernelRegistry::OpImplFunctionsV2 *>(registered);
+    if (official == nullptr || official->tiling == nullptr || official->tiling_parse == nullptr ||
+        official->compile_info_creator == nullptr || official->compile_info_deleter == nullptr) {
+        return 0;
+    }
+    g_officialMatMulV2Tiling = official->tiling;
+    official->tiling = MatMulV2ShrinkTiling;
+    return 1;
 }
 
 //NEW
 extern "C" __attribute__((visibility("default"))) int MatMulV2ShrinkRegistrationReady()
 {
-    return g_officialMatMulV2Tiling == nullptr ? 0 : 1;
+    if (g_officialMatMulV2Tiling == nullptr) {
+        return 0;
+    }
+    const auto registry = gert::DefaultOpImplSpaceRegistryV2::GetInstance().GetSpaceRegistry();
+    if (registry == nullptr) {
+        return 0;
+    }
+    const auto *impl = registry->GetOpImpl("MatMulV2");
+    return impl != nullptr && impl->tiling == MatMulV2ShrinkTiling && impl->tiling_parse != nullptr &&
+        impl->compile_info_creator != nullptr && impl->compile_info_deleter != nullptr ? 1 : 0;
 }
