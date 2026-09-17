@@ -28,18 +28,34 @@ if ! cmake -S . -B "${host_build}" \
     cat "${build_log}" >&2
     exit 1
 fi
-if ! cmake --build "${host_build}" --target ophost_nn opapi_nn -- -j1 >>"${build_log}" 2>&1; then
+if ! cmake --build "${host_build}" --target ophost_nn -- -j1 >>"${build_log}" 2>&1; then
     cat "${build_log}" >&2
     exit 1
 fi
 
 #NEW
 v3_host_library="${host_build}/libophost_nn.so"
-v3_opapi_library="${host_build}/libopapi_nn.so"
-if [[ ! -f "${v3_host_library}" || ! -f "${v3_opapi_library}" ]]; then
-    echo "fatal: independently built MatMulV3 host or API library is missing" >&2
+if [[ ! -f "${v3_host_library}" ]]; then
+    echo "fatal: independently built MatMulV3 host library is missing" >&2
     exit 1
 fi
+
+#NEW
+official_opapi_nn_library=""
+for candidate in \
+    "${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64/libopapi_nn.so" \
+    "${ASCEND_HOME_PATH}/lib64/libopapi_nn.so" \
+    "${ASCEND_OPP_PATH}/lib64/libopapi_nn.so"; do
+    if [[ -f "${candidate}" ]]; then
+        official_opapi_nn_library="${candidate}"
+        break
+    fi
+done
+if [[ -z "${official_opapi_nn_library}" ]]; then
+    echo "fatal: installed CANN libopapi_nn.so is missing" >&2
+    exit 1
+fi
+official_opapi_nn_dir="$(dirname -- "${official_opapi_nn_library}")"
 
 #NEW
 official_opapi_math_library=""
@@ -57,40 +73,70 @@ if [[ -z "${official_opapi_math_library}" ]]; then
     exit 1
 fi
 official_opapi_math_dir="$(dirname -- "${official_opapi_math_library}")"
-runtime_path="${official_opapi_math_dir}:${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
+runtime_path="${official_opapi_nn_dir}:${official_opapi_math_dir}:${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
+
+#NEW
+official_legacy_common_library=""
+for candidate in \
+    "${ASCEND_OPP_PATH}/built-in/op_impl/ai_core/tbe/op_host/lib/linux/$(uname -m)/libophost_comm_legacy.so" \
+    "${ASCEND_HOME_PATH}/opp/built-in/op_impl/ai_core/tbe/op_host/lib/linux/$(uname -m)/libophost_comm_legacy.so"; do
+    if [[ -f "${candidate}" ]]; then
+        official_legacy_common_library="${candidate}"
+        break
+    fi
+done
+if [[ -z "${official_legacy_common_library}" ]]; then
+    echo "fatal: installed CANN libophost_comm_legacy.so is missing" >&2
+    exit 1
+fi
+#NEW
+if ! nm -D "${official_opapi_nn_library}" | awk '$3 ~ /^aclnnMatmulGetWorkspaceSize(@.*)?$/ {found=1} END {exit !found}'; then
+    echo "fatal: installed CANN libopapi_nn.so has no aclnnMatmulGetWorkspaceSize" >&2
+    exit 1
+fi
+if ! nm -D "${official_legacy_common_library}" | awk '$3 ~ /^LegacyMmCheckHitV3Shape(@.*)?$/ {found=1} END {exit !found}'; then
+    echo "fatal: installed CANN legacy library has no MatMul V3 selector" >&2
+    exit 1
+fi
 
 example_source="matmul/mat_mul_v3/examples/test_aclnn_matmul.cpp"
-controlled_binary="${host_build}/test_aclnn_matmul_v3_controlled"
+example_binary="${host_build}/test_aclnn_matmul"
 runtime_library="-lacl_rt"
 if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/lib64/libascendcl.so" ]]; then
     runtime_library="-lascendcl"
 fi
 common_link_args=(
+    -std=gnu++17 \
+    -D_GLIBCXX_USE_CXX11_ABI=0 \
+    -I "${PWD}" \
     -I "${ASCEND_HOME_PATH}/include" \
     -I "${ASCEND_HOME_PATH}/include/aclnnop" \
     -I "${ASCEND_HOME_PATH}/include/aclnn" \
     -I "${ASCEND_HOME_PATH}/$(uname -m)-linux/pkg_inc" \
     -L "${ASCEND_OPP_PATH}/lib64" \
     -L "${ASCEND_HOME_PATH}/lib64" \
-    -lopapi_math "${runtime_library}" -lnnopbase -lregister -lopp_registry
+    -L "${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64" \
+    "${official_opapi_nn_library}" "${official_opapi_math_library}" \
+    "${runtime_library}" -lnnopbase -lregister -lopp_registry -ldl
 )
-if ! g++ "${example_source}" "${v3_opapi_library}" "${common_link_args[@]}" \
-    -Wl,-rpath,"${host_build}" -o "${controlled_binary}" >>"${build_log}" 2>&1; then
+if ! g++ "${example_source}" "${common_link_args[@]}" \
+    -Wl,-rpath,"${official_opapi_nn_dir}:${official_opapi_math_dir}" \
+    -o "${example_binary}" >>"${build_log}" 2>&1; then
     cat "${build_log}" >&2
     exit 1
 fi
 
 #NEW
-# Resolve the controlled binary before touching the NPU. Both measurements use
-# this exact binary; only MATMUL_V3_SHRINK_IDLE_CORES changes between them.
-loaded_opapi="$(LD_LIBRARY_PATH="${host_build}:${runtime_path}" ldd "${controlled_binary}" | awk '$1 == "libopapi_nn.so" {print $3; exit}')"
-loaded_math="$(LD_LIBRARY_PATH="${host_build}:${runtime_path}" ldd "${controlled_binary}" | awk '$1 == "libopapi_math.so" {print $3; exit}')"
-if [[ "$(readlink -f -- "${loaded_opapi}")" != "$(readlink -f -- "${v3_opapi_library}")" ]]; then
-    echo "fatal: controlled runner did not resolve the local MatMulV3 libopapi_nn.so" >&2
+# The runner must use CANN's complete official API. Only the MatMulV3 host
+# tiler is repository-local.
+loaded_opapi="$(LD_LIBRARY_PATH="${runtime_path}" ldd "${example_binary}" | awk '$1 == "libopapi_nn.so" {print $3; exit}')"
+loaded_math="$(LD_LIBRARY_PATH="${runtime_path}" ldd "${example_binary}" | awk '$1 == "libopapi_math.so" {print $3; exit}')"
+if [[ -z "${loaded_opapi}" || "$(readlink -f -- "${loaded_opapi}")" != "$(readlink -f -- "${official_opapi_nn_library}")" ]]; then
+    echo "fatal: runner did not resolve installed CANN libopapi_nn.so" >&2
     exit 1
 fi
-if [[ -z "${loaded_math}" || "${loaded_math}" == "${host_build}/common/stub/"* ]]; then
-    echo "fatal: controlled runner resolved the host-only libopapi_math stub" >&2
+if [[ -z "${loaded_math}" || "$(readlink -f -- "${loaded_math}")" != "$(readlink -f -- "${official_opapi_math_library}")" ]]; then
+    echo "fatal: runner did not resolve installed CANN libopapi_math.so" >&2
     exit 1
 fi
 
@@ -129,11 +175,12 @@ if [[ "$#" -gt 0 ]]; then
 fi
 
 if ! original_raw="$(MATMUL_SHRINK_MODE=0 \
-    MATMUL_SHRINK_SINGLE_V3=1 \
+    MATMUL_V3_ONLY=1 \
     MATMUL_V3_SHRINK_IDLE_CORES=0 \
     MATMUL_V3_HOST_LIBRARY="${v3_host_library}" \
-    LD_LIBRARY_PATH="${host_build}:${runtime_path}" \
-    "${controlled_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
+    MATMUL_LEGACY_COMMON_LIBRARY="${official_legacy_common_library}" \
+    LD_LIBRARY_PATH="${runtime_path}" \
+    "${example_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
     echo "fatal: original measurement failed" >&2
     if [[ -n "${original_raw}" ]]; then
         printf '%s\n' "${original_raw}" >&2
@@ -143,19 +190,18 @@ if ! original_raw="$(MATMUL_SHRINK_MODE=0 \
 fi
 mapfile -t original_results < <(printf '%s\n' "${original_raw}" | \
     awk -F'|' 'NF == 5 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+([.][0-9]+)?$/')
-expected_result_count=$((${#shape_args[@]} / 3))
-if [[ "${#original_results[@]}" -ne "${expected_result_count}" ]]; then
-    printf 'fatal: original output count mismatch: expected=%d actual=%d\n' \
-        "${expected_result_count}" "${#original_results[@]}" >&2
+if [[ "${#original_results[@]}" -eq 0 ]]; then
+    echo "fatal: no supplied shape selected MatMulV3" >&2
     exit 1
 fi
 
 if ! shrinked_raw="$(MATMUL_SHRINK_MODE=1 \
-    MATMUL_SHRINK_SINGLE_V3=1 \
+    MATMUL_V3_ONLY=1 \
     MATMUL_V3_SHRINK_IDLE_CORES=1 \
     MATMUL_V3_HOST_LIBRARY="${v3_host_library}" \
-    LD_LIBRARY_PATH="${host_build}:${runtime_path}" \
-    "${controlled_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
+    MATMUL_LEGACY_COMMON_LIBRARY="${official_legacy_common_library}" \
+    LD_LIBRARY_PATH="${runtime_path}" \
+    "${example_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
     echo "fatal: shrink measurement failed" >&2
     if [[ -n "${shrinked_raw}" ]]; then
         printf '%s\n' "${shrinked_raw}" >&2

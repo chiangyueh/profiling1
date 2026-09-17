@@ -16,10 +16,17 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <dlfcn.h> //NEW
 #include <string>
 #include "acl/acl.h"
-#include "aclnnop/aclnn_matmul.h"
+#include "exe_graph/runtime/tensor.h" //NEW
+#include "matmul/mat_mul_v3/op_host/op_api/aclnn_matmul.h"
+#include "opdev/common_types.h" //NEW
+#include "opdev/platform.h" //NEW
 
+#ifdef CHECK_RET
+#undef CHECK_RET
+#endif
 #define CHECK_RET(cond, return_expr) \
   do {                               \
     if (!(cond)) {                   \
@@ -85,6 +92,10 @@ std::string ReadSelectedBranch() {
   if (selectedBranch != nullptr && selectedBranch[0] != '\0') {
     return selectedBranch;
   }
+  const char* v3Only = std::getenv("MATMUL_V3_ONLY");
+  if (v3Only != nullptr && v3Only[0] == '1' && v3Only[1] == '\0') {
+    return "";
+  }
   const char* shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
   return shrinkMode != nullptr && shrinkMode[0] == '1' && shrinkMode[1] == '\0' ? "" : "OFFICIAL_BASELINE";
 }
@@ -97,14 +108,65 @@ void ClearSelectedBranch() {
   (void)::unsetenv("MATMUL_SHRINK_OLD_CORES");
   (void)::unsetenv("MATMUL_SHRINK_NEW_CORES");
   (void)::unsetenv("MATMUL_TILING_STAGE");
-  (void)::unsetenv("MATMUL_SHRINK_API_ROUTE");
+}
+
+//NEW
+int SelectOfficialMatMulV3Route(int64_t m, int64_t n, int64_t k, std::string* failureDetail) {
+  const auto socVersion = op::GetCurrentPlatformInfo().GetSocVersion();
+  if (socVersion == op::SocVersion::ASCEND910_95) {
+    return 1;
+  }
+  if (socVersion != op::SocVersion::ASCEND910B && socVersion != op::SocVersion::ASCEND910_93) {
+    return 0;
+  }
+
+  using Selector = bool (*)(const gert::Tensor*, const gert::Tensor*, const gert::Tensor*, bool, bool,
+                            op::Format, bool, uint32_t, const std::string&);
+  static void* selectorHandle = nullptr;
+  static Selector selector = nullptr;
+  static bool selectorLoadAttempted = false;
+  if (!selectorLoadAttempted) {
+    selectorLoadAttempted = true;
+    const char* selectorLibrary = std::getenv("MATMUL_LEGACY_COMMON_LIBRARY");
+    if (selectorLibrary != nullptr && selectorLibrary[0] != '\0') {
+      selectorHandle = dlopen(selectorLibrary, RTLD_LAZY | RTLD_LOCAL);
+      if (selectorHandle != nullptr) {
+        selector = reinterpret_cast<Selector>(dlsym(selectorHandle, "LegacyMmCheckHitV3Shape"));
+      }
+    }
+  }
+  if (selector == nullptr) {
+    const char* loaderError = dlerror();
+    *failureDetail = loaderError == nullptr ? "official MatMul V3 selector is unavailable" : loaderError;
+    return -1;
+  }
+
+  gert::Tensor selfTensor;
+  selfTensor.MutableOriginShape() = gert::Shape({m, k});
+  selfTensor.MutableStorageShape() = gert::Shape({m, k});
+  selfTensor.SetOriginFormat(ge::FORMAT_ND);
+  selfTensor.SetStorageFormat(ge::FORMAT_ND);
+  selfTensor.SetDataType(ge::DT_FLOAT);
+
+  gert::Tensor mat2Tensor;
+  mat2Tensor.MutableOriginShape() = gert::Shape({k, n});
+  mat2Tensor.MutableStorageShape() = gert::Shape({k, n});
+  mat2Tensor.SetOriginFormat(ge::FORMAT_ND);
+  mat2Tensor.SetStorageFormat(ge::FORMAT_ND);
+  mat2Tensor.SetDataType(ge::DT_FLOAT);
+
+  // The benchmark tensors are 2-D, contiguous FP32, NN and ND. For exactly
+  // this input contract the upstream dispatcher passes ND and supportSplitK=false.
+  return selector(&selfTensor, &mat2Tensor, nullptr, false, false, ge::FORMAT_ND, false,
+                  op::GetCurrentPlatformInfo().GetCubeCoreNum(),
+                  op::GetCurrentPlatformInfo().GetSocLongVersion()) ? 1 : 0;
 }
 
 //NEW
 extern "C" uint32_t TbeLoadSoAndSaveToRegistry(const char* soPath);
 
 //NEW
-int EnableMatMulShrink() {
+int EnableMatMulV3Host() {
   const char* v3LibraryPath = std::getenv("MATMUL_V3_HOST_LIBRARY");
   if (v3LibraryPath == nullptr || v3LibraryPath[0] == '\0') {
     fprintf(stderr, "tiling registration failed: MatMulV3 host library path is missing\n");
@@ -112,8 +174,8 @@ int EnableMatMulShrink() {
   }
 
   //NEW
-  // The shrink process creates only MatMulV3 nodes.  Load only the matching
-  // local MatMulV3 host library; there is no MatMulV2 hook or mixed registry.
+  // V2 inputs are rejected by the official dispatcher predicate before an
+  // executor is built. Only the matching local MatMulV3 host is registered.
   const uint32_t v3Status = TbeLoadSoAndSaveToRegistry(v3LibraryPath);
   if (v3Status != 0U) {
     fprintf(stderr, "tiling registration failed: cannot register MatMulV3 host library rc=%u\n", v3Status);
@@ -125,6 +187,22 @@ int EnableMatMulShrink() {
 //NEW
 int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* averageMs,
                  std::string* branch, std::string* failedStage, std::string* failureDetail) {
+  constexpr int kSkipNotMatMulV3 = 10001;
+  //NEW
+  // Reject official MatMulV2 routes before allocating or copying any tensor.
+  const char* v3Only = std::getenv("MATMUL_V3_ONLY");
+  if (v3Only != nullptr && v3Only[0] == '1' && v3Only[1] == '\0') {
+    const int selectedRoute = SelectOfficialMatMulV3Route(m, n, k, failureDetail);
+    if (selectedRoute < 0) {
+      *failedStage = "official_v3_route_selection";
+      return 4;
+    }
+    if (selectedRoute == 0) {
+      failedStage->clear();
+      return kSkipNotMatMulV3;
+    }
+  }
+
   auto ret = ACL_SUCCESS;
   std::vector<int64_t> selfShape = {m, k};
   std::vector<int64_t> mat2Shape = {k, n};
@@ -177,15 +255,11 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   }
   //NEW
   *branch = ReadSelectedBranch();
-  const char* singleV3Route = std::getenv("MATMUL_SHRINK_SINGLE_V3");
-  const char* apiRoute = std::getenv("MATMUL_SHRINK_API_ROUTE");
-  if (singleV3Route != nullptr && singleV3Route[0] == '1' && singleV3Route[1] == '\0' &&
-      (branch->empty() || apiRoute == nullptr || std::string(apiRoute) != "MATMUL_V3")) {
+  if (v3Only != nullptr && v3Only[0] == '1' && v3Only[1] == '\0' && branch->empty()) {
     (void)aclDestroyAclOpExecutor(executor);
     executor = nullptr;
-    *failedStage = "single_v3_route_invariant";
-    *failureDetail = apiRoute == nullptr ? "MatMulV3 API route was not entered" :
-        "MatMulV3 tiling callback did not publish a branch";
+    *failedStage = "v3_tiling_callback_invariant";
+    *failureDetail = "official dispatcher selected MatMulV3 but the local V3 tiler was not entered";
     return 4;
   }
   //NEW
@@ -286,6 +360,7 @@ struct MeasurementResult {
 
 //NEW
 int main(int argc, char** argv) {
+  constexpr int kSkipNotMatMulV3 = 10001;
   CHECK_RET(argc >= 4 && (argc - 1) % 3 == 0, return 2);
 
   // 1. （固定写法）device/stream初始化，参考acl API手册
@@ -315,13 +390,12 @@ int main(int argc, char** argv) {
   }
 
   //NEW
-  const char* singleV3Route = std::getenv("MATMUL_SHRINK_SINGLE_V3");
-  const bool singleV3Enabled =
-      singleV3Route != nullptr && singleV3Route[0] == '1' && singleV3Route[1] == '\0';
-  if (singleV3Enabled) {
-    ret = EnableMatMulShrink();
+  const char* v3Only = std::getenv("MATMUL_V3_ONLY");
+  const bool v3OnlyEnabled = v3Only != nullptr && v3Only[0] == '1' && v3Only[1] == '\0';
+  if (v3OnlyEnabled) {
+    ret = EnableMatMulV3Host();
     CHECK_RET(ret == ACL_SUCCESS,
-              LOG_PRINT("MatMul shrink setup failed. ERROR: %d\n", ret); return ret);
+              LOG_PRINT("MatMulV3 host setup failed. ERROR: %d\n", ret); return ret);
   }
 
   for (size_t index = 0; index < results.size(); ++index) {
@@ -333,6 +407,9 @@ int main(int argc, char** argv) {
     std::string failureDetail;
     ret = MeasureShape(result.m, result.n, result.k, stream, &result.averageMs, &result.branch,
                        &failedStage, &failureDetail);
+    if (ret == kSkipNotMatMulV3) {
+      continue;
+    }
     if (ret != ACL_SUCCESS) {
       //NEW
       const char* tilingStage = std::getenv("MATMUL_TILING_STAGE");
@@ -351,7 +428,10 @@ int main(int argc, char** argv) {
 
   //NEW
   for (const auto& result : results) {
-    CHECK_RET(result.complete && !result.branch.empty(), return 4);
+    if (!result.complete) {
+      continue;
+    }
+    CHECK_RET(!result.branch.empty(), return 4);
     LOG_PRINT("%ld|%ld|%ld|%.9f|%s\n", static_cast<long>(result.m), static_cast<long>(result.n),
               static_cast<long>(result.k), result.averageMs, result.branch.c_str());
   }
