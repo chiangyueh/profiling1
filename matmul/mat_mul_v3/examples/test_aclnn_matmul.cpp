@@ -99,22 +99,31 @@ void ClearSelectedBranch() {
 extern "C" void TbeLoadSoAndSaveToRegistry(const char* soPath);
 
 //NEW
-int EnableMatMulV2ShrinkIfRequested() {
+int EnableMatMulTilingVariants() {
   const char* shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
-  if (shrinkMode == nullptr || shrinkMode[0] != '1' || shrinkMode[1] != '\0') {
-    return ACL_SUCCESS;
-  }
-  const char* libraryPath = std::getenv("MATMUL_V2_SHRINK_LIBRARY");
   const char* officialLibraryPath = std::getenv("MATMUL_V2_OFFICIAL_LIBRARY");
-  if (libraryPath == nullptr || libraryPath[0] == '\0' ||
-      officialLibraryPath == nullptr || officialLibraryPath[0] == '\0') {
+  const char* v3LibraryPath = std::getenv("MATMUL_V3_HOST_LIBRARY");
+  if (officialLibraryPath == nullptr || officialLibraryPath[0] == '\0' ||
+      v3LibraryPath == nullptr || v3LibraryPath[0] == '\0') {
     return 4;
   }
   //NEW
-  // Load the official implementation first so the independent wrapper can save its callback.
+  // Preserve natural dispatch: only install the two implementations selected by that dispatcher.
   TbeLoadSoAndSaveToRegistry(officialLibraryPath);
-  TbeLoadSoAndSaveToRegistry(libraryPath);
-  void* handle = dlopen(libraryPath, RTLD_NOW | RTLD_GLOBAL);
+  TbeLoadSoAndSaveToRegistry(v3LibraryPath);
+  if (dlopen(v3LibraryPath, RTLD_NOW | RTLD_GLOBAL) == nullptr) {
+    return 4;
+  }
+  if (shrinkMode == nullptr || shrinkMode[0] != '1' || shrinkMode[1] != '\0') {
+    return ACL_SUCCESS;
+  }
+
+  const char* v2ShrinkLibraryPath = std::getenv("MATMUL_V2_SHRINK_LIBRARY");
+  if (v2ShrinkLibraryPath == nullptr || v2ShrinkLibraryPath[0] == '\0') {
+    return 4;
+  }
+  TbeLoadSoAndSaveToRegistry(v2ShrinkLibraryPath);
+  void* handle = dlopen(v2ShrinkLibraryPath, RTLD_NOW | RTLD_GLOBAL);
   if (handle == nullptr) {
     return 4;
   }
@@ -129,7 +138,6 @@ int EnableMatMulV2ShrinkIfRequested() {
 //NEW
 int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* averageMs,
                  std::string* branch) {
-  constexpr int kNoEffectiveShrink = 10;
   auto ret = ACL_SUCCESS;
   std::vector<int64_t> selfShape = {m, k};
   std::vector<int64_t> mat2Shape = {k, n};
@@ -170,14 +178,6 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMatmulGetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
   //NEW
   *branch = ReadSelectedBranch();
-  const char* shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
-  const bool shrinkRequested = shrinkMode != nullptr && shrinkMode[0] == '1' && shrinkMode[1] == '\0';
-  const char* shrinkEffective = std::getenv("MATMUL_SHRINK_EFFECTIVE");
-  if (shrinkRequested &&
-      (shrinkEffective == nullptr || shrinkEffective[0] != '1' || shrinkEffective[1] != '\0')) {
-    return kNoEffectiveShrink;
-  }
-  //NEW
   ret = aclSetAclOpExecutorRepeatable(executor);
   CHECK_RET(ret == ACL_SUCCESS,
             LOG_PRINT("aclSetAclOpExecutorRepeatable failed. ERROR: %d\n", ret); return ret);
@@ -258,9 +258,9 @@ int main(int argc, char** argv) {
   auto ret = Init(deviceId, &stream);
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("Init acl failed. ERROR: %d\n", ret); return ret);
   //NEW
-  ret = EnableMatMulV2ShrinkIfRequested();
+  ret = EnableMatMulTilingVariants();
   CHECK_RET(ret == ACL_SUCCESS,
-            LOG_PRINT("MatMulV2 shrink registration failed. ERROR: %d\n", ret); return ret);
+            LOG_PRINT("MatMul tiling registration failed. ERROR: %d\n", ret); return ret);
 
   for (int arg = 1; arg < argc; arg += 3) {
     const int64_t m = std::strtoll(argv[arg], nullptr, 10);
@@ -279,10 +279,6 @@ int main(int argc, char** argv) {
     //NEW
     std::string branch;
     ret = MeasureShape(m, n, k, stream, &averageMs, &branch);
-    //NEW
-    if (ret == 10) {
-      continue;
-    }
     if (ret != ACL_SUCCESS) {
       //NEW
       fprintf(stderr, "measurement failed: M%ld_N%ld_K%ld_NN rc=%d\n",

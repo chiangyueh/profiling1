@@ -28,8 +28,15 @@ if ! cmake -S . -B "${host_build}" \
     cat "${build_log}" >&2
     exit 1
 fi
-if ! cmake --build "${host_build}" --target opapi_nn -- -j1 >>"${build_log}" 2>&1; then
+if ! cmake --build "${host_build}" --target ophost_nn -- -j1 >>"${build_log}" 2>&1; then
     cat "${build_log}" >&2
+    exit 1
+fi
+
+#NEW
+v3_host_library="${host_build}/libophost_nn.so"
+if [[ ! -f "${v3_host_library}" ]]; then
+    echo "fatal: independently built MatMulV3 host library is missing" >&2
     exit 1
 fi
 
@@ -67,22 +74,11 @@ if ! g++ "${example_source}" \
     -I "${ASCEND_HOME_PATH}/include" \
     -I "${ASCEND_HOME_PATH}/include/aclnnop" \
     -I "${ASCEND_HOME_PATH}/include/aclnn" \
-    -L "${host_build}" \
     -L "${ASCEND_OPP_PATH}/lib64" \
     -L "${ASCEND_HOME_PATH}/lib64" \
-    -Wl,-rpath,"${host_build}" \
     -lopapi_nn -lopapi_math "${runtime_library}" -lnnopbase -lregister -ldl \
     -o "${example_binary}" >>"${build_log}" 2>&1; then
     cat "${build_log}" >&2
-    exit 1
-fi
-
-#NEW
-custom_library_path="${host_build}:${LD_LIBRARY_PATH:-}"
-linked_opapi="$(LD_LIBRARY_PATH="${custom_library_path}" ldd "${example_binary}" | \
-    awk '$1 == "libopapi_nn.so" {print $3; exit}')"
-if [[ -z "${linked_opapi}" || "$(readlink -f "${linked_opapi}")" != "$(readlink -f "${host_build}/libopapi_nn.so")" ]]; then
-    echo "fatal: benchmark is not linked to the independently built libopapi_nn.so" >&2
     exit 1
 fi
 
@@ -120,10 +116,9 @@ if [[ "$#" -gt 0 ]]; then
     shape_args=("$@")
 fi
 
-if ! shrinked_raw="$(LD_LIBRARY_PATH="${custom_library_path}" \
-    MATMUL_FORCE_V2_SHRINK_COMPARISON=1 \
-    MATMUL_SHRINK_MODE=1 \
-    MATMUL_V3_SHRINK_IDLE_CORES=0 \
+if ! shrinked_raw="$(MATMUL_SHRINK_MODE=1 \
+    MATMUL_V3_SHRINK_IDLE_CORES=1 \
+    MATMUL_V3_HOST_LIBRARY="${v3_host_library}" \
     MATMUL_V2_OFFICIAL_LIBRARY="${v2_official_library}" \
     MATMUL_V2_SHRINK_LIBRARY="${v2_shrink_library}" \
     "${example_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
@@ -133,8 +128,10 @@ if ! shrinked_raw="$(LD_LIBRARY_PATH="${custom_library_path}" \
 fi
 mapfile -t shrinked_results < <(printf '%s\n' "${shrinked_raw}" | \
     awk -F'|' 'NF == 5 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+([.][0-9]+)?$/')
-if [[ "${#shrinked_results[@]}" -eq 0 ]]; then
-    echo "fatal: no supplied shape produced an actual MatMulV2 core reduction" >&2
+expected_result_count=$((${#shape_args[@]} / 3))
+if [[ "${#shrinked_results[@]}" -ne "${expected_result_count}" ]]; then
+    printf 'fatal: shrink output count mismatch: expected=%d actual=%d\n' \
+        "${expected_result_count}" "${#shrinked_results[@]}" >&2
     exit 1
 fi
 
@@ -144,9 +141,9 @@ for shrinked_result in "${shrinked_results[@]}"; do
     original_args+=("${candidate_m}" "${candidate_n}" "${candidate_k}")
 done
 
-if ! original_raw="$(LD_LIBRARY_PATH="${custom_library_path}" \
-    MATMUL_FORCE_V2_SHRINK_COMPARISON=1 \
-    MATMUL_SHRINK_MODE=0 MATMUL_V3_SHRINK_IDLE_CORES=0 \
+if ! original_raw="$(MATMUL_SHRINK_MODE=0 MATMUL_V3_SHRINK_IDLE_CORES=0 \
+    MATMUL_V3_HOST_LIBRARY="${v3_host_library}" \
+    MATMUL_V2_OFFICIAL_LIBRARY="${v2_official_library}" \
     "${example_binary}" "${original_args[@]}" 2>>"${run_log}")"; then
     echo "fatal: original measurement failed" >&2
     cat "${run_log}" >&2
@@ -168,8 +165,8 @@ for ((result_index = 0; result_index < ${#shrinked_results[@]}; ++result_index))
         echo "fatal: result shape order changed between shrinked and original runs" >&2
         exit 1
     fi
-    if [[ "${branch}" != "MATMUL_V2" || "${original_branch}" != "MATMUL_V2" ]]; then
-        echo "fatal: a measurement did not execute the independent MatMulV2 path" >&2
+    if [[ "${branch}" != "${original_branch}" ]]; then
+        echo "fatal: natural branch changed between shrinked and original runs for M${m}_N${n}_K${k}" >&2
         exit 1
     fi
     printf '{"shape":"M%s_N%s_K%s_NN","branch":"%s","shrinked_latency":"%s","original_latency":"%s"}\n' \

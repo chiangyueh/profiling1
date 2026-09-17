@@ -16,6 +16,7 @@
 #include <cinttypes>
 //NEW
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include "matmul_v3_base_tiling.h"
 #include "../../op_kernel/mat_mul_v3_tiling_key.h"
@@ -2717,7 +2718,7 @@ const char *MatmulV3BaseTiling::GetSelectedBranchName()
 }
 
 //NEW
-void MatmulV3BaseTiling::ShrinkIdleCores()
+bool MatmulV3BaseTiling::ShrinkIdleCores()
 {
     auto &matmul = tilingData_.matmulTiling;
     const auto &l2 = tilingData_.tileL2cacheTiling;
@@ -2725,7 +2726,7 @@ void MatmulV3BaseTiling::ShrinkIdleCores()
     const uint64_t singleCoreM = static_cast<uint64_t>(matmul.singleCoreM);
     const uint64_t singleCoreN = static_cast<uint64_t>(matmul.singleCoreN);
     if (oldUsedCoreNum == 0 || singleCoreM == 0 || singleCoreN == 0) {
-        return;
+        return false;
     }
 
     const uint64_t mTotal = ops::CeilDiv(static_cast<uint64_t>(matmul.M), singleCoreM);
@@ -2740,7 +2741,7 @@ void MatmulV3BaseTiling::ShrinkIdleCores()
                 nCnt = std::min(nTotal, static_cast<uint64_t>(l2.nTileBlock));
             } else {
                 if (l2.mTileCntL2 == 0 || l2.nTileCntL2 == 0) {
-                    return;
+                    return false;
                 }
                 mCnt = ops::CeilDiv(mTotal, static_cast<uint64_t>(l2.mTileCntL2));
                 nCnt = ops::CeilDiv(nTotal, static_cast<uint64_t>(l2.nTileCntL2));
@@ -2756,12 +2757,13 @@ void MatmulV3BaseTiling::ShrinkIdleCores()
         case TilingEnableSplitCore::DETERMINISTIC_SPLIT_K:
         case TilingEnableSplitCore::MULTI_CORE_SPLIT_K:
         default:
-            return;
+            return false;
     }
 
     const uint64_t newUsedCoreNum = std::max<uint64_t>(
         1, std::min(oldUsedCoreNum, activeCoreUpperBound));
     matmul.usedCoreNum = static_cast<uint32_t>(newUsedCoreNum);
+    return newUsedCoreNum < oldUsedCoreNum;
 }
 
 ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
@@ -2805,12 +2807,22 @@ ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
     //NEW
     const char *selectedBranch = GetSelectedBranchName();
     (void)::setenv("MATMUL_V3_SELECTED_BRANCH", selectedBranch, 1);
+    (void)::setenv("MATMUL_SELECTED_BRANCH", selectedBranch, 1);
 
     //NEW
     const char *shrinkMode = std::getenv("MATMUL_V3_SHRINK_IDLE_CORES");
     const bool shrinkEnabled = shrinkMode != nullptr && shrinkMode[0] == '1' && shrinkMode[1] == '\0';
     if (shrinkEnabled) {
-        ShrinkIdleCores();
+        const uint32_t oldCoreNum = tilingData_.matmulTiling.usedCoreNum;
+        const bool effective = ShrinkIdleCores();
+        const uint32_t newCoreNum = tilingData_.matmulTiling.usedCoreNum;
+        char oldCoreText[16] = {};
+        char newCoreText[16] = {};
+        (void)snprintf(oldCoreText, sizeof(oldCoreText), "%u", oldCoreNum);
+        (void)snprintf(newCoreText, sizeof(newCoreText), "%u", newCoreNum);
+        (void)::setenv("MATMUL_SHRINK_EFFECTIVE", effective ? "1" : "0", 1);
+        (void)::setenv("MATMUL_SHRINK_OLD_CORES", oldCoreText, 1);
+        (void)::setenv("MATMUL_SHRINK_NEW_CORES", newCoreText, 1);
     }
 
     return ge::GRAPH_SUCCESS;

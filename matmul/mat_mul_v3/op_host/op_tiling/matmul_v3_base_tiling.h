@@ -78,7 +78,7 @@ protected:
     uint64_t GetDeterministicSplitKWorkspaceSize(uint64_t alignedM, uint64_t alignedN);
     void DoBasicTiling();
     //NEW
-    void ShrinkIdleCores();
+    bool ShrinkIdleCores();
     //NEW
     const char *GetSelectedBranchName();
     void FormulaicBaseBlockTiling();
