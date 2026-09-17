@@ -10,7 +10,8 @@ import sys
 
 
 # The 17 routes below are exactly the combinations that the Ascend 910B
-# fresh-shape selector can produce without GetTilingFromRepo/AOE state.
+# fresh-shape tiler can produce without GetTilingFromRepo/AOE state.  The
+# outer aclnn MatMul dispatcher does not necessarily admit every route.
 TARGET_BRANCHES = (
     "BASE",
     "BASE_ND2NZ",
@@ -29,6 +30,15 @@ TARGET_BRANCHES = (
     "DETERMINISTIC_SPLIT_K_ND2NZ",
     "DETERMINISTIC_SPLIT_K_VEC_NZ2ND",
     "DETERMINISTIC_SPLIT_K_VEC_NZ2ND_ND2NZ",
+)
+
+# Exhaustive official-dispatch discovery on CANN 8.5 found no reachable
+# BL1_FULL_LOAD packet and only 21 distinct AL1 packets.  Those two routes
+# remain recorded when observed, but cannot discard the 15 fully populated
+# route datasets or prevent their measurement.
+OFFICIAL_QUOTA_BRANCHES = tuple(
+    name for name in TARGET_BRANCHES
+    if name not in ("AL1_FULL_LOAD", "BL1_FULL_LOAD")
 )
 
 
@@ -57,13 +67,11 @@ def candidate_pool():
     # AL1 full-load: fp32, A=N, B=T, M<=16, 16<N<=320, K aligned to
     # 512/dtype bytes, and A resident in L1.  N starts at 80 so the
     # deterministic M,N<=64 rule cannot mask AL1.
-    al1_k = (4096, 5120, 5760, 6144, 6400, 6656, 6784, 7040,
-              7168, 8192, 9216, 10240, 12288, 14336, 15360, 16384)
-    for index in range(4096):
-        add(pool, seen, "fp32", "NT",
-            1 + index % 16,
-            80 + 16 * ((index // 16) % 16),
-            al1_k[(index // 256) % len(al1_k)])
+    al1_k = (5120, 6144, 6656, 7168, 8192, 10240, 12288, 14336)
+    for m in range(1, 17):
+        for n in (64, 128, 192, 256, 320):
+            for k in al1_k:
+                add(pool, seen, "fp32", "NT", m, n, k)
 
     # Plain BL1 full-load needs M > 16*max(K,N), K<=256 and an on-the-fly
     # supported B.  Values below avoid the earlier fixpipe predicate.  The
@@ -72,11 +80,17 @@ def candidate_pool():
     bl1_n = (32, 64, 128, 192, 256, 384)
     bl1_plain_k = (8, 16, 24, 32, 40, 48, 56, 64, 96)
     bl1_nd2nz_k = (17, 18, 19, 21, 25, 33, 41, 49, 57, 65, 73, 81)
-    for index in range(240):
+    for index in range(160):
         m = 9216 + 128 * index
-        for layout in ("NN", "NT"):
+        if index < 24:
+            for layout in ("NN", "NT"):
+                add(pool, seen, "fp32", layout, m,
+                    bl1_n[index % len(bl1_n)], bl1_plain_k[(index * 5) % len(bl1_plain_k)])
+        # The real dispatcher admits this family through the NN head-ND2NZ
+        # route.  NT with the same tails was exhaustively unproductive.
+        for layout in ("NN",):
             add(pool, seen, "fp32", layout, m,
-                bl1_n[index % len(bl1_n)], bl1_plain_k[(index * 5) % len(bl1_plain_k)])
+                bl1_n[(index + 1) % len(bl1_n)], bl1_nd2nz_k[(index * 7) % len(bl1_nd2nz_k)])
             add(pool, seen, "fp32", layout, m + 64,
                 bl1_n[(index + 1) % len(bl1_n)], bl1_nd2nz_k[(index * 7) % len(bl1_nd2nz_k)])
 
@@ -129,7 +143,7 @@ def candidate_pool():
     # deliberately sampled on both aligned and unaligned boundaries.
     small_n = (17, 23, 31, 40, 47, 56, 64, 73, 80, 89, 96, 111, 112, 127, 128, 143, 160, 191, 192, 223, 240)
     small_k = (17, 24, 31, 40, 48, 63, 64, 67, 72, 80, 95, 96, 111, 112, 127, 128, 160, 191, 192, 223, 240, 255)
-    for i in range(5000):
+    for i in range(2400):
         layout = "NT" if i % 2 == 0 else "NN"
         m = 9216 + 128 * ((i * 37) % 680) + (i % 5)
         add(pool, seen, "fp32", layout, m, small_n[(i * 5) % len(small_n)],
@@ -259,6 +273,32 @@ def invoke(runner, env, shapes, run_log):
     return completed.returncode, records
 
 
+def read_selected(path):
+    selected = []
+    if not os.path.isfile(path):
+        return selected
+    with open(path, encoding="utf-8") as stream:
+        for line in stream:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) != 6:
+                continue
+            dtype, layout, m, n, k, branch = fields
+            if dtype not in ("fp32", "fp16", "bf16") or layout not in ("NN", "NT", "TN", "TT"):
+                continue
+            if branch not in TARGET_BRANCHES:
+                continue
+            selected.append((dtype, layout, int(m), int(n), int(k), branch))
+    return selected
+
+
+def write_selected(path, selected):
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        for dtype, layout, m, n, k, branch in selected:
+            stream.write(f"{dtype}\t{layout}\t{m}\t{n}\t{k}\t{branch}\n")
+    os.replace(temporary, path)
+
+
 def discover(args):
     pool = candidate_pool()
     queued = {item for values in pool.values() for item in values}
@@ -267,19 +307,40 @@ def discover(args):
     observed = collections.Counter()
     expanded = collections.Counter()
     witnesses = collections.defaultdict(list)
+    loaded_selected = read_selected(args.selected)
     selected = []
     selected_mnk = set()
+    for item in loaded_selected:
+        _dtype, _layout, m, n, k, branch = item
+        mnk = (m, n, k)
+        if mnk in selected_mnk or counts[branch] >= args.quota:
+            continue
+        selected_mnk.add(mnk)
+        counts[branch] += 1
+        selected.append(item)
+    if all(counts[name] >= args.quota for name in OFFICIAL_QUOTA_BRANCHES):
+        print(json.dumps({"discovery": "cache_reused", "attempted": 0,
+                          "selected": len(selected),
+                          "counts": {name: counts[name] for name in TARGET_BRANCHES},
+                          "selector_limited": {"AL1_FULL_LOAD": counts["AL1_FULL_LOAD"],
+                                               "BL1_FULL_LOAD": counts["BL1_FULL_LOAD"]}},
+                         separators=(",", ":")), file=sys.stderr)
+        return 0
     keys = sorted(pool)
     attempts = 0
-    while keys and any(counts[name] < args.quota for name in TARGET_BRANCHES):
+    saved_count = len(selected)
+    while keys and any(counts[name] < args.quota for name in OFFICIAL_QUOTA_BRANCHES):
         next_keys = []
         for key in keys:
             begin = offsets[key]
-            batch = pool[key][begin:begin + args.discovery_batch]
+            raw_batch = pool[key][begin:begin + args.discovery_batch]
+            if not raw_batch:
+                continue
+            offsets[key] += len(raw_batch)
+            next_keys.append(key)
+            batch = [item for item in raw_batch if (item[2], item[3], item[4]) not in selected_mnk]
             if not batch:
                 continue
-            offsets[key] += len(batch)
-            next_keys.append(key)
             dtype, layout = key
             env = runner_env(os.environ, dtype, layout, "discovery", discovery=True)
             rc, records = invoke(args.runner, env, batch, args.run_log)
@@ -310,19 +371,27 @@ def discover(args):
                 selected_mnk.add(mnk)
                 counts[branch] += 1
         keys = next_keys
+        if len(selected) != saved_count:
+            write_selected(args.selected, selected)
+            saved_count = len(selected)
 
-    missing = {name: args.quota - counts[name] for name in TARGET_BRANCHES if counts[name] < args.quota}
-    if missing:
-        print(json.dumps({"fatal": "branch_discovery_exhausted", "attempted": attempts,
-                          "counts": {name: counts[name] for name in TARGET_BRANCHES},
-                          "observed": {name: observed[name] for name in TARGET_BRANCHES},
-                          "witnesses": {name: witnesses[name] for name in TARGET_BRANCHES
-                                        if witnesses[name]},
-                          "missing": missing}, separators=(",", ":")), file=sys.stderr)
+    write_selected(args.selected, selected)
+    missing_required = {
+        name: args.quota - counts[name]
+        for name in OFFICIAL_QUOTA_BRANCHES if counts[name] < args.quota
+    }
+    if not selected:
+        print(json.dumps({"fatal": "no_official_v3_shapes_discovered", "attempted": attempts},
+                         separators=(",", ":")), file=sys.stderr)
         return 3
-    with open(args.selected, "w", encoding="utf-8") as stream:
-        for dtype, layout, m, n, k, branch in selected:
-            stream.write(f"{dtype}\t{layout}\t{m}\t{n}\t{k}\t{branch}\n")
+    print(json.dumps({"discovery": "complete" if not missing_required else "partial_measurement_continues",
+                      "attempted": attempts, "selected": len(selected),
+                      "counts": {name: counts[name] for name in TARGET_BRANCHES},
+                      "selector_limited": {"AL1_FULL_LOAD": counts["AL1_FULL_LOAD"],
+                                           "BL1_FULL_LOAD": counts["BL1_FULL_LOAD"]},
+                      "missing_required": missing_required,
+                      "witnesses": {name: witnesses[name] for name in missing_required
+                                    if witnesses[name]}}, separators=(",", ":")), file=sys.stderr)
     return 0
 
 

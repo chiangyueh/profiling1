@@ -12,10 +12,19 @@ host_build="${PWD}/build"
 build_log="$(mktemp)"
 run_log="$(mktemp)"
 #NEW
-selected_shapes="$(mktemp)"
+remove_selected_shapes=0
+if [[ "$#" -gt 0 ]]; then
+    selected_shapes="$(mktemp)"
+    remove_selected_shapes=1
+else
+    selected_shapes="${host_build}/core_oracle_official_v3_q100.tsv"
+fi
 
 cleanup() {
-    rm -f "${build_log}" "${run_log}" "${selected_shapes}"
+    rm -f "${build_log}" "${run_log}"
+    if [[ "${remove_selected_shapes}" -eq 1 ]]; then
+        rm -f "${selected_shapes}"
+    fi
 }
 trap cleanup EXIT
 
