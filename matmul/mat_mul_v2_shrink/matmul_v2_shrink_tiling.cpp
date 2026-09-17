@@ -147,7 +147,8 @@ extern "C" __attribute__((visibility("default"))) int ConfigureMatMulV2OfficialT
     }
     const auto *registered = registry->GetOpImpl("MatMulV2");
     auto *official = const_cast<gert::OpImplKernelRegistry::OpImplFunctionsV2 *>(registered);
-    if (official == nullptr || official->tiling == nullptr || official->tiling_parse == nullptr ||
+    if (official == nullptr || official->infer_shape == nullptr || official->tiling == nullptr ||
+        official->tiling_parse == nullptr ||
         official->compile_info_creator == nullptr || official->compile_info_deleter == nullptr) {
         return 0;
     }
@@ -167,6 +168,7 @@ extern "C" __attribute__((visibility("default"))) int MatMulV2ShrinkRegistration
         return 0;
     }
     const auto *impl = registry->GetOpImpl("MatMulV2");
-    return impl != nullptr && impl->tiling == MatMulV2ShrinkTiling && impl->tiling_parse != nullptr &&
+    return impl != nullptr && impl->infer_shape != nullptr && impl->tiling == MatMulV2ShrinkTiling &&
+        impl->tiling_parse != nullptr &&
         impl->compile_info_creator != nullptr && impl->compile_info_deleter != nullptr ? 1 : 0;
 }

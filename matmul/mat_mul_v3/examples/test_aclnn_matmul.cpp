@@ -86,7 +86,7 @@ std::string ReadSelectedBranch() {
   if (selectedBranch != nullptr && selectedBranch[0] != '\0') {
     return selectedBranch;
   }
-  return "MATMUL_V2";
+  return "UNINSTRUMENTED_OFFICIAL";
 }
 
 //NEW
@@ -104,17 +104,31 @@ extern "C" uint32_t TbeLoadSoAndSaveToRegistry(const char* soPath);
 
 //NEW
 int EnableMatMulTilingVariants() {
+  //NEW
+  // Keep the baseline process completely outside the custom registry.
+  const char* shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
+  if (shrinkMode == nullptr || shrinkMode[0] != '1' || shrinkMode[1] != '\0') {
+    return ACL_SUCCESS;
+  }
+
+  const char* officialHostLibrary = std::getenv("MATMUL_OFFICIAL_HOST_LIBRARY");
   const char* officialTilingLibrary = std::getenv("MATMUL_V2_OFFICIAL_TILING_LIBRARY");
   const char* v3LibraryPath = std::getenv("MATMUL_V3_HOST_LIBRARY");
-  if (officialTilingLibrary == nullptr || officialTilingLibrary[0] == '\0' ||
+  if (officialHostLibrary == nullptr || officialHostLibrary[0] == '\0' ||
+      officialTilingLibrary == nullptr || officialTilingLibrary[0] == '\0' ||
       v3LibraryPath == nullptr || v3LibraryPath[0] == '\0') {
     fprintf(stderr, "tiling registration failed: required library path is missing\n");
     return 4;
   }
 
   //NEW
-  // MatMulV2 is a legacy implementation. Resolve its real tiling entry point
-  // directly, then register the V2 wrapper and V3 callback from one host library.
+  // Load the complete installed host registration first. liboptiling alone does
+  // not provide MatMulV2 infer-shape and cannot form a runnable registry.
+  void* officialHostHandle = dlopen(officialHostLibrary, RTLD_NOW | RTLD_GLOBAL);
+  if (officialHostHandle == nullptr) {
+    fprintf(stderr, "tiling registration failed: cannot load official host library: %s\n", dlerror());
+    return 4;
+  }
   void* officialHandle = dlopen(officialTilingLibrary, RTLD_NOW | RTLD_GLOBAL);
   if (officialHandle == nullptr) {
     fprintf(stderr, "tiling registration failed: cannot load official liboptiling: %s\n", dlerror());
@@ -130,14 +144,6 @@ int EnableMatMulTilingVariants() {
   if (hostHandle == nullptr) {
     fprintf(stderr, "tiling registration failed: cannot load MatMulV3 host library: %s\n", dlerror());
     return 4;
-  }
-
-  //NEW
-  // The original process uses the official MatMulV2 registration unchanged.
-  // Only the shrink process replaces its tiling function pointer.
-  const char* shrinkMode = std::getenv("MATMUL_SHRINK_MODE");
-  if (shrinkMode == nullptr || shrinkMode[0] != '1' || shrinkMode[1] != '\0') {
-    return ACL_SUCCESS;
   }
 
   using ConfigureFunction = int (*)();
