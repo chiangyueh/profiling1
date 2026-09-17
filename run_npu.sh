@@ -141,29 +141,18 @@ if [[ -z "${loaded_math}" || "$(readlink -f -- "${loaded_math}")" != "$(readlink
 fi
 
 shape_args=()
-default_m=(1 3 5 7 9 11 13 15 16 17 24 32 48 64 96 128 192 256 384 512)
-default_n=(65 80 96 112 128 160 192 256 320 384 512 640 768 1024 1280 1536 1792 2048)
-default_k=(512 768 1024 1536 2048 3072 4096 5120 5632 6144 6656 7168 8192 10240 12288 16384)
-m_offset=(0 2 4 6 8 10 12)
-n_offset=(0 3 5 7 9 11 13)
-k_offset=(0 1 3 5 7 9 11)
+default_m=(1 2 3 4 5 6 7)
+default_n=(64 80 96 112 128 144 160 176 192 208 224 240 256 272 288 304)
+default_k=(4096 4608 5120 5632 6144 6656 7168)
 
 #NEW
-# The first 100 shapes emphasize skinny matrices, where an idle-core reduction
-# can exist. The remaining 20 widen M/N so the V3 shrink rule is not tested
-# only on one narrow shape class.
+# Every default shape satisfies the official FP32 AL1_FULL_LOAD conditions:
+# NT, M <= 16, 16 < N < 320, K >= 4096 and K aligned to 128 elements.
 for ((shape_index = 0; shape_index < 100; ++shape_index)); do
     shape_args+=(
         "${default_m[shape_index % ${#default_m[@]}]}"
-        "${default_n[(shape_index * 5 + 3) % ${#default_n[@]}]}"
-        "${default_k[(shape_index * 7 + 1) % ${#default_k[@]}]}"
-    )
-done
-for ((shape_index = 0; shape_index < 20; ++shape_index)); do
-    shape_args+=(
-        "$((default_m[(shape_index * 7 + 13) % ${#default_m[@]}] + m_offset[shape_index % ${#m_offset[@]}]))"
-        "$((default_n[(shape_index * 3 + 4) % ${#default_n[@]}] + n_offset[(shape_index * 2 + 1) % ${#n_offset[@]}]))"
-        "$((default_k[(shape_index * 5 + 6) % ${#default_k[@]}] + k_offset[(shape_index * 3 + 2) % ${#k_offset[@]}]))"
+        "${default_n[(shape_index / ${#default_m[@]}) % ${#default_n[@]}]}"
+        "${default_k[(shape_index * 3 + shape_index / ${#default_m[@]}) % ${#default_k[@]}]}"
     )
 done
 if [[ "$#" -gt 0 ]]; then
@@ -173,6 +162,7 @@ if [[ "$#" -gt 0 ]]; then
     fi
     shape_args=("$@")
 fi
+expected_shape_count=$((${#shape_args[@]} / 3))
 
 if ! original_raw="$(MATMUL_SHRINK_MODE=0 \
     MATMUL_V3_ONLY=1 \
@@ -192,6 +182,11 @@ mapfile -t original_results < <(printf '%s\n' "${original_raw}" | \
     awk -F'|' 'NF == 5 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+([.][0-9]+)?$/')
 if [[ "${#original_results[@]}" -eq 0 ]]; then
     echo "fatal: no supplied shape selected MatMulV3" >&2
+    exit 1
+fi
+if [[ "${#original_results[@]}" -ne "${expected_shape_count}" ]]; then
+    printf 'fatal: not every supplied shape selected MatMulV3: expected=%d actual=%d\n' \
+        "${expected_shape_count}" "${#original_results[@]}" >&2
     exit 1
 fi
 
@@ -229,6 +224,11 @@ for ((result_index = 0; result_index < ${#shrinked_results[@]}; ++result_index))
         echo "fatal: MatMulV3 branch changed between shrinked and original runs" >&2
         exit 1
     fi
-    printf '{"shape":"M%s_N%s_K%s_NN","branch":"%s","shrinked_latency":"%s","original_latency":"%s"}\n' \
+    if [[ "${branch}" != "AL1_FULL_LOAD" ]]; then
+        printf 'fatal: expected AL1_FULL_LOAD but selected %s for M%s_N%s_K%s_NT\n' \
+            "${branch}" "${m}" "${n}" "${k}" >&2
+        exit 1
+    fi
+    printf '{"shape":"M%s_N%s_K%s_NT","branch":"%s","shrinked_latency":"%s","original_latency":"%s"}\n' \
         "${m}" "${n}" "${k}" "${branch}" "${shrinked_latency}" "${original_latency}"
 done

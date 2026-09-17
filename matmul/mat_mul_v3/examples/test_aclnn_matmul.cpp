@@ -83,6 +83,23 @@ int CreateAclTensor(const std::vector<T>& hostData, const std::vector<int64_t>& 
 }
 
 //NEW
+template <typename T>
+int CreateTransposedAclTensor(const std::vector<T>& hostData, const std::vector<int64_t>& logicalShape,
+                              const std::vector<int64_t>& storageShape, void** deviceAddr,
+                              aclDataType dataType, aclTensor** tensor) {
+  auto size = GetShapeSize(storageShape) * sizeof(T);
+  auto ret = aclrtMalloc(deviceAddr, size, ACL_MEM_MALLOC_HUGE_FIRST);
+  CHECK_RET(ret == ACL_SUCCESS, return ret);
+  ret = aclrtMemcpy(*deviceAddr, size, hostData.data(), size, ACL_MEMCPY_HOST_TO_DEVICE);
+  CHECK_RET(ret == ACL_SUCCESS, return ret);
+  std::vector<int64_t> strides = {1, logicalShape[0]};
+  *tensor = aclCreateTensor(logicalShape.data(), logicalShape.size(), dataType, strides.data(), 0,
+                            aclFormat::ACL_FORMAT_ND, storageShape.data(), storageShape.size(), *deviceAddr);
+  CHECK_RET(*tensor != nullptr, return ACL_ERROR_INVALID_PARAM);
+  return 0;
+}
+
+//NEW
 std::string ReadSelectedBranch() {
   const char* commonBranch = std::getenv("MATMUL_SELECTED_BRANCH");
   if (commonBranch != nullptr && commonBranch[0] != '\0') {
@@ -150,14 +167,16 @@ int SelectOfficialMatMulV3Route(int64_t m, int64_t n, int64_t k, std::string* fa
 
   gert::Tensor mat2Tensor;
   mat2Tensor.MutableOriginShape() = gert::Shape({k, n});
-  mat2Tensor.MutableStorageShape() = gert::Shape({k, n});
+  //NEW
+  mat2Tensor.MutableStorageShape() = gert::Shape({n, k});
   mat2Tensor.SetOriginFormat(ge::FORMAT_ND);
   mat2Tensor.SetStorageFormat(ge::FORMAT_ND);
   mat2Tensor.SetDataType(ge::DT_FLOAT);
 
-  // The benchmark tensors are 2-D, contiguous FP32, NN and ND. For exactly
-  // this input contract the upstream dispatcher passes ND and supportSplitK=false.
-  return selector(&selfTensor, &mat2Tensor, nullptr, false, false, ge::FORMAT_ND, false,
+  //NEW
+  // The benchmark uses the same non-contiguous transposed-B tensor contract as
+  // the earlier AL1 measurements: FP32, NT and ND.
+  return selector(&selfTensor, &mat2Tensor, nullptr, false, true, ge::FORMAT_ND, false,
                   op::GetCurrentPlatformInfo().GetCubeCoreNum(),
                   op::GetCurrentPlatformInfo().GetSocLongVersion()) ? 1 : 0;
 }
@@ -206,6 +225,8 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   auto ret = ACL_SUCCESS;
   std::vector<int64_t> selfShape = {m, k};
   std::vector<int64_t> mat2Shape = {k, n};
+  //NEW
+  std::vector<int64_t> mat2StorageShape = {n, k};
   std::vector<int64_t> outShape = {m, n};
   void* selfDeviceAddr = nullptr;
   void* mat2DeviceAddr = nullptr;
@@ -215,7 +236,7 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   aclTensor* out = nullptr;
   //NEW
   std::vector<float> selfHostData(GetShapeSize(selfShape), 1);
-  std::vector<float> mat2HostData(GetShapeSize(mat2Shape), 1);
+  std::vector<float> mat2HostData(GetShapeSize(mat2StorageShape), 1);
   std::vector<float> outHostData(GetShapeSize(outShape), 0);
   // 创建self aclTensor
   *failedStage = "create_self";
@@ -225,7 +246,9 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   CHECK_RET(ret == ACL_SUCCESS, return ret);
   // 创建mat2 aclTensor
   *failedStage = "create_mat2";
-  ret = CreateAclTensor(mat2HostData, mat2Shape, &mat2DeviceAddr, aclDataType::ACL_FLOAT, &mat2);
+  //NEW
+  ret = CreateTransposedAclTensor(mat2HostData, mat2Shape, mat2StorageShape, &mat2DeviceAddr,
+                                  aclDataType::ACL_FLOAT, &mat2);
   std::unique_ptr<aclTensor, aclnnStatus (*)(const aclTensor*)> mat2TensorPtr(mat2, aclDestroyTensor);
   std::unique_ptr<void, aclError (*)(void*)> mat2DeviceAddrPtr(mat2DeviceAddr, aclrtFree);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
