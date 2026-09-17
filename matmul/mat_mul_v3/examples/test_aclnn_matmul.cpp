@@ -118,6 +118,27 @@ std::string ReadSelectedBranch() {
 }
 
 //NEW
+std::string ReadEnvironment(const char* name) {
+  const char* value = std::getenv(name);
+  return value == nullptr ? "" : value;
+}
+
+//NEW
+uint32_t ReadEnvironmentUint(const char* name) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return 0;
+  }
+  return static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+}
+
+//NEW
+bool UseTransposedB() {
+  const char* value = std::getenv("MATMUL_B_TRANSPOSE");
+  return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+//NEW
 void ClearSelectedBranch() {
   (void)::unsetenv("MATMUL_SELECTED_BRANCH");
   (void)::unsetenv("MATMUL_V3_SELECTED_BRANCH");
@@ -125,10 +146,15 @@ void ClearSelectedBranch() {
   (void)::unsetenv("MATMUL_SHRINK_OLD_CORES");
   (void)::unsetenv("MATMUL_SHRINK_NEW_CORES");
   (void)::unsetenv("MATMUL_TILING_STAGE");
+  (void)::unsetenv("MATMUL_V3_OFFICIAL_CORE");
+  (void)::unsetenv("MATMUL_V3_REQUESTED_CORE");
+  (void)::unsetenv("MATMUL_V3_ACTUAL_CORE");
+  (void)::unsetenv("MATMUL_V3_TILING_JSON");
 }
 
 //NEW
-int SelectOfficialMatMulV3Route(int64_t m, int64_t n, int64_t k, std::string* failureDetail) {
+int SelectOfficialMatMulV3Route(int64_t m, int64_t n, int64_t k, bool transposeB,
+                               std::string* failureDetail) {
   const auto socVersion = op::GetCurrentPlatformInfo().GetSocVersion();
   if (socVersion == op::SocVersion::ASCEND910_95) {
     return 1;
@@ -167,18 +193,21 @@ int SelectOfficialMatMulV3Route(int64_t m, int64_t n, int64_t k, std::string* fa
 
   gert::Tensor mat2Tensor;
   //NEW
-  // ContiguousAndCast swaps the non-contiguous {K,N} view to the contiguous
-  // {N,K} tensor before calling the V3 selector with transposeX2=true.
-  mat2Tensor.MutableOriginShape() = gert::Shape({n, k});
-  mat2Tensor.MutableStorageShape() = gert::Shape({n, k});
+  // ContiguousAndCast swaps an NT {K,N} view to {N,K} before calling the
+  // selector. NN remains {K,N}.
+  if (transposeB) {
+    mat2Tensor.MutableOriginShape() = gert::Shape({n, k});
+    mat2Tensor.MutableStorageShape() = gert::Shape({n, k});
+  } else {
+    mat2Tensor.MutableOriginShape() = gert::Shape({k, n});
+    mat2Tensor.MutableStorageShape() = gert::Shape({k, n});
+  }
   mat2Tensor.SetOriginFormat(ge::FORMAT_ND);
   mat2Tensor.SetStorageFormat(ge::FORMAT_ND);
   mat2Tensor.SetDataType(ge::DT_FLOAT);
 
   //NEW
-  // The benchmark uses the same non-contiguous transposed-B tensor contract as
-  // the earlier AL1 measurements: FP32, NT and ND.
-  return selector(&selfTensor, &mat2Tensor, nullptr, false, true, ge::FORMAT_ND, false,
+  return selector(&selfTensor, &mat2Tensor, nullptr, false, transposeB, ge::FORMAT_ND, false,
                   op::GetCurrentPlatformInfo().GetCubeCoreNum(),
                   op::GetCurrentPlatformInfo().GetSocLongVersion()) ? 1 : 0;
 }
@@ -207,13 +236,16 @@ int EnableMatMulV3Host() {
 
 //NEW
 int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* averageMs,
-                 std::string* branch, std::string* failedStage, std::string* failureDetail) {
+                 std::string* branch, uint64_t* workspaceBytes, std::string* tilingJson,
+                 uint32_t* officialCore, uint32_t* requestedCore, uint32_t* actualCore,
+                 bool* timingComplete, std::string* failedStage, std::string* failureDetail) {
   constexpr int kSkipNotMatMulV3 = 10001;
+  const bool transposeB = UseTransposedB();
   //NEW
   // Reject official MatMulV2 routes before allocating or copying any tensor.
   const char* v3Only = std::getenv("MATMUL_V3_ONLY");
   if (v3Only != nullptr && v3Only[0] == '1' && v3Only[1] == '\0') {
-    const int selectedRoute = SelectOfficialMatMulV3Route(m, n, k, failureDetail);
+    const int selectedRoute = SelectOfficialMatMulV3Route(m, n, k, transposeB, failureDetail);
     if (selectedRoute < 0) {
       *failedStage = "official_v3_route_selection";
       return 4;
@@ -228,7 +260,7 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   std::vector<int64_t> selfShape = {m, k};
   std::vector<int64_t> mat2Shape = {k, n};
   //NEW
-  std::vector<int64_t> mat2StorageShape = {n, k};
+  std::vector<int64_t> mat2StorageShape = transposeB ? std::vector<int64_t>{n, k} : mat2Shape;
   std::vector<int64_t> outShape = {m, n};
   void* selfDeviceAddr = nullptr;
   void* mat2DeviceAddr = nullptr;
@@ -249,8 +281,12 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   // 创建mat2 aclTensor
   *failedStage = "create_mat2";
   //NEW
-  ret = CreateTransposedAclTensor(mat2HostData, mat2Shape, mat2StorageShape, &mat2DeviceAddr,
-                                  aclDataType::ACL_FLOAT, &mat2);
+  if (transposeB) {
+    ret = CreateTransposedAclTensor(mat2HostData, mat2Shape, mat2StorageShape, &mat2DeviceAddr,
+                                    aclDataType::ACL_FLOAT, &mat2);
+  } else {
+    ret = CreateAclTensor(mat2HostData, mat2Shape, &mat2DeviceAddr, aclDataType::ACL_FLOAT, &mat2);
+  }
   std::unique_ptr<aclTensor, aclnnStatus (*)(const aclTensor*)> mat2TensorPtr(mat2, aclDestroyTensor);
   std::unique_ptr<void, aclError (*)(void*)> mat2DeviceAddrPtr(mat2DeviceAddr, aclrtFree);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
@@ -280,6 +316,11 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   }
   //NEW
   *branch = ReadSelectedBranch();
+  *workspaceBytes = workspaceSize;
+  *tilingJson = ReadEnvironment("MATMUL_V3_TILING_JSON");
+  *officialCore = ReadEnvironmentUint("MATMUL_V3_OFFICIAL_CORE");
+  *requestedCore = ReadEnvironmentUint("MATMUL_V3_REQUESTED_CORE");
+  *actualCore = ReadEnvironmentUint("MATMUL_V3_ACTUAL_CORE");
   if (v3Only != nullptr && v3Only[0] == '1' && v3Only[1] == '\0' && branch->empty()) {
     (void)aclDestroyAclOpExecutor(executor);
     executor = nullptr;
@@ -352,6 +393,7 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   ret = aclrtEventElapsedTime(&totalMs, startEvent, endEvent);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
   *averageMs = totalMs / repeat;
+  *timingComplete = true;
 
   aclrtDestroyEvent(endEvent);
   aclrtDestroyEvent(startEvent);
@@ -380,8 +422,50 @@ struct MeasurementResult {
   int64_t k = 0;
   float averageMs = 0.0F;
   std::string branch;
+  uint64_t workspaceBytes = 0;
+  std::string tilingJson;
+  uint32_t officialCore = 0;
+  uint32_t requestedCore = 0;
+  uint32_t actualCore = 0;
+  bool timingComplete = false;
+  int resultCode = 0;
+  std::string failedStage;
   bool complete = false;
 };
+
+//NEW
+void PrintMeasurementResult(const MeasurementResult& result) {
+  const bool transposeB = UseTransposedB();
+  const std::string mode = ReadEnvironment("MATMUL_V3_MEASUREMENT_MODE").empty() ?
+      "official" : ReadEnvironment("MATMUL_V3_MEASUREMENT_MODE");
+  const std::string soc = op::GetCurrentPlatformInfo().GetSocLongVersion();
+  const char* status = result.resultCode == ACL_SUCCESS ? "OK" :
+      (result.resultCode == 3 ? "INVALID_OUTPUT" : "ERROR");
+  const char* correctness = result.resultCode == ACL_SUCCESS ? "PASS" :
+      (result.resultCode == 3 ? "FAIL" : "NOT_CHECKED");
+  const std::string requestedCore = result.requestedCore == 0 ? "null" : std::to_string(result.requestedCore);
+  char latencyText[64] = {};
+  if (result.timingComplete) {
+    (void)snprintf(latencyText, sizeof(latencyText), "%.9f", result.averageMs);
+  }
+  const std::string latency = result.timingComplete ? latencyText : "null";
+  const std::string tiling = result.tilingJson.empty() ? "null" : result.tilingJson;
+  const std::string failedStage = result.failedStage.empty() ? "null" : "\"" + result.failedStage + "\"";
+  const std::string branch = result.branch.empty() ? "UNKNOWN" : result.branch;
+  LOG_PRINT(
+      "{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"dtype\":\"fp32\",\"layout\":\"%s\","
+      "\"soc\":\"%s\",\"branch\":\"%s\",\"mode\":\"%s\","
+      "\"experiment\":\"fixed_tiling_core_sweep\","
+      "\"override_scope\":\"used_core_num_block_dim_workspace\",\"requested_core\":%s,"
+      "\"official_core\":%u,\"actual_core\":%u,\"latency_ms\":%s,"
+      "\"workspace_bytes\":%llu,\"warmup\":10,\"repeats\":100,"
+      "\"status\":\"%s\",\"correctness\":\"%s\",\"failure_stage\":%s,\"tiling\":%s}\n",
+      static_cast<long>(result.m), static_cast<long>(result.n), static_cast<long>(result.k),
+      transposeB ? "NT" : "NN", transposeB ? "NT" : "NN", soc.c_str(), branch.c_str(), mode.c_str(),
+      requestedCore.c_str(), result.officialCore, result.actualCore, latency.c_str(),
+      static_cast<unsigned long long>(result.workspaceBytes), status, correctness,
+      failedStage.c_str(), tiling.c_str());
+}
 
 //NEW
 int main(int argc, char** argv) {
@@ -428,37 +512,17 @@ int main(int argc, char** argv) {
 
     //NEW
     ClearSelectedBranch();
-    std::string failedStage;
     std::string failureDetail;
     ret = MeasureShape(result.m, result.n, result.k, stream, &result.averageMs, &result.branch,
-                       &failedStage, &failureDetail);
+                       &result.workspaceBytes, &result.tilingJson, &result.officialCore,
+                       &result.requestedCore, &result.actualCore, &result.timingComplete,
+                       &result.failedStage, &failureDetail);
     if (ret == kSkipNotMatMulV3) {
       continue;
     }
-    if (ret != ACL_SUCCESS) {
-      //NEW
-      const char* tilingStage = std::getenv("MATMUL_TILING_STAGE");
-      fprintf(stderr, "measurement failed: M%ld_N%ld_K%ld_NT stage=%s rc=%d tiling_stage=%s detail=%s\n",
-              static_cast<long>(result.m), static_cast<long>(result.n), static_cast<long>(result.k),
-              failedStage.c_str(), ret,
-              tilingStage == nullptr ? "not_reached" : tilingStage,
-              failureDetail.empty() ? "unavailable" : failureDetail.c_str());
-      aclrtDestroyStream(stream);
-      aclrtResetDevice(deviceId);
-      aclFinalize();
-      return ret;
-    }
+    result.resultCode = ret;
     result.complete = true;
-  }
-
-  //NEW
-  for (const auto& result : results) {
-    if (!result.complete) {
-      continue;
-    }
-    CHECK_RET(!result.branch.empty(), return 4);
-    LOG_PRINT("%ld|%ld|%ld|%.9f|%s\n", static_cast<long>(result.m), static_cast<long>(result.n),
-              static_cast<long>(result.k), result.averageMs, result.branch.c_str());
+    PrintMeasurementResult(result);
   }
 
   // 6. 释放device资源，需要根据具体API的接口定义修改

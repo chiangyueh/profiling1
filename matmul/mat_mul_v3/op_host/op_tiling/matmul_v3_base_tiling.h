@@ -81,6 +81,8 @@ protected:
     bool ShrinkIdleCores();
     //NEW
     const char *GetSelectedBranchName();
+    //NEW
+    void ExportCoreOracleTiling(uint32_t officialCoreNum, uint32_t requestedCoreNum);
     void FormulaicBaseBlockTiling();
     void FormulaicTilingNoTrans();
     void CalL1TilingV200();

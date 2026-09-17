@@ -140,80 +140,117 @@ if [[ -z "${loaded_math}" || "$(readlink -f -- "${loaded_math}")" != "$(readlink
     exit 1
 fi
 
-shape_args=()
-default_m=(1 2 3 4 5 6 7)
-default_n=(64 80 96 112 128 144 160 176 192 208 224 240 256 272 288 304)
-default_k=(4096 4608 5120 5632 6144 6656 7168)
+nt_shape_args=()
+nn_shape_args=()
+al1_m=(1 2 3 4 5 6 7)
+al1_n=(64 80 96 112 128 144 160 176 192 208 224 240 256 272 288 304)
+al1_k=(4096 4608 5120 5632 6144 6656 7168)
 
 #NEW
-# Every default shape satisfies the official FP32 AL1_FULL_LOAD conditions:
-# NT, M <= 16, 16 < N < 320, K >= 4096 and K aligned to 128 elements.
-for ((shape_index = 0; shape_index < 100; ++shape_index)); do
-    shape_args+=(
-        "${default_m[shape_index % ${#default_m[@]}]}"
-        "${default_n[(shape_index / ${#default_m[@]}) % ${#default_n[@]}]}"
-        "${default_k[(shape_index * 3 + shape_index / ${#default_m[@]}) % ${#default_k[@]}]}"
+# Sixty statically legal AL1 shapes plus twenty NT probes for BASE, BL1 and
+# Split-K selection. The actual branch is always reported by the local tiler.
+for ((shape_index = 0; shape_index < 60; ++shape_index)); do
+    nt_shape_args+=(
+        "${al1_m[shape_index % ${#al1_m[@]}]}"
+        "${al1_n[(shape_index / ${#al1_m[@]}) % ${#al1_n[@]}]}"
+        "${al1_k[(shape_index * 3 + shape_index / ${#al1_m[@]}) % ${#al1_k[@]}]}"
     )
 done
+nt_shape_args+=(
+    5 1024 16384 384 112 16384 96 640 16384 192 112 10240
+    24 80 16384 13 384 16384 16 80 10240 5 2048 16384
+    384 256 16384 26 89 16389 1920 32 27392 2048 16 32768
+    2048 64 96 4096 64 96 8192 64 96 12288 80 192
+    16384 96 256 20480 112 128 512 512 32768 768 256 27392
+)
+
+#NEW
+# Forty varied NN shapes plus targeted small-MN, large-K and NKM probes.
+nn_m=(1 3 5 7 9 11 13 15 16 17 24 32 48 64 96 128 192 256 384 512)
+nn_n=(65 80 96 112 128 160 192 256 320 384 512 640 768 1024 1280 1536 1792 2048)
+nn_k=(512 768 1024 1536 2048 3072 4096 5120 5632 6144 6656 7168 8192 10240 12288 16384)
+for ((shape_index = 0; shape_index < 40; ++shape_index)); do
+    nn_shape_args+=(
+        "${nn_m[shape_index % ${#nn_m[@]}]}"
+        "${nn_n[(shape_index * 5 + 3) % ${#nn_n[@]}]}"
+        "${nn_k[(shape_index * 7 + 1) % ${#nn_k[@]}]}"
+    )
+done
+nn_shape_args+=(
+    16 16 6144 32 32 16384 64 64 16384 96 32 32768
+    128 64 32768 256 128 32768 384 256 16384 512 512 16384
+    768 256 27392 1024 512 32768 1920 32 27392 2048 16 32768
+    1024 1024 4096 768 768 8192 512 1024 16384 256 1536 16384
+    128 2048 16384 64 1024 32768 96 640 27392 192 384 32768
+)
+
 if [[ "$#" -gt 0 ]]; then
     if (( $# % 3 != 0 )); then
         echo "fatal: shapes must be supplied as M N K triples" >&2
         exit 2
     fi
-    shape_args=("$@")
-fi
-if ! original_raw="$(MATMUL_SHRINK_MODE=0 \
-    MATMUL_V3_ONLY=1 \
-    MATMUL_V3_SHRINK_IDLE_CORES=0 \
-    MATMUL_V3_HOST_LIBRARY="${v3_host_library}" \
-    MATMUL_LEGACY_COMMON_LIBRARY="${official_legacy_common_library}" \
-    LD_LIBRARY_PATH="${runtime_path}" \
-    "${example_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
-    echo "fatal: original measurement failed" >&2
-    if [[ -n "${original_raw}" ]]; then
-        printf '%s\n' "${original_raw}" >&2
-    fi
-    cat "${run_log}" >&2
-    exit 1
-fi
-mapfile -t original_results < <(printf '%s\n' "${original_raw}" | \
-    awk -F'|' 'NF == 5 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+([.][0-9]+)?$/')
-if ! shrinked_raw="$(MATMUL_SHRINK_MODE=1 \
-    MATMUL_V3_ONLY=1 \
-    MATMUL_V3_SHRINK_IDLE_CORES=1 \
-    MATMUL_V3_HOST_LIBRARY="${v3_host_library}" \
-    MATMUL_LEGACY_COMMON_LIBRARY="${official_legacy_common_library}" \
-    LD_LIBRARY_PATH="${runtime_path}" \
-    "${example_binary}" "${shape_args[@]}" 2>>"${run_log}")"; then
-    echo "fatal: shrink measurement failed" >&2
-    if [[ -n "${shrinked_raw}" ]]; then
-        printf '%s\n' "${shrinked_raw}" >&2
-    fi
-    cat "${run_log}" >&2
-    exit 1
-fi
-mapfile -t shrinked_results < <(printf '%s\n' "${shrinked_raw}" | \
-    awk -F'|' 'NF == 5 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+([.][0-9]+)?$/')
-if [[ "${#shrinked_results[@]}" -ne "${#original_results[@]}" ]]; then
-    printf 'fatal: shrink output count mismatch: expected=%d actual=%d\n' \
-        "${#original_results[@]}" "${#shrinked_results[@]}" >&2
-    exit 1
+    nt_shape_args=("$@")
+    nn_shape_args=("$@")
 fi
 
-for ((result_index = 0; result_index < ${#shrinked_results[@]}; ++result_index)); do
-    IFS='|' read -r m n k shrinked_latency branch <<<"${shrinked_results[result_index]}"
-    IFS='|' read -r original_m original_n original_k original_latency original_branch \
-        <<<"${original_results[result_index]}"
-    if [[ "${m}" != "${original_m}" || "${n}" != "${original_n}" || "${k}" != "${original_k}" ]]; then
-        echo "fatal: result shape order changed between shrinked and original runs" >&2
-        exit 1
+#NEW
+run_measurements() {
+    local layout="$1"
+    local mode="$2"
+    local requested_core="$3"
+    shift 3
+    local transpose_b=0
+    local raw=""
+    local rc=0
+    if [[ "${layout}" == "NT" ]]; then
+        transpose_b=1
     fi
-    if [[ "${branch}" != "${original_branch}" ]]; then
-        continue
+    if [[ "${requested_core}" == "0" ]]; then
+        if raw="$(env -u MATMUL_V3_FORCE_CORE_NUM \
+            MATMUL_B_TRANSPOSE="${transpose_b}" \
+            MATMUL_V3_MEASUREMENT_MODE="${mode}" \
+            MATMUL_V3_ONLY=1 MATMUL_V3_SHRINK_IDLE_CORES=0 \
+            MATMUL_V3_HOST_LIBRARY="${v3_host_library}" \
+            MATMUL_LEGACY_COMMON_LIBRARY="${official_legacy_common_library}" \
+            LD_LIBRARY_PATH="${runtime_path}" \
+            "${example_binary}" "$@" 2>>"${run_log}")"; then
+            :
+        else
+            rc=$?
+        fi
+    else
+        if raw="$(MATMUL_V3_FORCE_CORE_NUM="${requested_core}" \
+            MATMUL_B_TRANSPOSE="${transpose_b}" \
+            MATMUL_V3_MEASUREMENT_MODE="${mode}" \
+            MATMUL_V3_ONLY=1 MATMUL_V3_SHRINK_IDLE_CORES=0 \
+            MATMUL_V3_HOST_LIBRARY="${v3_host_library}" \
+            MATMUL_LEGACY_COMMON_LIBRARY="${official_legacy_common_library}" \
+            LD_LIBRARY_PATH="${runtime_path}" \
+            "${example_binary}" "$@" 2>>"${run_log}")"; then
+            :
+        else
+            rc=$?
+        fi
     fi
-    if [[ "${branch}" != "AL1_FULL_LOAD" ]]; then
-        continue
+    printf '%s\n' "${raw}" | awk '/^\{"shape":/'
+    if [[ "${rc}" -ne 0 ]]; then
+        printf '{"layout":"%s","mode":"%s","requested_core":%s,"status":"RUNNER_ERROR","rc":%d}\n' \
+            "${layout}" "${mode}" "${requested_core}" "${rc}"
     fi
-    printf '{"shape":"M%s_N%s_K%s_NT","branch":"%s","shrinked_latency":"%s","original_latency":"%s"}\n' \
-        "${m}" "${n}" "${k}" "${branch}" "${shrinked_latency}" "${original_latency}"
+}
+
+#NEW
+# Interleaving high and low core counts reduces correlation with thermal drift.
+core_order=(20 1 19 2 18 3 17 4 16 5 15 6 14 7 13 8 12 9 11 10)
+for layout in NT NN; do
+    if [[ "${layout}" == "NT" ]]; then
+        active_shapes=("${nt_shape_args[@]}")
+    else
+        active_shapes=("${nn_shape_args[@]}")
+    fi
+    run_measurements "${layout}" official_pre 0 "${active_shapes[@]}"
+    for requested_core in "${core_order[@]}"; do
+        run_measurements "${layout}" core_sweep "${requested_core}" "${active_shapes[@]}"
+    done
+    run_measurements "${layout}" official_post 0 "${active_shapes[@]}"
 done

@@ -2766,6 +2766,68 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
     return newUsedCoreNum < oldUsedCoreNum;
 }
 
+//NEW
+void MatmulV3BaseTiling::ExportCoreOracleTiling(uint32_t officialCoreNum, uint32_t requestedCoreNum)
+{
+    const auto &matmul = tilingData_.matmulTiling;
+    const auto &l2 = tilingData_.tileL2cacheTiling;
+    const auto &run = tilingData_.matmulRunInfo;
+    const auto mix = GetMixNd2nzType();
+    char officialCoreText[16] = {};
+    char requestedCoreText[16] = {};
+    char actualCoreText[16] = {};
+    (void)snprintf(officialCoreText, sizeof(officialCoreText), "%u", officialCoreNum);
+    (void)snprintf(requestedCoreText, sizeof(requestedCoreText), "%u", requestedCoreNum);
+    (void)snprintf(actualCoreText, sizeof(actualCoreText), "%d", matmul.usedCoreNum);
+    (void)::setenv("MATMUL_V3_OFFICIAL_CORE", officialCoreText, 1);
+    (void)::setenv("MATMUL_V3_REQUESTED_CORE", requestedCoreText, 1);
+    (void)::setenv("MATMUL_V3_ACTUAL_CORE", actualCoreText, 1);
+
+    char json[4096] = {};
+    const int written = snprintf(
+        json, sizeof(json),
+        "{\"tiling_key\":%" PRIu64 ",\"compile_core_num\":%" PRIu64 ","
+        "\"flags\":{\"split_core\":%d,\"full_load\":%d,\"fix_opti\":%d,"
+        "\"special_opti\":%d,\"mix_nd2nz\":%d},"
+        "\"packet\":{\"used_core_num\":%d,\"M\":%d,\"N\":%d,\"Ka\":%d,\"Kb\":%d,"
+        "\"single_core_m\":%d,\"single_core_n\":%d,\"single_core_k\":%d,"
+        "\"base_m\":%d,\"base_n\":%d,\"base_k\":%d,"
+        "\"depth_a1\":%d,\"depth_b1\":%d,\"step_m\":%d,\"step_n\":%d,"
+        "\"step_ka\":%d,\"step_kb\":%d,\"iterate_order\":%d,"
+        "\"db_l0a\":%d,\"db_l0b\":%d,\"db_l0c\":%d,\"is_bias\":%d,"
+        "\"trans_length\":%d,\"share_mode\":%d,\"share_l1_size\":%d,"
+        "\"share_l0c_size\":%d,\"share_ub_size\":%d,"
+        "\"batch_m\":%d,\"batch_n\":%d,\"single_batch_m\":%d,\"single_batch_n\":%d},"
+        "\"l2\":{\"m_tile_count\":%u,\"n_tile_count\":%u,\"m_tile_block\":%u,"
+        "\"n_tile_block\":%u,\"cal_order\":%u,\"cache_flag\":%u},"
+        "\"run_info\":{\"trans_a\":%u,\"trans_b\":%u,\"nd2nz_a\":%u,\"nd2nz_b\":%u,"
+        "\"is_nz_a\":%u,\"is_nz_b\":%u,\"is_hf32\":%u},"
+        "\"nd2nz_base\":{\"a_n\":%u,\"a_d\":%u,\"b_n\":%u,\"b_d\":%u}}",
+        tilingKey_, compileInfo_.aicNum,
+        static_cast<int32_t>(tilingEnable_.tilingEnableSplitCore),
+        static_cast<int32_t>(tilingEnable_.tilingEnableFullLoad),
+        static_cast<int32_t>(tilingEnable_.tilingEnableFixOpti),
+        static_cast<int32_t>(tilingEnable_.tilingEnableSpecialOpti), static_cast<int32_t>(mix),
+        matmul.usedCoreNum, matmul.M, matmul.N, matmul.Ka, matmul.Kb,
+        matmul.singleCoreM, matmul.singleCoreN, matmul.singleCoreK,
+        matmul.baseM, matmul.baseN, matmul.baseK,
+        matmul.depthA1, matmul.depthB1, matmul.stepM, matmul.stepN,
+        matmul.stepKa, matmul.stepKb, matmul.iterateOrder,
+        matmul.dbL0A, matmul.dbL0B, matmul.dbL0C, matmul.isBias,
+        matmul.transLength, matmul.shareMode, matmul.shareL1Size,
+        matmul.shareL0CSize, matmul.shareUbSize,
+        matmul.batchM, matmul.batchN, matmul.singleBatchM, matmul.singleBatchN,
+        l2.mTileCntL2, l2.nTileCntL2, l2.mTileBlock, l2.nTileBlock, l2.calOrder,
+        tilingData_.l2cacheUseInfo.l2CacheFlag,
+        run.transA, run.transB, run.nd2nzA, run.nd2nzB, run.isNzA, run.isNzB, run.isHf32,
+        tilingData_.baseAN, tilingData_.baseAD, tilingData_.baseBN, tilingData_.baseBD);
+    if (written > 0 && static_cast<size_t>(written) < sizeof(json)) {
+        (void)::setenv("MATMUL_V3_TILING_JSON", json, 1);
+    } else {
+        (void)::unsetenv("MATMUL_V3_TILING_JSON");
+    }
+}
+
 ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
 {
     SetRunInfo();
@@ -2808,6 +2870,7 @@ ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
     const char *selectedBranch = GetSelectedBranchName();
     (void)::setenv("MATMUL_V3_SELECTED_BRANCH", selectedBranch, 1);
     (void)::setenv("MATMUL_SELECTED_BRANCH", selectedBranch, 1);
+    const uint32_t officialCoreNum = tilingData_.matmulTiling.usedCoreNum;
 
     //NEW
     const char *shrinkMode = std::getenv("MATMUL_V3_SHRINK_IDLE_CORES");
@@ -2824,6 +2887,19 @@ ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
         (void)::setenv("MATMUL_SHRINK_OLD_CORES", oldCoreText, 1);
         (void)::setenv("MATMUL_SHRINK_NEW_CORES", newCoreText, 1);
     }
+
+    //NEW
+    uint32_t requestedCoreNum = 0;
+    const char *requestedCore = std::getenv("MATMUL_V3_FORCE_CORE_NUM");
+    if (requestedCore != nullptr && requestedCore[0] != '\0') {
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(requestedCore, &end, 10);
+        if (end != requestedCore && *end == '\0' && parsed >= 1UL && parsed <= compileInfo_.aicNum) {
+            requestedCoreNum = static_cast<uint32_t>(parsed);
+            tilingData_.matmulTiling.usedCoreNum = static_cast<int32_t>(requestedCoreNum);
+        }
+    }
+    ExportCoreOracleTiling(officialCoreNum, requestedCoreNum);
 
     return ge::GRAPH_SUCCESS;
 }
