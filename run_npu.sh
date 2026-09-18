@@ -13,17 +13,24 @@ build_log="$(mktemp)"
 run_log="$(mktemp)"
 #NEW
 remove_selected_shapes=0
+remove_measurement_checkpoint=0
 if [[ "$#" -gt 0 ]]; then
     selected_shapes="$(mktemp)"
+    measurement_checkpoint="$(mktemp)"
     remove_selected_shapes=1
+    remove_measurement_checkpoint=1
 else
     selected_shapes="${host_build}/core_oracle_official_v3_q100.tsv"
+    measurement_checkpoint="${host_build}/core_response_4_to_20_v1.jsonl"
 fi
 
 cleanup() {
     rm -f "${build_log}" "${run_log}"
     if [[ "${remove_selected_shapes}" -eq 1 ]]; then
         rm -f "${selected_shapes}"
+    fi
+    if [[ "${remove_measurement_checkpoint}" -eq 1 ]]; then
+        rm -f "${measurement_checkpoint}"
     fi
 }
 trap cleanup EXIT
@@ -176,4 +183,4 @@ fi
 #NEW
 python3 scripts/core_oracle_sampler.py measure \
     --runner "${example_binary}" --selected "${selected_shapes}" \
-    --run-log "${run_log}"
+    --run-log "${run_log}" --checkpoint "${measurement_checkpoint}"

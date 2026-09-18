@@ -270,7 +270,7 @@ def invoke(runner, env, shapes, run_log):
             records.append(json.loads(line))
         except json.JSONDecodeError:
             pass
-    return completed.returncode, records
+    return completed.returncode, records, completed.stderr
 
 
 def read_selected(path):
@@ -343,7 +343,7 @@ def discover(args):
                 continue
             dtype, layout = key
             env = runner_env(os.environ, dtype, layout, "discovery", discovery=True)
-            rc, records = invoke(args.runner, env, batch, args.run_log)
+            rc, records, _stderr = invoke(args.runner, env, batch, args.run_log)
             attempts += len(batch)
             if rc != 0:
                 continue
@@ -404,21 +404,71 @@ def load_selected(path):
     return groups
 
 
+def measurement_key(record):
+    return (record.get("shape"), record.get("dtype"), record.get("layout"),
+            record.get("mode"), record.get("requested_core"))
+
+
+def load_checkpoint(path):
+    records = {}
+    if not path or not os.path.isfile(path):
+        return records
+    with open(path, encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict) or not record.get("shape"):
+                continue
+            records[measurement_key(record)] = record
+    return records
+
+
+def append_checkpoint(path, records):
+    if not path or not records:
+        return
+    with open(path, "a", encoding="utf-8") as stream:
+        for record in records:
+            stream.write(json.dumps(record, separators=(",", ":")) + "\n")
+        stream.flush()
+
+
 def measure(args):
     groups = load_selected(args.selected)
-    core_order = (20, 1, 19, 2, 18, 3, 17, 4, 16, 5, 15, 6, 14, 7, 13, 8, 12, 9, 11, 10)
-    modes = [("official_pre", None)] + [("core_sweep", core) for core in core_order] + [("official_post", None)]
-    for mode, core in modes:
-        for (dtype, layout), shapes in sorted(groups.items()):
-            for begin in range(0, len(shapes), args.measurement_batch):
-                batch = shapes[begin:begin + args.measurement_batch]
+    # Core 1 and 2 are already complete in result18 and are broadly slower;
+    # core 1 is also incorrect for deterministic Split-K.  Result17 shows
+    # AL1 improvements beginning at core 4, so the useful unresolved range
+    # is 4..20.  Each small batch completes the full range before advancing.
+    modes = [("official_pre", None)] + [("core_sweep", core) for core in range(4, 21)] + [
+        ("official_post", None)]
+    checkpoint = load_checkpoint(args.checkpoint)
+    for record in checkpoint.values():
+        print(json.dumps(record, separators=(",", ":")), flush=True)
+    for (dtype, layout), shapes in sorted(groups.items()):
+        for begin in range(0, len(shapes), args.measurement_batch):
+            batch = shapes[begin:begin + args.measurement_batch]
+            for mode, core in modes:
+                pending = []
+                for item in batch:
+                    _, _, m, n, k = item
+                    shape = f"M{m}_N{n}_K{k}_{layout}"
+                    key = (shape, dtype, layout, mode, core)
+                    if key not in checkpoint:
+                        pending.append(item)
+                if not pending:
+                    continue
                 env = runner_env(os.environ, dtype, layout, mode, requested_core=core)
-                rc, records = invoke(args.runner, env, batch, args.run_log)
+                rc, records, stderr = invoke(args.runner, env, pending, args.run_log)
+                append_checkpoint(args.checkpoint, records)
                 for record in records:
+                    checkpoint[measurement_key(record)] = record
                     print(json.dumps(record, separators=(",", ":")), flush=True)
                 if rc != 0:
+                    detail = " ".join(stderr.strip().split())[-2000:]
                     print(json.dumps({"dtype": dtype, "layout": layout, "mode": mode,
-                                      "requested_core": core, "status": "RUNNER_ERROR", "rc": rc},
+                                      "requested_core": core, "status": "RUNNER_ERROR", "rc": rc,
+                                      "pending_shapes": len(pending), "detail": detail},
                                      separators=(",", ":")), flush=True)
     return 0
 
@@ -434,7 +484,8 @@ def main():
     discover_parser.add_argument("--quota", type=int, default=100)
     discover_parser.add_argument("--discovery-batch", type=int, default=48)
     measure_parser = sub.add_parser("measure", parents=[common])
-    measure_parser.add_argument("--measurement-batch", type=int, default=160)
+    measure_parser.add_argument("--measurement-batch", type=int, default=8)
+    measure_parser.add_argument("--checkpoint", required=True)
     args = parser.parse_args()
     return discover(args) if args.command == "discover" else measure(args)
 
