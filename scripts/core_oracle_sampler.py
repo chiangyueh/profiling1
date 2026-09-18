@@ -32,12 +32,17 @@ TARGET_BRANCHES = (
     "DETERMINISTIC_SPLIT_K_VEC_NZ2ND_ND2NZ",
 )
 
+# The current pass is intentionally restricted to non-Split-K routes.  The
+# completed Split-K response curves remain in the checkpoint, but are neither
+# selected nor printed again.
+MEASUREMENT_BRANCHES = tuple(name for name in TARGET_BRANCHES if "SPLIT_K" not in name)
+
 # Exhaustive official-dispatch discovery on CANN 8.5 found no reachable
 # BL1_FULL_LOAD packet and only 21 distinct AL1 packets.  Those two routes
-# remain recorded when observed, but cannot discard the 15 fully populated
-# route datasets or prevent their measurement.
+# remain recorded when observed, but cannot prevent the reachable non-Split-K
+# route datasets from being measured.
 OFFICIAL_QUOTA_BRANCHES = tuple(
-    name for name in TARGET_BRANCHES
+    name for name in MEASUREMENT_BRANCHES
     if name not in ("AL1_FULL_LOAD", "BL1_FULL_LOAD")
 )
 
@@ -313,6 +318,8 @@ def discover(args):
     selected_mnk = set()
     for item in loaded_selected:
         _dtype, _layout, m, n, k, branch = item
+        if branch not in MEASUREMENT_BRANCHES:
+            continue
         mnk = (m, n, k)
         if mnk in selected_mnk or counts[branch] >= args.quota:
             continue
@@ -357,7 +364,7 @@ def discover(args):
                 if record is None:
                     continue
                 branch = record.get("branch")
-                if branch in TARGET_BRANCHES:
+                if branch in MEASUREMENT_BRANCHES:
                     observed[branch] += 1
                     if len(witnesses[branch]) < 3:
                         witnesses[branch].append({"dtype": dtype, "layout": layout,
@@ -366,7 +373,7 @@ def discover(args):
                         expand_witness(pool, queued, item, branch)
                         expanded[branch] += 1
                 mnk = (m, n, k)
-                if branch not in TARGET_BRANCHES or counts[branch] >= args.quota or mnk in selected_mnk:
+                if branch not in MEASUREMENT_BRANCHES or counts[branch] >= args.quota or mnk in selected_mnk:
                     continue
                 selected.append(item + (branch,))
                 selected_mnk.add(mnk)
@@ -402,7 +409,9 @@ def load_selected(path, branch_quota):
     with open(path, encoding="utf-8") as stream:
         for line in stream:
             dtype, layout, m, n, k, branch = line.rstrip("\n").split("\t")
-            if branch in TARGET_BRANCHES and branch_counts[branch] >= branch_quota:
+            if branch != "USER" and branch not in MEASUREMENT_BRANCHES:
+                continue
+            if branch in MEASUREMENT_BRANCHES and branch_counts[branch] >= branch_quota:
                 continue
             branch_counts[branch] += 1
             groups[(dtype, layout)].append((dtype, layout, int(m), int(n), int(k)))
@@ -441,15 +450,11 @@ def append_checkpoint(path, records):
 
 def measure(args):
     groups = load_selected(args.selected, args.quota)
-    # Core 1 and 2 are already complete in result18 and are broadly slower;
-    # core 1 is also incorrect for deterministic Split-K.  Result17 shows
-    # AL1 improvements beginning at core 4, so the useful unresolved range
-    # is 4..20.  Each shape completes the full range before advancing.
+    # The non-Split-K pass measures the useful unresolved range 4..20.  Each
+    # shape completes the full range before advancing.
     modes = [("official_pre", None)] + [("core_sweep", core) for core in range(4, 21)] + [
         ("official_post", None)]
     checkpoint = load_checkpoint(args.checkpoint)
-    for record in checkpoint.values():
-        print(json.dumps(record, separators=(",", ":")), flush=True)
     for (dtype, layout), shapes in sorted(groups.items()):
         for item in shapes:
             _, _, m, n, k = item
