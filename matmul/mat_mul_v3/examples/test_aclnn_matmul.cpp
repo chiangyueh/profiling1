@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring> //NEW
 #include <dlfcn.h> //NEW
+#include <sstream> //NEW
 #include <string>
 #include "acl/acl.h"
 #include "exe_graph/runtime/tensor.h" //NEW
@@ -683,22 +684,67 @@ int main(int argc, char** argv) {
               LOG_PRINT("MatMulV3 host setup failed. ERROR: %d\n", ret); return ret);
   }
 
-  for (size_t index = 0; index < results.size(); ++index) {
-    auto& result = results[index];
-
-    //NEW
-    ClearSelectedBranch();
-    std::string failureDetail;
-    ret = MeasureShape(result.m, result.n, result.k, stream, &result.averageMs, &result.branch,
-                       &result.workspaceBytes, &result.tilingJson, &result.officialCore,
-                       &result.requestedCore, &result.actualCore, &result.timingComplete,
-                       &result.failedStage, &failureDetail);
-    if (ret == kSkipNotMatMulV3) {
-      continue;
+  //NEW
+  // A measurement plan keeps one shape on one initialized ACL stream while
+  // completing its entire core-response curve.  An empty plan preserves the
+  // original single-mode runner used by discovery.
+  std::vector<std::string> measurementPlan;
+  const char* planText = std::getenv("MATMUL_V3_MEASUREMENT_PLAN");
+  if (planText != nullptr && planText[0] != '\0') {
+    std::stringstream planStream(planText);
+    std::string token;
+    while (std::getline(planStream, token, ',')) {
+      if (token.empty()) {
+        continue;
+      }
+      if (token != "official_pre" && token != "official_post") {
+        char* end = nullptr;
+        const unsigned long core = std::strtoul(token.c_str(), &end, 10);
+        if (end == token.c_str() || *end != '\0' || core < 4UL || core > 20UL) {
+          LOG_PRINT("invalid measurement plan token: %s\n", token.c_str());
+          aclrtDestroyStream(stream);
+          aclrtResetDevice(deviceId);
+          aclFinalize();
+          return 2;
+        }
+      }
+      measurementPlan.push_back(token);
     }
-    result.resultCode = ret;
-    result.complete = true;
-    PrintMeasurementResult(result);
+  }
+  if (measurementPlan.empty()) {
+    measurementPlan.push_back("");
+  }
+
+  for (size_t index = 0; index < results.size(); ++index) {
+    const auto seed = results[index];
+    for (const auto& planItem : measurementPlan) {
+      //NEW
+      if (planItem == "official_pre" || planItem == "official_post") {
+        (void)::setenv("MATMUL_V3_MEASUREMENT_MODE", planItem.c_str(), 1);
+        (void)::unsetenv("MATMUL_V3_FORCE_CORE_NUM");
+      } else if (!planItem.empty()) {
+        (void)::setenv("MATMUL_V3_MEASUREMENT_MODE", "core_sweep", 1);
+        (void)::setenv("MATMUL_V3_FORCE_CORE_NUM", planItem.c_str(), 1);
+      }
+
+      MeasurementResult result;
+      result.m = seed.m;
+      result.n = seed.n;
+      result.k = seed.k;
+      ClearSelectedBranch();
+      std::string failureDetail;
+      ret = MeasureShape(result.m, result.n, result.k, stream, &result.averageMs, &result.branch,
+                         &result.workspaceBytes, &result.tilingJson, &result.officialCore,
+                         &result.requestedCore, &result.actualCore, &result.timingComplete,
+                         &result.failedStage, &failureDetail);
+      if (ret == kSkipNotMatMulV3) {
+        continue;
+      }
+      result.resultCode = ret;
+      result.complete = true;
+      PrintMeasurementResult(result);
+      (void)fflush(stdout);
+    }
   }
 
   // 6. 释放device资源，需要根据具体API的接口定义修改

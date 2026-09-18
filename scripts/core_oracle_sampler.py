@@ -242,6 +242,7 @@ def runner_env(base, dtype, layout, mode, requested_core=None, discovery=False):
     env["MATMUL_V3_MEASUREMENT_MODE"] = mode
     env["MATMUL_V3_ONLY"] = "1"
     env["MATMUL_V3_SHRINK_IDLE_CORES"] = "0"
+    env.pop("MATMUL_V3_MEASUREMENT_PLAN", None)
     if discovery:
         env["MATMUL_V3_DISCOVERY_ONLY"] = "1"
     else:
@@ -395,11 +396,15 @@ def discover(args):
     return 0
 
 
-def load_selected(path):
+def load_selected(path, branch_quota):
     groups = collections.defaultdict(list)
+    branch_counts = collections.Counter()
     with open(path, encoding="utf-8") as stream:
         for line in stream:
-            dtype, layout, m, n, k, _branch = line.rstrip("\n").split("\t")
+            dtype, layout, m, n, k, branch = line.rstrip("\n").split("\t")
+            if branch in TARGET_BRANCHES and branch_counts[branch] >= branch_quota:
+                continue
+            branch_counts[branch] += 1
             groups[(dtype, layout)].append((dtype, layout, int(m), int(n), int(k)))
     return groups
 
@@ -435,41 +440,39 @@ def append_checkpoint(path, records):
 
 
 def measure(args):
-    groups = load_selected(args.selected)
+    groups = load_selected(args.selected, args.quota)
     # Core 1 and 2 are already complete in result18 and are broadly slower;
     # core 1 is also incorrect for deterministic Split-K.  Result17 shows
     # AL1 improvements beginning at core 4, so the useful unresolved range
-    # is 4..20.  Each small batch completes the full range before advancing.
+    # is 4..20.  Each shape completes the full range before advancing.
     modes = [("official_pre", None)] + [("core_sweep", core) for core in range(4, 21)] + [
         ("official_post", None)]
     checkpoint = load_checkpoint(args.checkpoint)
     for record in checkpoint.values():
         print(json.dumps(record, separators=(",", ":")), flush=True)
     for (dtype, layout), shapes in sorted(groups.items()):
-        for begin in range(0, len(shapes), args.measurement_batch):
-            batch = shapes[begin:begin + args.measurement_batch]
-            for mode, core in modes:
-                pending = []
-                for item in batch:
-                    _, _, m, n, k = item
-                    shape = f"M{m}_N{n}_K{k}_{layout}"
-                    key = (shape, dtype, layout, mode, core)
-                    if key not in checkpoint:
-                        pending.append(item)
-                if not pending:
-                    continue
-                env = runner_env(os.environ, dtype, layout, mode, requested_core=core)
-                rc, records, stderr = invoke(args.runner, env, pending, args.run_log)
-                append_checkpoint(args.checkpoint, records)
-                for record in records:
-                    checkpoint[measurement_key(record)] = record
-                    print(json.dumps(record, separators=(",", ":")), flush=True)
-                if rc != 0:
-                    detail = " ".join(stderr.strip().split())[-2000:]
-                    print(json.dumps({"dtype": dtype, "layout": layout, "mode": mode,
-                                      "requested_core": core, "status": "RUNNER_ERROR", "rc": rc,
-                                      "pending_shapes": len(pending), "detail": detail},
-                                     separators=(",", ":")), flush=True)
+        for item in shapes:
+            _, _, m, n, k = item
+            shape = f"M{m}_N{n}_K{k}_{layout}"
+            pending_modes = [
+                (mode, core) for mode, core in modes
+                if (shape, dtype, layout, mode, core) not in checkpoint
+            ]
+            if not pending_modes:
+                continue
+            plan = [mode if core is None else str(core) for mode, core in pending_modes]
+            env = runner_env(os.environ, dtype, layout, "core_response")
+            env["MATMUL_V3_MEASUREMENT_PLAN"] = ",".join(plan)
+            rc, records, stderr = invoke(args.runner, env, [item], args.run_log)
+            append_checkpoint(args.checkpoint, records)
+            for record in records:
+                checkpoint[measurement_key(record)] = record
+                print(json.dumps(record, separators=(",", ":")), flush=True)
+            if rc != 0:
+                detail = " ".join(stderr.strip().split())[-2000:]
+                print(json.dumps({"shape": shape, "dtype": dtype, "layout": layout,
+                                  "measurement_plan": plan, "status": "RUNNER_ERROR", "rc": rc,
+                                  "detail": detail}, separators=(",", ":")), flush=True)
     return 0
 
 
@@ -481,11 +484,11 @@ def main():
     common.add_argument("--selected", required=True)
     common.add_argument("--run-log", required=True)
     discover_parser = sub.add_parser("discover", parents=[common])
-    discover_parser.add_argument("--quota", type=int, default=100)
+    discover_parser.add_argument("--quota", type=int, default=20)
     discover_parser.add_argument("--discovery-batch", type=int, default=48)
     measure_parser = sub.add_parser("measure", parents=[common])
-    measure_parser.add_argument("--measurement-batch", type=int, default=8)
     measure_parser.add_argument("--checkpoint", required=True)
+    measure_parser.add_argument("--quota", type=int, default=20)
     args = parser.parse_args()
     return discover(args) if args.command == "discover" else measure(args)
 

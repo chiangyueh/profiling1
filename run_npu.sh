@@ -177,10 +177,10 @@ if [[ "$#" -gt 0 ]]; then
 else
     python3 scripts/core_oracle_sampler.py discover \
         --runner "${example_binary}" --selected "${selected_shapes}" \
-        --run-log "${run_log}" --quota 100
+        --run-log "${run_log}" --quota 20
 fi
 
 #NEW
 python3 scripts/core_oracle_sampler.py measure \
     --runner "${example_binary}" --selected "${selected_shapes}" \
-    --run-log "${run_log}" --checkpoint "${measurement_checkpoint}"
+    --run-log "${run_log}" --checkpoint "${measurement_checkpoint}" --quota 20
