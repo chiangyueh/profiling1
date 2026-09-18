@@ -214,6 +214,71 @@ def candidate_pool():
     return pool
 
 
+def shrink_validation_shapes():
+    """Generate a bounded, source-directed set that is disjoint from the fitted rows."""
+    selected = []
+    seen = set()
+
+    def put(dtype, layout, m, n, k):
+        item = (dtype, layout, int(m), int(n), int(k), "USER")
+        key = item[:5]
+        if key in seen or min(m, n, k) <= 0:
+            return
+        element_size = 4 if dtype == "fp32" else 2
+        if (m * k + k * n + m * n) * element_size > 320 * 1024 * 1024:
+            return
+        seen.add(key)
+        selected.append(item)
+
+    # AL1 full load, including unmeasured N ownership counts between 4 and 20.
+    al1_n = (80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 288, 320)
+    al1_k = (5120, 5632, 6144, 6656, 7168, 7680, 8192, 9216)
+    for i in range(20):
+        put("fp32", "NT", 6 + i % 11, al1_n[i % len(al1_n)], al1_k[(i * 3) % len(al1_k)])
+
+    # Plain BASE near the AL1 L1-capacity boundary.  These M/K pairs were not
+    # present in the research curves and exercise the four-core launch floor.
+    for i in range(20):
+        put("fp32", "NT", 6 + i % 11, (48, 64, 80, 96)[i % 4],
+            (10240, 12288, 14336, 16384)[(i * 3) % 4])
+
+    # BL1 full load with A-head ND2NZ.  Odd K selects the VNCHW head path.
+    bl1_nd_k = (17, 19, 21, 25, 33, 41, 49, 57, 65, 73, 81)
+    bl1_nd_n = (32, 64, 96, 128, 192, 256, 384)
+    for i in range(24):
+        put("fp32", "NN", 11648 + 192 * i + (i % 3),
+            bl1_nd_n[(i * 3) % len(bl1_nd_n)], bl1_nd_k[(i * 5) % len(bl1_nd_k)])
+
+    # BL1 Vector NZ2ND output: new M/N/K combinations around each formula guard.
+    vec_n = (23, 31, 40, 47, 56, 73, 80, 89, 96, 111, 112, 127, 143, 160, 191)
+    vec_k = (24, 40, 64, 80, 96, 112, 128)
+    for i in range(28):
+        put("fp32", "NN", 12800 + 2816 * i + (i % 7),
+            vec_n[(i * 4) % len(vec_n)], vec_k[(i * 5) % len(vec_k)])
+
+    # Fixpipe controls, both without and with head ND2NZ.  Their formal rule
+    # is no shrink, so these verify that the hook preserves official latency.
+    for i in range(16):
+        put("fp32", "NN", 14848 + 3328 * i + (i % 5),
+            (17, 31, 47, 73, 112, 143, 191, 223)[i % 8],
+            (63, 67, 95, 127)[(i * 3) % 4])
+        put("fp32", "NN", 15104 + 3456 * i + (i % 7),
+            (23, 56, 80, 96, 111, 127, 160, 240)[(i * 3) % 8],
+            (80, 112, 191, 223, 255)[(i * 2) % 5])
+
+    # BASE_ND2NZ controls at new mixed-scale points.
+    for i in range(16):
+        dtype = "bf16" if i % 2 == 0 else "fp16"
+        put(dtype, "NN", 576 + 128 * (i % 13), 521 + 134 * (i % 11),
+            27456 + 256 * (i % 17))
+    return selected
+
+
+def select_shrink(args):
+    write_selected(args.selected, shrink_validation_shapes())
+    return 0
+
+
 def expand_witness(pool, queued, item, branch):
     """Add a bounded local stencil around a route proven by the real selector."""
     dtype, layout, m, n, k = item
@@ -481,6 +546,41 @@ def measure(args):
     return 0
 
 
+def compare(args):
+    groups = load_selected(args.selected, args.quota)
+    emitted = 0
+    for (dtype, layout), shapes in sorted(groups.items()):
+        for offset in range(0, len(shapes), args.batch_size):
+            batch = shapes[offset:offset + args.batch_size]
+            env = runner_env(os.environ, dtype, layout, "core_shrink_compare")
+            env["MATMUL_V3_MEASUREMENT_PLAN"] = "official_pre,shrink,official_post"
+            _rc, records, _stderr = invoke(args.runner, env, batch, args.run_log)
+            by_key = {(record.get("shape"), record.get("mode")): record for record in records}
+            for _, _, m, n, k in batch:
+                shape = f"M{m}_N{n}_K{k}_{layout}"
+                pre = by_key.get((shape, "official_pre"))
+                shrink = by_key.get((shape, "shrink"))
+                post = by_key.get((shape, "official_post"))
+                trio = (pre, shrink, post)
+                if any(record is None or record.get("status") != "OK" or
+                       record.get("correctness") != "PASS" or
+                       not isinstance(record.get("latency_ms"), (int, float))
+                       for record in trio):
+                    continue
+                if pre.get("branch") != shrink.get("branch") or post.get("branch") != shrink.get("branch"):
+                    continue
+                original_latency = min(float(pre["latency_ms"]), float(post["latency_ms"]))
+                output = {
+                    "shape": shape,
+                    "branch": shrink.get("branch", "UNKNOWN"),
+                    "shrinked_latency": f"{float(shrink['latency_ms']):.9f}",
+                    "original_latency": f"{original_latency:.9f}",
+                }
+                print(json.dumps(output, separators=(",", ":")), flush=True)
+                emitted += 1
+    return 0 if emitted else 3
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -494,8 +594,19 @@ def main():
     measure_parser = sub.add_parser("measure", parents=[common])
     measure_parser.add_argument("--checkpoint", required=True)
     measure_parser.add_argument("--quota", type=int, default=20)
+    select_parser = sub.add_parser("select-shrink")
+    select_parser.add_argument("--selected", required=True)
+    compare_parser = sub.add_parser("compare", parents=[common])
+    compare_parser.add_argument("--quota", type=int, default=1000)
+    compare_parser.add_argument("--batch-size", type=int, default=8)
     args = parser.parse_args()
-    return discover(args) if args.command == "discover" else measure(args)
+    if args.command == "discover":
+        return discover(args)
+    if args.command == "measure":
+        return measure(args)
+    if args.command == "select-shrink":
+        return select_shrink(args)
+    return compare(args)
 
 
 if __name__ == "__main__":

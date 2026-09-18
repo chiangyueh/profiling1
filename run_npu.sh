@@ -12,26 +12,10 @@ host_build="${PWD}/build"
 build_log="$(mktemp)"
 run_log="$(mktemp)"
 #NEW
-remove_selected_shapes=0
-remove_measurement_checkpoint=0
-if [[ "$#" -gt 0 ]]; then
-    selected_shapes="$(mktemp)"
-    measurement_checkpoint="$(mktemp)"
-    remove_selected_shapes=1
-    remove_measurement_checkpoint=1
-else
-    selected_shapes="${host_build}/core_oracle_official_v3_q100.tsv"
-    measurement_checkpoint="${host_build}/core_response_4_to_20_v1.jsonl"
-fi
+selected_shapes="$(mktemp)"
 
 cleanup() {
-    rm -f "${build_log}" "${run_log}"
-    if [[ "${remove_selected_shapes}" -eq 1 ]]; then
-        rm -f "${selected_shapes}"
-    fi
-    if [[ "${remove_measurement_checkpoint}" -eq 1 ]]; then
-        rm -f "${measurement_checkpoint}"
-    fi
+    rm -f "${build_log}" "${run_log}" "${selected_shapes}"
 }
 trap cleanup EXIT
 
@@ -175,12 +159,14 @@ if [[ "$#" -gt 0 ]]; then
         shift 3
     done
 else
-    python3 scripts/core_oracle_sampler.py discover \
-        --runner "${example_binary}" --selected "${selected_shapes}" \
-        --run-log "${run_log}" --quota 20
+    python3 scripts/core_oracle_sampler.py select-shrink --selected "${selected_shapes}"
 fi
 
 #NEW
-python3 scripts/core_oracle_sampler.py measure \
+if ! python3 scripts/core_oracle_sampler.py compare \
     --runner "${example_binary}" --selected "${selected_shapes}" \
-    --run-log "${run_log}" --checkpoint "${measurement_checkpoint}" --quota 20
+    --run-log "${run_log}" --batch-size 8; then
+    cat "${run_log}" >&2
+    echo "fatal: no valid MatMulV3 shrink comparison was produced" >&2
+    exit 1
+fi

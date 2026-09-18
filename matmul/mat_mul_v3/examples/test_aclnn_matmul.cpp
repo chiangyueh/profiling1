@@ -697,7 +697,8 @@ int main(int argc, char** argv) {
       if (token.empty()) {
         continue;
       }
-      if (token != "official_pre" && token != "official_post") {
+      if (token != "official_pre" && token != "official_post" &&
+          token != "original" && token != "shrink") {
         char* end = nullptr;
         const unsigned long core = std::strtoul(token.c_str(), &end, 10);
         if (end == token.c_str() || *end != '\0' || core < 4UL || core > 20UL) {
@@ -719,12 +720,18 @@ int main(int argc, char** argv) {
     const auto seed = results[index];
     for (const auto& planItem : measurementPlan) {
       //NEW
-      if (planItem == "official_pre" || planItem == "official_post") {
+      if (planItem == "official_pre" || planItem == "official_post" || planItem == "original") {
         (void)::setenv("MATMUL_V3_MEASUREMENT_MODE", planItem.c_str(), 1);
         (void)::unsetenv("MATMUL_V3_FORCE_CORE_NUM");
+        (void)::setenv("MATMUL_V3_SHRINK_IDLE_CORES", "0", 1);
+      } else if (planItem == "shrink") {
+        (void)::setenv("MATMUL_V3_MEASUREMENT_MODE", "shrink", 1);
+        (void)::unsetenv("MATMUL_V3_FORCE_CORE_NUM");
+        (void)::setenv("MATMUL_V3_SHRINK_IDLE_CORES", "1", 1);
       } else if (!planItem.empty()) {
         (void)::setenv("MATMUL_V3_MEASUREMENT_MODE", "core_sweep", 1);
         (void)::setenv("MATMUL_V3_FORCE_CORE_NUM", planItem.c_str(), 1);
+        (void)::setenv("MATMUL_V3_SHRINK_IDLE_CORES", "0", 1);
       }
 
       MeasurementResult result;
