@@ -165,6 +165,21 @@ if [[ "${MATMUL_V3_CAMPAIGN:-}" == "remaining_core_sweep" ]]; then
 fi
 
 #NEW
+if [[ "${MATMUL_V3_CAMPAIGN:-}" == "shrink_supplement" ]]; then
+    if [[ "$#" -ne 0 ]]; then
+        echo "fatal: shrink supplement uses its own fresh branch-directed shapes" >&2
+        exit 2
+    fi
+    python3 scripts/core_oracle_sampler.py select-shrink-supplement \
+        --runner "${example_binary}" --selected "${selected_shapes}" \
+        --run-log "${run_log}" --discovery-batch 64
+    python3 scripts/core_oracle_sampler.py compare \
+        --runner "${example_binary}" --selected "${selected_shapes}" \
+        --run-log "${run_log}" --quota 30 --batch-size 8
+    exit 0
+fi
+
+#NEW
 if [[ "$#" -gt 0 ]]; then
     if (( $# % 3 != 0 )); then
         echo "fatal: shapes must be supplied as M N K triples" >&2

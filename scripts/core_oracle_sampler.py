@@ -343,6 +343,51 @@ def shrink_validation_shapes():
     return selected
 
 
+def shrink_supplement_shapes():
+    """Fresh candidates for the exact deficits left by result24."""
+    selected = []
+    seen = set()
+
+    def put(target, dtype, layout, m, n, k):
+        item = (dtype, layout, int(m), int(n), int(k), target)
+        key = item[:5]
+        if key in seen or min(key[2:]) <= 0:
+            return
+        element_size = 4 if dtype == "fp32" else 2
+        if (m * k + k * n + m * n) * element_size > 320 * 1024 * 1024:
+            return
+        seen.add(key)
+        selected.append(item)
+
+    # AL1 is a narrow fp32 NT selector pocket.  N=48 is a proven official V3
+    # route; dense, previously unused K values provide far more than the 27
+    # missing points without changing the branch predicate.
+    retired_al1_k = {6400, 6912}
+    for m in range(1, 8):
+        for k in range(4224, 8577, 128):
+            if k not in retired_al1_k:
+                put("AL1_FULL_LOAD", "fp32", "NT", m, 48, k)
+
+    # BASE supplements stay in the proven narrow-N region but use K values
+    # outside result24's grid.
+    retired_base_k = {9472, 9984, 10752, 11776, 12800, 13824, 14848, 15872}
+    for m in range(17, 32):
+        for n in (40, 56):
+            for k in range(9216, 16641, 128):
+                if k not in retired_base_k:
+                    put("BASE", "fp32", "NT", m, n, k)
+
+    # result24 filled TT but found only one of the intended 15 TN points.  The
+    # supplement therefore targets the missing TN subdomain rather than adding
+    # more TT evidence.
+    for dtype in ("fp16", "bf16"):
+        for m in range(17, 128, 3):
+            for n in (96, 112, 128, 144, 160):
+                for k in (12416, 16512, 24832, 32896, 41088, 49280, 61569):
+                    put("DETERMINISTIC_SPLIT_K_ND2NZ", dtype, "TN", m, n, k)
+    return selected
+
+
 def remaining_validation_shapes():
     """Source-directed fresh candidates for the 13 non-shrink routes."""
     selected = []
@@ -522,7 +567,110 @@ def select_shrink(args):
                 if not progressed:
                     break
     write_selected(args.selected, selected)
-    return 0 if selected else 3
+    missing = {branch: args.quota - counts[branch] for branch in SHRINK_ENABLED_BRANCHES
+               if counts[branch] < args.quota}
+    print(json.dumps({"shrink_selection": "complete" if not missing else "incomplete_no_npu_run",
+                      "counts": {branch: counts[branch] for branch in SHRINK_ENABLED_BRANCHES},
+                      "missing": missing}, separators=(",", ":")), file=sys.stderr)
+    return 0 if not missing else 4
+
+
+def select_shrink_supplement(args):
+    quotas = {
+        "AL1_FULL_LOAD": 27,
+        "BASE": 5,
+        "DETERMINISTIC_SPLIT_K_ND2NZ": 14,
+    }
+    candidates = collections.defaultdict(list)
+    for item in shrink_supplement_shapes():
+        candidates[item[5]].append(item[:5])
+    selected = []
+    selected_keys = set()
+    counts = collections.Counter()
+
+    for target, quota in quotas.items():
+        ordered = sorted(candidates[target], key=lambda item: item[2] * item[3] * item[4])
+        cut1 = (len(ordered) + 2) // 3
+        cut2 = (2 * len(ordered) + 2) // 3
+        tiers = (ordered[:cut1], ordered[cut1:cut2], ordered[cut2:])
+        tier_quotas = (quota // 3, quota // 3, quota - 2 * (quota // 3))
+        attempted = set()
+        for tier, tier_quota in zip(tiers, tier_quotas):
+            accepted = 0
+            by_environment = collections.defaultdict(list)
+            for item in tier:
+                by_environment[(item[0], item[1])].append(item)
+            for dtype, layout in sorted(by_environment):
+                shapes = by_environment[(dtype, layout)]
+                for offset in range(0, len(shapes), args.discovery_batch):
+                    if accepted >= tier_quota or counts[target] >= quota:
+                        break
+                    batch = shapes[offset:offset + args.discovery_batch]
+                    attempted.update(batch)
+                    env = runner_env(os.environ, dtype, layout, "discovery", discovery=True)
+                    env["MATMUL_V3_SHRINK_IDLE_CORES"] = "1"
+                    _rc, records, _stderr = invoke(args.runner, env, batch, args.run_log)
+                    by_shape = {record.get("shape"): record for record in records
+                                if record.get("status") == "DISCOVERED"}
+                    for item in batch:
+                        _, _, m, n, k = item
+                        record = by_shape.get(f"M{m}_N{n}_K{k}_{layout}")
+                        if record is None or record.get("branch") != target or item in selected_keys:
+                            continue
+                        official_core = record.get("official_core")
+                        actual_core = record.get("actual_core")
+                        if (not isinstance(official_core, int) or not isinstance(actual_core, int) or
+                                actual_core <= 0 or actual_core >= official_core):
+                            continue
+                        selected.append(item + (target,))
+                        selected_keys.add(item)
+                        counts[target] += 1
+                        accepted += 1
+                        if accepted >= tier_quota or counts[target] >= quota:
+                            break
+
+        # Size tiers are preferred, but a sparse selector pocket must not
+        # leave a quota short when another tier has valid unseen points.
+        if counts[target] < quota:
+            remaining = [item for item in ordered if item not in attempted and item not in selected_keys]
+            by_environment = collections.defaultdict(list)
+            for item in remaining:
+                by_environment[(item[0], item[1])].append(item)
+            for dtype, layout in sorted(by_environment):
+                shapes = by_environment[(dtype, layout)]
+                for offset in range(0, len(shapes), args.discovery_batch):
+                    if counts[target] >= quota:
+                        break
+                    batch = shapes[offset:offset + args.discovery_batch]
+                    env = runner_env(os.environ, dtype, layout, "discovery", discovery=True)
+                    env["MATMUL_V3_SHRINK_IDLE_CORES"] = "1"
+                    _rc, records, _stderr = invoke(args.runner, env, batch, args.run_log)
+                    by_shape = {record.get("shape"): record for record in records
+                                if record.get("status") == "DISCOVERED"}
+                    for item in batch:
+                        _, _, m, n, k = item
+                        record = by_shape.get(f"M{m}_N{n}_K{k}_{layout}")
+                        if record is None or record.get("branch") != target or item in selected_keys:
+                            continue
+                        official_core = record.get("official_core")
+                        actual_core = record.get("actual_core")
+                        if (not isinstance(official_core, int) or not isinstance(actual_core, int) or
+                                actual_core <= 0 or actual_core >= official_core):
+                            continue
+                        selected.append(item + (target,))
+                        selected_keys.add(item)
+                        counts[target] += 1
+                        if counts[target] >= quota:
+                            break
+
+    selected.sort(key=lambda item: (item[5], item[2] * item[3] * item[4]))
+    write_selected(args.selected, selected)
+    missing = {branch: quota - counts[branch] for branch, quota in quotas.items()
+               if counts[branch] < quota}
+    print(json.dumps({"supplement_selection": "complete" if not missing else "incomplete_no_npu_run",
+                      "counts": {branch: counts[branch] for branch in quotas},
+                      "missing": missing}, separators=(",", ":")), file=sys.stderr)
+    return 0 if not missing else 4
 
 
 def select_remaining(args):
@@ -1051,11 +1199,19 @@ def compare(args):
                 if (shrink_pre.get("actual_core", 0) >= shrink_pre.get("official_core", 0) or
                         shrink_post.get("actual_core", 0) >= shrink_post.get("official_core", 0)):
                     continue
+                official_cores = {record.get("official_core") for record in quartet}
+                shrink_cores = {shrink_pre.get("actual_core"), shrink_post.get("actual_core")}
+                if (len(official_cores) != 1 or len(shrink_cores) != 1 or
+                        not all(isinstance(core, int) and core > 0
+                                for core in official_cores | shrink_cores)):
+                    continue
                 original_latency = (float(pre["latency_ms"]) + float(post["latency_ms"])) / 2.0
                 shrink_latency = (float(shrink_pre["latency_ms"]) + float(shrink_post["latency_ms"])) / 2.0
                 output = {
                     "shape": shape,
                     "branch": branch,
+                    "official_core": official_cores.pop(),
+                    "shrinked_core": shrink_cores.pop(),
                     "shrinked_latency": f"{shrink_latency:.9f}",
                     "original_latency": f"{original_latency:.9f}",
                 }
@@ -1081,6 +1237,8 @@ def main():
     select_parser = sub.add_parser("select-shrink", parents=[common])
     select_parser.add_argument("--quota", type=int, default=30)
     select_parser.add_argument("--discovery-batch", type=int, default=64)
+    supplement_parser = sub.add_parser("select-shrink-supplement", parents=[common])
+    supplement_parser.add_argument("--discovery-batch", type=int, default=64)
     remaining_select_parser = sub.add_parser("select-remaining", parents=[common])
     remaining_select_parser.add_argument("--quota", type=int, default=20)
     remaining_select_parser.add_argument("--discovery-batch", type=int, default=64)
@@ -1096,6 +1254,8 @@ def main():
         return measure(args)
     if args.command == "select-shrink":
         return select_shrink(args)
+    if args.command == "select-shrink-supplement":
+        return select_shrink_supplement(args)
     if args.command == "select-remaining":
         return select_remaining(args)
     if args.command == "measure-remaining":
