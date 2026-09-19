@@ -2738,16 +2738,89 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
     if (oldUsedCoreNum == 0 || singleCoreM == 0 || singleCoreN == 0 || matmul.M <= 0 || matmul.N <= 0) {
         return false;
     }
+    const uint64_t m = static_cast<uint64_t>(matmul.M);
+    const uint64_t n = static_cast<uint64_t>(matmul.N);
 
-    //NEW: The core formulas below are route-specific.  Split-K routes keep
-    // the official core count because changing only usedCoreNum changes their
-    // K ownership/reduction contract rather than merely removing idle blocks.
+    //NEW: Deterministic Split-K has two opposing core-count effects.  More AICs
+    // shorten the per-core K ownership, while fewer AICs reduce partial-C
+    // workspace traffic.  Only shrink on the current K-wave plateau, and only
+    // when the reduction work per AIV is large enough to fill one complete UB
+    // chunk plus a useful second iteration.  Small reductions (20 -> 18/19) are deliberately kept at the
+    // official count because the existing controlled sweeps do not separate
+    // them reliably from measurement and scheduling noise.
+    if (tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::DETERMINISTIC_SPLIT_K) {
+        const uint64_t singleCoreK = static_cast<uint64_t>(matmul.singleCoreK);
+        const bool strictPacket =
+            tilingEnable_.tilingEnableFullLoad == TilingEnableFullLoad::BASE &&
+            tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE &&
+            tilingEnable_.tilingEnableSpecialOpti == TilingEnableSpecialOpti::BASE &&
+            GetMixNd2nzType() == MixNd2NzType::NO_ND2NZ &&
+            oldUsedCoreNum == compileInfo_.aicNum && oldUsedCoreNum == 20UL &&
+            compileInfo_.supportL0c2out && !args_.hasBias &&
+            run.nd2nzA == 0 && run.nd2nzB == 0 &&
+            singleCoreK > 0 && matmul.Ka > 0 && matmul.Ka == matmul.Kb &&
+            (matmul.iterateOrder == 0 || matmul.iterateOrder == 1);
+        if (!strictPacket) {
+            return false;
+        }
+
+        const uint64_t kCount = ops::CeilDiv(static_cast<uint64_t>(matmul.Ka), singleCoreK);
+        const uint64_t officialKWaves = ops::CeilDiv(kCount, oldUsedCoreNum);
+        if (officialKWaves == 0) {
+            return false;
+        }
+        const uint64_t candidateCoreNum = ops::CeilDiv(kCount, officialKWaves);
+        constexpr uint64_t minRemovedCoreNum = 3UL;
+        if (candidateCoreNum == 0 || candidateCoreNum >= oldUsedCoreNum ||
+            oldUsedCoreNum - candidateCoreNum < minRemovedCoreNum) {
+            return false;
+        }
+
+        const bool orderMN = matmul.iterateOrder == 0;
+        const bool isL2CacheSplit = orderMN ? m != singleCoreM : n != singleCoreN;
+        const uint64_t vectorCoreNum = NUMBER_TWO * candidateCoreNum;
+        uint64_t reductionSlice = 0;
+        if (isL2CacheSplit) {
+            uint64_t reductionN = singleCoreN;
+            const uint64_t nCount = ops::CeilDiv(n, singleCoreN);
+            if (orderMN && nCount == 1) {
+                constexpr uint64_t fp32ElementsPer256Bytes = 256UL / DATA_SIZE_FP32;
+                reductionN = ops::CeilAlign(n, fp32ElementsPer256Bytes);
+            }
+            reductionSlice = ops::CeilDiv(singleCoreM, vectorCoreNum) * reductionN;
+        } else if (orderMN) {
+            uint64_t reductionN = singleCoreN;
+            const uint64_t nCount = ops::CeilDiv(n, singleCoreN);
+            if (nCount == 1) {
+                constexpr uint64_t fp32ElementsPer256Bytes = 256UL / DATA_SIZE_FP32;
+                reductionN = ops::CeilAlign(n, fp32ElementsPer256Bytes);
+            }
+            reductionSlice = ops::CeilDiv(m, vectorCoreNum) * reductionN;
+        } else {
+            reductionSlice = ops::CeilDiv(singleCoreM * n, vectorCoreNum);
+        }
+
+        //NEW: This is 1.5 * MAX_NUM from the reduction loop in
+        // mat_mul_deterministic_splitk_kernel.h.  A slice just above MAX_NUM
+        // pays for a second MTE2/V/MTE3 iteration with a nearly empty tail;
+        // require that second iteration to be at least half occupied.
+        constexpr uint64_t reductionUbChunkElements = 12UL * 1024UL;
+        constexpr uint64_t minEfficientReductionElements =
+            reductionUbChunkElements + reductionUbChunkElements / NUMBER_TWO;
+        if (reductionSlice < minEfficientReductionElements) {
+            return false;
+        }
+        matmul.usedCoreNum = static_cast<uint32_t>(candidateCoreNum);
+        return true;
+    }
+
+    //NEW: The remaining Split-K routes keep the official core count because
+    // changing only usedCoreNum changes their K ownership/reduction contract
+    // rather than merely removing idle blocks.
     if (tilingEnable_.tilingEnableSplitCore != TilingEnableSplitCore::BASE) {
         return false;
     }
 
-    const uint64_t m = static_cast<uint64_t>(matmul.M);
-    const uint64_t n = static_cast<uint64_t>(matmul.N);
     const uint64_t mTotal = ops::CeilDiv(static_cast<uint64_t>(matmul.M), singleCoreM);
     const uint64_t nTotal = ops::CeilDiv(static_cast<uint64_t>(matmul.N), singleCoreN);
 
