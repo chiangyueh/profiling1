@@ -46,6 +46,17 @@ OFFICIAL_QUOTA_BRANCHES = tuple(
     if name not in ("AL1_FULL_LOAD", "BL1_FULL_LOAD")
 )
 
+#NEW: Only these routes currently have a source/ISA-derived rule that can
+# actually lower usedCoreNum.  Discovery below enables the real shrink hook
+# and admits a shape only when actual_core < official_core, so the timed quota
+# cannot be filled by fallback/no-op packets.
+SHRINK_ENABLED_BRANCHES = (
+    "BASE",
+    "AL1_FULL_LOAD",
+    "BL1_FULL_LOAD_ND2NZ",
+    "BL1_FULL_LOAD_VEC_NZ2ND",
+)
+
 
 def add(pool, seen, dtype, layout, m, n, k):
     item = (dtype, layout, int(m), int(n), int(k))
@@ -215,7 +226,7 @@ def candidate_pool():
 
 
 def shrink_validation_shapes():
-    """Generate a bounded, source-directed set that is disjoint from the fitted rows."""
+    """Generate source-directed candidates for the four enabled shrink rules."""
     selected = []
     seen = set()
 
@@ -230,53 +241,90 @@ def shrink_validation_shapes():
         seen.add(key)
         selected.append(item)
 
-    # AL1 full load, including unmeasured N ownership counts between 4 and 20.
-    al1_n = (80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 288, 320)
-    al1_k = (5120, 5632, 6144, 6656, 7168, 7680, 8192, 9216)
-    for i in range(20):
-        put("fp32", "NT", 6 + i % 11, al1_n[i % len(al1_n)], al1_k[(i * 3) % len(al1_k)])
+    # AL1: M<8 avoids the small-MN deterministic Split-K precedence rule.
+    # N<320 guarantees an ownership count below 20, while the K grid spans
+    # several legal A-resident footprints.
+    al1_n = (48, 80, 96, 112, 144, 160, 176, 208, 224, 240, 272, 288, 304)
+    al1_k = (4352, 4608, 4864, 5376, 5632, 5888, 6400, 6912, 7424, 7680, 7936)
+    for i in range(180):
+        put("fp32", "NT", 1 + i % 7,
+            al1_n[(i * 5 + i // 13) % len(al1_n)],
+            al1_k[(i * 7 + i // 11) % len(al1_k)])
 
-    # Plain BASE near the AL1 L1-capacity boundary.  These M/K pairs were not
-    # present in the research curves and exercise the four-core launch floor.
-    for i in range(20):
-        put("fp32", "NT", 6 + i % 11, (48, 64, 80, 96)[i % 4],
-            (10240, 12288, 14336, 16384)[(i * 3) % 4])
+    # Pure BASE immediately beyond the AL1 resident-A domain.  Discovery
+    # rejects any candidate that is routed elsewhere or whose BASE rule is a
+    # no-op, so this may deliberately over-cover the selector boundary.
+    base_n = (40, 56, 72, 88, 104, 120)
+    base_k = (9472, 9984, 10752, 11776, 12800, 13824, 14848, 15872)
+    for i in range(220):
+        put("fp32", "NT", 3 + i % 21,
+            base_n[(i * 5 + i // 17) % len(base_n)],
+            base_k[(i * 3 + i // 19) % len(base_k)])
 
-    # BL1 full load with A-head ND2NZ.  Odd K selects the VNCHW head path.
+    # BL1 + A-head VNCHW ND2NZ.  The new rule preserves both the official
+    # body wave count and the serialized head wave count.
     bl1_nd_k = (17, 19, 21, 25, 33, 41, 49, 57, 65, 73, 81)
     bl1_nd_n = (32, 64, 96, 128, 192, 256, 384)
-    for i in range(24):
-        put("fp32", "NN", 11648 + 192 * i + (i % 3),
-            bl1_nd_n[(i * 3) % len(bl1_nd_n)], bl1_nd_k[(i * 5) % len(bl1_nd_k)])
+    for i in range(220):
+        put("fp32", "NN", 11731 + 96 * i + (i % 5),
+            bl1_nd_n[(i * 3 + i // 7) % len(bl1_nd_n)],
+            bl1_nd_k[(i * 5 + i // 11) % len(bl1_nd_k)])
 
-    # BL1 Vector NZ2ND output: new M/N/K combinations around each formula guard.
-    vec_n = (23, 31, 40, 47, 56, 73, 80, 89, 96, 111, 112, 127, 143, 160, 191)
+    # BL1 Vector NZ2ND output.  Points straddle the rule's depth/tail
+    # fallbacks; discovery keeps only packets on which the production formula
+    # really shrinks.
+    vec_n = (23, 31, 40, 47, 56, 73, 80, 89, 96, 111, 112, 127, 143, 160, 175, 191)
     vec_k = (24, 40, 64, 80, 96, 112, 128)
-    for i in range(28):
-        put("fp32", "NN", 12800 + 2816 * i + (i % 7),
-            vec_n[(i * 4) % len(vec_n)], vec_k[(i * 5) % len(vec_k)])
-
-    # Fixpipe controls, both without and with head ND2NZ.  Their formal rule
-    # is no shrink, so these verify that the hook preserves official latency.
-    for i in range(16):
-        put("fp32", "NN", 14848 + 3328 * i + (i % 5),
-            (17, 31, 47, 73, 112, 143, 191, 223)[i % 8],
-            (63, 67, 95, 127)[(i * 3) % 4])
-        put("fp32", "NN", 15104 + 3456 * i + (i % 7),
-            (23, 56, 80, 96, 111, 127, 160, 240)[(i * 3) % 8],
-            (80, 112, 191, 223, 255)[(i * 2) % 5])
-
-    # BASE_ND2NZ controls at new mixed-scale points.
-    for i in range(16):
-        dtype = "bf16" if i % 2 == 0 else "fp16"
-        put(dtype, "NN", 576 + 128 * (i % 13), 521 + 134 * (i % 11),
-            27456 + 256 * (i % 17))
+    for i in range(260):
+        put("fp32", "NN", 13037 + 320 * i + (i % 13),
+            vec_n[(i * 7 + i // 9) % len(vec_n)],
+            vec_k[(i * 5 + i // 13) % len(vec_k)])
     return selected
 
 
 def select_shrink(args):
-    write_selected(args.selected, shrink_validation_shapes())
-    return 0
+    #NEW: First ask the real host tiler which route each candidate reaches,
+    # with the production shrink hook enabled.  This is metadata-only: no NPU
+    # kernel is launched.  Keep at most quota effective-shrink shapes per
+    # route and stop accepting a route as soon as it is full.
+    candidates = shrink_validation_shapes()
+    groups = collections.defaultdict(list)
+    for item in candidates:
+        groups[(item[0], item[1])].append(item[:5])
+
+    counts = collections.Counter()
+    selected = []
+    for (dtype, layout), shapes in groups.items():
+        for offset in range(0, len(shapes), args.discovery_batch):
+            if all(counts[name] >= args.quota for name in SHRINK_ENABLED_BRANCHES):
+                break
+            batch = shapes[offset:offset + args.discovery_batch]
+            env = runner_env(os.environ, dtype, layout, "discovery", discovery=True)
+            env["MATMUL_V3_SHRINK_IDLE_CORES"] = "1"
+            rc, records, _stderr = invoke(args.runner, env, batch, args.run_log)
+            if rc != 0:
+                continue
+            by_shape = {record.get("shape"): record for record in records
+                        if record.get("status") == "DISCOVERED"}
+            for item in batch:
+                _, _, m, n, k = item
+                shape = f"M{m}_N{n}_K{k}_{layout}"
+                record = by_shape.get(shape)
+                if record is None:
+                    continue
+                branch = record.get("branch")
+                official_core = record.get("official_core")
+                actual_core = record.get("actual_core")
+                if (branch not in SHRINK_ENABLED_BRANCHES or counts[branch] >= args.quota or
+                        not isinstance(official_core, int) or not isinstance(actual_core, int) or
+                        actual_core <= 0 or actual_core >= official_core):
+                    continue
+                selected.append(item + (branch,))
+                counts[branch] += 1
+        if all(counts[name] >= args.quota for name in SHRINK_ENABLED_BRANCHES):
+            break
+    write_selected(args.selected, selected)
+    return 0 if selected else 3
 
 
 def expand_witness(pool, queued, item, branch):
@@ -549,35 +597,48 @@ def measure(args):
 def compare(args):
     groups = load_selected(args.selected, args.quota)
     emitted = 0
+    branch_counts = collections.Counter()
     for (dtype, layout), shapes in sorted(groups.items()):
         for offset in range(0, len(shapes), args.batch_size):
             batch = shapes[offset:offset + args.batch_size]
             env = runner_env(os.environ, dtype, layout, "core_shrink_compare")
-            env["MATMUL_V3_MEASUREMENT_PLAN"] = "official_pre,shrink,official_post"
+            #NEW: Symmetric ABBA sampling removes the old bias that compared
+            # one shrink sample with the faster of two official samples.
+            env["MATMUL_V3_MEASUREMENT_PLAN"] = \
+                "official_pre,shrink_pre,shrink_post,official_post"
             _rc, records, _stderr = invoke(args.runner, env, batch, args.run_log)
             by_key = {(record.get("shape"), record.get("mode")): record for record in records}
             for _, _, m, n, k in batch:
                 shape = f"M{m}_N{n}_K{k}_{layout}"
                 pre = by_key.get((shape, "official_pre"))
-                shrink = by_key.get((shape, "shrink"))
+                shrink_pre = by_key.get((shape, "shrink_pre"))
+                shrink_post = by_key.get((shape, "shrink_post"))
                 post = by_key.get((shape, "official_post"))
-                trio = (pre, shrink, post)
+                quartet = (pre, shrink_pre, shrink_post, post)
                 if any(record is None or record.get("status") != "OK" or
                        record.get("correctness") != "PASS" or
                        not isinstance(record.get("latency_ms"), (int, float))
-                       for record in trio):
+                       for record in quartet):
                     continue
-                if pre.get("branch") != shrink.get("branch") or post.get("branch") != shrink.get("branch"):
+                branch = shrink_pre.get("branch")
+                if any(record.get("branch") != branch for record in quartet):
                     continue
-                original_latency = min(float(pre["latency_ms"]), float(post["latency_ms"]))
+                if branch not in SHRINK_ENABLED_BRANCHES or branch_counts[branch] >= args.quota:
+                    continue
+                if (shrink_pre.get("actual_core", 0) >= shrink_pre.get("official_core", 0) or
+                        shrink_post.get("actual_core", 0) >= shrink_post.get("official_core", 0)):
+                    continue
+                original_latency = (float(pre["latency_ms"]) + float(post["latency_ms"])) / 2.0
+                shrink_latency = (float(shrink_pre["latency_ms"]) + float(shrink_post["latency_ms"])) / 2.0
                 output = {
                     "shape": shape,
-                    "branch": shrink.get("branch", "UNKNOWN"),
-                    "shrinked_latency": f"{float(shrink['latency_ms']):.9f}",
+                    "branch": branch,
+                    "shrinked_latency": f"{shrink_latency:.9f}",
                     "original_latency": f"{original_latency:.9f}",
                 }
                 print(json.dumps(output, separators=(",", ":")), flush=True)
                 emitted += 1
+                branch_counts[branch] += 1
     return 0 if emitted else 3
 
 
@@ -594,8 +655,9 @@ def main():
     measure_parser = sub.add_parser("measure", parents=[common])
     measure_parser.add_argument("--checkpoint", required=True)
     measure_parser.add_argument("--quota", type=int, default=20)
-    select_parser = sub.add_parser("select-shrink")
-    select_parser.add_argument("--selected", required=True)
+    select_parser = sub.add_parser("select-shrink", parents=[common])
+    select_parser.add_argument("--quota", type=int, default=30)
+    select_parser.add_argument("--discovery-batch", type=int, default=64)
     compare_parser = sub.add_parser("compare", parents=[common])
     compare_parser.add_argument("--quota", type=int, default=1000)
     compare_parser.add_argument("--batch-size", type=int, default=8)

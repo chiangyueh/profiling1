@@ -2859,9 +2859,10 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
             return true;
         }
 
-        //NEW: BL1_FULL_LOAD_ND2NZ has a serialized A-head conversion and a
-        // private B1 copy for every body work item.  The formula retains both
-        // the body L2-saturation boundary and the exact VNCHW head-wave bound.
+        //NEW: BL1_FULL_LOAD_ND2NZ has a serialized A-head conversion followed
+        // by a one-dimensional M-tile body. Shrink only inside the official
+        // head/body wave plateaus: neither the busiest AIV nor the busiest AIC
+        // may receive one more non-empty work item after shrinking.
         const bool isBl1FullLoadNd2Nz =
             tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE &&
             tilingEnable_.tilingEnableSpecialOpti == TilingEnableSpecialOpti::BASE &&
@@ -2871,7 +2872,6 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
         }
 
         constexpr uint64_t fp32Bytes = sizeof(float);
-        constexpr uint64_t hf32CubeMacPerCycle = 2048UL;
         constexpr uint64_t vnchwRepeatMax = 255UL;
         constexpr uint64_t vnchwAlignedH = 16UL;
         const uint64_t fp32C0 = BLOCK_BYTE_SIZE / fp32Bytes;
@@ -2897,63 +2897,15 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
             return false;
         }
 
-        const uint64_t alignedKa = ops::CeilAlign(k, fp32C0);
-        const uint64_t alignedNb = ops::CeilAlign(n, fp32C0);
-        const uint64_t alignedKb = ops::CeilAlign(k, vnchwAlignedH);
-        const uint64_t aStreamBytes = singleCoreM * alignedKa * fp32Bytes;
-        const uint64_t bResidentBytes = alignedNb * alignedKb * fp32Bytes;
-        const uint64_t cOutputBytes = singleCoreM * n * fp32Bytes;
-        const uint64_t l2BytesPerTile = aStreamBytes + bResidentBytes + cOutputBytes;
-        if (bResidentBytes == 0 || bResidentBytes > compileInfo_.l1Size || l2BytesPerTile == 0) {
+        //NEW: MatmulBaseBlock uses ceil(totalTiles/core) body rounds. Keep the
+        // official round count exactly and choose the smallest core count on
+        // that same discrete plateau. This removes only tail imbalance and
+        // uses no inferred L2 bandwidth or Cube-cycle constant.
+        const uint64_t officialBodyWaves = ops::CeilDiv(totalTiles, oldUsedCoreNum);
+        if (officialBodyWaves == 0) {
             return false;
         }
-
-        const uint64_t alignedM = ops::CeilAlign(m, vnchwAlignedH);
-        const long double bodyWorkingSet =
-            static_cast<long double>(alignedM) * alignedKa * fp32Bytes +
-            static_cast<long double>(bResidentBytes) + static_cast<long double>(m) * n * fp32Bytes;
-        if (compileInfo_.l2Size == 0 || bodyWorkingSet > static_cast<long double>(compileInfo_.l2Size)) {
-            return false;
-        }
-
-        auto platformInfo = context_->GetPlatformInfo();
-        if (platformInfo == nullptr) {
-            return false;
-        }
-        auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
-        uint64_t l2BwPerWorkerBytesPerCycle = 0;
-        ascendcPlatform.GetCoreMemBw(platform_ascendc::CoreMemType::L2, l2BwPerWorkerBytesPerCycle);
-        if (l2BwPerWorkerBytesPerCycle == 0 || compileInfo_.aivNum == 0 ||
-            l2BwPerWorkerBytesPerCycle > UINT64_MAX / compileInfo_.aivNum ||
-            matmul.baseN == 0 || matmul.baseK == 0 || matmul.stepN == 0) {
-            return false;
-        }
-        //NEW: GetCoreMemBw returns the AICoreMemoryRates per-worker value
-        // (110 B/cycle on 910B3), while the saturation equation requires the
-        // shared aggregate.  The C220 route owns two AIV workers per AIC.
-        const uint64_t l2BwBytesPerCycle = l2BwPerWorkerBytesPerCycle * compileInfo_.aivNum;
-
-        const long double nIssue =
-            static_cast<long double>(matmul.baseN) * static_cast<uint64_t>(matmul.stepN);
-        const long double kIssue =
-            static_cast<long double>(matmul.baseK) * static_cast<uint64_t>(matmul.stepKa);
-        const long double issueMacEnvelope = static_cast<long double>(singleCoreM) * nIssue * kIssue;
-        if (issueMacEnvelope <= 0.0L) {
-            return false;
-        }
-        const long double bodyWaveRatio =
-            static_cast<long double>(totalTiles) * hf32CubeMacPerCycle * l2BytesPerTile /
-            (static_cast<long double>(l2BwBytesPerCycle) * issueMacEnvelope);
-        uint64_t bodyWaves = 1;
-        if (bodyWaveRatio >= static_cast<long double>(totalTiles)) {
-            bodyWaves = totalTiles;
-        } else if (bodyWaveRatio > 1.0L) {
-            bodyWaves = static_cast<uint64_t>(bodyWaveRatio);
-            if (static_cast<long double>(bodyWaves) < bodyWaveRatio) {
-                ++bodyWaves;
-            }
-        }
-        const uint64_t cBody = ops::CeilDiv(totalTiles, bodyWaves);
+        const uint64_t cBody = ops::CeilDiv(totalTiles, officialBodyWaves);
 
         const uint64_t wTail = k % fp32C0;
         uint64_t gcdA = vnchwAlignedH;
@@ -2989,11 +2941,14 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
         const uint64_t hBuffer = eleNum * hEle;
         const uint64_t headLoops = ops::CeilDiv(m, hBuffer);
         const uint64_t oldHeadWaves = ops::CeilDiv(headLoops, NUMBER_TWO * oldUsedCoreNum);
-        const uint64_t cHeadPlusOne =
-            ops::CeilDiv(headLoops, NUMBER_TWO * (oldHeadWaves + 1UL));
-        uint64_t newUsedCoreNum = std::max(cBody, cHeadPlusOne);
-        newUsedCoreNum = std::max<uint64_t>(1, std::min(newUsedCoreNum, totalTiles));
-        newUsedCoreNum = std::min(newUsedCoreNum, oldUsedCoreNum);
+        if (oldHeadWaves == 0 || oldHeadWaves > UINT64_MAX / NUMBER_TWO) {
+            return false;
+        }
+        //NEW: Do not permit an extra serialized VNCHW wave. The head must
+        // complete before any Cube body work starts.
+        const uint64_t cHead = ops::CeilDiv(headLoops, NUMBER_TWO * oldHeadWaves);
+        uint64_t newUsedCoreNum = std::max(cBody, cHead);
+        newUsedCoreNum = std::max<uint64_t>(1, std::min(newUsedCoreNum, oldUsedCoreNum));
         if (newUsedCoreNum >= oldUsedCoreNum) {
             return false;
         }
