@@ -9,9 +9,8 @@ import subprocess
 import sys
 
 
-# The 21 routes below are exactly the combinations named by the Ascend 910B
-# fresh-shape tiler can produce without GetTilingFromRepo/AOE state.  The
-# outer aclnn MatMul dispatcher does not necessarily admit every route.
+# The 21 route names below cover the installed MatMulV3 kernels.  The formula
+# fallback cannot synthesize four of them for a previously unseen shape.
 TARGET_BRANCHES = (
     "BASE",
     "BASE_ND2NZ",
@@ -73,6 +72,20 @@ SHRINK_ENABLED_BRANCHES = (
     "DETERMINISTIC_SPLIT_K",
     "DETERMINISTIC_SPLIT_K_ND2NZ",
 )
+
+REMAINING_CORE_SWEEP_BRANCHES = tuple(
+    branch for branch in TARGET_BRANCHES if branch not in SHRINK_ENABLED_BRANCHES
+)
+
+FRESH_FORMULA_UNREACHABLE_BRANCHES = (
+    "BL1_FULL_LOAD_CVP_PARALLEL",
+    "BASE_CVP_PARALLEL",
+    "BASE_K_SHIFT",
+    "MULTI_CORE_SPLIT_K",
+)
+
+REPO_ONLY_BRANCHES = ("BASE_K_SHIFT", "MULTI_CORE_SPLIT_K")
+SOURCE_UNREACHABLE_BRANCHES = ("BL1_FULL_LOAD_CVP_PARALLEL", "BASE_CVP_PARALLEL")
 
 def add(pool, seen, dtype, layout, m, n, k):
     item = (dtype, layout, int(m), int(n), int(k))
@@ -330,6 +343,94 @@ def shrink_validation_shapes():
     return selected
 
 
+def remaining_validation_shapes():
+    """Source-directed fresh candidates for the 13 non-shrink routes."""
+    selected = []
+    seen = set()
+
+    def put(target, dtype, layout, m, n, k):
+        item = (dtype, layout, int(m), int(n), int(k), target)
+        key = item[:5]
+        if target not in REMAINING_CORE_SWEEP_BRANCHES or key in seen or min(key[2:]) <= 0:
+            return
+        element_size = 4 if dtype == "fp32" else 2
+        if (m * k + k * n + m * n) * element_size > 320 * 1024 * 1024:
+            return
+        seen.add(key)
+        selected.append(item)
+
+    # BASE with a head conversion.  Prime offsets keep these points distinct
+    # from the earlier regular grids while spanning small, medium and large
+    # operation counts.
+    for i in range(360):
+        dtype = ("fp32", "fp16", "bf16")[i % 3]
+        layout = ("NN", "TN", "TT")[(i // 3) % 3]
+        m = (97, 193, 385, 641, 1025, 1537, 2305, 3073)[(i * 5) % 8] + i % 11
+        n = (83, 179, 353, 547, 773, 1157, 1667, 2179)[(i * 7 + i // 8) % 8]
+        k = (769, 1281, 2305, 3585, 5121, 7425, 9857, 13569)[(i * 3 + i // 9) % 8]
+        put("BASE_ND2NZ", dtype, layout, m, n, k)
+
+    # Plain BL1: avoid the earlier Fixpipe selector with N >= 256 while
+    # retaining the exact on-the-fly dimensions required by the BL1 formula.
+    for i in range(240):
+        layout = "NT" if i % 2 else "NN"
+        n = (256, 384)[(i // 2) % 2]
+        k = (8, 16, 24, 32, 40, 48, 56, 64, 96)[(i * 5) % 9]
+        m = 32771 + 193 * i
+        put("BL1_FULL_LOAD", "fp32", layout, m, n, k)
+
+    # The two K=1536 orientations have explicit 8.5 selectors.
+    for i in range(96):
+        long_axis = 49280 + 128 * i
+        dtype = "fp16" if i % 2 == 0 else "bf16"
+        layout = ("NN", "NT", "TN", "TT")[i % 4]
+        put("SINGLE_CORE_SPLIT_K", dtype, layout, 384, long_axis, 1536)
+        put("SINGLE_CORE_NKM_SPLIT_K", dtype, layout, long_axis, 384, 1536)
+
+    # Generic Split-K variants.  The aligned NT points select the GM-to-L1
+    # path; head/tail conversions split the companion ND2NZ routes.
+    for i in range(420):
+        dtype = "fp16" if i % 2 == 0 else "bf16"
+        m = 577 + 64 * (i % 37)
+        n_aligned = 640 + 128 * ((i * 7 + i // 13) % 31)
+        n_tail = n_aligned + 1 + 2 * (i % 29)
+        k_aligned = 27776 + 128 * ((i * 11 + i // 17) % 83)
+        k_tail = k_aligned + 1 + 2 * (i % 17)
+        put("SINGLE_CORE_SPLIT_K_ND2NZ", dtype, "NN", m, n_tail, k_aligned)
+        put("SINGLE_CORE_SPLIT_K_GM_TO_L1", dtype, "NT", m + 63, n_aligned, k_aligned)
+        put("SINGLE_CORE_SPLIT_K_GM_TO_L1_ND2NZ", dtype, "NT", m + 127, n_aligned, k_tail)
+
+    # Deterministic Split-K Vector NZ2ND output, with and without a head
+    # input conversion.  Odd output N prevents the aligned fixpipe route.
+    for i in range(420):
+        m = 131 + (i * 7 + i // 19) % 61
+        n = 131 + (i * 11 + i // 23) % 61
+        if n % 2 == 0:
+            n += 1
+        k = 9344 + 128 * ((i * 13 + i // 29) % 337)
+        put("DETERMINISTIC_SPLIT_K_VEC_NZ2ND", "fp32", "TN", m, n, k)
+        put("DETERMINISTIC_SPLIT_K_VEC_NZ2ND_ND2NZ",
+            "fp16" if i % 2 == 0 else "bf16", "TT", m, n, k + 1)
+
+    # K-shift and Multi-Core Split-K are repository/AOE-only.  Broad official
+    # candidates are still offered so an installed bank hit can be accepted;
+    # no route name is fabricated.  The two CVP names get no candidates
+    # because GetMixNd2nzType() cannot return V_PARALELL_ND2NZ in this source.
+    for i in range(240):
+        dtype = ("fp32", "fp16", "bf16")[i % 3]
+        layout = ("NN", "NT", "TN", "TT")[(i // 3) % 4]
+        m = 257 + 128 * (i % 29)
+        n = 263 + 64 * ((i * 5) % 31)
+        k = 4097 + 128 * ((i * 7) % 43)
+        put("BASE_K_SHIFT", dtype, layout, m, n, k)
+    for i in range(240):
+        m = 16 * (1 + i % 16)
+        n = 16 * (1 + (i * 7 + i // 16) % 16)
+        k = 8320 + 128 * ((i * 11 + i // 17) % 400)
+        put("MULTI_CORE_SPLIT_K", "fp32", "NT", m, n, k)
+    return selected
+
+
 def select_shrink(args):
     #NEW: First ask the real host tiler which route each candidate reaches,
     # with the production shrink hook enabled.  This is metadata-only: no NPU
@@ -421,6 +522,123 @@ def select_shrink(args):
                 if not progressed:
                     break
     write_selected(args.selected, selected)
+    return 0 if selected else 3
+
+
+def select_remaining(args):
+    candidates = collections.defaultdict(list)
+    for item in remaining_validation_shapes():
+        candidates[item[5]].append(item[:5])
+
+    counts = collections.Counter()
+    selected = []
+    selected_keys = set()
+    for item in read_selected(args.selected):
+        if item[5] not in REMAINING_CORE_SWEEP_BRANCHES or counts[item[5]] >= args.quota:
+            continue
+        key = item[:5]
+        if key in selected_keys:
+            continue
+        selected.append(item)
+        selected_keys.add(key)
+        counts[item[5]] += 1
+
+    discovery_order = tuple(
+        branch for branch in REMAINING_CORE_SWEEP_BRANCHES
+        if branch not in FRESH_FORMULA_UNREACHABLE_BRANCHES
+    ) + FRESH_FORMULA_UNREACHABLE_BRANCHES
+    for target in discovery_order:
+        if counts[target] >= args.quota:
+            continue
+        ordered = sorted(
+            (item for item in candidates[target] if item not in selected_keys),
+            key=lambda item: item[2] * item[3] * item[4], reverse=True)
+        attempted = set()
+        cut1 = (len(ordered) + 2) // 3
+        cut2 = (2 * len(ordered) + 2) // 3
+        tiers = (ordered[:cut1], ordered[cut1:cut2], ordered[cut2:])
+        tier_quotas = (args.quota // 3 + (1 if args.quota % 3 else 0),
+                       args.quota // 3 + (1 if args.quota % 3 > 1 else 0),
+                       args.quota // 3)
+        for tier, tier_quota in zip(tiers, tier_quotas):
+            accepted = 0
+            by_environment = collections.defaultdict(list)
+            for item in tier:
+                by_environment[(item[0], item[1])].append(item)
+            for dtype, layout in sorted(by_environment):
+                environment_shapes = by_environment[(dtype, layout)]
+                for offset in range(0, len(environment_shapes), args.discovery_batch):
+                    if accepted >= tier_quota or counts[target] >= args.quota:
+                        break
+                    batch = environment_shapes[offset:offset + args.discovery_batch]
+                    attempted.update(batch)
+                    env = runner_env(os.environ, dtype, layout, "discovery", discovery=True)
+                    env["MATMUL_V3_SHRINK_IDLE_CORES"] = "0"
+                    _rc, records, _stderr = invoke(args.runner, env, batch, args.run_log)
+                    by_shape = {
+                        (record.get("shape"), record.get("dtype"), record.get("layout")): record
+                        for record in records if record.get("status") == "DISCOVERED"
+                    }
+                    for item in batch:
+                        _, _, m, n, k = item
+                        shape = f"M{m}_N{n}_K{k}_{layout}"
+                        record = by_shape.get((shape, dtype, layout))
+                        if record is None or record.get("branch") != target or item in selected_keys:
+                            continue
+                        selected.append(item + (target,))
+                        selected_keys.add(item)
+                        counts[target] += 1
+                        accepted += 1
+                        if accepted >= tier_quota or counts[target] >= args.quota:
+                            break
+
+        # A narrow selector may not exist in all three size tiers.  Preserve
+        # the large-to-small preference, but do not leave the branch below 20
+        # when additional untried legal candidates remain in another tier.
+        if counts[target] < args.quota:
+            by_environment = collections.defaultdict(list)
+            for item in ordered:
+                if item not in attempted and item not in selected_keys:
+                    by_environment[(item[0], item[1])].append(item)
+            for dtype, layout in sorted(by_environment):
+                environment_shapes = by_environment[(dtype, layout)]
+                for offset in range(0, len(environment_shapes), args.discovery_batch):
+                    if counts[target] >= args.quota:
+                        break
+                    batch = environment_shapes[offset:offset + args.discovery_batch]
+                    env = runner_env(os.environ, dtype, layout, "discovery", discovery=True)
+                    env["MATMUL_V3_SHRINK_IDLE_CORES"] = "0"
+                    _rc, records, _stderr = invoke(args.runner, env, batch, args.run_log)
+                    by_shape = {
+                        (record.get("shape"), record.get("dtype"), record.get("layout")): record
+                        for record in records if record.get("status") == "DISCOVERED"
+                    }
+                    for item in batch:
+                        _, _, m, n, k = item
+                        shape = f"M{m}_N{n}_K{k}_{layout}"
+                        record = by_shape.get((shape, dtype, layout))
+                        if record is None or record.get("branch") != target or item in selected_keys:
+                            continue
+                        selected.append(item + (target,))
+                        selected_keys.add(item)
+                        counts[target] += 1
+                        if counts[target] >= args.quota:
+                            break
+
+    branch_index = {branch: index for index, branch in enumerate(REMAINING_CORE_SWEEP_BRANCHES)}
+    selected.sort(key=lambda item: (branch_index[item[5]], -(item[2] * item[3] * item[4]),
+                                    -item[2], -item[3], -item[4]))
+    write_selected(args.selected, selected)
+    missing = {branch: args.quota - counts[branch] for branch in REMAINING_CORE_SWEEP_BRANCHES
+               if counts[branch] < args.quota}
+    print(json.dumps({"selection": "complete" if not missing else "partial",
+                      "counts": {branch: counts[branch] for branch in REMAINING_CORE_SWEEP_BRANCHES},
+                      "missing": missing,
+                      "repo_only_fresh_unreachable": [branch for branch in REPO_ONLY_BRANCHES
+                                                       if counts[branch] < args.quota],
+                      "source_unreachable": [branch for branch in SOURCE_UNREACHABLE_BRANCHES
+                                             if counts[branch] < args.quota]},
+                     separators=(",", ":")), file=sys.stderr)
     return 0 if selected else 3
 
 
@@ -691,6 +909,114 @@ def measure(args):
     return 0
 
 
+def hardware_skip_reason(branch, requested_core, official_record):
+    tiling = official_record.get("tiling") if isinstance(official_record, dict) else None
+    if not isinstance(tiling, dict):
+        return None
+    compile_core_num = tiling.get("compile_core_num")
+    if isinstance(compile_core_num, int) and requested_core > compile_core_num:
+        return f"requested_core_exceeds_compile_core_num:{compile_core_num}"
+    if branch != "MULTI_CORE_SPLIT_K":
+        return None
+    packet = tiling.get("packet")
+    if not isinstance(packet, dict):
+        return None
+    try:
+        m_count = (int(packet["M"]) + int(packet["single_core_m"]) - 1) // int(packet["single_core_m"])
+        n_count = (int(packet["N"]) + int(packet["single_core_n"]) - 1) // int(packet["single_core_n"])
+        k_count = (int(packet["Ka"]) + int(packet["single_core_k"]) - 1) // int(packet["single_core_k"])
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
+    task_count = m_count * n_count * k_count
+    # This kernel maps one block id to exactly one (M,N,K) task and has no
+    # grid-stride loop.  Fewer blocks omit work; extra blocks index past K.
+    if requested_core != task_count:
+        return f"multi_core_split_k_requires_exact_task_count:{task_count}"
+    return None
+
+
+def measure_remaining(args):
+    selected = [item for item in read_selected(args.selected)
+                if item[5] in REMAINING_CORE_SWEEP_BRANCHES]
+    branch_index = {branch: index for index, branch in enumerate(REMAINING_CORE_SWEEP_BRANCHES)}
+    selected.sort(key=lambda item: (branch_index[item[5]], -(item[2] * item[3] * item[4]),
+                                    -item[2], -item[3], -item[4]))
+    checkpoint = load_checkpoint(args.checkpoint)
+
+    def store(records):
+        fresh = []
+        for record in records:
+            key = measurement_key(record)
+            if key in checkpoint:
+                continue
+            checkpoint[key] = record
+            fresh.append(record)
+        append_checkpoint(args.checkpoint, fresh)
+        for record in fresh:
+            print(json.dumps(record, separators=(",", ":")), flush=True)
+
+    def run_plan(item, tokens):
+        dtype, layout, _m, _n, _k, _branch = item
+        env = runner_env(os.environ, dtype, layout, "core_response")
+        env["MATMUL_V3_MEASUREMENT_PLAN"] = ",".join(tokens)
+        return invoke(args.runner, env, [item[:5]], args.run_log)
+
+    for item in selected:
+        dtype, layout, m, n, k, branch = item
+        shape = f"M{m}_N{n}_K{k}_{layout}"
+        modes = [("official_pre", None)] + [("core_sweep", core) for core in range(4, 21)] + [
+            ("official_post", None)]
+
+        if branch == "MULTI_CORE_SPLIT_K":
+            official_key = (shape, dtype, layout, "official_pre", None)
+            if official_key not in checkpoint:
+                _rc, records, _stderr = run_plan(item, ["official_pre"])
+                store(records)
+            official_record = checkpoint.get(official_key, {})
+            skipped = []
+            for core in range(4, 21):
+                key = (shape, dtype, layout, "core_sweep", core)
+                if key in checkpoint:
+                    continue
+                reason = hardware_skip_reason(branch, core, official_record)
+                if reason is None:
+                    continue
+                skipped.append({"shape": shape, "dtype": dtype, "layout": layout,
+                                "branch": branch, "mode": "core_sweep",
+                                "requested_core": core, "latency_ms": None,
+                                "status": "SKIPPED_HARDWARE_RULE",
+                                "correctness": "NOT_RUN", "skip_reason": reason})
+            store(skipped)
+
+        pending = [(mode, core) for mode, core in modes
+                   if (shape, dtype, layout, mode, core) not in checkpoint]
+        if not pending:
+            continue
+        tokens = [mode if core is None else str(core) for mode, core in pending]
+        rc, records, stderr = run_plan(item, tokens)
+        store(records)
+
+        # A per-core kernel error is already a normal JSON record and the C++
+        # runner continues with the next core.  Only a process-level failure
+        # can hide later records; retry exactly those missing modes one by one.
+        missing = [(mode, core) for mode, core in pending
+                   if (shape, dtype, layout, mode, core) not in checkpoint]
+        for mode, core in missing:
+            token = mode if core is None else str(core)
+            retry_rc, retry_records, retry_stderr = run_plan(item, [token])
+            store(retry_records)
+            key = (shape, dtype, layout, mode, core)
+            if key in checkpoint:
+                continue
+            detail = " ".join((retry_stderr or stderr).strip().split())[-1000:]
+            store([{"shape": shape, "dtype": dtype, "layout": layout,
+                    "branch": branch, "mode": mode, "requested_core": core,
+                    "latency_ms": None, "status": "RUNNER_ERROR",
+                    "correctness": "NOT_CHECKED", "failure_stage": "runner_no_record",
+                    "rc": retry_rc if retry_rc != 0 else rc, "detail": detail}])
+    return 0
+
+
 def compare(args):
     groups = load_selected(args.selected, args.quota, SHRINK_ENABLED_BRANCHES)
     emitted = 0
@@ -755,6 +1081,11 @@ def main():
     select_parser = sub.add_parser("select-shrink", parents=[common])
     select_parser.add_argument("--quota", type=int, default=30)
     select_parser.add_argument("--discovery-batch", type=int, default=64)
+    remaining_select_parser = sub.add_parser("select-remaining", parents=[common])
+    remaining_select_parser.add_argument("--quota", type=int, default=20)
+    remaining_select_parser.add_argument("--discovery-batch", type=int, default=64)
+    remaining_measure_parser = sub.add_parser("measure-remaining", parents=[common])
+    remaining_measure_parser.add_argument("--checkpoint", required=True)
     compare_parser = sub.add_parser("compare", parents=[common])
     compare_parser.add_argument("--quota", type=int, default=1000)
     compare_parser.add_argument("--batch-size", type=int, default=8)
@@ -765,6 +1096,10 @@ def main():
         return measure(args)
     if args.command == "select-shrink":
         return select_shrink(args)
+    if args.command == "select-remaining":
+        return select_remaining(args)
+    if args.command == "measure-remaining":
+        return measure_remaining(args)
     return compare(args)
 
 

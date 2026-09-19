@@ -148,6 +148,23 @@ export MATMUL_LEGACY_COMMON_LIBRARY="${official_legacy_common_library}"
 export LD_LIBRARY_PATH="${runtime_path}"
 
 #NEW
+if [[ "${MATMUL_V3_CAMPAIGN:-}" == "remaining_core_sweep" ]]; then
+    if [[ "$#" -ne 0 ]]; then
+        echo "fatal: remaining core sweep uses its own branch-directed shapes" >&2
+        exit 2
+    fi
+    remaining_selected="${host_build}/remaining_core_sweep_selected.tsv"
+    remaining_checkpoint="${host_build}/remaining_core_sweep_checkpoint.jsonl"
+    python3 scripts/core_oracle_sampler.py select-remaining \
+        --runner "${example_binary}" --selected "${remaining_selected}" \
+        --run-log "${run_log}" --quota 20 --discovery-batch 64
+    python3 scripts/core_oracle_sampler.py measure-remaining \
+        --runner "${example_binary}" --selected "${remaining_selected}" \
+        --run-log "${run_log}" --checkpoint "${remaining_checkpoint}"
+    exit 0
+fi
+
+#NEW
 if [[ "$#" -gt 0 ]]; then
     if (( $# % 3 != 0 )); then
         echo "fatal: shapes must be supplied as M N K triples" >&2
