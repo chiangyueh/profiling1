@@ -324,7 +324,14 @@ def select_shrink(args):
         if all(counts[name] >= args.quota for name in SHRINK_ENABLED_BRANCHES):
             break
     write_selected(args.selected, selected)
-    return 0 if selected else 3
+    missing = {name: args.quota - counts[name] for name in SHRINK_ENABLED_BRANCHES
+               if counts[name] < args.quota}
+    if missing:
+        print(json.dumps({"fatal": "effective_shrink_quota_not_reached",
+                          "counts": {name: counts[name] for name in SHRINK_ENABLED_BRANCHES},
+                          "missing": missing}, separators=(",", ":")), file=sys.stderr)
+        return 3
+    return 0
 
 
 def expand_witness(pool, queued, item, branch):
