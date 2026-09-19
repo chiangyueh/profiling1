@@ -165,15 +165,15 @@ if [[ "${MATMUL_V3_CAMPAIGN:-}" == "remaining_core_sweep" ]]; then
 fi
 
 #NEW
-if [[ "${MATMUL_V3_CAMPAIGN:-}" == "shrink_supplement" ]]; then
+if [[ "${MATMUL_V3_CAMPAIGN:-}" == "shrink_core_validation" ]]; then
     if [[ "$#" -ne 0 ]]; then
-        echo "fatal: shrink supplement uses its own fresh branch-directed shapes" >&2
+        echo "fatal: shrink core validation uses its own fresh branch-directed shapes" >&2
         exit 2
     fi
-    python3 scripts/core_oracle_sampler.py select-shrink-supplement \
+    python3 scripts/core_oracle_sampler.py select-shrink-core-validation \
         --runner "${example_binary}" --selected "${selected_shapes}" \
         --run-log "${run_log}" --discovery-batch 64
-    python3 scripts/core_oracle_sampler.py compare \
+    python3 scripts/core_oracle_sampler.py compare-core-validation \
         --runner "${example_binary}" --selected "${selected_shapes}" \
         --run-log "${run_log}" --quota 30 --batch-size 8
     exit 0

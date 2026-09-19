@@ -343,8 +343,8 @@ def shrink_validation_shapes():
     return selected
 
 
-def shrink_supplement_shapes():
-    """Fresh candidates for the exact deficits left by result24."""
+def shrink_core_validation_shapes():
+    """Fresh candidates for a complete core-aware 8-branch validation."""
     selected = []
     seen = set()
 
@@ -360,16 +360,15 @@ def shrink_supplement_shapes():
         selected.append(item)
 
     # AL1 is a narrow fp32 NT selector pocket.  N=48 is a proven official V3
-    # route; dense, previously unused K values provide far more than the 27
-    # missing points without changing the branch predicate.
+    # route; dense, previously unused K values avoid result24.
     retired_al1_k = {6400, 6912}
     for m in range(1, 8):
         for k in range(4224, 8577, 128):
             if k not in retired_al1_k:
                 put("AL1_FULL_LOAD", "fp32", "NT", m, 48, k)
 
-    # BASE supplements stay in the proven narrow-N region but use K values
-    # outside result24's grid.
+    # BASE stays in the proven narrow-N region but uses K values outside
+    # result24's grid.
     retired_base_k = {9472, 9984, 10752, 11776, 12800, 13824, 14848, 15872}
     for m in range(17, 32):
         for n in (40, 56):
@@ -377,14 +376,57 @@ def shrink_supplement_shapes():
                 if k not in retired_base_k:
                     put("BASE", "fp32", "NT", m, n, k)
 
-    # result24 filled TT but found only one of the intended 15 TN points.  The
-    # supplement therefore targets the missing TN subdomain rather than adding
-    # more TT evidence.
+    # BL1 head-ND2NZ: new M progressions preserve the source predicate while
+    # making every exact shape distinct from the earlier campaign.
+    bl1_n = (32, 64, 96, 128, 192, 256, 384)
+    bl1_k = (17, 19, 21, 25, 33, 41, 49, 57, 65, 73, 81)
+    for i in range(560):
+        put("BL1_FULL_LOAD_ND2NZ", "fp32", "NN", 11811 + 112 * i + i % 11,
+            bl1_n[(i * 3 + i // 17) % len(bl1_n)],
+            bl1_k[(i * 5 + i // 19) % len(bl1_k)])
+
+    # BL1 Vector NZ2ND: retain the strict short-K packet, with fresh M values.
+    vec_n = (23, 31, 40, 47, 56, 73, 80, 89, 96, 111, 112, 127, 143, 160, 175, 191)
+    vec_k = (24, 40, 64, 80, 96, 112, 128)
+    for i in range(560):
+        put("BL1_FULL_LOAD_VEC_NZ2ND", "fp32", "NN", 13109 + 288 * i + i % 17,
+            vec_n[(i * 7 + i // 13) % len(vec_n)],
+            vec_k[(i * 5 + i // 23) % len(vec_k)])
+
+    # Fixpipe is deliberately split between its transposed-A and seven-wave NN
+    # subdomains because result24 showed materially different performance.
+    for i in range(320):
+        put("BL1_FULL_LOAD_FIXPIPE", "fp32", "TN", 11312 + 64 * i,
+            (11, 17, 31, 47, 51, 63)[i % 6],
+            (96, 112, 127, 128, 160, 192, 224, 256)[(i * 3) % 8])
+        put("BL1_FULL_LOAD_FIXPIPE", "fp32", "NN", 15489 + 13 * i,
+            (128, 144, 160, 176, 192)[(i * 3) % 5],
+            (65, 67, 69, 71, 73)[(i * 2) % 5])
+        put("BL1_FULL_LOAD_FIXPIPE_ND2NZ", "fp32", "NN", 19507 + 73 * i,
+            (17, 19, 23, 25, 31)[(i * 3) % 5],
+            (65, 80, 96, 112, 127)[(i * 2) % 5])
+
+    # Deterministic Split-K covers both half dtypes plus the two fp32 packet
+    # equations, all outside result24's exact K grid.
+    for i in range(360):
+        dtype = "fp16" if i % 2 == 0 else "bf16"
+        put("DETERMINISTIC_SPLIT_K", dtype, "NT", 1312 + 64 * (i % 28),
+            (512, 896, 1152, 1536, 1792)[(i * 3) % 5],
+            33792 + 128 * (i % 32))
+        put("DETERMINISTIC_SPLIT_K", "fp32", "NN",
+            (33, 49, 65, 81, 97, 113, 127)[i % 7],
+            (16, 32, 48, 64)[(i * 3) % 4],
+            (16640, 24832, 33024)[(i * 5) % 3])
+        put("DETERMINISTIC_SPLIT_K", "fp32", "NT", 1568 + 64 * (i % 18),
+            (16, 24, 32)[(i * 2) % 3], 28352 + 64 * (i % 24))
+
+    # Balance the two input-conversion layouts at 15 fresh points each.
     for dtype in ("fp16", "bf16"):
         for m in range(17, 128, 3):
             for n in (96, 112, 128, 144, 160):
                 for k in (12416, 16512, 24832, 32896, 41088, 49280, 61569):
                     put("DETERMINISTIC_SPLIT_K_ND2NZ", dtype, "TN", m, n, k)
+                    put("DETERMINISTIC_SPLIT_K_ND2NZ", dtype, "TT", m + 2, n + 1, k)
     return selected
 
 
@@ -575,21 +617,43 @@ def select_shrink(args):
     return 0 if not missing else 4
 
 
-def select_shrink_supplement(args):
-    quotas = {
-        "AL1_FULL_LOAD": 27,
-        "BASE": 5,
-        "DETERMINISTIC_SPLIT_K_ND2NZ": 14,
+def select_shrink_core_validation(args):
+    def scenario(item):
+        dtype, layout, _m, _n, _k, target = item
+        if target == "BL1_FULL_LOAD_FIXPIPE":
+            return "fixpipe_trans_a" if layout[0] == "T" else "fixpipe_seven_wave"
+        if target == "DETERMINISTIC_SPLIT_K":
+            if dtype in ("fp16", "bf16"):
+                return f"deterministic_{dtype}"
+            return "deterministic_fp32_small" if layout == "NN" else "deterministic_fp32_narrow"
+        if target == "DETERMINISTIC_SPLIT_K_ND2NZ":
+            return f"deterministic_nd2nz_{dtype}_{layout.lower()}"
+        return target.lower()
+
+    scenario_quotas = {
+        "fixpipe_trans_a": 23,
+        "fixpipe_seven_wave": 22,
+        "deterministic_fp16": 8,
+        "deterministic_bf16": 7,
+        "deterministic_fp32_small": 15,
+        "deterministic_fp32_narrow": 15,
+        "deterministic_nd2nz_fp16_tn": 12,
+        "deterministic_nd2nz_bf16_tn": 11,
+        "deterministic_nd2nz_fp16_tt": 11,
+        "deterministic_nd2nz_bf16_tt": 11,
     }
     candidates = collections.defaultdict(list)
-    for item in shrink_supplement_shapes():
-        candidates[item[5]].append(item[:5])
+    for item in shrink_core_validation_shapes():
+        candidates[(item[5], scenario(item))].append(item[:5])
     selected = []
     selected_keys = set()
     counts = collections.Counter()
+    scenario_counts = collections.Counter()
 
-    for target, quota in quotas.items():
-        ordered = sorted(candidates[target], key=lambda item: item[2] * item[3] * item[4])
+    for (target, scenario_name), scenario_candidates in candidates.items():
+        scenario_key = (target, scenario_name)
+        quota = scenario_quotas.get(scenario_name, 45)
+        ordered = sorted(scenario_candidates, key=lambda item: item[2] * item[3] * item[4])
         cut1 = (len(ordered) + 2) // 3
         cut2 = (2 * len(ordered) + 2) // 3
         tiers = (ordered[:cut1], ordered[cut1:cut2], ordered[cut2:])
@@ -603,7 +667,7 @@ def select_shrink_supplement(args):
             for dtype, layout in sorted(by_environment):
                 shapes = by_environment[(dtype, layout)]
                 for offset in range(0, len(shapes), args.discovery_batch):
-                    if accepted >= tier_quota or counts[target] >= quota:
+                    if accepted >= tier_quota or scenario_counts[scenario_key] >= quota:
                         break
                     batch = shapes[offset:offset + args.discovery_batch]
                     attempted.update(batch)
@@ -625,13 +689,14 @@ def select_shrink_supplement(args):
                         selected.append(item + (target,))
                         selected_keys.add(item)
                         counts[target] += 1
+                        scenario_counts[scenario_key] += 1
                         accepted += 1
-                        if accepted >= tier_quota or counts[target] >= quota:
+                        if accepted >= tier_quota or scenario_counts[scenario_key] >= quota:
                             break
 
         # Size tiers are preferred, but a sparse selector pocket must not
         # leave a quota short when another tier has valid unseen points.
-        if counts[target] < quota:
+        if scenario_counts[scenario_key] < quota:
             remaining = [item for item in ordered if item not in attempted and item not in selected_keys]
             by_environment = collections.defaultdict(list)
             for item in remaining:
@@ -639,7 +704,7 @@ def select_shrink_supplement(args):
             for dtype, layout in sorted(by_environment):
                 shapes = by_environment[(dtype, layout)]
                 for offset in range(0, len(shapes), args.discovery_batch):
-                    if counts[target] >= quota:
+                    if scenario_counts[scenario_key] >= quota:
                         break
                     batch = shapes[offset:offset + args.discovery_batch]
                     env = runner_env(os.environ, dtype, layout, "discovery", discovery=True)
@@ -660,15 +725,17 @@ def select_shrink_supplement(args):
                         selected.append(item + (target,))
                         selected_keys.add(item)
                         counts[target] += 1
-                        if counts[target] >= quota:
+                        scenario_counts[scenario_key] += 1
+                        if scenario_counts[scenario_key] >= quota:
                             break
 
     selected.sort(key=lambda item: (item[5], item[2] * item[3] * item[4]))
     write_selected(args.selected, selected)
-    missing = {branch: quota - counts[branch] for branch, quota in quotas.items()
-               if counts[branch] < quota}
-    print(json.dumps({"supplement_selection": "complete" if not missing else "incomplete_no_npu_run",
-                      "counts": {branch: counts[branch] for branch in quotas},
+    missing = {branch: 45 - counts[branch] for branch in SHRINK_ENABLED_BRANCHES
+               if counts[branch] < 45}
+    print(json.dumps({"core_validation_selection": "complete" if not missing else "incomplete_no_npu_run",
+                      "counts": {branch: counts[branch] for branch in SHRINK_ENABLED_BRANCHES},
+                      "success_target_per_branch": 30, "reserve_target_per_branch": 45,
                       "missing": missing}, separators=(",", ":")), file=sys.stderr)
     return 0 if not missing else 4
 
@@ -1221,6 +1288,84 @@ def compare(args):
     return 0 if emitted else 3
 
 
+def compare_core_validation(args):
+    groups = collections.defaultdict(list)
+    for dtype, layout, m, n, k, branch in read_selected(args.selected):
+        if branch in SHRINK_ENABLED_BRANCHES:
+            groups[(branch, dtype, layout)].append((dtype, layout, m, n, k))
+
+    branch_counts = collections.Counter()
+    for expected_branch in SHRINK_ENABLED_BRANCHES:
+        environments = sorted(key for key in groups if key[0] == expected_branch)
+        offsets = {key: 0 for key in environments}
+        while branch_counts[expected_branch] < args.quota:
+            made_progress = False
+            for _branch, dtype, layout in environments:
+                key = (expected_branch, dtype, layout)
+                offset = offsets[key]
+                shapes = groups[key]
+                if offset >= len(shapes):
+                    continue
+                made_progress = True
+                offsets[key] += args.batch_size
+                if branch_counts[expected_branch] >= args.quota:
+                    break
+                batch = shapes[offset:offset + args.batch_size]
+                env = runner_env(os.environ, dtype, layout, "core_shrink_compare")
+                env["MATMUL_V3_MEASUREMENT_PLAN"] = \
+                    "official_pre,shrink_pre,shrink_post,official_post"
+                _rc, records, _stderr = invoke(args.runner, env, batch, args.run_log)
+                by_key = {(record.get("shape"), record.get("mode")): record for record in records}
+                for _, _, m, n, k in batch:
+                    if branch_counts[expected_branch] >= args.quota:
+                        break
+                    shape = f"M{m}_N{n}_K{k}_{layout}"
+                    pre = by_key.get((shape, "official_pre"))
+                    shrink_pre = by_key.get((shape, "shrink_pre"))
+                    shrink_post = by_key.get((shape, "shrink_post"))
+                    post = by_key.get((shape, "official_post"))
+                    quartet = (pre, shrink_pre, shrink_post, post)
+                    if any(record is None or record.get("status") != "OK" or
+                           record.get("correctness") != "PASS" or
+                           not isinstance(record.get("latency_ms"), (int, float))
+                           for record in quartet):
+                        continue
+                    if any(record.get("branch") != expected_branch for record in quartet):
+                        continue
+                    official_cores = {record.get("official_core") for record in quartet}
+                    shrink_cores = {shrink_pre.get("actual_core"), shrink_post.get("actual_core")}
+                    if (len(official_cores) != 1 or len(shrink_cores) != 1 or
+                            not all(isinstance(core, int) and core > 0
+                                    for core in official_cores | shrink_cores)):
+                        continue
+                    official_core = official_cores.pop()
+                    shrinked_core = shrink_cores.pop()
+                    if shrinked_core >= official_core:
+                        continue
+                    original_latency = (float(pre["latency_ms"]) + float(post["latency_ms"])) / 2.0
+                    shrink_latency = \
+                        (float(shrink_pre["latency_ms"]) + float(shrink_post["latency_ms"])) / 2.0
+                    output = {
+                        "shape": shape,
+                        "branch": expected_branch,
+                        "official_core": official_core,
+                        "shrinked_core": shrinked_core,
+                        "shrinked_latency": f"{shrink_latency:.9f}",
+                        "original_latency": f"{original_latency:.9f}",
+                    }
+                    print(json.dumps(output, separators=(",", ":")), flush=True)
+                    branch_counts[expected_branch] += 1
+            if not made_progress:
+                break
+
+    missing = {branch: args.quota - branch_counts[branch] for branch in SHRINK_ENABLED_BRANCHES
+               if branch_counts[branch] < args.quota}
+    print(json.dumps({"core_validation": "complete" if not missing else "incomplete",
+                      "counts": {branch: branch_counts[branch] for branch in SHRINK_ENABLED_BRANCHES},
+                      "missing": missing}, separators=(",", ":")), file=sys.stderr)
+    return 0 if not missing else 4
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1237,8 +1382,8 @@ def main():
     select_parser = sub.add_parser("select-shrink", parents=[common])
     select_parser.add_argument("--quota", type=int, default=30)
     select_parser.add_argument("--discovery-batch", type=int, default=64)
-    supplement_parser = sub.add_parser("select-shrink-supplement", parents=[common])
-    supplement_parser.add_argument("--discovery-batch", type=int, default=64)
+    core_validation_parser = sub.add_parser("select-shrink-core-validation", parents=[common])
+    core_validation_parser.add_argument("--discovery-batch", type=int, default=64)
     remaining_select_parser = sub.add_parser("select-remaining", parents=[common])
     remaining_select_parser.add_argument("--quota", type=int, default=20)
     remaining_select_parser.add_argument("--discovery-batch", type=int, default=64)
@@ -1247,6 +1392,9 @@ def main():
     compare_parser = sub.add_parser("compare", parents=[common])
     compare_parser.add_argument("--quota", type=int, default=1000)
     compare_parser.add_argument("--batch-size", type=int, default=8)
+    core_compare_parser = sub.add_parser("compare-core-validation", parents=[common])
+    core_compare_parser.add_argument("--quota", type=int, default=30)
+    core_compare_parser.add_argument("--batch-size", type=int, default=8)
     args = parser.parse_args()
     if args.command == "discover":
         return discover(args)
@@ -1254,12 +1402,14 @@ def main():
         return measure(args)
     if args.command == "select-shrink":
         return select_shrink(args)
-    if args.command == "select-shrink-supplement":
-        return select_shrink_supplement(args)
+    if args.command == "select-shrink-core-validation":
+        return select_shrink_core_validation(args)
     if args.command == "select-remaining":
         return select_remaining(args)
     if args.command == "measure-remaining":
         return measure_remaining(args)
+    if args.command == "compare-core-validation":
+        return compare_core_validation(args)
     return compare(args)
 
 
