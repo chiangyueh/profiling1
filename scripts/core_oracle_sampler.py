@@ -74,21 +74,6 @@ SHRINK_ENABLED_BRANCHES = (
     "DETERMINISTIC_SPLIT_K_ND2NZ",
 )
 
-#NEW: Distinct correctness-passing core curves or ABBA comparisons already
-# available for each production rule.  They reduce only the next validation
-# campaign's quota; this bookkeeping is never read by the runtime tiler.
-HISTORICAL_VALIDATED_SHAPES = {
-    "BASE": 30,
-    "AL1_FULL_LOAD": 21,
-    "BL1_FULL_LOAD_ND2NZ": 15,
-    "BL1_FULL_LOAD_FIXPIPE": 3,
-    "BL1_FULL_LOAD_FIXPIPE_ND2NZ": 1,
-    "BL1_FULL_LOAD_VEC_NZ2ND": 32,
-    "DETERMINISTIC_SPLIT_K": 7,
-    "DETERMINISTIC_SPLIT_K_ND2NZ": 3,
-}
-
-
 def add(pool, seen, dtype, layout, m, n, k):
     item = (dtype, layout, int(m), int(n), int(k))
     if min(item[2:]) <= 0 or item in seen:
@@ -275,14 +260,8 @@ def shrink_validation_shapes():
     # AL1: M<8 avoids the small-MN deterministic Split-K precedence rule.
     # N<320 guarantees an ownership count below 20, while the K grid spans
     # several legal A-resident footprints.
-    # These seven packets extend the 21 distinct fully validated AL1 shapes;
-    # M7/N64/K6144 is deliberately omitted because result17 already covers it.
-    for k in (6144, 6656, 7168):
-        put("AL1_FULL_LOAD", "fp32", "NT", 6, 64, k)
-    put("AL1_FULL_LOAD", "fp32", "NT", 6, 256, 7168)
-    for k in (6656, 7168):
-        put("AL1_FULL_LOAD", "fp32", "NT", 7, 64, k)
-    put("AL1_FULL_LOAD", "fp32", "NT", 7, 256, 7168)
+    # The grid deliberately omits all previously timed AL1 witnesses.  Host
+    # discovery still has to prove that each fresh point reaches AL1.
     al1_n = (48, 80, 96, 112, 144, 160, 176, 208, 224, 240, 272, 288, 304)
     al1_k = (4352, 4608, 4864, 5376, 5632, 5888, 6400, 6912, 7424, 7680, 7936)
     for i in range(180):
@@ -338,12 +317,12 @@ def shrink_validation_shapes():
         dtype = "fp16" if i % 2 == 0 else "bf16"
         put("DETERMINISTIC_SPLIT_K", dtype, "NT", 1280 + 64 * (i % 24),
             (512, 1024, 1152, 1536, 1792)[(i * 3) % 5],
-            31104 + 128 * (i % 16))
+            31168 + 128 * (i % 16))
         put("DETERMINISTIC_SPLIT_K", "fp32", "NN", (32, 48, 64, 80, 96, 112, 128)[i % 7],
             (16, 32, 48, 64)[(i * 3) % 4],
-            (16384, 24576, 32768)[(i * 5) % 3])
+            (16512, 24704, 32896)[(i * 5) % 3])
         put("DETERMINISTIC_SPLIT_K", "fp32", "NT", 1536 + 64 * (i % 16),
-            (16, 24, 32)[(i * 2) % 3], 26880 + 64 * (i % 20))
+            (16, 24, 32)[(i * 2) % 3], 26944 + 64 * (i % 20))
     for i in range(180):
         put("DETERMINISTIC_SPLIT_K_ND2NZ", "fp16", "TN" if i % 2 == 0 else "TT",
             32 + (i * 7) % 129, 32 + (i * 11) % 161,
@@ -357,45 +336,90 @@ def select_shrink(args):
     # kernel is launched.  Keep at most quota effective-shrink shapes per
     # route and stop accepting a route as soon as it is full.
     candidates = shrink_validation_shapes()
+    def scenario(item):
+        dtype, layout, _m, _n, _k, target = item
+        if target == "BL1_FULL_LOAD_FIXPIPE":
+            return "fixpipe_trans_a" if layout[0] == "T" else "fixpipe_seven_wave"
+        if target == "DETERMINISTIC_SPLIT_K":
+            if dtype in ("fp16", "bf16"):
+                return f"deterministic_{dtype}"
+            return "deterministic_fp32_small" if layout == "NN" else "deterministic_fp32_narrow"
+        if target == "DETERMINISTIC_SPLIT_K_ND2NZ":
+            return f"deterministic_nd2nz_{layout.lower()}"
+        return target.lower()
+
+    #NEW: This is a fresh holdout campaign.  Historical measurements do not
+    # reduce any quota.  Formula subdomains get independent quotas so one easy
+    # pocket cannot stand in for an entire branch.
+    scenario_quota = {
+        "fixpipe_trans_a": args.quota // 2,
+        "fixpipe_seven_wave": args.quota - args.quota // 2,
+        "deterministic_fp16": args.quota // 6,
+        "deterministic_bf16": args.quota // 6,
+        "deterministic_fp32_small": args.quota // 3,
+        "deterministic_fp32_narrow": args.quota - 2 * (args.quota // 3),
+        "deterministic_nd2nz_tn": args.quota // 2,
+        "deterministic_nd2nz_tt": args.quota - args.quota // 2,
+    }
     groups = collections.defaultdict(list)
     for item in candidates:
-        groups[(item[0], item[1], item[5])].append(item[:5])
+        groups[(item[5], scenario(item))].append(item[:5])
 
-    counts = collections.Counter(HISTORICAL_VALIDATED_SHAPES)
+    counts = collections.Counter()
+    scenario_counts = collections.Counter()
     selected = []
-    for (dtype, layout, target), shapes in groups.items():
-        if all(counts[name] >= args.quota for name in SHRINK_ENABLED_BRANCHES):
-            break
-        if counts[target] >= args.quota:
-            continue
-        for offset in range(0, len(shapes), args.discovery_batch):
-            if counts[target] >= args.quota:
-                break
-            batch = shapes[offset:offset + args.discovery_batch]
-            env = runner_env(os.environ, dtype, layout, "discovery", discovery=True)
-            env["MATMUL_V3_SHRINK_IDLE_CORES"] = "1"
-            rc, records, _stderr = invoke(args.runner, env, batch, args.run_log)
-            if rc != 0:
-                continue
-            by_shape = {record.get("shape"): record for record in records
-                        if record.get("status") == "DISCOVERED"}
-            for item in batch:
-                _, _, m, n, k = item
-                shape = f"M{m}_N{n}_K{k}_{layout}"
-                record = by_shape.get(shape)
-                if record is None:
-                    continue
-                branch = record.get("branch")
-                official_core = record.get("official_core")
-                actual_core = record.get("actual_core")
-                if (branch not in SHRINK_ENABLED_BRANCHES or counts[branch] >= args.quota or
-                        not isinstance(official_core, int) or not isinstance(actual_core, int) or
-                        actual_core <= 0 or actual_core >= official_core):
-                    continue
-                selected.append(item + (branch,))
-                counts[branch] += 1
-        if all(counts[name] >= args.quota for name in SHRINK_ENABLED_BRANCHES):
-            break
+    for (target, scenario_name), shapes in groups.items():
+        target_quota = scenario_quota.get(scenario_name, args.quota)
+        #NEW: Split each formula subdomain by operation count and require an
+        # equal number of small, medium, and large holdout points.
+        ordered = sorted(shapes, key=lambda item: item[2] * item[3] * item[4])
+        cut1 = (len(ordered) + 2) // 3
+        cut2 = (2 * len(ordered) + 2) // 3
+        tiers = (ordered[:cut1], ordered[cut1:cut2], ordered[cut2:])
+        tier_quotas = (target_quota // 3, target_quota // 3,
+                       target_quota - 2 * (target_quota // 3))
+        for tier_index, tier in enumerate(tiers):
+            tier_key = (target, scenario_name, tier_index)
+            by_environment = collections.defaultdict(list)
+            for item in tier:
+                by_environment[(item[0], item[1])].append(item)
+            offsets = {key: 0 for key in by_environment}
+            while scenario_counts[tier_key] < tier_quotas[tier_index]:
+                progressed = False
+                for (dtype, layout), environment_shapes in by_environment.items():
+                    begin = offsets[(dtype, layout)]
+                    batch = environment_shapes[begin:begin + args.discovery_batch]
+                    if not batch:
+                        continue
+                    progressed = True
+                    offsets[(dtype, layout)] += len(batch)
+                    env = runner_env(os.environ, dtype, layout, "discovery", discovery=True)
+                    env["MATMUL_V3_SHRINK_IDLE_CORES"] = "1"
+                    rc, records, _stderr = invoke(args.runner, env, batch, args.run_log)
+                    if rc != 0:
+                        continue
+                    by_shape = {record.get("shape"): record for record in records
+                                if record.get("status") == "DISCOVERED"}
+                    for item in batch:
+                        _, _, m, n, k = item
+                        shape = f"M{m}_N{n}_K{k}_{layout}"
+                        record = by_shape.get(shape)
+                        if record is None or record.get("branch") != target:
+                            continue
+                        official_core = record.get("official_core")
+                        actual_core = record.get("actual_core")
+                        if (not isinstance(official_core, int) or not isinstance(actual_core, int) or
+                                actual_core <= 0 or actual_core >= official_core):
+                            continue
+                        selected.append(item + (target,))
+                        counts[target] += 1
+                        scenario_counts[tier_key] += 1
+                        if scenario_counts[tier_key] >= tier_quotas[tier_index]:
+                            break
+                    if scenario_counts[tier_key] >= tier_quotas[tier_index]:
+                        break
+                if not progressed:
+                    break
     write_selected(args.selected, selected)
     return 0 if selected else 3
 
