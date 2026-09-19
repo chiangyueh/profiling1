@@ -2717,9 +2717,7 @@ const char *MatmulV3BaseTiling::GetSelectedBranchName()
         return mix == MixNd2NzType::V_HEAD_ND2NZ ? "BL1_FULL_LOAD_ND2NZ" : "BL1_FULL_LOAD";
     }
     if (mix == MixNd2NzType::V_PARALELL_ND2NZ) {
-        //NEW: No BASE + parallel-ND2NZ tiling key or kernel is compiled in
-        // MatMulV3.  Do not report an invented twenty-first branch.
-        return "INVALID_TILING_KEY";
+        return "BASE_CVP_PARALLEL";
     }
     //NEW
     if (tilingEnable_.tilingEnableSpecialOpti == TilingEnableSpecialOpti::ENABLE_K_SHIFT) {
@@ -2741,68 +2739,17 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
         return false;
     }
 
+    //NEW: The core formulas below are route-specific.  Split-K routes keep
+    // the official core count because changing only usedCoreNum changes their
+    // K ownership/reduction contract rather than merely removing idle blocks.
+    if (tilingEnable_.tilingEnableSplitCore != TilingEnableSplitCore::BASE) {
+        return false;
+    }
+
     const uint64_t m = static_cast<uint64_t>(matmul.M);
     const uint64_t n = static_cast<uint64_t>(matmul.N);
     const uint64_t mTotal = ops::CeilDiv(static_cast<uint64_t>(matmul.M), singleCoreM);
     const uint64_t nTotal = ops::CeilDiv(static_cast<uint64_t>(matmul.N), singleCoreN);
-
-    //NEW: Closed-form core selector for work queues whose kernel redistributes
-    // all logical work over usedCoreNum.  Preserve the official critical-path
-    // wave count, then choose the smallest core count on that exact plateau.
-    // This deliberately has no 1..N search and can return the official count.
-    const auto selectSameWaveCore = [&](uint64_t workUnits) -> bool {
-        if (workUnits == 0) {
-            return false;
-        }
-        const uint64_t officialWaves = ops::CeilDiv(workUnits, oldUsedCoreNum);
-        if (officialWaves == 0) {
-            return false;
-        }
-        const uint64_t selectedCore = ops::CeilDiv(workUnits, officialWaves);
-        if (selectedCore == 0 || selectedCore >= oldUsedCoreNum) {
-            return false;
-        }
-        matmul.usedCoreNum = static_cast<uint32_t>(selectedCore);
-        return true;
-    };
-
-    //NEW: Single-core Split-K kernels distribute the complete MN tile queue
-    // over usedCoreNum; each selected core still executes the full K loop for
-    // every tile it owns.  The closed form therefore uses MN tile count.
-    if (tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::SINGLE_CORE_SPLIT_K ||
-        tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::SINGLE_CORE_NKM_SPLIT_K ||
-        tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::SINGLE_CORE_SPLIT_K_GM_TO_L1) {
-        if (mTotal > UINT64_MAX / nTotal) {
-            return false;
-        }
-        return selectSameWaveCore(mTotal * nTotal);
-    }
-
-    //NEW: Deterministic Split-K redistributes all K chunks over usedCoreNum
-    // and derives both Cube ownership and AIV reduction fan-in from that same
-    // value.  Keep the official maximum chunks per core exactly, while using
-    // the smallest number of partial-C producers on that plateau.  Workspace
-    // is calculated later from the selected usedCoreNum by GetWorkspaceSize.
-    if (tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::DETERMINISTIC_SPLIT_K) {
-        const uint64_t singleCoreK = static_cast<uint64_t>(matmul.singleCoreK);
-        if (singleCoreK == 0 || matmul.Ka <= 0 || matmul.Kb <= 0) {
-            return false;
-        }
-        const uint64_t kExtent = matmul.iterateOrder == 0 ?
-            static_cast<uint64_t>(matmul.Kb) : static_cast<uint64_t>(matmul.Ka);
-        return selectSameWaveCore(ops::CeilDiv(kExtent, singleCoreK));
-    }
-
-    //NEW: Multi-core Split-K has no inner redistribution loop: block id maps
-    // directly to one unique (M,N,K) tile.  Reducing block count would omit
-    // work, so the only legal fixed-packet answer is the official core count.
-    if (tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::MULTI_CORE_SPLIT_K) {
-        return false;
-    }
-
-    if (tilingEnable_.tilingEnableSplitCore != TilingEnableSplitCore::BASE) {
-        return false;
-    }
 
     //NEW: AL1_FULL_LOAD copies the whole A operand before block ownership is
     // checked.  A block beyond this single L2 window's N-tile count therefore

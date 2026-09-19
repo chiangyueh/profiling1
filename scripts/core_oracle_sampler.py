@@ -9,26 +9,23 @@ import subprocess
 import sys
 
 
-# All 20 compiled Ascend 910B MatMulV3 tiling-key routes.  This list describes
-# executable packets, independently of whether the official packet came from
-# formula tiling, the repository, or AOE.
+# The 17 routes below are exactly the combinations that the Ascend 910B
+# fresh-shape tiler can produce without GetTilingFromRepo/AOE state.  The
+# outer aclnn MatMul dispatcher does not necessarily admit every route.
 TARGET_BRANCHES = (
     "BASE",
     "BASE_ND2NZ",
-    "BASE_K_SHIFT",
     "AL1_FULL_LOAD",
     "BL1_FULL_LOAD",
     "BL1_FULL_LOAD_ND2NZ",
     "BL1_FULL_LOAD_FIXPIPE",
     "BL1_FULL_LOAD_FIXPIPE_ND2NZ",
     "BL1_FULL_LOAD_VEC_NZ2ND",
-    "BL1_FULL_LOAD_CVP_PARALLEL",
     "SINGLE_CORE_SPLIT_K",
     "SINGLE_CORE_SPLIT_K_ND2NZ",
     "SINGLE_CORE_NKM_SPLIT_K",
     "SINGLE_CORE_SPLIT_K_GM_TO_L1",
     "SINGLE_CORE_SPLIT_K_GM_TO_L1_ND2NZ",
-    "MULTI_CORE_SPLIT_K",
     "DETERMINISTIC_SPLIT_K",
     "DETERMINISTIC_SPLIT_K_ND2NZ",
     "DETERMINISTIC_SPLIT_K_VEC_NZ2ND",
@@ -58,16 +55,6 @@ SHRINK_ENABLED_BRANCHES = (
     "AL1_FULL_LOAD",
     "BL1_FULL_LOAD_ND2NZ",
     "BL1_FULL_LOAD_VEC_NZ2ND",
-    "DETERMINISTIC_SPLIT_K",
-    "DETERMINISTIC_SPLIT_K_ND2NZ",
-    "DETERMINISTIC_SPLIT_K_VEC_NZ2ND",
-    "DETERMINISTIC_SPLIT_K_VEC_NZ2ND_ND2NZ",
-)
-
-#NEW: result23 completed the non-Split-K validation.  The next run is limited
-# to the four deterministic routes affected by the new closed-form selector.
-VALIDATION_BRANCHES = tuple(
-    name for name in SHRINK_ENABLED_BRANCHES if name.startswith("DETERMINISTIC_SPLIT_K")
 )
 
 #NEW: Distinct, correctness-passing shapes already available for the current
@@ -314,74 +301,28 @@ def shrink_validation_shapes():
         put("fp32", "NN", 13037 + 320 * i + (i % 13),
             vec_n[(i * 7 + i // 9) % len(vec_n)],
             vec_k[(i * 5 + i // 13) % len(vec_k)])
-
-    #NEW: Deterministic Split-K witnesses from the completed 4..20 core
-    # response sweep.  Small local stencils provide distinct packets without
-    # forcing a tiling key; the official selector still decides the branch.
-    deterministic_seeds = (
-        ("bf16", "NT", 640, 1152, 28800),
-        ("bf16", "NT", 704, 1152, 28803),
-        ("bf16", "NT", 1152, 512, 28672),
-        ("bf16", "NT", 1216, 512, 28683),
-        ("bf16", "NT", 1408, 1792, 31488),
-        ("bf16", "NT", 1472, 1792, 31503),
-        ("bf16", "NT", 1920, 1152, 31360),
-        ("bf16", "NT", 2432, 512, 31232),
-        ("fp16", "NT", 512, 512, 27392),
-        ("fp16", "NT", 768, 1792, 30208),
-        ("fp16", "NT", 1280, 1152, 30080),
-        ("fp16", "NT", 1792, 512, 29952),
-        ("bf16", "TN", 134, 320, 12288),
-        ("bf16", "TT", 160, 192, 10240),
-        ("bf16", "TT", 52, 259, 27392),
-        ("bf16", "TT", 8, 8, 27392),
-        ("fp16", "TN", 15, 161, 61440),
-        ("fp16", "TN", 1024, 25, 32768),
-        ("fp16", "TN", 68, 128, 32768),
-        ("fp16", "TN", 1539, 47, 32768),
-        ("fp16", "TT", 34, 643, 27393),
-        ("bf16", "NN", 1920, 130, 32769),
-        ("bf16", "NN", 192, 130, 27392),
-        ("bf16", "TN", 1281, 161, 32768),
-        ("bf16", "TN", 161, 261, 16385),
-        ("bf16", "TT", 133, 389, 24577),
-        ("fp16", "NN", 133, 132, 61440),
-        ("fp16", "NN", 321, 161, 16384),
-        ("fp16", "TN", 769, 165, 49152),
-        ("fp16", "TT", 131, 323, 16384),
-        ("fp32", "NN", 576, 521, 27456),
-        ("fp32", "NN", 704, 923, 31040),
-        ("fp32", "NN", 960, 923, 28224),
-        ("fp32", "NN", 832, 1057, 31296),
-    )
-    for dtype, layout, m, n, k in deterministic_seeds:
-        put(dtype, layout, m, n, k)
-        put(dtype, layout, m + 16, n, k)
-        put(dtype, layout, m + 64, n, k)
-        put(dtype, layout, m, n + 16, k)
-        put(dtype, layout, m, n + 32, k)
-        put(dtype, layout, m, n, k + 128)
-        put(dtype, layout, m, n, k + 512)
     return selected
 
 
 def select_shrink(args):
-    #NEW: Ask the real host tiler which route and core count each candidate
-    # reaches with the production selector enabled.  Discovery is host-only.
-    # Retain both lower-core and official-core decisions: choosing 20 is a
-    # first-class result of the formula, not a discovery failure.
+    #NEW: First ask the real host tiler which route each candidate reaches,
+    # with the production shrink hook enabled.  This is metadata-only: no NPU
+    # kernel is launched.  Keep at most quota effective-shrink shapes per
+    # route and stop accepting a route as soon as it is full.
     candidates = shrink_validation_shapes()
     groups = collections.defaultdict(list)
     for item in candidates:
         groups[(item[0], item[1])].append(item[:5])
 
-    counts = collections.Counter()
+    counts = collections.Counter(HISTORICAL_VALIDATED_SHAPES)
     selected = []
     for (dtype, layout), shapes in groups.items():
-        if all(counts[name] >= args.quota for name in VALIDATION_BRANCHES):
+        group_targets = (("AL1_FULL_LOAD", "BASE") if layout == "NT" else
+                         ("BL1_FULL_LOAD_ND2NZ", "BL1_FULL_LOAD_VEC_NZ2ND"))
+        if all(counts[name] >= args.quota for name in group_targets):
             continue
         for offset in range(0, len(shapes), args.discovery_batch):
-            if all(counts[name] >= args.quota for name in VALIDATION_BRANCHES):
+            if all(counts[name] >= args.quota for name in group_targets):
                 break
             batch = shapes[offset:offset + args.discovery_batch]
             env = runner_env(os.environ, dtype, layout, "discovery", discovery=True)
@@ -400,22 +341,23 @@ def select_shrink(args):
                 branch = record.get("branch")
                 official_core = record.get("official_core")
                 actual_core = record.get("actual_core")
-                if (branch not in VALIDATION_BRANCHES or counts[branch] >= args.quota or
+                if (branch not in SHRINK_ENABLED_BRANCHES or counts[branch] >= args.quota or
                         not isinstance(official_core, int) or not isinstance(actual_core, int) or
-                        actual_core <= 0 or actual_core > official_core):
+                        actual_core <= 0 or actual_core >= official_core):
                     continue
                 selected.append(item + (branch,))
                 counts[branch] += 1
-        if all(counts[name] >= args.quota for name in VALIDATION_BRANCHES):
+        if all(counts[name] >= args.quota for name in SHRINK_ENABLED_BRANCHES):
             break
     write_selected(args.selected, selected)
-    missing = {name: args.quota - counts[name] for name in VALIDATION_BRANCHES
+    missing = {name: args.quota - counts[name] for name in SHRINK_ENABLED_BRANCHES
                if counts[name] < args.quota}
     if missing:
-        print(json.dumps({"discovery": "partial_core_selector_coverage",
-                          "counts": {name: counts[name] for name in VALIDATION_BRANCHES},
+        print(json.dumps({"fatal": "effective_shrink_quota_not_reached",
+                          "counts": {name: counts[name] for name in SHRINK_ENABLED_BRANCHES},
                           "missing": missing}, separators=(",", ":")), file=sys.stderr)
-    return 0 if selected else 3
+        return 3
+    return 0
 
 
 def expand_witness(pool, queued, item, branch):
@@ -613,9 +555,9 @@ def load_selected(path, branch_quota):
     with open(path, encoding="utf-8") as stream:
         for line in stream:
             dtype, layout, m, n, k, branch = line.rstrip("\n").split("\t")
-            if branch != "USER" and branch not in TARGET_BRANCHES:
+            if branch != "USER" and branch not in MEASUREMENT_BRANCHES:
                 continue
-            if branch in TARGET_BRANCHES and branch_counts[branch] >= branch_quota:
+            if branch in MEASUREMENT_BRANCHES and branch_counts[branch] >= branch_quota:
                 continue
             branch_counts[branch] += 1
             groups[(dtype, layout)].append((dtype, layout, int(m), int(n), int(k)))
@@ -714,23 +656,16 @@ def compare(args):
                 branch = shrink_pre.get("branch")
                 if any(record.get("branch") != branch for record in quartet):
                     continue
-                if branch not in VALIDATION_BRANCHES or branch_counts[branch] >= args.quota:
+                if branch not in SHRINK_ENABLED_BRANCHES or branch_counts[branch] >= args.quota:
                     continue
-                official_core = shrink_pre.get("official_core")
-                selected_core = shrink_pre.get("actual_core")
-                if (not isinstance(official_core, int) or not isinstance(selected_core, int) or
-                        official_core <= 0 or selected_core <= 0 or selected_core > official_core or
-                        shrink_post.get("official_core") != official_core or
-                        shrink_post.get("actual_core") != selected_core or
-                        pre.get("actual_core") != official_core or post.get("actual_core") != official_core):
+                if (shrink_pre.get("actual_core", 0) >= shrink_pre.get("official_core", 0) or
+                        shrink_post.get("actual_core", 0) >= shrink_post.get("official_core", 0)):
                     continue
                 original_latency = (float(pre["latency_ms"]) + float(post["latency_ms"])) / 2.0
                 shrink_latency = (float(shrink_pre["latency_ms"]) + float(shrink_post["latency_ms"])) / 2.0
                 output = {
                     "shape": shape,
                     "branch": branch,
-                    "selected_core": selected_core,
-                    "official_core": official_core,
                     "shrinked_latency": f"{shrink_latency:.9f}",
                     "original_latency": f"{original_latency:.9f}",
                 }

@@ -161,13 +161,13 @@ if [[ "$#" -gt 0 ]]; then
 else
     python3 scripts/core_oracle_sampler.py select-shrink \
         --runner "${example_binary}" --selected "${selected_shapes}" \
-        --run-log "${run_log}" --quota 20 --discovery-batch 64
+        --run-log "${run_log}" --quota 30 --discovery-batch 64
 fi
 
 #NEW
 if ! python3 scripts/core_oracle_sampler.py compare \
     --runner "${example_binary}" --selected "${selected_shapes}" \
-    --run-log "${run_log}" --quota 20 --batch-size 8; then
+    --run-log "${run_log}" --quota 30 --batch-size 8; then
     cat "${run_log}" >&2
     echo "fatal: no valid MatMulV3 shrink comparison was produced" >&2
     exit 1
