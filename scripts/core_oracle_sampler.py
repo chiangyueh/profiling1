@@ -55,7 +55,6 @@ SHRINK_ENABLED_BRANCHES = (
     "AL1_FULL_LOAD",
     "BL1_FULL_LOAD_ND2NZ",
     "BL1_FULL_LOAD_VEC_NZ2ND",
-    "DETERMINISTIC_SPLIT_K",
 )
 
 #NEW: Distinct, correctness-passing shapes already available for the current
@@ -70,7 +69,6 @@ HISTORICAL_VALIDATED_SHAPES = {
     "AL1_FULL_LOAD": 21,
     "BL1_FULL_LOAD_ND2NZ": 15,
     "BL1_FULL_LOAD_VEC_NZ2ND": 32,
-    "DETERMINISTIC_SPLIT_K": 5,
 }
 
 
@@ -242,7 +240,7 @@ def candidate_pool():
 
 
 def shrink_validation_shapes():
-    """Generate source-directed candidates for the enabled shrink rules."""
+    """Generate source-directed candidates for the four enabled shrink rules."""
     selected = []
     seen = set()
 
@@ -274,19 +272,6 @@ def shrink_validation_shapes():
         put("fp32", "NT", 1 + i % 7,
             al1_n[(i * 5 + i // 13) % len(al1_n)],
             al1_k[(i * 7 + i // 11) % len(al1_k)])
-
-    # Deterministic Split-K: these fresh FP16/BF16 points surround, but do not
-    # repeat, the five result20 packets accepted by the new formula.  Discovery
-    # still requires the real tiler to choose the plain no-ND2NZ route and the
-    # production hook to lower usedCoreNum, so selector misses are free skips.
-    det_m = (1536, 1664, 1792, 2048, 2176, 2304, 2688, 2816)
-    det_n = (512, 1152, 1792)
-    det_k = (30976, 31616, 32000, 32384)
-    for dtype in ("fp16", "bf16"):
-        for m in det_m:
-            for n in det_n:
-                for k in det_k:
-                    put(dtype, "NT", m, n, k)
 
     # Pure BASE immediately beyond the AL1 resident-A domain.  Discovery
     # rejects any candidate that is routed elsewhere or whose BASE rule is a
@@ -332,12 +317,8 @@ def select_shrink(args):
     counts = collections.Counter(HISTORICAL_VALIDATED_SHAPES)
     selected = []
     for (dtype, layout), shapes in groups.items():
-        if dtype in ("fp16", "bf16") and layout == "NT":
-            group_targets = ("DETERMINISTIC_SPLIT_K",)
-        elif layout == "NT":
-            group_targets = ("AL1_FULL_LOAD", "BASE")
-        else:
-            group_targets = ("BL1_FULL_LOAD_ND2NZ", "BL1_FULL_LOAD_VEC_NZ2ND")
+        group_targets = (("AL1_FULL_LOAD", "BASE") if layout == "NT" else
+                         ("BL1_FULL_LOAD_ND2NZ", "BL1_FULL_LOAD_VEC_NZ2ND"))
         if all(counts[name] >= args.quota for name in group_targets):
             continue
         for offset in range(0, len(shapes), args.discovery_batch):
