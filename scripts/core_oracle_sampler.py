@@ -37,10 +37,10 @@ TARGET_BRANCHES = (
 # selected nor printed again.
 MEASUREMENT_BRANCHES = tuple(name for name in TARGET_BRANCHES if "SPLIT_K" not in name)
 
-# Exhaustive official-dispatch discovery on CANN 8.5 found no reachable
-# BL1_FULL_LOAD packet and only 21 distinct AL1 packets.  Those two routes
-# remain recorded when observed, but cannot prevent the reachable non-Split-K
-# route datasets from being measured.
+# Official-dispatch discovery on CANN 8.5 found no reachable plain
+# BL1_FULL_LOAD packet and AL1 occupies a very narrow selector pocket.  Those
+# two routes remain recorded when observed, but cannot prevent the broad
+# reachable non-Split-K route datasets from being measured.
 OFFICIAL_QUOTA_BRANCHES = tuple(
     name for name in MEASUREMENT_BRANCHES
     if name not in ("AL1_FULL_LOAD", "BL1_FULL_LOAD")
@@ -56,6 +56,20 @@ SHRINK_ENABLED_BRANCHES = (
     "BL1_FULL_LOAD_ND2NZ",
     "BL1_FULL_LOAD_VEC_NZ2ND",
 )
+
+#NEW: Distinct, correctness-passing shapes already available for the current
+# production rules.  BASE and VEC combine disjoint result21/result22 shapes;
+# AL1 combines 20 result21 shapes with the one non-duplicate result17 shape.
+# BL1-ND2NZ counts only the 15 result20 shapes on which the revised same-wave
+# rule actually lowers the core count; the obsolete result22 formula is not
+# credited.  This is measurement-campaign bookkeeping only and is never read
+# by the runtime tiler.
+HISTORICAL_VALIDATED_SHAPES = {
+    "BASE": 30,
+    "AL1_FULL_LOAD": 21,
+    "BL1_FULL_LOAD_ND2NZ": 15,
+    "BL1_FULL_LOAD_VEC_NZ2ND": 32,
+}
 
 
 def add(pool, seen, dtype, layout, m, n, k):
@@ -244,6 +258,14 @@ def shrink_validation_shapes():
     # AL1: M<8 avoids the small-MN deterministic Split-K precedence rule.
     # N<320 guarantees an ownership count below 20, while the K grid spans
     # several legal A-resident footprints.
+    # These seven packets extend the 21 distinct fully validated AL1 shapes;
+    # M7/N64/K6144 is deliberately omitted because result17 already covers it.
+    for k in (6144, 6656, 7168):
+        put("fp32", "NT", 6, 64, k)
+    put("fp32", "NT", 6, 256, 7168)
+    for k in (6656, 7168):
+        put("fp32", "NT", 7, 64, k)
+    put("fp32", "NT", 7, 256, 7168)
     al1_n = (48, 80, 96, 112, 144, 160, 176, 208, 224, 240, 272, 288, 304)
     al1_k = (4352, 4608, 4864, 5376, 5632, 5888, 6400, 6912, 7424, 7680, 7936)
     for i in range(180):
@@ -292,11 +314,15 @@ def select_shrink(args):
     for item in candidates:
         groups[(item[0], item[1])].append(item[:5])
 
-    counts = collections.Counter()
+    counts = collections.Counter(HISTORICAL_VALIDATED_SHAPES)
     selected = []
     for (dtype, layout), shapes in groups.items():
+        group_targets = (("AL1_FULL_LOAD", "BASE") if layout == "NT" else
+                         ("BL1_FULL_LOAD_ND2NZ", "BL1_FULL_LOAD_VEC_NZ2ND"))
+        if all(counts[name] >= args.quota for name in group_targets):
+            continue
         for offset in range(0, len(shapes), args.discovery_batch):
-            if all(counts[name] >= args.quota for name in SHRINK_ENABLED_BRANCHES):
+            if all(counts[name] >= args.quota for name in group_targets):
                 break
             batch = shapes[offset:offset + args.discovery_batch]
             env = runner_env(os.environ, dtype, layout, "discovery", discovery=True)
