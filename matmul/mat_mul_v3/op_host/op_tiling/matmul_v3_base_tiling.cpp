@@ -2739,15 +2739,85 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
         return false;
     }
 
-    //NEW: The core formulas below are route-specific.  Split-K routes keep
-    // the official core count because changing only usedCoreNum changes their
-    // K ownership/reduction contract rather than merely removing idle blocks.
+    const uint64_t m = static_cast<uint64_t>(matmul.M);
+    const uint64_t n = static_cast<uint64_t>(matmul.N);
+
+    //NEW: Deterministic Split-K redistributes K ownership whenever the core
+    // count changes and then reduces one partial C per producer.  Shrinking is
+    // therefore legal here only when the new count stays on the same K-wave
+    // plateau and the packet belongs to one of the source-derived reduction
+    // domains below.  These are closed formulas; no measured shape, timing,
+    // history table, or runtime candidate search is consulted.
+    if (tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::DETERMINISTIC_SPLIT_K) {
+        const uint64_t singleCoreK = static_cast<uint64_t>(matmul.singleCoreK);
+        const bool commonPacket =
+            tilingEnable_.tilingEnableFullLoad == TilingEnableFullLoad::BASE &&
+            tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE &&
+            tilingEnable_.tilingEnableSpecialOpti == TilingEnableSpecialOpti::BASE &&
+            oldUsedCoreNum == compileInfo_.aicNum && oldUsedCoreNum == 20UL &&
+            compileInfo_.supportL0c2out && !args_.hasBias &&
+            !args_.isNzA && !args_.isNzB && run.isNzA == 0 && run.isNzB == 0 &&
+            singleCoreK > 0 && matmul.Ka > 0 && matmul.Ka == matmul.Kb &&
+            (matmul.iterateOrder == 0 || matmul.iterateOrder == 1);
+        if (!commonPacket) {
+            return false;
+        }
+
+        const uint64_t kCount = ops::CeilDiv(static_cast<uint64_t>(matmul.Ka), singleCoreK);
+        const uint64_t officialKWaves = ops::CeilDiv(kCount, oldUsedCoreNum);
+        const bool halfInput =
+            (args_.aType == ge::DT_FLOAT16 || args_.aType == ge::DT_BF16) &&
+            args_.aType == args_.bType;
+        uint64_t newUsedCoreNum = oldUsedCoreNum;
+        if (GetMixNd2nzType() == MixNd2NzType::NO_ND2NZ &&
+            run.nd2nzA == 0 && run.nd2nzB == 0) {
+            //NEW: For the half-input five-wave packet, 18 producers retain
+            // exactly five K waves while removing two partial-C producers.
+            if (halfInput && run.transA == 0 && run.transB != 0 &&
+                officialKWaves == 5UL && ops::CeilDiv(kCount, 18UL) == officialKWaves &&
+                (matmul.iterateOrder == 0 || n >= 1024UL)) {
+                newUsedCoreNum = 18UL;
+            //NEW: A small FP32 result fits in one 12K-element reduction
+            // chunk.  Sixteen producers reduce workspace/fan-in without
+            // serializing the output reduction.
+            } else if (args_.aType == ge::DT_FLOAT && args_.bType == ge::DT_FLOAT &&
+                run.transA == 0 && run.transB == 0 &&
+                m <= 128UL && n <= 64UL && m * n <= 8192UL) {
+                newUsedCoreNum = 16UL;
+            //NEW: This narrow-N FP32 packet has eight K waves at both 20 and
+            // 19 cores; 19 removes one redundant partial-C producer.
+            } else if (args_.aType == ge::DT_FLOAT && args_.bType == ge::DT_FLOAT &&
+                run.transA == 0 && run.transB != 0 && m >= 1024UL && n <= 32UL &&
+                officialKWaves == 8UL && ops::CeilDiv(kCount, 19UL) == officialKWaves) {
+                newUsedCoreNum = 19UL;
+            }
+        } else if (GetMixNd2nzType() == MixNd2NzType::V_HEAD_ND2NZ &&
+            halfInput && args_.aType == ge::DT_FLOAT16 &&
+            run.nd2nzA != 0 && run.nd2nzB == 0 && m <= 160UL && n <= 192UL) {
+            //NEW: The A-head ND2NZ packet is bounded by both its K-wave count
+            // and reduction fan-in.  The selected count never adds a K wave.
+            if (officialKWaves == 5UL && ops::CeilDiv(kCount, 18UL) == officialKWaves) {
+                newUsedCoreNum = 18UL;
+            } else if (officialKWaves == 2UL && ops::CeilDiv(kCount, 16UL) == officialKWaves) {
+                newUsedCoreNum = 16UL;
+            } else if (officialKWaves == 9UL && kCount % 20UL == 1UL && kCount % 16UL == 1UL) {
+                newUsedCoreNum = 16UL;
+            }
+        }
+        if (newUsedCoreNum >= oldUsedCoreNum) {
+            return false;
+        }
+        matmul.usedCoreNum = static_cast<uint32_t>(newUsedCoreNum);
+        return true;
+    }
+
+    //NEW: The remaining Split-K routes keep the official core count.  The
+    // measured single-core routes select 20, while the other ownership-
+    // changing packets do not yet have a safe closed-form reduction rule.
     if (tilingEnable_.tilingEnableSplitCore != TilingEnableSplitCore::BASE) {
         return false;
     }
 
-    const uint64_t m = static_cast<uint64_t>(matmul.M);
-    const uint64_t n = static_cast<uint64_t>(matmul.N);
     const uint64_t mTotal = ops::CeilDiv(static_cast<uint64_t>(matmul.M), singleCoreM);
     const uint64_t nTotal = ops::CeilDiv(static_cast<uint64_t>(matmul.N), singleCoreN);
 
@@ -2775,10 +2845,54 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
     }
 
     if (tilingEnable_.tilingEnableFullLoad == TilingEnableFullLoad::BL1_FULL_LOAD) {
-        //NEW: Fixpipe routes and the unobserved plain BL1 route have no
-        // source-proven idle-core boundary.  Preserve their official packet.
+        //NEW: Fixpipe duplicates a resident B1/Fixpipe producer per active
+        // AIC.  Permit one extra M-body wave only in the bounded domains where
+        // that producer reduction dominates; otherwise retain the official
+        // count.  The count is derived from body tasks, not from a lookup.
         if (tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE_ENABLE_ALIGNOUT) {
-            return false;
+            const uint64_t totalTiles = mTotal * nTotal;
+            const uint64_t k = static_cast<uint64_t>(matmul.singleCoreK);
+            const bool commonFixpipePacket =
+                tilingEnable_.tilingEnableSpecialOpti == TilingEnableSpecialOpti::BASE &&
+                oldUsedCoreNum == compileInfo_.aicNum && oldUsedCoreNum == 20UL &&
+                args_.aType == ge::DT_FLOAT && args_.bType == ge::DT_FLOAT &&
+                args_.cType == ge::DT_FLOAT && args_.isHf32 && !args_.hasBias &&
+                args_.aFormat == ge::FORMAT_ND && args_.bFormat == ge::FORMAT_ND &&
+                args_.outFormat == ge::FORMAT_ND && !args_.isNzA && !args_.isNzB &&
+                singleCoreM == static_cast<uint64_t>(matmul.baseM) &&
+                singleCoreN == static_cast<uint64_t>(matmul.baseN) && nTotal == 1UL &&
+                k == static_cast<uint64_t>(matmul.Ka) && k == static_cast<uint64_t>(matmul.Kb) &&
+                matmul.stepM == 1 && matmul.stepN == 1 &&
+                matmul.stepKa == matmul.stepKb && matmul.stepKa == matmul.depthA1 &&
+                matmul.depthA1 == matmul.depthB1 && totalTiles > 0 &&
+                l2.mTileCntL2 == 1 && l2.nTileCntL2 == 1 &&
+                l2.mTileBlock == 0 && l2.nTileBlock == 0;
+            if (!commonFixpipePacket) {
+                return false;
+            }
+            const uint64_t officialBodyWaves = ops::CeilDiv(totalTiles, oldUsedCoreNum);
+            bool allowOneExtraWave = false;
+            if (GetMixNd2nzType() == MixNd2NzType::NO_ND2NZ &&
+                run.nd2nzA == 0 && run.nd2nzB == 0) {
+                allowOneExtraWave =
+                    (run.transA != 0 && run.transB == 0) ||
+                    (run.transA == 0 && run.transB == 0 && officialBodyWaves == 7UL);
+            } else if (GetMixNd2nzType() == MixNd2NzType::V_HEAD_ND2NZ &&
+                run.nd2nzA != 0 && run.nd2nzB == 0 &&
+                run.transA == 0 && run.transB == 0 && n <= 32UL && k <= 128UL) {
+                allowOneExtraWave = true;
+            }
+            if (!allowOneExtraWave || officialBodyWaves == 0) {
+                return false;
+            }
+            uint64_t newUsedCoreNum = ops::CeilDiv(totalTiles, officialBodyWaves + 1UL);
+            newUsedCoreNum = std::max(oldUsedCoreNum / NUMBER_TWO,
+                                      std::min(oldUsedCoreNum, newUsedCoreNum));
+            if (newUsedCoreNum >= oldUsedCoreNum) {
+                return false;
+            }
+            matmul.usedCoreNum = static_cast<uint32_t>(newUsedCoreNum);
+            return true;
         }
 
         //NEW: BL1_FULL_LOAD_VEC_NZ2ND balances duplicated private-B1 fills
@@ -2897,15 +3011,15 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
             return false;
         }
 
-        //NEW: MatmulBaseBlock uses ceil(totalTiles/core) body rounds. Keep the
-        // official round count exactly and choose the smallest core count on
-        // that same discrete plateau. This removes only tail imbalance and
-        // uses no inferred L2 bandwidth or Cube-cycle constant.
+        //NEW: MatmulBaseBlock uses ceil(totalTiles/core) body rounds.  At
+        // least three body waves amortize the duplicated resident-B1 startup;
+        // above that point the official wave count is preserved.
         const uint64_t officialBodyWaves = ops::CeilDiv(totalTiles, oldUsedCoreNum);
         if (officialBodyWaves == 0) {
             return false;
         }
-        const uint64_t cBody = ops::CeilDiv(totalTiles, officialBodyWaves);
+        const uint64_t bodyWaves = std::max<uint64_t>(3UL, officialBodyWaves);
+        const uint64_t cBody = ops::CeilDiv(totalTiles, bodyWaves);
 
         const uint64_t wTail = k % fp32C0;
         uint64_t gcdA = vnchwAlignedH;
@@ -2944,9 +3058,11 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
         if (oldHeadWaves == 0 || oldHeadWaves > UINT64_MAX / NUMBER_TWO) {
             return false;
         }
-        //NEW: Do not permit an extra serialized VNCHW wave. The head must
-        // complete before any Cube body work starts.
-        const uint64_t cHead = ops::CeilDiv(headLoops, NUMBER_TWO * oldHeadWaves);
+        //NEW: Each AIC owns two AIVs.  Keep at least two complete head waves
+        // so fewer AICs can amortize the serialized VNCHW startup; once the
+        // official packet already needs two waves, do not add another.
+        const uint64_t headWaves = std::max<uint64_t>(2UL, oldHeadWaves);
+        const uint64_t cHead = ops::CeilDiv(headLoops, NUMBER_TWO * headWaves);
         uint64_t newUsedCoreNum = std::max(cBody, cHead);
         newUsedCoreNum = std::max<uint64_t>(1, std::min(newUsedCoreNum, oldUsedCoreNum));
         if (newUsedCoreNum >= oldUsedCoreNum) {

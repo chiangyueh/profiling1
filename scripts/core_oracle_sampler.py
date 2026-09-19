@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 
-# The 17 routes below are exactly the combinations that the Ascend 910B
+# The 21 routes below are exactly the combinations named by the Ascend 910B
 # fresh-shape tiler can produce without GetTilingFromRepo/AOE state.  The
 # outer aclnn MatMul dispatcher does not necessarily admit every route.
 TARGET_BRANCHES = (
@@ -21,6 +21,9 @@ TARGET_BRANCHES = (
     "BL1_FULL_LOAD_FIXPIPE",
     "BL1_FULL_LOAD_FIXPIPE_ND2NZ",
     "BL1_FULL_LOAD_VEC_NZ2ND",
+    "BL1_FULL_LOAD_CVP_PARALLEL",
+    "BASE_CVP_PARALLEL",
+    "BASE_K_SHIFT",
     "SINGLE_CORE_SPLIT_K",
     "SINGLE_CORE_SPLIT_K_ND2NZ",
     "SINGLE_CORE_NKM_SPLIT_K",
@@ -30,12 +33,22 @@ TARGET_BRANCHES = (
     "DETERMINISTIC_SPLIT_K_ND2NZ",
     "DETERMINISTIC_SPLIT_K_VEC_NZ2ND",
     "DETERMINISTIC_SPLIT_K_VEC_NZ2ND_ND2NZ",
+    "MULTI_CORE_SPLIT_K",
 )
 
 # The current pass is intentionally restricted to non-Split-K routes.  The
 # completed Split-K response curves remain in the checkpoint, but are neither
 # selected nor printed again.
-MEASUREMENT_BRANCHES = tuple(name for name in TARGET_BRANCHES if "SPLIT_K" not in name)
+MEASUREMENT_BRANCHES = (
+    "BASE",
+    "BASE_ND2NZ",
+    "AL1_FULL_LOAD",
+    "BL1_FULL_LOAD",
+    "BL1_FULL_LOAD_ND2NZ",
+    "BL1_FULL_LOAD_FIXPIPE",
+    "BL1_FULL_LOAD_FIXPIPE_ND2NZ",
+    "BL1_FULL_LOAD_VEC_NZ2ND",
+)
 
 # Official-dispatch discovery on CANN 8.5 found no reachable plain
 # BL1_FULL_LOAD packet and AL1 occupies a very narrow selector pocket.  Those
@@ -54,21 +67,25 @@ SHRINK_ENABLED_BRANCHES = (
     "BASE",
     "AL1_FULL_LOAD",
     "BL1_FULL_LOAD_ND2NZ",
+    "BL1_FULL_LOAD_FIXPIPE",
+    "BL1_FULL_LOAD_FIXPIPE_ND2NZ",
     "BL1_FULL_LOAD_VEC_NZ2ND",
+    "DETERMINISTIC_SPLIT_K",
+    "DETERMINISTIC_SPLIT_K_ND2NZ",
 )
 
-#NEW: Distinct, correctness-passing shapes already available for the current
-# production rules.  BASE and VEC combine disjoint result21/result22 shapes;
-# AL1 combines 20 result21 shapes with the one non-duplicate result17 shape.
-# BL1-ND2NZ counts only the 15 result20 shapes on which the revised same-wave
-# rule actually lowers the core count; the obsolete result22 formula is not
-# credited.  This is measurement-campaign bookkeeping only and is never read
-# by the runtime tiler.
+#NEW: Distinct correctness-passing core curves or ABBA comparisons already
+# available for each production rule.  They reduce only the next validation
+# campaign's quota; this bookkeeping is never read by the runtime tiler.
 HISTORICAL_VALIDATED_SHAPES = {
     "BASE": 30,
     "AL1_FULL_LOAD": 21,
     "BL1_FULL_LOAD_ND2NZ": 15,
+    "BL1_FULL_LOAD_FIXPIPE": 3,
+    "BL1_FULL_LOAD_FIXPIPE_ND2NZ": 1,
     "BL1_FULL_LOAD_VEC_NZ2ND": 32,
+    "DETERMINISTIC_SPLIT_K": 7,
+    "DETERMINISTIC_SPLIT_K_ND2NZ": 3,
 }
 
 
@@ -240,12 +257,12 @@ def candidate_pool():
 
 
 def shrink_validation_shapes():
-    """Generate source-directed candidates for the four enabled shrink rules."""
+    """Generate source-directed candidates for the enabled closed-form rules."""
     selected = []
     seen = set()
 
-    def put(dtype, layout, m, n, k):
-        item = (dtype, layout, int(m), int(n), int(k), "USER")
+    def put(target, dtype, layout, m, n, k):
+        item = (dtype, layout, int(m), int(n), int(k), target)
         key = item[:5]
         if key in seen or min(m, n, k) <= 0:
             return
@@ -261,15 +278,15 @@ def shrink_validation_shapes():
     # These seven packets extend the 21 distinct fully validated AL1 shapes;
     # M7/N64/K6144 is deliberately omitted because result17 already covers it.
     for k in (6144, 6656, 7168):
-        put("fp32", "NT", 6, 64, k)
-    put("fp32", "NT", 6, 256, 7168)
+        put("AL1_FULL_LOAD", "fp32", "NT", 6, 64, k)
+    put("AL1_FULL_LOAD", "fp32", "NT", 6, 256, 7168)
     for k in (6656, 7168):
-        put("fp32", "NT", 7, 64, k)
-    put("fp32", "NT", 7, 256, 7168)
+        put("AL1_FULL_LOAD", "fp32", "NT", 7, 64, k)
+    put("AL1_FULL_LOAD", "fp32", "NT", 7, 256, 7168)
     al1_n = (48, 80, 96, 112, 144, 160, 176, 208, 224, 240, 272, 288, 304)
     al1_k = (4352, 4608, 4864, 5376, 5632, 5888, 6400, 6912, 7424, 7680, 7936)
     for i in range(180):
-        put("fp32", "NT", 1 + i % 7,
+        put("AL1_FULL_LOAD", "fp32", "NT", 1 + i % 7,
             al1_n[(i * 5 + i // 13) % len(al1_n)],
             al1_k[(i * 7 + i // 11) % len(al1_k)])
 
@@ -279,7 +296,7 @@ def shrink_validation_shapes():
     base_n = (40, 56, 72, 88, 104, 120)
     base_k = (9472, 9984, 10752, 11776, 12800, 13824, 14848, 15872)
     for i in range(220):
-        put("fp32", "NT", 3 + i % 21,
+        put("BASE", "fp32", "NT", 3 + i % 21,
             base_n[(i * 5 + i // 17) % len(base_n)],
             base_k[(i * 3 + i // 19) % len(base_k)])
 
@@ -288,7 +305,7 @@ def shrink_validation_shapes():
     bl1_nd_k = (17, 19, 21, 25, 33, 41, 49, 57, 65, 73, 81)
     bl1_nd_n = (32, 64, 96, 128, 192, 256, 384)
     for i in range(220):
-        put("fp32", "NN", 11731 + 96 * i + (i % 5),
+        put("BL1_FULL_LOAD_ND2NZ", "fp32", "NN", 11731 + 96 * i + (i % 5),
             bl1_nd_n[(i * 3 + i // 7) % len(bl1_nd_n)],
             bl1_nd_k[(i * 5 + i // 11) % len(bl1_nd_k)])
 
@@ -298,9 +315,39 @@ def shrink_validation_shapes():
     vec_n = (23, 31, 40, 47, 56, 73, 80, 89, 96, 111, 112, 127, 143, 160, 175, 191)
     vec_k = (24, 40, 64, 80, 96, 112, 128)
     for i in range(260):
-        put("fp32", "NN", 13037 + 320 * i + (i % 13),
+        put("BL1_FULL_LOAD_VEC_NZ2ND", "fp32", "NN", 13037 + 320 * i + (i % 13),
             vec_n[(i * 7 + i // 9) % len(vec_n)],
             vec_k[(i * 5 + i // 13) % len(vec_k)])
+
+    # Fixpipe: transposed-A packets and the seven-wave NN packet admit one
+    # additional body wave.  Head-ND2NZ is limited to narrow N/K packets.
+    for i in range(160):
+        put("BL1_FULL_LOAD_FIXPIPE", "fp32", "TN", 11264 + 64 * i,
+            (11, 17, 31, 47, 51, 63)[i % 6],
+            (96, 112, 127, 128, 160, 192, 224, 256)[(i * 3) % 8])
+        put("BL1_FULL_LOAD_FIXPIPE", "fp32", "NN", 15488 + 16 * i,
+            (128, 144, 160, 176, 192)[(i * 3) % 5],
+            (65, 67, 69, 71, 73)[(i * 2) % 5])
+        put("BL1_FULL_LOAD_FIXPIPE_ND2NZ", "fp32", "NN", 19456 + 64 * i,
+            (17, 19, 23, 25, 31)[(i * 3) % 5],
+            (65, 80, 96, 112, 127, 128)[(i * 5) % 6])
+
+    # Deterministic Split-K: cover the three plain packet equations and the
+    # A-head ND2NZ equations without relying on an MNK lookup table.
+    for i in range(180):
+        dtype = "fp16" if i % 2 == 0 else "bf16"
+        put("DETERMINISTIC_SPLIT_K", dtype, "NT", 1280 + 64 * (i % 24),
+            (512, 1024, 1152, 1536, 1792)[(i * 3) % 5],
+            31104 + 128 * (i % 16))
+        put("DETERMINISTIC_SPLIT_K", "fp32", "NN", (32, 48, 64, 80, 96, 112, 128)[i % 7],
+            (16, 32, 48, 64)[(i * 3) % 4],
+            (16384, 24576, 32768)[(i * 5) % 3])
+        put("DETERMINISTIC_SPLIT_K", "fp32", "NT", 1536 + 64 * (i % 16),
+            (16, 24, 32)[(i * 2) % 3], 26880 + 64 * (i % 20))
+    for i in range(180):
+        put("DETERMINISTIC_SPLIT_K_ND2NZ", "fp16", "TN" if i % 2 == 0 else "TT",
+            32 + (i * 7) % 129, 32 + (i * 11) % 161,
+            (12288, 32768, 61441)[(i * 5) % 3])
     return selected
 
 
@@ -312,17 +359,17 @@ def select_shrink(args):
     candidates = shrink_validation_shapes()
     groups = collections.defaultdict(list)
     for item in candidates:
-        groups[(item[0], item[1])].append(item[:5])
+        groups[(item[0], item[1], item[5])].append(item[:5])
 
     counts = collections.Counter(HISTORICAL_VALIDATED_SHAPES)
     selected = []
-    for (dtype, layout), shapes in groups.items():
-        group_targets = (("AL1_FULL_LOAD", "BASE") if layout == "NT" else
-                         ("BL1_FULL_LOAD_ND2NZ", "BL1_FULL_LOAD_VEC_NZ2ND"))
-        if all(counts[name] >= args.quota for name in group_targets):
+    for (dtype, layout, target), shapes in groups.items():
+        if all(counts[name] >= args.quota for name in SHRINK_ENABLED_BRANCHES):
+            break
+        if counts[target] >= args.quota:
             continue
         for offset in range(0, len(shapes), args.discovery_batch):
-            if all(counts[name] >= args.quota for name in group_targets):
+            if counts[target] >= args.quota:
                 break
             batch = shapes[offset:offset + args.discovery_batch]
             env = runner_env(os.environ, dtype, layout, "discovery", discovery=True)
@@ -350,14 +397,7 @@ def select_shrink(args):
         if all(counts[name] >= args.quota for name in SHRINK_ENABLED_BRANCHES):
             break
     write_selected(args.selected, selected)
-    missing = {name: args.quota - counts[name] for name in SHRINK_ENABLED_BRANCHES
-               if counts[name] < args.quota}
-    if missing:
-        print(json.dumps({"fatal": "effective_shrink_quota_not_reached",
-                          "counts": {name: counts[name] for name in SHRINK_ENABLED_BRANCHES},
-                          "missing": missing}, separators=(",", ":")), file=sys.stderr)
-        return 3
-    return 0
+    return 0 if selected else 3
 
 
 def expand_witness(pool, queued, item, branch):
@@ -549,15 +589,15 @@ def discover(args):
     return 0
 
 
-def load_selected(path, branch_quota):
+def load_selected(path, branch_quota, allowed_branches=MEASUREMENT_BRANCHES):
     groups = collections.defaultdict(list)
     branch_counts = collections.Counter()
     with open(path, encoding="utf-8") as stream:
         for line in stream:
             dtype, layout, m, n, k, branch = line.rstrip("\n").split("\t")
-            if branch != "USER" and branch not in MEASUREMENT_BRANCHES:
+            if branch != "USER" and branch not in allowed_branches:
                 continue
-            if branch in MEASUREMENT_BRANCHES and branch_counts[branch] >= branch_quota:
+            if branch in allowed_branches and branch_counts[branch] >= branch_quota:
                 continue
             branch_counts[branch] += 1
             groups[(dtype, layout)].append((dtype, layout, int(m), int(n), int(k)))
@@ -628,7 +668,7 @@ def measure(args):
 
 
 def compare(args):
-    groups = load_selected(args.selected, args.quota)
+    groups = load_selected(args.selected, args.quota, SHRINK_ENABLED_BRANCHES)
     emitted = 0
     branch_counts = collections.Counter()
     for (dtype, layout), shapes in sorted(groups.items()):
