@@ -14,6 +14,11 @@
  */
 
 #include <cinttypes>
+//NEW BEGIN: core-shrink comparison support
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+//NEW END: core-shrink comparison support
 #include "matmul_v3_base_tiling.h"
 #include "../../op_kernel/mat_mul_v3_tiling_key.h"
 
@@ -2668,6 +2673,335 @@ bool MatmulV3BaseTiling::CheckMMTilingDataIsVaild()
         CheckNumberIsValid(runInfo_.l2Info.nTileBlock, args_.opName, "runInfo_.l2Info.nTileBlock"));
 }
 
+//NEW BEGIN: core-shrink formulas preserved from 88fb714
+bool MatmulV3BaseTiling::ShrinkIdleCores()
+{
+    auto &matmul = tilingData_.matmulTiling;
+    const auto &l2 = tilingData_.tileL2cacheTiling;
+    const auto &run = tilingData_.matmulRunInfo;
+    const uint64_t oldUsedCoreNum = static_cast<uint64_t>(matmul.usedCoreNum);
+    const uint64_t singleCoreM = static_cast<uint64_t>(matmul.singleCoreM);
+    const uint64_t singleCoreN = static_cast<uint64_t>(matmul.singleCoreN);
+    if (oldUsedCoreNum == 0 || singleCoreM == 0 || singleCoreN == 0 || matmul.M <= 0 || matmul.N <= 0) {
+        return false;
+    }
+
+    const uint64_t m = static_cast<uint64_t>(matmul.M);
+    const uint64_t n = static_cast<uint64_t>(matmul.N);
+
+    // Fresh result26 validation showed that preserving the K-wave count
+    // is not sufficient: plain deterministic Split-K lost on 32/37 shapes,
+    // and A-head ND2NZ lost on all 50 shapes across FP32/FP16/BF16.  The
+    // reduction/ND2NZ critical path needs all official producers, so the
+    // deterministic family now deliberately retains the official core count.
+    if (tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::DETERMINISTIC_SPLIT_K) {
+        return false;
+    }
+
+    // The remaining Split-K routes keep the official core count.  The
+    // measured single-core routes select 20, while the other ownership-
+    // changing packets do not yet have a safe closed-form reduction rule.
+    if (tilingEnable_.tilingEnableSplitCore != TilingEnableSplitCore::BASE) {
+        return false;
+    }
+
+    const uint64_t mTotal = ops::CeilDiv(static_cast<uint64_t>(matmul.M), singleCoreM);
+    const uint64_t nTotal = ops::CeilDiv(static_cast<uint64_t>(matmul.N), singleCoreN);
+
+    // AL1_FULL_LOAD copies the whole A operand before block ownership is
+    // checked.  A block beyond this single L2 window's N-tile count therefore
+    // performs only a redundant A1 startup and owns no output tile.
+    if (tilingEnable_.tilingEnableFullLoad == TilingEnableFullLoad::AL1_FULL_LOAD) {
+        if (tilingEnable_.tilingEnableFixOpti != TilingEnableFixOpti::BASE ||
+            tilingEnable_.tilingEnableSpecialOpti != TilingEnableSpecialOpti::BASE ||
+            GetMixNd2nzType() != MixNd2NzType::NO_ND2NZ ||
+            singleCoreM != m || singleCoreN != BASIC_ALIGN_16 ||
+            l2.mTileCntL2 != 1 || l2.nTileCntL2 != 1 || l2.mTileBlock != 1 ||
+            static_cast<uint64_t>(l2.nTileBlock) != nTotal) {
+            return false;
+        }
+        const uint64_t windowTasks =
+            std::min(mTotal, static_cast<uint64_t>(l2.mTileBlock)) *
+            std::min(nTotal, static_cast<uint64_t>(l2.nTileBlock));
+        const uint64_t newUsedCoreNum = std::min(oldUsedCoreNum, windowTasks);
+        if (newUsedCoreNum == 0 || newUsedCoreNum >= oldUsedCoreNum) {
+            return false;
+        }
+        matmul.usedCoreNum = static_cast<uint32_t>(newUsedCoreNum);
+        return true;
+    }
+
+    if (tilingEnable_.tilingEnableFullLoad == TilingEnableFullLoad::BL1_FULL_LOAD) {
+        // Fixpipe duplicates a resident B1/Fixpipe producer per active
+        // AIC.  Permit one extra M-body wave only in the bounded domains where
+        // that producer reduction dominates; otherwise retain the official
+        // count.  The count is derived from body tasks, not from a lookup.
+        if (tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE_ENABLE_ALIGNOUT) {
+            // Plain Fixpipe lost on 10/12 fresh result26 shapes.  Keep
+            // the official count there; the independently validated A-head
+            // ND2NZ Fixpipe packet remains eligible below.
+            if (GetMixNd2nzType() == MixNd2NzType::NO_ND2NZ &&
+                run.nd2nzA == 0 && run.nd2nzB == 0) {
+                return false;
+            }
+            const uint64_t totalTiles = mTotal * nTotal;
+            const uint64_t k = static_cast<uint64_t>(matmul.singleCoreK);
+            const bool commonFixpipePacket =
+                tilingEnable_.tilingEnableSpecialOpti == TilingEnableSpecialOpti::BASE &&
+                oldUsedCoreNum == compileInfo_.aicNum && oldUsedCoreNum == 20UL &&
+                args_.aType == ge::DT_FLOAT && args_.bType == ge::DT_FLOAT &&
+                args_.cType == ge::DT_FLOAT && args_.isHf32 && run.isHf32 != 0 && !args_.hasBias &&
+                args_.aFormat == ge::FORMAT_ND && args_.bFormat == ge::FORMAT_ND &&
+                args_.outFormat == ge::FORMAT_ND && !args_.isNzA && !args_.isNzB &&
+                singleCoreM == static_cast<uint64_t>(matmul.baseM) &&
+                singleCoreN == static_cast<uint64_t>(matmul.baseN) && nTotal == 1UL &&
+                k == static_cast<uint64_t>(matmul.Ka) && k == static_cast<uint64_t>(matmul.Kb) &&
+                matmul.stepM == 1 && matmul.stepN == 1 &&
+                matmul.stepKa == matmul.stepKb && matmul.stepKa == matmul.depthA1 &&
+                matmul.depthA1 == matmul.depthB1 && totalTiles > 0 &&
+                l2.mTileCntL2 == 1 && l2.nTileCntL2 == 1 &&
+                l2.mTileBlock == 0 && l2.nTileBlock == 0;
+            if (!commonFixpipePacket) {
+                return false;
+            }
+            const uint64_t officialBodyWaves = ops::CeilDiv(totalTiles, oldUsedCoreNum);
+            bool allowOneExtraWave = false;
+            if (GetMixNd2nzType() == MixNd2NzType::NO_ND2NZ &&
+                run.nd2nzA == 0 && run.nd2nzB == 0) {
+                allowOneExtraWave =
+                    (run.transA != 0 && run.transB == 0) ||
+                    (run.transA == 0 && run.transB == 0 && officialBodyWaves == 7UL);
+            } else if (GetMixNd2nzType() == MixNd2NzType::V_HEAD_ND2NZ &&
+                run.nd2nzA != 0 && run.nd2nzB == 0 &&
+                run.transA == 0 && run.transB == 0 && n <= 32UL && k <= 128UL) {
+                allowOneExtraWave = true;
+            }
+            if (!allowOneExtraWave || officialBodyWaves == 0) {
+                return false;
+            }
+            uint64_t newUsedCoreNum = ops::CeilDiv(totalTiles, officialBodyWaves + 1UL);
+            newUsedCoreNum = std::max(oldUsedCoreNum / NUMBER_TWO,
+                                      std::min(oldUsedCoreNum, newUsedCoreNum));
+            if (newUsedCoreNum >= oldUsedCoreNum) {
+                return false;
+            }
+            matmul.usedCoreNum = static_cast<uint32_t>(newUsedCoreNum);
+            return true;
+        }
+
+        // BL1_FULL_LOAD_VEC_NZ2ND balances duplicated private-B1 fills
+        // against the coupled 1-AIC:2-AIV output pipeline.  Every condition
+        // outside the source-derived packet domain falls back to official.
+        if (tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::VEC_NZ2ND_UNALIGNOUT) {
+            const uint64_t k = static_cast<uint64_t>(matmul.singleCoreK);
+            const uint64_t baseM = static_cast<uint64_t>(matmul.baseM);
+            const uint64_t baseN = static_cast<uint64_t>(matmul.baseN);
+            const uint64_t baseK = static_cast<uint64_t>(matmul.baseK);
+            const uint64_t depthB1 = static_cast<uint64_t>(matmul.depthB1);
+            const uint64_t c0 = BLOCK_BYTE_SIZE / DATA_SIZE_FP32;
+            const uint64_t alignedN = ops::CeilAlign(n, N_ALIGNED);
+            const bool strictPacket =
+                tilingEnable_.tilingEnableSpecialOpti == TilingEnableSpecialOpti::BASE &&
+                GetMixNd2nzType() == MixNd2NzType::NO_ND2NZ &&
+                oldUsedCoreNum == compileInfo_.aicNum && oldUsedCoreNum == 20UL &&
+                args_.aType == ge::DT_FLOAT && args_.bType == ge::DT_FLOAT &&
+                args_.cType == ge::DT_FLOAT && args_.isHf32 && !args_.hasBias &&
+                !args_.isATrans && !args_.isBTrans &&
+                args_.aFormat == ge::FORMAT_ND && args_.bFormat == ge::FORMAT_ND &&
+                args_.outFormat == ge::FORMAT_ND && !args_.nd2nzA && !args_.nd2nzB &&
+                !args_.isNzA && !args_.isNzB &&
+                singleCoreM == baseM && baseM == SMALL_SHAPE_LOWER_THRES &&
+                singleCoreN == baseN && baseN == alignedN && nTotal == 1UL &&
+                k == static_cast<uint64_t>(matmul.Ka) && k == static_cast<uint64_t>(matmul.Kb) &&
+                c0 > 0 && k % c0 == 0UL && n <= 192UL && baseK > 0UL && depthB1 > 0UL &&
+                static_cast<uint64_t>(matmul.depthA1) == depthB1 &&
+                static_cast<uint64_t>(matmul.stepKa) == static_cast<uint64_t>(matmul.depthA1) &&
+                static_cast<uint64_t>(matmul.stepKb) == depthB1 &&
+                matmul.dbL0A == DB_SIZE && matmul.dbL0B == DB_SIZE && matmul.dbL0C == 1 &&
+                run.transA == 0 && run.transB == 0 && run.nd2nzA == 0 && run.nd2nzB == 0 &&
+                run.isHf32 != 0 && l2.mTileCntL2 == 1 && l2.nTileCntL2 == 1 &&
+                l2.mTileBlock == 0 && l2.nTileBlock == 0;
+            if (!strictPacket) {
+                return false;
+            }
+
+            const uint64_t aBytes = m * k * DATA_SIZE_FP32;
+            const uint64_t bBytes = k * n * DATA_SIZE_FP32;
+            const uint64_t cBytes = m * n * DATA_SIZE_FP32;
+            const uint64_t vecWorkspaceBytes =
+                oldUsedCoreNum * NUMBER_TWO * baseM * alignedN * DATA_SIZE_FP32;
+            const uint64_t l2FootprintBytes = aBytes + bBytes + cBytes + vecWorkspaceBytes;
+            if (compileInfo_.l2Size == 0UL || l2FootprintBytes > compileInfo_.l2Size) {
+                return false;
+            }
+
+            const uint64_t shortKLimit = BASIC_ALIGN_256 / DATA_SIZE_FP32;
+            const uint64_t smallNLimit = BASIC_BLOCK_K_128_BYTE / DATA_SIZE_FP32;
+            if (baseN == baseM || depthB1 > NUMBER_TWO ||
+                (k > shortKLimit && (k % baseK) != 0UL && baseN > smallNLimit) ||
+                (k >= NUMBER_TWO * baseK && baseN + N_ALIGNED >= baseM)) {
+                return false;
+            }
+
+            const uint64_t totalTiles = mTotal * nTotal;
+            const uint64_t halfCore = ops::CeilDiv(oldUsedCoreNum, NUMBER_TWO);
+            uint64_t minCore = halfCore;
+            uint64_t balanceCore = halfCore;
+            if (m >= oldUsedCoreNum * (MIN_TAIL + baseM)) {
+                const uint64_t vecEquivalentK = NUMBER_TWO * c0;
+                balanceCore = ops::CeilDiv(oldUsedCoreNum * k, k + vecEquivalentK);
+                balanceCore = std::max(halfCore, std::min(oldUsedCoreNum, balanceCore));
+                if (k <= shortKLimit && baseN > baseM) {
+                    const uint64_t core90 = ops::CeilDiv(oldUsedCoreNum * 9UL, 10UL);
+                    minCore = std::max(minCore, core90);
+                    balanceCore = std::max(balanceCore, minCore);
+                }
+            }
+            const uint64_t waves = ops::CeilDiv(totalTiles, balanceCore);
+            uint64_t newUsedCoreNum = ops::CeilDiv(totalTiles, waves);
+            newUsedCoreNum = std::max(minCore, std::min(oldUsedCoreNum, newUsedCoreNum));
+            if (newUsedCoreNum >= oldUsedCoreNum) {
+                return false;
+            }
+            matmul.usedCoreNum = static_cast<uint32_t>(newUsedCoreNum);
+            return true;
+        }
+
+        // BL1_FULL_LOAD_ND2NZ has a serialized A-head conversion followed
+        // by a one-dimensional M-tile body. Shrink only inside the official
+        // head/body wave plateaus: neither the busiest AIV nor the busiest AIC
+        // may receive one more non-empty work item after shrinking.
+        const bool isBl1FullLoadNd2Nz =
+            tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE &&
+            tilingEnable_.tilingEnableSpecialOpti == TilingEnableSpecialOpti::BASE &&
+            GetMixNd2nzType() == MixNd2NzType::V_HEAD_ND2NZ;
+        if (!isBl1FullLoadNd2Nz) {
+            return false;
+        }
+
+        constexpr uint64_t fp32Bytes = sizeof(float);
+        constexpr uint64_t vnchwRepeatMax = 255UL;
+        constexpr uint64_t vnchwAlignedH = 16UL;
+        const uint64_t fp32C0 = BLOCK_BYTE_SIZE / fp32Bytes;
+        const uint64_t k = static_cast<uint64_t>(matmul.Ka);
+        const uint64_t totalTiles = mTotal * nTotal;
+        if (oldUsedCoreNum != compileInfo_.aicNum || totalTiles == 0 ||
+            args_.aType != ge::DT_FLOAT || args_.bType != ge::DT_FLOAT || args_.cType != ge::DT_FLOAT ||
+            aDtypeSize_ != fp32Bytes || bDtypeSize_ != fp32Bytes || cDtypeSize_ != fp32Bytes ||
+            !args_.isHf32 || args_.hasBias || args_.isATrans || args_.isBTrans ||
+            args_.aFormat != ge::FORMAT_ND || args_.bFormat != ge::FORMAT_ND ||
+            args_.outFormat != ge::FORMAT_ND || !args_.nd2nzA || args_.nd2nzB ||
+            args_.isNzA || args_.isNzB || args_.unAlignProcessType != 1 ||
+            !compileInfo_.supportL0c2out || compileInfo_.ubSize < UB_SIZE ||
+            static_cast<uint64_t>(matmul.Kb) != k || static_cast<uint64_t>(matmul.singleCoreK) != k ||
+            singleCoreN != n || nTotal != 1 || l2.mTileCntL2 != 1 || l2.nTileCntL2 != 1 ||
+            l2.mTileBlock != mTotal || l2.nTileBlock != 1 || l2.calOrder != 1 ||
+            matmul.stepM != 1 || singleCoreM != NUMBER_TWO * static_cast<uint64_t>(matmul.baseM) ||
+            matmul.stepKa == 0 || matmul.stepKa != matmul.stepKb ||
+            static_cast<uint64_t>(matmul.depthA1) != NUMBER_TWO * static_cast<uint64_t>(matmul.stepKa) ||
+            static_cast<uint64_t>(matmul.depthB1) !=
+                static_cast<uint64_t>(matmul.stepN) * static_cast<uint64_t>(matmul.stepKb) ||
+            fp32C0 == 0 || (k % fp32C0) == 0) {
+            return false;
+        }
+
+        // MatmulBaseBlock uses ceil(totalTiles/core) body rounds.  At
+        // least three body waves amortize the duplicated resident-B1 startup;
+        // above that point the official wave count is preserved.
+        const uint64_t officialBodyWaves = ops::CeilDiv(totalTiles, oldUsedCoreNum);
+        if (officialBodyWaves == 0) {
+            return false;
+        }
+        const uint64_t bodyWaves = std::max<uint64_t>(3UL, officialBodyWaves);
+        const uint64_t cBody = ops::CeilDiv(totalTiles, bodyWaves);
+
+        const uint64_t wTail = k % fp32C0;
+        uint64_t gcdA = vnchwAlignedH;
+        uint64_t gcdB = wTail;
+        while (gcdB != 0) {
+            const uint64_t remainder = gcdA % gcdB;
+            gcdA = gcdB;
+            gcdB = remainder;
+        }
+        if (gcdA == 0) {
+            return false;
+        }
+        const uint64_t mBlockNumEle = vnchwAlignedH / gcdA;
+        const uint64_t hBlockNumEle = std::max<uint64_t>(1, mBlockNumEle * NUMBER_TWO / fp32Bytes);
+        const uint64_t alignedKForVnchw = ops::CeilAlign(k, fp32C0);
+        uint64_t ubTotalWidth = k + NUMBER_TWO * alignedKForVnchw;
+        if (k <= fp32C0) {
+            ubTotalWidth += k;
+        }
+        if (ubTotalWidth == 0 || hBlockNumEle > vnchwRepeatMax) {
+            return false;
+        }
+        const uint64_t hMax = UB_SIZE / fp32Bytes / ubTotalWidth;
+        const uint64_t hEle = hBlockNumEle * vnchwAlignedH;
+        if (hEle == 0) {
+            return false;
+        }
+        uint64_t eleNum = std::min(ops::CeilDiv(m, hEle), hMax / hEle);
+        eleNum = std::min(eleNum, vnchwRepeatMax / hBlockNumEle);
+        if (eleNum == 0) {
+            return false;
+        }
+        const uint64_t hBuffer = eleNum * hEle;
+        const uint64_t headLoops = ops::CeilDiv(m, hBuffer);
+        const uint64_t oldHeadWaves = ops::CeilDiv(headLoops, NUMBER_TWO * oldUsedCoreNum);
+        if (oldHeadWaves == 0 || oldHeadWaves > UINT64_MAX / NUMBER_TWO) {
+            return false;
+        }
+        // Each AIC owns two AIVs.  Keep at least two complete head waves
+        // so fewer AICs can amortize the serialized VNCHW startup; once the
+        // official packet already needs two waves, do not add another.
+        const uint64_t headWaves = std::max<uint64_t>(2UL, oldHeadWaves);
+        const uint64_t cHead = ops::CeilDiv(headLoops, NUMBER_TWO * headWaves);
+        uint64_t newUsedCoreNum = std::max(cBody, cHead);
+        newUsedCoreNum = std::max<uint64_t>(1, std::min(newUsedCoreNum, oldUsedCoreNum));
+        // Fresh validation supports the 16/17-core plateaus.  The
+        // 18/19-core plateaus were weak and included a severe 18-core
+        // regression, so they retain the official count.
+        if (newUsedCoreNum >= oldUsedCoreNum || newUsedCoreNum > 17UL) {
+            return false;
+        }
+        matmul.usedCoreNum = static_cast<uint32_t>(newUsedCoreNum);
+        return true;
+    }
+
+    // BASE_ND2NZ, CVP parallel, K-shift, and other special routes retain
+    // the official core count because their conversion/L2 packets were built
+    // for that count and are not recomputed by this post-tiling hook.
+    const bool pureBaseNoNd2Nz =
+        tilingEnable_.tilingEnableFullLoad == TilingEnableFullLoad::BASE &&
+        tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE &&
+        tilingEnable_.tilingEnableSpecialOpti == TilingEnableSpecialOpti::BASE &&
+        GetMixNd2nzType() == MixNd2NzType::NO_ND2NZ && run.nd2nzA == 0 && run.nd2nzB == 0;
+    if (!pureBaseNoNd2Nz || compileInfo_.aicNum != 20UL || oldUsedCoreNum != 20UL ||
+        l2.mTileCntL2 != 1 || l2.nTileCntL2 != 1) {
+        return false;
+    }
+
+    uint64_t mWindowTasks = mTotal;
+    uint64_t nWindowTasks = nTotal;
+    if (l2.mTileBlock > 0 && l2.nTileBlock > 0) {
+        mWindowTasks = std::min(mTotal, static_cast<uint64_t>(l2.mTileBlock));
+        nWindowTasks = std::min(nTotal, static_cast<uint64_t>(l2.nTileBlock));
+    }
+    const uint64_t windowTasks = mWindowTasks * nWindowTasks;
+    constexpr uint64_t maxConflictDim20Aic = 5UL;
+    const uint64_t minLaunchCores = oldUsedCoreNum / maxConflictDim20Aic;
+    const uint64_t newUsedCoreNum =
+        std::min(oldUsedCoreNum, std::max(windowTasks, minLaunchCores));
+    if (newUsedCoreNum >= oldUsedCoreNum) {
+        return false;
+    }
+    matmul.usedCoreNum = static_cast<uint32_t>(newUsedCoreNum);
+    return true;
+}
+//NEW END: core-shrink formulas preserved from 88fb714
+
+
 ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
 {
     SetRunInfo();
@@ -2705,6 +3039,20 @@ ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
     DoTilingKey();
     L2Cache l2Cache(args_, tilingData_);
     l2Cache.SetL2CacheFlag(tilingEnable_, compileInfo_.l2Size, l2CacheFlag_);
+
+    //NEW BEGIN: one switch, one shrink call, and two values for the comparison runner
+    const char *shrink = std::getenv("MATMUL_V3_SHRINK_IDLE_CORES");
+    if (shrink != nullptr && shrink[0] == '1' && shrink[1] == '\0') {
+        (void)ShrinkIdleCores();
+    }
+    char tilingText[32] = {};
+    char coreText[16] = {};
+    (void)snprintf(tilingText, sizeof(tilingText), "0x%" PRIx64, tilingKey_);
+    (void)snprintf(coreText, sizeof(coreText), "%u",
+                   static_cast<uint32_t>(tilingData_.matmulTiling.usedCoreNum));
+    (void)::setenv("MATMUL_V3_COMPARE_TILING", tilingText, 1);
+    (void)::setenv("MATMUL_V3_COMPARE_CORE", coreText, 1);
+    //NEW END: one switch, one shrink call, and two values for the comparison runner
     return ge::GRAPH_SUCCESS;
 }
 

@@ -10,8 +10,11 @@
 
 #include <iostream>
 #include <memory>
+#include <cstdlib>
+#include <string>
 #include <vector>
 #include "acl/acl.h"
+#include "aclnn/acl_meta.h"
 #include "aclnnop/aclnn_matmul.h"
 
 #define CHECK_RET(cond, return_expr) \
@@ -68,6 +71,90 @@ int CreateAclTensor(const std::vector<T>& hostData, const std::vector<int64_t>& 
   return 0;
 }
 
+//NEW BEGIN: minimal original-versus-shrink measurement
+struct Measurement {
+  std::string tiling;
+  uint32_t core = 0;
+  float latency = 0.0F;
+};
+
+int Measure(const aclTensor* self, const aclTensor* mat2, aclTensor* out,
+            aclrtStream stream, bool shrink, Measurement* measurement) {
+  constexpr int kWarmup = 1;
+  constexpr int kRepeat = 10;
+  (void)::setenv("MATMUL_V3_SHRINK_IDLE_CORES", shrink ? "1" : "0", 1);
+  (void)::unsetenv("MATMUL_V3_COMPARE_TILING");
+  (void)::unsetenv("MATMUL_V3_COMPARE_CORE");
+
+  uint64_t workspaceSize = 0;
+  aclOpExecutor* executor = nullptr;
+  auto ret = aclnnMatmulGetWorkspaceSize(self, mat2, out, 1, &workspaceSize, &executor);
+  CHECK_RET(ret == ACL_SUCCESS,
+            LOG_PRINT("aclnnMatmulGetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
+  std::unique_ptr<aclOpExecutor, aclnnStatus (*)(aclOpExecutor*)> executorPtr(
+      executor, aclDestroyAclOpExecutor);
+
+  const char* tiling = std::getenv("MATMUL_V3_COMPARE_TILING");
+  const char* core = std::getenv("MATMUL_V3_COMPARE_CORE");
+  CHECK_RET(tiling != nullptr && core != nullptr,
+            LOG_PRINT("MatMulV3 comparison metadata is missing\n"); return 1);
+  measurement->tiling = tiling;
+  measurement->core = static_cast<uint32_t>(std::strtoul(core, nullptr, 10));
+
+  ret = aclSetAclOpExecutorRepeatable(executor);
+  CHECK_RET(ret == ACL_SUCCESS,
+            LOG_PRINT("aclSetAclOpExecutorRepeatable failed. ERROR: %d\n", ret); return ret);
+
+  void* workspace = nullptr;
+  std::unique_ptr<void, aclError (*)(void*)> workspacePtr(nullptr, aclrtFree);
+  if (workspaceSize > 0) {
+    ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+    CHECK_RET(ret == ACL_SUCCESS,
+              LOG_PRINT("aclrtMalloc failed. ERROR: %d\n", ret); return ret);
+    workspacePtr.reset(workspace);
+  }
+
+  for (int i = 0; i < kWarmup; ++i) {
+    ret = aclnnMatmul(workspace, workspaceSize, executor, stream);
+    CHECK_RET(ret == ACL_SUCCESS,
+              LOG_PRINT("aclnnMatmul warmup failed. ERROR: %d\n", ret); return ret);
+  }
+  ret = aclrtSynchronizeStream(stream);
+  CHECK_RET(ret == ACL_SUCCESS,
+            LOG_PRINT("aclrtSynchronizeStream failed. ERROR: %d\n", ret); return ret);
+
+  aclrtEvent start = nullptr;
+  aclrtEvent end = nullptr;
+  ret = aclrtCreateEvent(&start);
+  CHECK_RET(ret == ACL_SUCCESS,
+            LOG_PRINT("aclrtCreateEvent failed. ERROR: %d\n", ret); return ret);
+  ret = aclrtCreateEvent(&end);
+  CHECK_RET(ret == ACL_SUCCESS,
+            LOG_PRINT("aclrtCreateEvent failed. ERROR: %d\n", ret); return ret);
+  ret = aclrtRecordEvent(start, stream);
+  CHECK_RET(ret == ACL_SUCCESS,
+            LOG_PRINT("aclrtRecordEvent failed. ERROR: %d\n", ret); return ret);
+  for (int i = 0; i < kRepeat; ++i) {
+    ret = aclnnMatmul(workspace, workspaceSize, executor, stream);
+    CHECK_RET(ret == ACL_SUCCESS,
+              LOG_PRINT("aclnnMatmul failed. ERROR: %d\n", ret); return ret);
+  }
+  ret = aclrtRecordEvent(end, stream);
+  CHECK_RET(ret == ACL_SUCCESS,
+            LOG_PRINT("aclrtRecordEvent failed. ERROR: %d\n", ret); return ret);
+  ret = aclrtSynchronizeEvent(end);
+  CHECK_RET(ret == ACL_SUCCESS,
+            LOG_PRINT("aclrtSynchronizeEvent failed. ERROR: %d\n", ret); return ret);
+  float total = 0.0F;
+  ret = aclrtEventElapsedTime(&total, start, end);
+  CHECK_RET(ret == ACL_SUCCESS,
+            LOG_PRINT("aclrtEventElapsedTime failed. ERROR: %d\n", ret); return ret);
+  (void)aclrtDestroyEvent(end);
+  (void)aclrtDestroyEvent(start);
+  measurement->latency = total / static_cast<float>(kRepeat);
+  return ACL_SUCCESS;
+}
+
 int main() {
   // 1. （固定写法）device/stream初始化，参考acl API手册
   // 根据自己的实际device填写deviceId
@@ -105,28 +192,14 @@ int main() {
   std::unique_ptr<void, aclError (*)(void*)> outdeviceAddrPtr(outDeviceAddr, aclrtFree);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
 
-  // 3. 调用CANN算子库API，需要修改为具体的Api名称
-  int8_t cubeMathType = 1;
-  uint64_t workspaceSize = 0;
-  aclOpExecutor* executor = nullptr;
-  std::unique_ptr<void, aclError (*)(void*)> executorAddrPtr(nullptr, aclrtFree);
-  // 调用aclnnMatmul第一段接口
-  ret = aclnnMatmulGetWorkspaceSize(self, mat2, out, cubeMathType, &workspaceSize, &executor);
-  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMatmulGetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
-  // 根据第一段接口计算出的workspaceSize申请device内存
-  void* workspaceAddr = nullptr;
-  if (workspaceSize > 0) {
-    ret = aclrtMalloc(&workspaceAddr, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
-    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("allocate workspace failed. ERROR: %d\n", ret); return ret);
-    executorAddrPtr.reset(workspaceAddr);
-  }
-  // 调用aclnnMatmul第二段接口
-  ret = aclnnMatmul(workspaceAddr, workspaceSize, executor, stream);
-  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMatmul failed. ERROR: %d\n", ret); return ret);
-
-  // 4. （固定写法）同步等待任务执行结束
-  ret = aclrtSynchronizeStream(stream);
-  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSynchronizeStream failed. ERROR: %d\n", ret); return ret);
+  Measurement original;
+  Measurement shrinked;
+  ret = Measure(self, mat2, out, stream, false, &original);
+  CHECK_RET(ret == ACL_SUCCESS, return ret);
+  ret = Measure(self, mat2, out, stream, true, &shrinked);
+  CHECK_RET(ret == ACL_SUCCESS, return ret);
+  CHECK_RET(original.tiling == shrinked.tiling,
+            LOG_PRINT("original and shrinked tiling keys differ\n"); return 1);
 
   // 5. 获取输出的值，将device侧内存上的结果拷贝至host侧，需要根据具体API的接口定义修改
   auto size = GetShapeSize(outShape);
@@ -134,9 +207,10 @@ int main() {
   ret = aclrtMemcpy(resultData.data(), resultData.size() * sizeof(resultData[0]), outDeviceAddr,
                     size * sizeof(resultData[0]), ACL_MEMCPY_DEVICE_TO_HOST);
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("copy result from device to host failed. ERROR: %d\n", ret); return ret);
-  for (int64_t i = 0; i < size; i++) {
-    LOG_PRINT("result[%ld] is: %f\n", i, resultData[i]);
-  }
+  LOG_PRINT("{\"tiling\":\"%s\",\"shrinked_core\":%u,\"shrinked_latency\":%.9f,"
+            "\"original_core\":%u,\"original_latency\":%.9f}\n",
+            original.tiling.c_str(), shrinked.core, shrinked.latency,
+            original.core, original.latency);
 
   // 6. 释放device资源，需要根据具体API的接口定义修改
   aclrtDestroyStream(stream);
@@ -144,3 +218,4 @@ int main() {
   aclFinalize();
   return 0;
 }
+//NEW END: minimal original-versus-shrink measurement
