@@ -73,6 +73,31 @@ SHRINK_ENABLED_BRANCHES = (
     "DETERMINISTIC_SPLIT_K_ND2NZ",
 )
 
+# Official source restrictions, not measurement shortcuts.  AL1 and the
+# VNCHW/Fixpipe-ND2NZ/Vector BL1 packets are FP32-only in the installed
+# implementation.  Every other shrink-enabled route is validated for all
+# three API dtypes.
+SHRINK_BRANCH_DTYPES = {
+    "BASE": ("fp32", "fp16", "bf16"),
+    "AL1_FULL_LOAD": ("fp32",),
+    "BL1_FULL_LOAD_ND2NZ": ("fp32",),
+    "BL1_FULL_LOAD_FIXPIPE": ("fp32", "fp16", "bf16"),
+    "BL1_FULL_LOAD_FIXPIPE_ND2NZ": ("fp32",),
+    "BL1_FULL_LOAD_VEC_NZ2ND": ("fp32",),
+    "DETERMINISTIC_SPLIT_K": ("fp32", "fp16", "bf16"),
+    "DETERMINISTIC_SPLIT_K_ND2NZ": ("fp32", "fp16", "bf16"),
+}
+
+SHRINK_CORE_VALIDATION_SUCCESS = 50
+SHRINK_CORE_VALIDATION_RESERVE = 75
+
+
+def balanced_dtype_targets(branch, total):
+    dtypes = SHRINK_BRANCH_DTYPES[branch]
+    base, remainder = divmod(total, len(dtypes))
+    return {dtype: base + (1 if index < remainder else 0)
+            for index, dtype in enumerate(dtypes)}
+
 REMAINING_CORE_SWEEP_BRANCHES = tuple(
     branch for branch in TARGET_BRANCHES if branch not in SHRINK_ENABLED_BRANCHES
 )
@@ -376,6 +401,19 @@ def shrink_core_validation_shapes():
                 if k not in retired_base_k:
                     put("BASE", "fp32", "NT", m, n, k)
 
+    # BASE itself is not FP32-only.  The two TT grids below target the
+    # independently observed FP16 and BF16 L2 packets with fewer than twenty
+    # tasks in the active window.  Discovery still verifies the branch and
+    # that the production rule really changes usedCoreNum.
+    half_base_k = (14592, 15232, 16000, 16768, 17536, 18432, 19328, 20224)
+    for i in range(720):
+        put("BASE", "fp16", "TT", 2304 + 128 * (i % 49),
+            (7, 9, 11, 13, 17, 19, 23, 25, 29, 31)[(i * 3 + i // 17) % 10],
+            half_base_k[(i * 5 + i // 29) % len(half_base_k)])
+        put("BASE", "bf16", "TT", 17 + 8 * (i % 18),
+            (768, 1024, 1280, 1536, 1792, 2048, 2304, 2560)[(i * 5 + i // 19) % 8],
+            half_base_k[(i * 7 + i // 31) % len(half_base_k)])
+
     # BL1 head-ND2NZ: new M progressions preserve the source predicate while
     # making every exact shape distinct from the earlier campaign.
     bl1_n = (32, 64, 96, 128, 192, 256, 384)
@@ -406,6 +444,16 @@ def shrink_core_validation_shapes():
             (17, 19, 23, 25, 31)[(i * 3) % 5],
             (65, 80, 96, 112, 127)[(i * 2) % 5])
 
+    # NeedSolveFixBound explicitly supports two-byte FP16/BF16 inputs.  Their
+    # non-transposed packet disables head conversion, so target the legal
+    # seven-body-wave case rather than the FP32-only transposed-A shortcut.
+    for i in range(900):
+        m = 57344 + 128 * i + i % 23
+        n = (47, 51, 63, 73, 80, 89, 95, 111, 112, 119)[(i * 3 + i // 31) % 10]
+        k = (64, 80, 96, 112, 127, 128, 160, 192, 224, 256)[(i * 7 + i // 37) % 10]
+        put("BL1_FULL_LOAD_FIXPIPE", "fp16", "NN", m, n, k)
+        put("BL1_FULL_LOAD_FIXPIPE", "bf16", "NN", m + 37, n, k)
+
     # Deterministic Split-K covers both half dtypes plus the two fp32 packet
     # equations, all outside result24's exact K grid.
     for i in range(360):
@@ -420,15 +468,20 @@ def shrink_core_validation_shapes():
         put("DETERMINISTIC_SPLIT_K", "fp32", "NT", 1568 + 64 * (i % 18),
             (16, 24, 32)[(i * 2) % 3], 28352 + 64 * (i % 24))
 
-    # The production shrink rule deliberately accepts FP16 only in the
-    # A-head ND2NZ deterministic packet.  Do not request impossible BF16
-    # reserves during host discovery.  TN and TT jointly provide all 45
-    # reserves required before NPU measurement starts.
-    for m in range(17, 128, 3):
-        for n in (96, 112, 128, 144, 160):
-            for k in (12416, 16512, 24832, 32896, 41088, 49280, 61569):
+    # A-head ND2NZ is reachable for FP32, FP16 and BF16.  Five K waves are
+    # common to all three packets and remain five at 18 cores.  FP16 also
+    # retains its separately derived two/nine-wave domains.
+    for m in range(17, 158, 9):
+        for n in (32, 64, 96, 128, 160, 192):
+            for k in (15808, 16448, 17152):
+                put("DETERMINISTIC_SPLIT_K_ND2NZ", "fp32", "TN", m, n, k)
+            for k in (31872, 32640, 33408, 34176):
                 put("DETERMINISTIC_SPLIT_K_ND2NZ", "fp16", "TN", m, n, k)
-                put("DETERMINISTIC_SPLIT_K_ND2NZ", "fp16", "TT", m + 2, n + 1, k)
+                put("DETERMINISTIC_SPLIT_K_ND2NZ", "fp16", "TT", m + 1, n, k)
+                put("DETERMINISTIC_SPLIT_K_ND2NZ", "bf16", "TT", m + 2, n, k)
+            for k in (12416, 61569):
+                put("DETERMINISTIC_SPLIT_K_ND2NZ", "fp16", "TN", m, n, k)
+                put("DETERMINISTIC_SPLIT_K_ND2NZ", "fp16", "TT", m + 1, n, k)
     return selected
 
 
@@ -623,24 +676,32 @@ def select_shrink_core_validation(args):
     def scenario(item):
         dtype, layout, _m, _n, _k, target = item
         if target == "BL1_FULL_LOAD_FIXPIPE":
-            return "fixpipe_trans_a" if layout[0] == "T" else "fixpipe_seven_wave"
+            suffix = "trans_a" if layout[0] == "T" else "seven_wave"
+            return f"fixpipe_{dtype}_{suffix}"
         if target == "DETERMINISTIC_SPLIT_K":
             if dtype in ("fp16", "bf16"):
                 return f"deterministic_{dtype}"
             return "deterministic_fp32_small" if layout == "NN" else "deterministic_fp32_narrow"
         if target == "DETERMINISTIC_SPLIT_K_ND2NZ":
             return f"deterministic_nd2nz_{dtype}_{layout.lower()}"
-        return target.lower()
+        return f"{target.lower()}_{dtype}"
 
     scenario_quotas = {
-        "fixpipe_trans_a": 23,
-        "fixpipe_seven_wave": 22,
-        "deterministic_fp16": 8,
-        "deterministic_bf16": 7,
-        "deterministic_fp32_small": 15,
-        "deterministic_fp32_narrow": 15,
-        "deterministic_nd2nz_fp16_tn": 23,
-        "deterministic_nd2nz_fp16_tt": 22,
+        "base_fp32": 25,
+        "base_fp16": 25,
+        "base_bf16": 25,
+        "fixpipe_fp32_trans_a": 13,
+        "fixpipe_fp32_seven_wave": 12,
+        "fixpipe_fp16_seven_wave": 25,
+        "fixpipe_bf16_seven_wave": 25,
+        "deterministic_fp16": 25,
+        "deterministic_bf16": 25,
+        "deterministic_fp32_small": 13,
+        "deterministic_fp32_narrow": 12,
+        "deterministic_nd2nz_fp32_tn": 25,
+        "deterministic_nd2nz_fp16_tn": 13,
+        "deterministic_nd2nz_fp16_tt": 12,
+        "deterministic_nd2nz_bf16_tt": 25,
     }
     candidates = collections.defaultdict(list)
     for item in shrink_core_validation_shapes():
@@ -652,7 +713,7 @@ def select_shrink_core_validation(args):
 
     for (target, scenario_name), scenario_candidates in candidates.items():
         scenario_key = (target, scenario_name)
-        quota = scenario_quotas.get(scenario_name, 45)
+        quota = scenario_quotas.get(scenario_name, SHRINK_CORE_VALIDATION_RESERVE)
         ordered = sorted(scenario_candidates, key=lambda item: item[2] * item[3] * item[4])
         cut1 = (len(ordered) + 2) // 3
         cut2 = (2 * len(ordered) + 2) // 3
@@ -731,13 +792,33 @@ def select_shrink_core_validation(args):
 
     selected.sort(key=lambda item: (item[5], item[2] * item[3] * item[4]))
     write_selected(args.selected, selected)
-    missing = {branch: 45 - counts[branch] for branch in SHRINK_ENABLED_BRANCHES
-               if counts[branch] < 45}
-    print(json.dumps({"core_validation_selection": "complete" if not missing else "incomplete_no_npu_run",
+    selected_dtype_counts = collections.Counter((item[5], item[0]) for item in selected)
+    missing = {branch: SHRINK_CORE_VALIDATION_RESERVE - counts[branch]
+               for branch in SHRINK_ENABLED_BRANCHES
+               if counts[branch] < SHRINK_CORE_VALIDATION_RESERVE}
+    dtype_missing = {}
+    for branch in SHRINK_ENABLED_BRANCHES:
+        targets = balanced_dtype_targets(branch, SHRINK_CORE_VALIDATION_RESERVE)
+        missing_for_branch = {
+            dtype: target - selected_dtype_counts[(branch, dtype)]
+            for dtype, target in targets.items()
+            if selected_dtype_counts[(branch, dtype)] < target
+        }
+        if missing_for_branch:
+            dtype_missing[branch] = missing_for_branch
+    complete = not missing and not dtype_missing
+    print(json.dumps({"core_validation_selection": "complete" if complete else "incomplete_no_npu_run",
                       "counts": {branch: counts[branch] for branch in SHRINK_ENABLED_BRANCHES},
-                      "success_target_per_branch": 30, "reserve_target_per_branch": 45,
-                      "missing": missing}, separators=(",", ":")), file=sys.stderr)
-    return 0 if not missing else 4
+                      "dtype_counts": {
+                          branch: {dtype: selected_dtype_counts[(branch, dtype)]
+                                   for dtype in SHRINK_BRANCH_DTYPES[branch]}
+                          for branch in SHRINK_ENABLED_BRANCHES
+                      },
+                      "success_target_per_branch": SHRINK_CORE_VALIDATION_SUCCESS,
+                      "reserve_target_per_branch": SHRINK_CORE_VALIDATION_RESERVE,
+                      "missing": missing, "dtype_missing": dtype_missing},
+                     separators=(",", ":")), file=sys.stderr)
+    return 0 if complete else 4
 
 
 def select_remaining(args):
@@ -1295,13 +1376,18 @@ def compare_core_validation(args):
             groups[(branch, dtype, layout)].append((dtype, layout, m, n, k))
 
     branch_counts = collections.Counter()
+    dtype_counts = collections.Counter()
     for expected_branch in SHRINK_ENABLED_BRANCHES:
         environments = sorted(key for key in groups if key[0] == expected_branch)
         offsets = {key: 0 for key in environments}
+        supported_dtypes = SHRINK_BRANCH_DTYPES[expected_branch]
+        dtype_targets = balanced_dtype_targets(expected_branch, args.quota)
         while branch_counts[expected_branch] < args.quota:
             made_progress = False
             for _branch, dtype, layout in environments:
                 key = (expected_branch, dtype, layout)
+                if dtype_counts[(expected_branch, dtype)] >= dtype_targets.get(dtype, 0):
+                    continue
                 offset = offsets[key]
                 shapes = groups[key]
                 if offset >= len(shapes):
@@ -1317,7 +1403,8 @@ def compare_core_validation(args):
                 _rc, records, _stderr = invoke(args.runner, env, batch, args.run_log)
                 by_key = {(record.get("shape"), record.get("mode")): record for record in records}
                 for _, _, m, n, k in batch:
-                    if branch_counts[expected_branch] >= args.quota:
+                    if (branch_counts[expected_branch] >= args.quota or
+                            dtype_counts[(expected_branch, dtype)] >= dtype_targets[dtype]):
                         break
                     shape = f"M{m}_N{n}_K{k}_{layout}"
                     pre = by_key.get((shape, "official_pre"))
@@ -1347,6 +1434,8 @@ def compare_core_validation(args):
                         (float(shrink_pre["latency_ms"]) + float(shrink_post["latency_ms"])) / 2.0
                     output = {
                         "shape": shape,
+                        "dtype": dtype,
+                        "layout": layout,
                         "branch": expected_branch,
                         "official_core": official_core,
                         "shrinked_core": shrinked_core,
@@ -1355,6 +1444,7 @@ def compare_core_validation(args):
                     }
                     print(json.dumps(output, separators=(",", ":")), flush=True)
                     branch_counts[expected_branch] += 1
+                    dtype_counts[(expected_branch, dtype)] += 1
             if not made_progress:
                 break
 
@@ -1362,6 +1452,11 @@ def compare_core_validation(args):
                if branch_counts[branch] < args.quota}
     print(json.dumps({"core_validation": "complete" if not missing else "incomplete",
                       "counts": {branch: branch_counts[branch] for branch in SHRINK_ENABLED_BRANCHES},
+                      "dtype_counts": {
+                          branch: {dtype: dtype_counts[(branch, dtype)]
+                                   for dtype in SHRINK_BRANCH_DTYPES[branch]}
+                          for branch in SHRINK_ENABLED_BRANCHES
+                      },
                       "missing": missing}, separators=(",", ":")), file=sys.stderr)
     return 0 if not missing else 4
 

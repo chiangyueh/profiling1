@@ -2768,6 +2768,9 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
         const bool halfInput =
             (args_.aType == ge::DT_FLOAT16 || args_.aType == ge::DT_BF16) &&
             args_.aType == args_.bType;
+        //NEW: Validate the common five-wave ND2NZ rule for FP32 as well.
+        const bool fp32Input =
+            args_.aType == ge::DT_FLOAT && args_.bType == ge::DT_FLOAT;
         uint64_t newUsedCoreNum = oldUsedCoreNum;
         if (GetMixNd2nzType() == MixNd2NzType::NO_ND2NZ &&
             run.nd2nzA == 0 && run.nd2nzB == 0) {
@@ -2792,15 +2795,20 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
                 newUsedCoreNum = 19UL;
             }
         } else if (GetMixNd2nzType() == MixNd2NzType::V_HEAD_ND2NZ &&
-            halfInput && args_.aType == ge::DT_FLOAT16 &&
+            (halfInput || fp32Input) &&
             run.nd2nzA != 0 && run.nd2nzB == 0 && m <= 160UL && n <= 192UL) {
             //NEW: The A-head ND2NZ packet is bounded by both its K-wave count
             // and reduction fan-in.  The selected count never adds a K wave.
             if (officialKWaves == 5UL && ops::CeilDiv(kCount, 18UL) == officialKWaves) {
                 newUsedCoreNum = 18UL;
-            } else if (officialKWaves == 2UL && ops::CeilDiv(kCount, 16UL) == officialKWaves) {
+            //NEW: The 16-core two/nine-wave rules are retained only for FP16.
+            // Existing BF16 response curves do not justify the same count,
+            // while FP32 uses a different singleCoreK packet.
+            } else if (args_.aType == ge::DT_FLOAT16 && officialKWaves == 2UL &&
+                ops::CeilDiv(kCount, 16UL) == officialKWaves) {
                 newUsedCoreNum = 16UL;
-            } else if (officialKWaves == 9UL && kCount % 20UL == 1UL && kCount % 16UL == 1UL) {
+            } else if (args_.aType == ge::DT_FLOAT16 && officialKWaves == 9UL &&
+                kCount % 20UL == 1UL && kCount % 16UL == 1UL) {
                 newUsedCoreNum = 16UL;
             }
         }
@@ -2852,11 +2860,18 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
         if (tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE_ENABLE_ALIGNOUT) {
             const uint64_t totalTiles = mTotal * nTotal;
             const uint64_t k = static_cast<uint64_t>(matmul.singleCoreK);
+            //NEW: Fixpipe supports homogeneous FP32, FP16 and BF16 packets.
+            const bool fp32FixpipePacket =
+                args_.aType == ge::DT_FLOAT && args_.bType == ge::DT_FLOAT &&
+                args_.cType == ge::DT_FLOAT && args_.isHf32 && run.isHf32 != 0;
+            const bool halfFixpipePacket =
+                (args_.aType == ge::DT_FLOAT16 || args_.aType == ge::DT_BF16) &&
+                args_.aType == args_.bType && args_.aType == args_.cType &&
+                !args_.isHf32 && run.isHf32 == 0;
             const bool commonFixpipePacket =
                 tilingEnable_.tilingEnableSpecialOpti == TilingEnableSpecialOpti::BASE &&
                 oldUsedCoreNum == compileInfo_.aicNum && oldUsedCoreNum == 20UL &&
-                args_.aType == ge::DT_FLOAT && args_.bType == ge::DT_FLOAT &&
-                args_.cType == ge::DT_FLOAT && args_.isHf32 && !args_.hasBias &&
+                (fp32FixpipePacket || halfFixpipePacket) && !args_.hasBias &&
                 args_.aFormat == ge::FORMAT_ND && args_.bFormat == ge::FORMAT_ND &&
                 args_.outFormat == ge::FORMAT_ND && !args_.isNzA && !args_.isNzB &&
                 singleCoreM == static_cast<uint64_t>(matmul.baseM) &&
@@ -2875,7 +2890,7 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
             if (GetMixNd2nzType() == MixNd2NzType::NO_ND2NZ &&
                 run.nd2nzA == 0 && run.nd2nzB == 0) {
                 allowOneExtraWave =
-                    (run.transA != 0 && run.transB == 0) ||
+                    (fp32FixpipePacket && run.transA != 0 && run.transB == 0) ||
                     (run.transA == 0 && run.transB == 0 && officialBodyWaves == 7UL);
             } else if (GetMixNd2nzType() == MixNd2NzType::V_HEAD_ND2NZ &&
                 run.nd2nzA != 0 && run.nd2nzB == 0 &&

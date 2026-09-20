@@ -175,7 +175,7 @@ if [[ "${MATMUL_V3_CAMPAIGN:-}" == "shrink_core_validation" ]]; then
         --run-log "${run_log}" --discovery-batch 64
     python3 scripts/core_oracle_sampler.py compare-core-validation \
         --runner "${example_binary}" --selected "${selected_shapes}" \
-        --run-log "${run_log}" --quota 30 --batch-size 8
+        --run-log "${run_log}" --quota 50 --batch-size 8
     exit 0
 fi
 
