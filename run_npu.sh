@@ -161,6 +161,7 @@ if [[ -z "${MATMUL_V3_CAMPAIGN:-}" || "${MATMUL_V3_CAMPAIGN:-}" == "all_io_core_
     # the eventual formula winner and core-20 reference need deeper retests.
     export MATMUL_V3_WARMUP="${MATMUL_V3_WARMUP:-1}"
     export MATMUL_V3_REPEATS="${MATMUL_V3_REPEATS:-10}"
+    export MATMUL_V3_RUNNER_IDLE_TIMEOUT_SECONDS="${MATMUL_V3_RUNNER_IDLE_TIMEOUT_SECONDS:-180}"
     python3 scripts/core_oracle_sampler.py select-all-io-core-sweep \
         --runner "${example_binary}" --selected "${all_io_selected}" \
         --run-log "${run_log}" --quota 50 --discovery-batch 64

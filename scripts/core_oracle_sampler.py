@@ -6,8 +6,11 @@ import hashlib
 import json
 import os
 import random
+import select
 import subprocess
 import sys
+import tempfile
+import time
 
 
 # The 21 route names below cover the installed MatMulV3 kernels.  The formula
@@ -1425,24 +1428,70 @@ def runner_env(base, dtype, layout, mode, requested_core=None, discovery=False):
     return env
 
 
-def invoke(runner, env, shapes, run_log):
+def invoke(runner, env, shapes, run_log, record_callback=None):
     args = [runner]
     for _, _, m, n, k in shapes:
         args.extend((str(m), str(n), str(k)))
-    completed = subprocess.run(args, env=env, text=True, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, check=False)
-    if completed.stderr:
-        with open(run_log, "a", encoding="utf-8", errors="replace") as stream:
-            stream.write(completed.stderr)
+    idle_timeout = max(30, int(env.get("MATMUL_V3_RUNNER_IDLE_TIMEOUT_SECONDS", "300")))
     records = []
-    for line in completed.stdout.splitlines():
-        if not line.startswith('{"shape":'):
-            continue
-        try:
-            records.append(json.loads(line))
-        except json.JSONDecodeError:
-            pass
-    return completed.returncode, records, completed.stderr
+    timed_out = False
+    with tempfile.TemporaryFile(mode="w+b") as stderr_file:
+        process = subprocess.Popen(
+            args, env=env, stdout=subprocess.PIPE, stderr=stderr_file,
+            bufsize=0)
+        output_buffer = b""
+        last_output = time.monotonic()
+        stdout_fd = process.stdout.fileno()
+        while True:
+            ready, _, _ = select.select([stdout_fd], [], [], 1.0)
+            if ready:
+                chunk = os.read(stdout_fd, 65536)
+                if chunk:
+                    last_output = time.monotonic()
+                    output_buffer += chunk
+                    while b"\n" in output_buffer:
+                        raw_line, output_buffer = output_buffer.split(b"\n", 1)
+                        line = raw_line.decode("utf-8", errors="replace")
+                        if not line.startswith('{"shape":'):
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        records.append(record)
+                        if record_callback is not None:
+                            record_callback(record)
+                    continue
+            if process.poll() is not None:
+                tail = os.read(stdout_fd, 65536)
+                output_buffer += tail
+                break
+            if time.monotonic() - last_output >= idle_timeout:
+                timed_out = True
+                process.kill()
+                process.wait()
+                break
+        process.stdout.close()
+        if output_buffer:
+            line = output_buffer.decode("utf-8", errors="replace").strip()
+            if line.startswith('{"shape":'):
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    record = None
+                if record is not None:
+                    records.append(record)
+                    if record_callback is not None:
+                        record_callback(record)
+        return_code = 124 if timed_out else process.wait()
+        stderr_file.seek(0)
+        stderr = stderr_file.read().decode("utf-8", errors="replace")
+    if timed_out:
+        stderr += f"\nrunner produced no output for {idle_timeout} seconds; killed\n"
+    if stderr:
+        with open(run_log, "a", encoding="utf-8", errors="replace") as stream:
+            stream.write(stderr)
+    return return_code, records, stderr
 
 
 def read_selected(path):
@@ -1765,39 +1814,45 @@ def measure_all_io_core_sweep(args):
             os.environ, input_dtype, output_dtype, layout, "core_response")
         env["MATMUL_V3_MEASUREMENT_PLAN"] = ",".join(
             mode if core is None else str(core) for mode, core in pending)
-        rc, records, stderr = invoke(
-            args.runner, env, [(input_dtype, layout, m, n, k)], args.run_log)
-        by_key = {}
-        for record in records:
+        streamed_keys = set()
+        pending_keys = set(pending)
+
+        def store_streamed(record):
             if record.get("shape") != shape:
-                continue
+                return
             key = (record.get("mode"), record.get("requested_core"))
-            by_key[key] = record
+            if key not in pending_keys or key in streamed_keys:
+                return
+            if (record.get("status") == "OK" and
+                    record.get("correctness") == "PASS" and
+                    record.get("branch") != expected_branch):
+                record["expected_branch"] = expected_branch
+                record["status"] = "ROUTE_CHANGED"
+            store(record, combination)
+            streamed_keys.add(key)
+
+        rc, _records, stderr = invoke(
+            args.runner, env, [(input_dtype, layout, m, n, k)], args.run_log,
+            record_callback=store_streamed)
 
         retry = []
         for mode, core in pending:
-            record = by_key.get((mode, core))
-            # A concrete failure record already identifies the exact core.
-            # Persist it and continue; retry only a core for which a crashed
-            # process emitted no record at all.
-            if record is None:
-                retry.append((mode, core, record))
-                continue
-            if (record.get("status") != "OK" or
-                    record.get("correctness") != "PASS"):
-                store(record, combination)
-                continue
-            if record.get("branch") != expected_branch:
-                record["expected_branch"] = expected_branch
-                record["status"] = "ROUTE_CHANGED"
-                store(record, combination)
-                continue
-            store(record, combination)
+            if (mode, core) not in streamed_keys:
+                retry.append((mode, core))
+
+        # The first missing core was the one executing when the batch became
+        # silent.  Record that exact core as timed out instead of spending a
+        # second timeout retrying it; later cores still get independent runs.
+        if rc == 124 and retry:
+            mode, core = retry.pop(0)
+            store(synthetic_error(
+                shape, input_dtype, output_dtype, layout, expected_branch,
+                mode, core, rc, stderr), combination)
 
         # Slow recovery path: only a core missing because the batch process
         # stopped before emitting its record gets a fresh process.  A failed
         # core that did emit a record was already checkpointed above.
-        for mode, core, first_record in retry:
+        for mode, core in retry:
             token = mode if core is None else str(core)
             retry_env = all_io_runner_env(
                 os.environ, input_dtype, output_dtype, layout, "core_response")
@@ -1809,8 +1864,6 @@ def measure_all_io_core_sweep(args):
                         record.get("requested_core") == core]
             if matching:
                 record = matching[-1]
-            elif first_record is not None:
-                record = first_record
             else:
                 record = synthetic_error(
                     shape, input_dtype, output_dtype, layout, expected_branch,
