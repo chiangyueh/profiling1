@@ -420,13 +420,15 @@ def shrink_core_validation_shapes():
         put("DETERMINISTIC_SPLIT_K", "fp32", "NT", 1568 + 64 * (i % 18),
             (16, 24, 32)[(i * 2) % 3], 28352 + 64 * (i % 24))
 
-    # Balance the two input-conversion layouts at 15 fresh points each.
-    for dtype in ("fp16", "bf16"):
-        for m in range(17, 128, 3):
-            for n in (96, 112, 128, 144, 160):
-                for k in (12416, 16512, 24832, 32896, 41088, 49280, 61569):
-                    put("DETERMINISTIC_SPLIT_K_ND2NZ", dtype, "TN", m, n, k)
-                    put("DETERMINISTIC_SPLIT_K_ND2NZ", dtype, "TT", m + 2, n + 1, k)
+    # The production shrink rule deliberately accepts FP16 only in the
+    # A-head ND2NZ deterministic packet.  Do not request impossible BF16
+    # reserves during host discovery.  TN and TT jointly provide all 45
+    # reserves required before NPU measurement starts.
+    for m in range(17, 128, 3):
+        for n in (96, 112, 128, 144, 160):
+            for k in (12416, 16512, 24832, 32896, 41088, 49280, 61569):
+                put("DETERMINISTIC_SPLIT_K_ND2NZ", "fp16", "TN", m, n, k)
+                put("DETERMINISTIC_SPLIT_K_ND2NZ", "fp16", "TT", m + 2, n + 1, k)
     return selected
 
 
@@ -637,10 +639,8 @@ def select_shrink_core_validation(args):
         "deterministic_bf16": 7,
         "deterministic_fp32_small": 15,
         "deterministic_fp32_narrow": 15,
-        "deterministic_nd2nz_fp16_tn": 12,
-        "deterministic_nd2nz_bf16_tn": 11,
-        "deterministic_nd2nz_fp16_tt": 11,
-        "deterministic_nd2nz_bf16_tt": 11,
+        "deterministic_nd2nz_fp16_tn": 23,
+        "deterministic_nd2nz_fp16_tt": 22,
     }
     candidates = collections.defaultdict(list)
     for item in shrink_core_validation_shapes():
