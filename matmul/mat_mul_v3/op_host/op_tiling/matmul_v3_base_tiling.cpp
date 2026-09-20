@@ -2742,81 +2742,13 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
     const uint64_t m = static_cast<uint64_t>(matmul.M);
     const uint64_t n = static_cast<uint64_t>(matmul.N);
 
-    //NEW: Deterministic Split-K redistributes K ownership whenever the core
-    // count changes and then reduces one partial C per producer.  Shrinking is
-    // therefore legal here only when the new count stays on the same K-wave
-    // plateau and the packet belongs to one of the source-derived reduction
-    // domains below.  These are closed formulas; no measured shape, timing,
-    // history table, or runtime candidate search is consulted.
+    //NEW: Fresh result26 validation showed that preserving the K-wave count
+    // is not sufficient: plain deterministic Split-K lost on 32/37 shapes,
+    // and A-head ND2NZ lost on all 50 shapes across FP32/FP16/BF16.  The
+    // reduction/ND2NZ critical path needs all official producers, so the
+    // deterministic family now deliberately retains the official core count.
     if (tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::DETERMINISTIC_SPLIT_K) {
-        const uint64_t singleCoreK = static_cast<uint64_t>(matmul.singleCoreK);
-        const bool commonPacket =
-            tilingEnable_.tilingEnableFullLoad == TilingEnableFullLoad::BASE &&
-            tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE &&
-            tilingEnable_.tilingEnableSpecialOpti == TilingEnableSpecialOpti::BASE &&
-            oldUsedCoreNum == compileInfo_.aicNum && oldUsedCoreNum == 20UL &&
-            compileInfo_.supportL0c2out && !args_.hasBias &&
-            !args_.isNzA && !args_.isNzB && run.isNzA == 0 && run.isNzB == 0 &&
-            singleCoreK > 0 && matmul.Ka > 0 && matmul.Ka == matmul.Kb &&
-            (matmul.iterateOrder == 0 || matmul.iterateOrder == 1);
-        if (!commonPacket) {
-            return false;
-        }
-
-        const uint64_t kCount = ops::CeilDiv(static_cast<uint64_t>(matmul.Ka), singleCoreK);
-        const uint64_t officialKWaves = ops::CeilDiv(kCount, oldUsedCoreNum);
-        const bool halfInput =
-            (args_.aType == ge::DT_FLOAT16 || args_.aType == ge::DT_BF16) &&
-            args_.aType == args_.bType;
-        //NEW: Validate the common five-wave ND2NZ rule for FP32 as well.
-        const bool fp32Input =
-            args_.aType == ge::DT_FLOAT && args_.bType == ge::DT_FLOAT;
-        uint64_t newUsedCoreNum = oldUsedCoreNum;
-        if (GetMixNd2nzType() == MixNd2NzType::NO_ND2NZ &&
-            run.nd2nzA == 0 && run.nd2nzB == 0) {
-            //NEW: For the half-input five-wave packet, 18 producers retain
-            // exactly five K waves while removing two partial-C producers.
-            if (halfInput && run.transA == 0 && run.transB != 0 &&
-                officialKWaves == 5UL && ops::CeilDiv(kCount, 18UL) == officialKWaves &&
-                (matmul.iterateOrder == 0 || n >= 1024UL)) {
-                newUsedCoreNum = 18UL;
-            //NEW: A small FP32 result fits in one 12K-element reduction
-            // chunk.  Sixteen producers reduce workspace/fan-in without
-            // serializing the output reduction.
-            } else if (args_.aType == ge::DT_FLOAT && args_.bType == ge::DT_FLOAT &&
-                run.transA == 0 && run.transB == 0 &&
-                m <= 128UL && n <= 64UL && m * n <= 8192UL) {
-                newUsedCoreNum = 16UL;
-            //NEW: This narrow-N FP32 packet has eight K waves at both 20 and
-            // 19 cores; 19 removes one redundant partial-C producer.
-            } else if (args_.aType == ge::DT_FLOAT && args_.bType == ge::DT_FLOAT &&
-                run.transA == 0 && run.transB != 0 && m >= 1024UL && n <= 32UL &&
-                officialKWaves == 8UL && ops::CeilDiv(kCount, 19UL) == officialKWaves) {
-                newUsedCoreNum = 19UL;
-            }
-        } else if (GetMixNd2nzType() == MixNd2NzType::V_HEAD_ND2NZ &&
-            (halfInput || fp32Input) &&
-            run.nd2nzA != 0 && run.nd2nzB == 0 && m <= 160UL && n <= 192UL) {
-            //NEW: The A-head ND2NZ packet is bounded by both its K-wave count
-            // and reduction fan-in.  The selected count never adds a K wave.
-            if (officialKWaves == 5UL && ops::CeilDiv(kCount, 18UL) == officialKWaves) {
-                newUsedCoreNum = 18UL;
-            //NEW: The 16-core two/nine-wave rules are retained only for FP16.
-            // Existing BF16 response curves do not justify the same count,
-            // while FP32 uses a different singleCoreK packet.
-            } else if (args_.aType == ge::DT_FLOAT16 && officialKWaves == 2UL &&
-                ops::CeilDiv(kCount, 16UL) == officialKWaves) {
-                newUsedCoreNum = 16UL;
-            } else if (args_.aType == ge::DT_FLOAT16 && officialKWaves == 9UL &&
-                kCount % 20UL == 1UL && kCount % 16UL == 1UL) {
-                newUsedCoreNum = 16UL;
-            }
-        }
-        if (newUsedCoreNum >= oldUsedCoreNum) {
-            return false;
-        }
-        matmul.usedCoreNum = static_cast<uint32_t>(newUsedCoreNum);
-        return true;
+        return false;
     }
 
     //NEW: The remaining Split-K routes keep the official core count.  The
@@ -2858,20 +2790,20 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
         // that producer reduction dominates; otherwise retain the official
         // count.  The count is derived from body tasks, not from a lookup.
         if (tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE_ENABLE_ALIGNOUT) {
+            //NEW: Plain Fixpipe lost on 10/12 fresh result26 shapes.  Keep
+            // the official count there; the independently validated A-head
+            // ND2NZ Fixpipe packet remains eligible below.
+            if (GetMixNd2nzType() == MixNd2NzType::NO_ND2NZ &&
+                run.nd2nzA == 0 && run.nd2nzB == 0) {
+                return false;
+            }
             const uint64_t totalTiles = mTotal * nTotal;
             const uint64_t k = static_cast<uint64_t>(matmul.singleCoreK);
-            //NEW: Fixpipe supports homogeneous FP32, FP16 and BF16 packets.
-            const bool fp32FixpipePacket =
-                args_.aType == ge::DT_FLOAT && args_.bType == ge::DT_FLOAT &&
-                args_.cType == ge::DT_FLOAT && args_.isHf32 && run.isHf32 != 0;
-            const bool halfFixpipePacket =
-                (args_.aType == ge::DT_FLOAT16 || args_.aType == ge::DT_BF16) &&
-                args_.aType == args_.bType && args_.aType == args_.cType &&
-                !args_.isHf32 && run.isHf32 == 0;
             const bool commonFixpipePacket =
                 tilingEnable_.tilingEnableSpecialOpti == TilingEnableSpecialOpti::BASE &&
                 oldUsedCoreNum == compileInfo_.aicNum && oldUsedCoreNum == 20UL &&
-                (fp32FixpipePacket || halfFixpipePacket) && !args_.hasBias &&
+                args_.aType == ge::DT_FLOAT && args_.bType == ge::DT_FLOAT &&
+                args_.cType == ge::DT_FLOAT && args_.isHf32 && run.isHf32 != 0 && !args_.hasBias &&
                 args_.aFormat == ge::FORMAT_ND && args_.bFormat == ge::FORMAT_ND &&
                 args_.outFormat == ge::FORMAT_ND && !args_.isNzA && !args_.isNzB &&
                 singleCoreM == static_cast<uint64_t>(matmul.baseM) &&
@@ -2890,7 +2822,7 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
             if (GetMixNd2nzType() == MixNd2NzType::NO_ND2NZ &&
                 run.nd2nzA == 0 && run.nd2nzB == 0) {
                 allowOneExtraWave =
-                    (fp32FixpipePacket && run.transA != 0 && run.transB == 0) ||
+                    (run.transA != 0 && run.transB == 0) ||
                     (run.transA == 0 && run.transB == 0 && officialBodyWaves == 7UL);
             } else if (GetMixNd2nzType() == MixNd2NzType::V_HEAD_ND2NZ &&
                 run.nd2nzA != 0 && run.nd2nzB == 0 &&
@@ -3080,7 +3012,10 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
         const uint64_t cHead = ops::CeilDiv(headLoops, NUMBER_TWO * headWaves);
         uint64_t newUsedCoreNum = std::max(cBody, cHead);
         newUsedCoreNum = std::max<uint64_t>(1, std::min(newUsedCoreNum, oldUsedCoreNum));
-        if (newUsedCoreNum >= oldUsedCoreNum) {
+        //NEW: Fresh validation supports the 16/17-core plateaus.  The
+        // 18/19-core plateaus were weak and included a severe 18-core
+        // regression, so they retain the official count.
+        if (newUsedCoreNum >= oldUsedCoreNum || newUsedCoreNum > 17UL) {
             return false;
         }
         matmul.usedCoreNum = static_cast<uint32_t>(newUsedCoreNum);

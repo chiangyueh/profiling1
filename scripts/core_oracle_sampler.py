@@ -88,6 +88,15 @@ SHRINK_BRANCH_DTYPES = {
     "DETERMINISTIC_SPLIT_K_ND2NZ": ("fp32", "fp16", "bf16"),
 }
 
+# result26 rejects lowering the producer count for these complete families.
+# They remain in the eight-branch validation: the formula's correct decision
+# is to retain the official count rather than force a harmful shrink.
+CORE_RETAIN_BRANCHES = (
+    "BL1_FULL_LOAD_FIXPIPE",
+    "DETERMINISTIC_SPLIT_K",
+    "DETERMINISTIC_SPLIT_K_ND2NZ",
+)
+
 SHRINK_CORE_VALIDATION_SUCCESS = 50
 SHRINK_CORE_VALIDATION_RESERVE = 75
 
@@ -97,6 +106,15 @@ def balanced_dtype_targets(branch, total):
     base, remainder = divmod(total, len(dtypes))
     return {dtype: base + (1 if index < remainder else 0)
             for index, dtype in enumerate(dtypes)}
+
+
+def valid_core_decision(branch, official_core, actual_core):
+    if (not isinstance(official_core, int) or not isinstance(actual_core, int) or
+            official_core <= 0 or actual_core <= 0):
+        return False
+    if branch in CORE_RETAIN_BRANCHES:
+        return actual_core == official_core
+    return actual_core < official_core
 
 REMAINING_CORE_SWEEP_BRANCHES = tuple(
     branch for branch in TARGET_BRANCHES if branch not in SHRINK_ENABLED_BRANCHES
@@ -390,13 +408,14 @@ def shrink_core_validation_shapes():
     for m in range(1, 8):
         for k in range(4224, 8577, 128):
             if k not in retired_al1_k:
-                put("AL1_FULL_LOAD", "fp32", "NT", m, 48, k)
+                put("AL1_FULL_LOAD", "fp32", "NT", m, 52, k)
+                put("AL1_FULL_LOAD", "fp32", "NT", m, 68, k)
 
     # BASE stays in the proven narrow-N region but uses K values outside
     # result24's grid.
     retired_base_k = {9472, 9984, 10752, 11776, 12800, 13824, 14848, 15872}
     for m in range(17, 32):
-        for n in (40, 56):
+        for n in (44, 60):
             for k in range(9216, 16641, 128):
                 if k not in retired_base_k:
                     put("BASE", "fp32", "NT", m, n, k)
@@ -405,12 +424,12 @@ def shrink_core_validation_shapes():
     # independently observed FP16 and BF16 L2 packets with fewer than twenty
     # tasks in the active window.  Discovery still verifies the branch and
     # that the production rule really changes usedCoreNum.
-    half_base_k = (14592, 15232, 16000, 16768, 17536, 18432, 19328, 20224)
+    half_base_k = (14592, 15232, 16000, 16384, 16768, 17536, 18432, 19328, 20224)
     for i in range(720):
-        put("BASE", "fp16", "TT", 2304 + 128 * (i % 49),
+        put("BASE", "fp16", "TT", 2368 + 128 * (i % 49),
             (7, 9, 11, 13, 17, 19, 23, 25, 29, 31)[(i * 3 + i // 17) % 10],
             half_base_k[(i * 5 + i // 29) % len(half_base_k)])
-        put("BASE", "bf16", "TT", 17 + 8 * (i % 18),
+        put("BASE", "bf16", "TT", 21 + 8 * (i % 18),
             (768, 1024, 1280, 1536, 1792, 2048, 2304, 2560)[(i * 5 + i // 19) % 8],
             half_base_k[(i * 7 + i // 31) % len(half_base_k)])
 
@@ -419,36 +438,43 @@ def shrink_core_validation_shapes():
     bl1_n = (32, 64, 96, 128, 192, 256, 384)
     bl1_k = (17, 19, 21, 25, 33, 41, 49, 57, 65, 73, 81)
     for i in range(560):
-        put("BL1_FULL_LOAD_ND2NZ", "fp32", "NN", 11811 + 112 * i + i % 11,
+        put("BL1_FULL_LOAD_ND2NZ", "fp32", "NN", 11829 + 112 * i + i % 11,
             bl1_n[(i * 3 + i // 17) % len(bl1_n)],
             bl1_k[(i * 5 + i // 19) % len(bl1_k)])
+    # result26 validates only the 16/17-core body/head plateaus.  Supply a
+    # dense fresh grid inside that source-derived M interval so discovery is
+    # not forced to scan the rejected 18/19-core tail.
+    for i, m in enumerate(range(11840, 17249, 64)):
+        for n in (32, 64, 128, 192, 256):
+            put("BL1_FULL_LOAD_ND2NZ", "fp32", "NN", m + i % 7 + 1, n,
+                bl1_k[(i * 3 + n // 32) % len(bl1_k)])
 
     # BL1 Vector NZ2ND: retain the strict short-K packet, with fresh M values.
     vec_n = (23, 31, 40, 47, 56, 73, 80, 89, 96, 111, 112, 127, 143, 160, 175, 191)
     vec_k = (24, 40, 64, 80, 96, 112, 128)
     for i in range(560):
-        put("BL1_FULL_LOAD_VEC_NZ2ND", "fp32", "NN", 13109 + 288 * i + i % 17,
+        put("BL1_FULL_LOAD_VEC_NZ2ND", "fp32", "NN", 13127 + 288 * i + i % 17,
             vec_n[(i * 7 + i // 13) % len(vec_n)],
             vec_k[(i * 5 + i // 23) % len(vec_k)])
 
     # Fixpipe is deliberately split between its transposed-A and seven-wave NN
     # subdomains because result24 showed materially different performance.
     for i in range(320):
-        put("BL1_FULL_LOAD_FIXPIPE", "fp32", "TN", 11312 + 64 * i,
+        put("BL1_FULL_LOAD_FIXPIPE", "fp32", "TN", 11344 + 64 * i,
             (11, 17, 31, 47, 51, 63)[i % 6],
             (96, 112, 127, 128, 160, 192, 224, 256)[(i * 3) % 8])
-        put("BL1_FULL_LOAD_FIXPIPE", "fp32", "NN", 15489 + 13 * i,
+        put("BL1_FULL_LOAD_FIXPIPE", "fp32", "NN", 15507 + 13 * i,
             (128, 144, 160, 176, 192)[(i * 3) % 5],
             (65, 67, 69, 71, 73)[(i * 2) % 5])
-        put("BL1_FULL_LOAD_FIXPIPE_ND2NZ", "fp32", "NN", 19507 + 73 * i,
+        put("BL1_FULL_LOAD_FIXPIPE_ND2NZ", "fp32", "NN", 19529 + 73 * i,
             (17, 19, 23, 25, 31)[(i * 3) % 5],
             (65, 80, 96, 112, 127)[(i * 2) % 5])
 
-    # NeedSolveFixBound explicitly supports two-byte FP16/BF16 inputs.  Their
-    # non-transposed packet disables head conversion, so target the legal
-    # seven-body-wave case rather than the FP32-only transposed-A shortcut.
+    # NeedSolveFixBound explicitly supports two-byte FP16/BF16 inputs.  Keep
+    # these reachable plain-Fixpipe packets in validation even though the
+    # corrected core decision now retains the official count.
     for i in range(900):
-        m = 57344 + 128 * i + i % 23
+        m = 57363 + 128 * i + i % 23
         n = (47, 51, 63, 73, 80, 89, 95, 111, 112, 119)[(i * 3 + i // 31) % 10]
         k = (64, 80, 96, 112, 127, 128, 160, 192, 224, 256)[(i * 7 + i // 37) % 10]
         put("BL1_FULL_LOAD_FIXPIPE", "fp16", "NN", m, n, k)
@@ -458,20 +484,19 @@ def shrink_core_validation_shapes():
     # equations, all outside result24's exact K grid.
     for i in range(360):
         dtype = "fp16" if i % 2 == 0 else "bf16"
-        put("DETERMINISTIC_SPLIT_K", dtype, "NT", 1312 + 64 * (i % 28),
+        put("DETERMINISTIC_SPLIT_K", dtype, "NT", 1344 + 64 * (i % 28),
             (512, 896, 1152, 1536, 1792)[(i * 3) % 5],
             33792 + 128 * (i % 32))
         put("DETERMINISTIC_SPLIT_K", "fp32", "NN",
-            (33, 49, 65, 81, 97, 113, 127)[i % 7],
+            (35, 51, 67, 83, 99, 115, 125)[i % 7],
             (16, 32, 48, 64)[(i * 3) % 4],
             (16640, 24832, 33024)[(i * 5) % 3])
-        put("DETERMINISTIC_SPLIT_K", "fp32", "NT", 1568 + 64 * (i % 18),
+        put("DETERMINISTIC_SPLIT_K", "fp32", "NT", 1600 + 64 * (i % 18),
             (16, 24, 32)[(i * 2) % 3], 28352 + 64 * (i % 24))
 
-    # A-head ND2NZ is reachable for FP32, FP16 and BF16.  Five K waves are
-    # common to all three packets and remain five at 18 cores.  FP16 also
-    # retains its separately derived two/nine-wave domains.
-    for m in range(17, 158, 9):
+    # A-head ND2NZ is reachable for FP32, FP16 and BF16.  Sample all three
+    # input packets while the corrected decision retains the official count.
+    for m in range(20, 158, 9):
         for n in (32, 64, 96, 128, 160, 192):
             for k in (15808, 16448, 17152):
                 put("DETERMINISTIC_SPLIT_K_ND2NZ", "fp32", "TN", m, n, k)
@@ -744,8 +769,7 @@ def select_shrink_core_validation(args):
                             continue
                         official_core = record.get("official_core")
                         actual_core = record.get("actual_core")
-                        if (not isinstance(official_core, int) or not isinstance(actual_core, int) or
-                                actual_core <= 0 or actual_core >= official_core):
+                        if not valid_core_decision(target, official_core, actual_core):
                             continue
                         selected.append(item + (target,))
                         selected_keys.add(item)
@@ -780,8 +804,7 @@ def select_shrink_core_validation(args):
                             continue
                         official_core = record.get("official_core")
                         actual_core = record.get("actual_core")
-                        if (not isinstance(official_core, int) or not isinstance(actual_core, int) or
-                                actual_core <= 0 or actual_core >= official_core):
+                        if not valid_core_decision(target, official_core, actual_core):
                             continue
                         selected.append(item + (target,))
                         selected_keys.add(item)
@@ -1432,7 +1455,7 @@ def compare_core_validation(args):
                         continue
                     official_core = official_cores.pop()
                     shrinked_core = shrink_cores.pop()
-                    if shrinked_core >= official_core:
+                    if not valid_core_decision(expected_branch, official_core, shrinked_core):
                         continue
                     original_latency = (float(pre["latency_ms"]) + float(post["latency_ms"])) / 2.0
                     shrink_latency = \
@@ -1442,6 +1465,7 @@ def compare_core_validation(args):
                         "dtype": dtype,
                         "layout": layout,
                         "branch": expected_branch,
+                        "decision": "retain_official" if shrinked_core == official_core else "shrink",
                         "official_core": official_core,
                         "shrinked_core": shrinked_core,
                         "shrinked_latency": f"{shrink_latency:.9f}",
