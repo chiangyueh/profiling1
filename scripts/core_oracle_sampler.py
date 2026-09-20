@@ -84,10 +84,28 @@ UNREACHABLE_BRANCH_REASONS = {
 ALL_IO_ROUTE_DTYPES = {
     branch: ALL_ROUTE_IO_DTYPES[branch] for branch in FRESH_REACHABLE_BRANCHES
 }
-ALL_IO_COMBINATIONS = tuple(
+_ALL_IO_COMBINATIONS = tuple(
     (branch, input_dtype, output_dtype)
     for branch, dtype_pairs in ALL_IO_ROUTE_DTYPES.items()
     for input_dtype, output_dtype in dtype_pairs
+)
+PROVEN_PRIORITY_IO_COMBINATIONS = (
+    ("AL1_FULL_LOAD", "fp32", "fp32"),
+    ("BASE", "fp32", "fp32"),
+    ("DETERMINISTIC_SPLIT_K_ND2NZ", "fp32", "fp32"),
+    ("BL1_FULL_LOAD_VEC_NZ2ND", "fp32", "fp32"),
+    ("BL1_FULL_LOAD_FIXPIPE", "fp32", "fp32"),
+    ("DETERMINISTIC_SPLIT_K_VEC_NZ2ND", "fp32", "fp32"),
+    ("BL1_FULL_LOAD_FIXPIPE_ND2NZ", "fp32", "fp32"),
+    ("BASE_ND2NZ", "bf16", "bf16"),
+    ("BL1_FULL_LOAD_ND2NZ", "fp32", "fp32"),
+    ("DETERMINISTIC_SPLIT_K", "bf16", "bf16"),
+    ("DETERMINISTIC_SPLIT_K_ND2NZ", "bf16", "bf16"),
+)
+assert set(PROVEN_PRIORITY_IO_COMBINATIONS) <= set(_ALL_IO_COMBINATIONS)
+ALL_IO_COMBINATIONS = PROVEN_PRIORITY_IO_COMBINATIONS + tuple(
+    combination for combination in _ALL_IO_COMBINATIONS
+    if combination not in PROVEN_PRIORITY_IO_COMBINATIONS
 )
 assert len(ALL_IO_COMBINATIONS) == 75
 
@@ -857,16 +875,37 @@ def write_all_io_selected(path, selected):
 
 def select_all_io_core_sweep(args):
     """Discover real official packets for every fresh-reachable route/I/O pair."""
+    active_combinations = (PROVEN_PRIORITY_IO_COMBINATIONS
+                           if args.priority_only else ALL_IO_COMBINATIONS)
     candidate_groups = collections.defaultdict(list)
-    for item in all_io_core_sweep_candidates():
-        candidate_groups[(item[6], item[0], item[1])].append(item)
+    if not args.resume_only:
+        for item in all_io_core_sweep_candidates():
+            combination = (item[6], item[0], item[1])
+            if combination in active_combinations:
+                candidate_groups[combination].append(item)
 
     selected = []
     selected_keys = set()
     counts = collections.Counter()
+
+    # Seed each quota with already measured shapes.  Complete 4..20 curves
+    # come first, then partially measured curves.  This turns the first NPU
+    # work into completion of earlier evidence instead of unrelated discovery.
+    _complete, _measurements, historical_shapes = load_all_io_completed_measurements()
+    for item in historical_shapes:
+        combination = (item[6], item[0], item[1])
+        if combination not in active_combinations or counts[combination] >= args.quota:
+            continue
+        key = item[:6] + (item[6],)
+        if key in selected_keys:
+            continue
+        selected.append(item)
+        selected_keys.add(key)
+        counts[combination] += 1
+
     for item in read_all_io_selected(args.selected):
         combination = (item[6], item[0], item[1])
-        if counts[combination] >= args.quota:
+        if combination not in active_combinations or counts[combination] >= args.quota:
             continue
         key = item[:6] + (item[6],)
         if key in selected_keys:
@@ -905,7 +944,7 @@ def select_all_io_core_sweep(args):
                 accepted.append(item)
         return accepted
 
-    for combination in ALL_IO_COMBINATIONS:
+    for combination in (() if args.resume_only else active_combinations):
         if counts[combination] >= args.quota:
             continue
         candidates = [item for item in candidate_groups[combination]
@@ -973,14 +1012,14 @@ def select_all_io_core_sweep(args):
                           "output_dtype": output_dtype, "selected": counts[combination],
                           "target": args.quota}, separators=(",", ":")), file=sys.stderr)
 
-    order = {combination: index for index, combination in enumerate(ALL_IO_COMBINATIONS)}
+    order = {combination: index for index, combination in enumerate(active_combinations)}
     selected.sort(key=lambda item: (
         order[(item[6], item[0], item[1])], item[3] * item[4] * item[5],
         item[3], item[4], item[5]))
     write_all_io_selected(args.selected, selected)
     missing = {
         f"{branch}:{input_dtype}->{output_dtype}": args.quota - counts[(branch, input_dtype, output_dtype)]
-        for branch, input_dtype, output_dtype in ALL_IO_COMBINATIONS
+        for branch, input_dtype, output_dtype in active_combinations
         if counts[(branch, input_dtype, output_dtype)] < args.quota
     }
     branch_inventory = {}
@@ -992,8 +1031,15 @@ def select_all_io_core_sweep(args):
                 "selected_shapes": 0,
             }
             continue
-        combinations = [(branch, input_dtype, output_dtype)
-                        for input_dtype, output_dtype in ALL_IO_ROUTE_DTYPES[branch]]
+        combinations = [combination for combination in active_combinations
+                        if combination[0] == branch]
+        if not combinations:
+            branch_inventory[branch] = {
+                "status": "DEFERRED",
+                "selected_shapes": 0,
+                "io_combinations": 0,
+            }
+            continue
         selected_count = sum(counts[combination] for combination in combinations)
         branch_inventory[branch] = {
             "status": "COMPLETE" if all(
@@ -1003,9 +1049,10 @@ def select_all_io_core_sweep(args):
             "io_combinations": len(combinations),
         }
     print(json.dumps({"all_io_selection": "complete" if not missing else "partial",
+                      "phase": "proven_resume" if args.priority_only else "all_routes",
                       "branches_declared": len(TARGET_BRANCHES),
                       "branches_fresh_reachable": len(FRESH_REACHABLE_BRANCHES),
-                      "combinations": len(ALL_IO_COMBINATIONS),
+                      "combinations": len(active_combinations),
                       "selected_shapes": len(selected), "missing": missing,
                       "branch_inventory": branch_inventory},
                      separators=(",", ":")), file=sys.stderr)
@@ -1686,13 +1733,14 @@ def all_io_shape_fingerprint(branch, input_dtype, output_dtype, layout, shape):
 def load_all_io_completed_measurements():
     path = os.path.join(os.path.dirname(__file__), "all_io_core_sweep_resume.json")
     if not os.path.isfile(path):
-        return set(), set()
+        return set(), set(), []
     with open(path, encoding="utf-8") as stream:
         payload = json.load(stream)
     if (payload.get("schema") != 2 or
             payload.get("core_range") != [4, 20] or
             not isinstance(payload.get("complete_shape_sha256"), list) or
-            not isinstance(payload.get("measurement_sha256"), list)):
+            not isinstance(payload.get("measurement_sha256"), list) or
+            not isinstance(payload.get("resume_shapes"), list)):
         raise RuntimeError("invalid all-I/O core-sweep resume manifest")
     shapes = set(payload["complete_shape_sha256"])
     measurements = set(payload["measurement_sha256"])
@@ -1701,7 +1749,21 @@ def load_all_io_completed_measurements():
             any(not isinstance(value, str) or len(value) != 64
                 for value in shapes | measurements)):
         raise RuntimeError("invalid all-I/O completed-measurement fingerprint")
-    return shapes, measurements
+    resume_shapes = []
+    seen = set()
+    for fields in payload["resume_shapes"]:
+        if not isinstance(fields, list) or len(fields) != 7:
+            raise RuntimeError("invalid all-I/O resume shape")
+        branch, input_dtype, output_dtype, layout, m, n, k = fields
+        if ((branch, input_dtype, output_dtype) not in ALL_IO_COMBINATIONS or
+                layout not in ("NN", "NT", "TN", "TT") or
+                not all(isinstance(value, int) and value > 0 for value in (m, n, k))):
+            raise RuntimeError("invalid all-I/O resume shape fields")
+        item = (input_dtype, output_dtype, layout, m, n, k, branch)
+        if item not in seen:
+            resume_shapes.append(item)
+            seen.add(item)
+    return shapes, measurements, resume_shapes
 
 
 def load_all_io_checkpoint(path):
@@ -1722,13 +1784,17 @@ def load_all_io_checkpoint(path):
 
 def measure_all_io_core_sweep(args):
     """Measure one complete 4..20 response curve before changing shape."""
-    selected = read_all_io_selected(args.selected)
-    order = {combination: index for index, combination in enumerate(ALL_IO_COMBINATIONS)}
+    active_combinations = (PROVEN_PRIORITY_IO_COMBINATIONS
+                           if args.priority_only else ALL_IO_COMBINATIONS)
+    selected = [item for item in read_all_io_selected(args.selected)
+                if (item[6], item[0], item[1]) in active_combinations]
+    order = {combination: index for index, combination in enumerate(active_combinations)}
     selected.sort(key=lambda item: (
         order[(item[6], item[0], item[1])], item[3] * item[4] * item[5],
         item[3], item[4], item[5]))
     checkpoint = load_all_io_checkpoint(args.checkpoint)
-    completed_shapes, completed_measurements = load_all_io_completed_measurements()
+    completed_shapes, completed_measurements, _historical_shapes = \
+        load_all_io_completed_measurements()
     attempted = collections.Counter()
     succeeded = collections.Counter()
     failed = collections.Counter()
@@ -1738,6 +1804,7 @@ def measure_all_io_core_sweep(args):
     for branch in TARGET_BRANCHES:
         inventory = {
             "record_type": "branch_inventory",
+            "phase": "proven_resume" if args.priority_only else "all_routes",
             "branch": branch,
             "branch_status": "SELECTED" if selected_branch_counts[branch] else "MISSING",
             "selected_shapes": selected_branch_counts[branch],
@@ -1747,7 +1814,10 @@ def measure_all_io_core_sweep(args):
             inventory["branch_status"] = "UNREACHABLE"
             inventory["reason"] = UNREACHABLE_BRANCH_REASONS[branch]
         else:
-            inventory["io_combinations"] = len(ALL_IO_ROUTE_DTYPES[branch])
+            inventory["io_combinations"] = sum(
+                combination[0] == branch for combination in active_combinations)
+            if inventory["io_combinations"] == 0:
+                inventory["branch_status"] = "DEFERRED"
         print(json.dumps(inventory, separators=(",", ":")), flush=True)
 
     def store(record, combination):
@@ -1875,7 +1945,7 @@ def measure_all_io_core_sweep(args):
             store(record, combination)
 
     summary = {}
-    for branch, input_dtype, output_dtype in ALL_IO_COMBINATIONS:
+    for branch, input_dtype, output_dtype in active_combinations:
         combination = (branch, input_dtype, output_dtype)
         prefix = f"{branch}:{input_dtype}->{output_dtype}"
         summary[prefix] = {
@@ -1888,13 +1958,14 @@ def measure_all_io_core_sweep(args):
             "historical_core_records_skipped": historical_skips[combination],
         }
     print(json.dumps({"all_io_core_sweep": "finished_available_shapes",
+                      "phase": "proven_resume" if args.priority_only else "all_routes",
                       "branches_declared": len(TARGET_BRANCHES),
                       "branches_fresh_reachable": len(FRESH_REACHABLE_BRANCHES),
                       "branches_unreachable": {
                           branch: UNREACHABLE_BRANCH_REASONS[branch]
                           for branch in FRESH_FORMULA_UNREACHABLE_BRANCHES
                       },
-                      "combinations": len(ALL_IO_COMBINATIONS),
+                      "combinations": len(active_combinations),
                       "summary": summary}, separators=(",", ":")), file=sys.stderr)
     return 0
 
@@ -2221,8 +2292,11 @@ def main():
     all_io_select_parser = sub.add_parser("select-all-io-core-sweep", parents=[common])
     all_io_select_parser.add_argument("--quota", type=int, default=50)
     all_io_select_parser.add_argument("--discovery-batch", type=int, default=64)
+    all_io_select_parser.add_argument("--priority-only", action="store_true")
+    all_io_select_parser.add_argument("--resume-only", action="store_true")
     all_io_measure_parser = sub.add_parser("measure-all-io-core-sweep", parents=[common])
     all_io_measure_parser.add_argument("--checkpoint", required=True)
+    all_io_measure_parser.add_argument("--priority-only", action="store_true")
     args = parser.parse_args()
     if args.command == "discover":
         return discover(args)

@@ -154,6 +154,7 @@ if [[ -z "${MATMUL_V3_CAMPAIGN:-}" || "${MATMUL_V3_CAMPAIGN:-}" == "all_io_core_
         exit 2
     fi
     all_io_selected="${host_build}/all_io_core_sweep_v1_selected.tsv"
+    priority_selected="${host_build}/all_io_core_sweep_priority_v1_selected.tsv"
     all_io_checkpoint="${host_build}/all_io_core_sweep_v1_checkpoint.jsonl"
     #NEW: The exhaustive 4..20 pass is a coarse response-curve sweep.  One
     # warmup removes the first-launch path and ten timed launches provide a
@@ -162,6 +163,14 @@ if [[ -z "${MATMUL_V3_CAMPAIGN:-}" || "${MATMUL_V3_CAMPAIGN:-}" == "all_io_core_
     export MATMUL_V3_WARMUP="${MATMUL_V3_WARMUP:-1}"
     export MATMUL_V3_REPEATS="${MATMUL_V3_REPEATS:-10}"
     export MATMUL_V3_RUNNER_IDLE_TIMEOUT_SECONDS="${MATMUL_V3_RUNNER_IDLE_TIMEOUT_SECONDS:-180}"
+    python3 scripts/core_oracle_sampler.py select-all-io-core-sweep \
+        --runner "${example_binary}" --selected "${priority_selected}" \
+        --run-log "${run_log}" --quota 50 --discovery-batch 64 \
+        --priority-only --resume-only
+    python3 scripts/core_oracle_sampler.py measure-all-io-core-sweep \
+        --runner "${example_binary}" --selected "${priority_selected}" \
+        --run-log "${run_log}" --checkpoint "${all_io_checkpoint}" \
+        --priority-only
     python3 scripts/core_oracle_sampler.py select-all-io-core-sweep \
         --runner "${example_binary}" --selected "${all_io_selected}" \
         --run-log "${run_log}" --quota 50 --discovery-batch 64
