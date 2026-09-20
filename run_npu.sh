@@ -155,10 +155,12 @@ if [[ -z "${MATMUL_V3_CAMPAIGN:-}" || "${MATMUL_V3_CAMPAIGN:-}" == "all_io_core_
     fi
     all_io_selected="${host_build}/all_io_core_sweep_v1_selected.tsv"
     all_io_checkpoint="${host_build}/all_io_core_sweep_v1_checkpoint.jsonl"
-    #NEW: Each point is an average of 20 device-event launches after three
-    # warmups.  The values are emitted in every JSON record for auditability.
-    export MATMUL_V3_WARMUP="${MATMUL_V3_WARMUP:-3}"
-    export MATMUL_V3_REPEATS="${MATMUL_V3_REPEATS:-20}"
+    #NEW: The exhaustive 4..20 pass is a coarse response-curve sweep.  One
+    # warmup removes the first-launch path and ten timed launches provide a
+    # long enough aggregate event for the shortest observed kernels.  Only
+    # the eventual formula winner and core-20 reference need deeper retests.
+    export MATMUL_V3_WARMUP="${MATMUL_V3_WARMUP:-1}"
+    export MATMUL_V3_REPEATS="${MATMUL_V3_REPEATS:-10}"
     python3 scripts/core_oracle_sampler.py select-all-io-core-sweep \
         --runner "${example_binary}" --selected "${all_io_selected}" \
         --run-log "${run_log}" --quota 50 --discovery-batch 64
