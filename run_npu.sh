@@ -148,6 +148,23 @@ export MATMUL_LEGACY_COMMON_LIBRARY="${official_legacy_common_library}"
 export LD_LIBRARY_PATH="${runtime_path}"
 
 #NEW
+if [[ -z "${MATMUL_V3_CAMPAIGN:-}" || "${MATMUL_V3_CAMPAIGN:-}" == "all_io_core_sweep" ]]; then
+    if [[ "$#" -ne 0 ]]; then
+        echo "fatal: all-I/O core sweep uses its own branch-directed shapes" >&2
+        exit 2
+    fi
+    all_io_selected="${host_build}/all_io_core_sweep_v1_selected.tsv"
+    all_io_checkpoint="${host_build}/all_io_core_sweep_v1_checkpoint.jsonl"
+    python3 scripts/core_oracle_sampler.py select-all-io-core-sweep \
+        --runner "${example_binary}" --selected "${all_io_selected}" \
+        --run-log "${run_log}" --quota 50 --discovery-batch 64
+    python3 scripts/core_oracle_sampler.py measure-all-io-core-sweep \
+        --runner "${example_binary}" --selected "${all_io_selected}" \
+        --run-log "${run_log}" --checkpoint "${all_io_checkpoint}"
+    exit 0
+fi
+
+#NEW
 if [[ "${MATMUL_V3_CAMPAIGN:-}" == "remaining_core_sweep" ]]; then
     if [[ "$#" -ne 0 ]]; then
         echo "fatal: remaining core sweep uses its own branch-directed shapes" >&2

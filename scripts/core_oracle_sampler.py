@@ -35,6 +35,44 @@ TARGET_BRANCHES = (
     "MULTI_CORE_SPLIT_K",
 )
 
+# The Ascend910B3 host selector has eight reachable non-Split-K routes.  The
+# tuples below are the complete input/output dtype combinations accepted by
+# the official MatMulV3 implementation for each route.  A and B always share
+# the input dtype; the output may retain that dtype or accumulate to FP32.
+ALL_IO_ROUTE_DTYPES = {
+    "BASE": (
+        ("fp16", "fp16"), ("fp16", "fp32"),
+        ("bf16", "bf16"), ("bf16", "fp32"), ("fp32", "fp32"),
+    ),
+    "BASE_ND2NZ": (
+        ("fp16", "fp16"), ("fp16", "fp32"),
+        ("bf16", "bf16"), ("bf16", "fp32"), ("fp32", "fp32"),
+    ),
+    "AL1_FULL_LOAD": (("fp32", "fp32"),),
+    "BL1_FULL_LOAD": (
+        ("fp16", "fp16"), ("fp16", "fp32"),
+        ("bf16", "bf16"), ("bf16", "fp32"), ("fp32", "fp32"),
+    ),
+    "BL1_FULL_LOAD_ND2NZ": (
+        ("fp16", "fp16"), ("fp16", "fp32"),
+        ("bf16", "bf16"), ("bf16", "fp32"), ("fp32", "fp32"),
+    ),
+    "BL1_FULL_LOAD_FIXPIPE": (
+        ("fp16", "fp16"), ("fp16", "fp32"),
+        ("bf16", "bf16"), ("bf16", "fp32"), ("fp32", "fp32"),
+    ),
+    "BL1_FULL_LOAD_FIXPIPE_ND2NZ": (
+        ("fp16", "fp32"), ("bf16", "fp32"), ("fp32", "fp32"),
+    ),
+    "BL1_FULL_LOAD_VEC_NZ2ND": (("fp32", "fp32"),),
+}
+ALL_IO_COMBINATIONS = tuple(
+    (branch, input_dtype, output_dtype)
+    for branch, dtype_pairs in ALL_IO_ROUTE_DTYPES.items()
+    for input_dtype, output_dtype in dtype_pairs
+)
+assert len(ALL_IO_COMBINATIONS) == 30
+
 # The current pass is intentionally restricted to non-Split-K routes.  The
 # completed Split-K response curves remain in the checkpoint, but are neither
 # selected nor printed again.
@@ -598,6 +636,290 @@ def remaining_validation_shapes():
     return selected
 
 
+def all_io_core_sweep_candidates():
+    """Source-directed candidates for all 30 reachable route/dtype pairs."""
+    selected = []
+    seen = set()
+
+    def put(branch, input_dtype, output_dtype, layout, m, n, k):
+        if (input_dtype, output_dtype) not in ALL_IO_ROUTE_DTYPES[branch]:
+            return
+        item = (input_dtype, output_dtype, layout, int(m), int(n), int(k), branch)
+        if min(item[3:6]) <= 0 or item in seen:
+            return
+        input_size = 4 if input_dtype == "fp32" else 2
+        output_size = 4 if output_dtype == "fp32" else 2
+        tensor_bytes = (m * k + k * n) * input_size + m * n * output_size
+        if tensor_bytes > 320 * 1024 * 1024:
+            return
+        seen.add(item)
+        selected.append(item)
+
+    # Pure BASE: dense narrow-output grids stay outside AL1 while spanning
+    # all transpose patterns and several operation-count tiers.
+    for input_dtype, output_dtype in ALL_IO_ROUTE_DTYPES["BASE"]:
+        for i in range(1800):
+            layout = ("NN", "NT", "TN", "TT")[i % 4]
+            m = 17 + (i * 7 + i // 41) % 239
+            n = (40, 56, 72, 88, 104, 120, 136, 152)[(i * 5 + i // 37) % 8]
+            k = 8320 + 128 * ((i * 11 + i // 43) % 81)
+            put("BASE", input_dtype, output_dtype, layout, m, n, k)
+
+    # BASE with input head conversion.  Odd dimensions prevent accidental
+    # aligned packets; M/N/K progress independently to avoid a one-line grid.
+    for input_dtype, output_dtype in ALL_IO_ROUTE_DTYPES["BASE_ND2NZ"]:
+        for i in range(2200):
+            layout = ("NN", "TN", "TT")[(i + i // 29) % 3]
+            m = 193 + (i * 67 + i // 17) % 3901
+            n = 179 + (i * 43 + i // 23) % 2017
+            k = 769 + (i * 131 + i // 31) % 15121
+            if m % 2 == 0:
+                m += 1
+            if n % 2 == 0:
+                n += 1
+            if k % 2 == 0:
+                k += 1
+            put("BASE_ND2NZ", input_dtype, output_dtype, layout, m, n, k)
+
+    # AL1 is an official FP32 NT-only selector pocket.
+    for i in range(900):
+        m = 1 + i % 7
+        n = (52, 68, 84, 100, 116, 132, 148, 164, 180, 196,
+             212, 228, 244, 260, 276, 292, 308)[(i * 5 + i // 19) % 17]
+        k = 4224 + 128 * ((i * 7 + i // 23) % 35)
+        put("AL1_FULL_LOAD", "fp32", "fp32", "NT", m, n, k)
+
+    # Plain BL1 has two source-defined pockets.  FP16/BF16 use the explicit
+    # 512x512 core-split full-load predicate.  FP32 uses on-the-fly K/N axes
+    # that avoid both Fixpipe and input ND2NZ.
+    for input_dtype, output_dtype in ALL_IO_ROUTE_DTYPES["BL1_FULL_LOAD"]:
+        if input_dtype == "fp32":
+            for i in range(1800):
+                m = 9216 + 64 * i + i % 17
+                n = (64, 96, 128, 160, 192, 224, 256, 384)[(i * 3 + i // 31) % 8]
+                k = (8, 16, 24, 32, 40, 48, 56, 64)[(i * 5 + i // 37) % 8]
+                put("BL1_FULL_LOAD", input_dtype, output_dtype, "NT", m, n, k)
+        else:
+            for i in range(1200):
+                m = 30848 + 64 * i + i % 13
+                put("BL1_FULL_LOAD", input_dtype, output_dtype, "NT", m, 512, 512)
+
+    # BL1 with A-head ND2NZ: B remains on-the-fly while an odd K forces the
+    # A conversion.  The predicate is valid for all five I/O combinations.
+    for input_dtype, output_dtype in ALL_IO_ROUTE_DTYPES["BL1_FULL_LOAD_ND2NZ"]:
+        for i in range(2200):
+            m = 11265 + 96 * i + i % 19
+            n = (32, 64, 96, 128, 160, 192, 224, 256, 384)[(i * 5 + i // 29) % 9]
+            k = (17, 19, 21, 25, 33, 41, 49, 57, 65, 73, 81)[(i * 7 + i // 31) % 11]
+            put("BL1_FULL_LOAD_ND2NZ", input_dtype, output_dtype, "NN", m, n, k)
+
+    # Plain Fixpipe.  TN includes the already demonstrated high-benefit FP32
+    # region; NN/NT provide independent half and mixed-output packets.
+    for input_dtype, output_dtype in ALL_IO_ROUTE_DTYPES["BL1_FULL_LOAD_FIXPIPE"]:
+        for i in range(2600):
+            if input_dtype == "fp32":
+                layout = "TN" if i % 2 == 0 else "NN"
+                m = 11264 + 32 * i + i % 23
+                n = (11, 17, 31, 47, 51, 63, 73, 80, 89, 95,
+                     111, 112, 119, 127, 143, 160, 176, 191, 223)[(i * 5 + i // 41) % 19]
+                k = (63, 67, 73, 95, 111, 127, 160, 192, 224, 256)[(i * 7 + i // 43) % 10]
+            else:
+                layout = "NT" if output_dtype == "fp32" else "NN"
+                m = 12288 + 64 * i + i % 29
+                n = (47, 51, 63, 73, 80, 89, 95, 111, 112, 119)[(i * 3 + i // 37) % 10]
+                k = (64, 80, 96, 112, 128, 160, 192, 224, 256)[(i * 7 + i // 47) % 9]
+            put("BL1_FULL_LOAD_FIXPIPE", input_dtype, output_dtype, layout, m, n, k)
+
+    # Fixpipe plus head ND2NZ exists for FP32 output.  Odd K forces the A-head
+    # conversion for half/bfloat inputs without changing the public route.
+    for input_dtype, output_dtype in ALL_IO_ROUTE_DTYPES["BL1_FULL_LOAD_FIXPIPE_ND2NZ"]:
+        for i in range(2600):
+            m = 19457 + 64 * i + i % 31
+            n = (17, 19, 23, 25, 31, 47, 51, 63, 73, 80,
+                 89, 95, 111, 112, 119)[(i * 5 + i // 41) % 15]
+            k = (65, 67, 69, 71, 73, 81, 95, 97, 111, 113, 127)[(i * 7 + i // 43) % 11]
+            put("BL1_FULL_LOAD_FIXPIPE_ND2NZ", input_dtype, output_dtype, "NN", m, n, k)
+
+    # Vector NZ2ND is explicitly FP32-only.
+    for i in range(2600):
+        m = 12289 + 256 * i + i % 37
+        n = (23, 31, 40, 47, 56, 73, 80, 89, 96, 111,
+             112, 127, 143, 160, 175, 191)[(i * 7 + i // 41) % 16]
+        k = (24, 40, 64, 80, 96, 112, 128)[(i * 5 + i // 43) % 7]
+        put("BL1_FULL_LOAD_VEC_NZ2ND", "fp32", "fp32", "NN", m, n, k)
+    return selected
+
+
+def all_io_runner_env(base, input_dtype, output_dtype, layout, mode, discovery=False):
+    env = runner_env(base, input_dtype, layout, mode, discovery=discovery)
+    env["MATMUL_OUTPUT_DATA_TYPE"] = output_dtype
+    return env
+
+
+def read_all_io_selected(path):
+    selected = []
+    if not os.path.isfile(path):
+        return selected
+    with open(path, encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) != 7:
+                continue
+            input_dtype, output_dtype, layout, m, n, k, branch = fields
+            if ((branch, input_dtype, output_dtype) not in ALL_IO_COMBINATIONS or
+                    layout not in ("NN", "NT", "TN", "TT")):
+                continue
+            selected.append((input_dtype, output_dtype, layout,
+                             int(m), int(n), int(k), branch))
+    return selected
+
+
+def write_all_io_selected(path, selected):
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        for input_dtype, output_dtype, layout, m, n, k, branch in selected:
+            stream.write(
+                f"{input_dtype}\t{output_dtype}\t{layout}\t{m}\t{n}\t{k}\t{branch}\n")
+    os.replace(temporary, path)
+
+
+def select_all_io_core_sweep(args):
+    """Discover 50 real official packets for each of the 30 combinations."""
+    candidate_groups = collections.defaultdict(list)
+    for item in all_io_core_sweep_candidates():
+        candidate_groups[(item[6], item[0], item[1])].append(item)
+
+    selected = []
+    selected_keys = set()
+    counts = collections.Counter()
+    for item in read_all_io_selected(args.selected):
+        combination = (item[6], item[0], item[1])
+        if counts[combination] >= args.quota:
+            continue
+        key = item[:6] + (item[6],)
+        if key in selected_keys:
+            continue
+        selected.append(item)
+        selected_keys.add(key)
+        counts[combination] += 1
+
+    def discover(items, combination):
+        if not items:
+            return []
+        branch, input_dtype, output_dtype = combination
+        layout = items[0][2]
+        env = all_io_runner_env(
+            os.environ, input_dtype, output_dtype, layout, "discovery", discovery=True)
+        rc, records, _stderr = invoke(
+            args.runner, env,
+            [(input_dtype, layout, m, n, k) for _, _, _, m, n, k, _ in items],
+            args.run_log)
+        if rc != 0 and len(items) > 1:
+            accepted = []
+            for item in items:
+                accepted.extend(discover([item], combination))
+            return accepted
+        by_shape = {
+            (record.get("shape"), record.get("input_dtype", record.get("dtype")),
+             record.get("output_dtype"), record.get("layout")): record
+            for record in records if record.get("status") == "DISCOVERED"
+        }
+        accepted = []
+        for item in items:
+            _, _, item_layout, m, n, k, _ = item
+            shape = f"M{m}_N{n}_K{k}_{item_layout}"
+            record = by_shape.get((shape, input_dtype, output_dtype, item_layout))
+            if record is not None and record.get("branch") == branch:
+                accepted.append(item)
+        return accepted
+
+    for combination in ALL_IO_COMBINATIONS:
+        if counts[combination] >= args.quota:
+            continue
+        candidates = [item for item in candidate_groups[combination]
+                      if item[:6] + (item[6],) not in selected_keys]
+        ordered = sorted(candidates, key=lambda item: item[3] * item[4] * item[5])
+        cuts = ((0, (len(ordered) + 2) // 3),
+                ((len(ordered) + 2) // 3, (2 * len(ordered) + 2) // 3),
+                ((2 * len(ordered) + 2) // 3, len(ordered)))
+        tier_targets = (args.quota // 3, args.quota // 3,
+                        args.quota - 2 * (args.quota // 3))
+        attempted = set()
+        for (begin, end), tier_target in zip(cuts, tier_targets):
+            if counts[combination] >= args.quota:
+                break
+            tier_accepted = 0
+            by_layout = collections.defaultdict(list)
+            for item in ordered[begin:end]:
+                by_layout[item[2]].append(item)
+            for layout in sorted(by_layout):
+                values = by_layout[layout]
+                for offset in range(0, len(values), args.discovery_batch):
+                    if tier_accepted >= tier_target or counts[combination] >= args.quota:
+                        break
+                    batch = values[offset:offset + args.discovery_batch]
+                    attempted.update(batch)
+                    for item in discover(batch, combination):
+                        key = item[:6] + (item[6],)
+                        if key in selected_keys:
+                            continue
+                        selected.append(item)
+                        selected_keys.add(key)
+                        counts[combination] += 1
+                        tier_accepted += 1
+                        if tier_accepted >= tier_target or counts[combination] >= args.quota:
+                            break
+                    write_all_io_selected(args.selected, selected)
+
+        # Sparse selector pockets are allowed to borrow unused candidates
+        # from another size tier, but never from another dtype combination.
+        if counts[combination] < args.quota:
+            by_layout = collections.defaultdict(list)
+            for item in ordered:
+                if item not in attempted and item[:6] + (item[6],) not in selected_keys:
+                    by_layout[item[2]].append(item)
+            for layout in sorted(by_layout):
+                values = by_layout[layout]
+                for offset in range(0, len(values), args.discovery_batch):
+                    if counts[combination] >= args.quota:
+                        break
+                    batch = values[offset:offset + args.discovery_batch]
+                    for item in discover(batch, combination):
+                        key = item[:6] + (item[6],)
+                        if key in selected_keys:
+                            continue
+                        selected.append(item)
+                        selected_keys.add(key)
+                        counts[combination] += 1
+                        if counts[combination] >= args.quota:
+                            break
+                    write_all_io_selected(args.selected, selected)
+
+        branch, input_dtype, output_dtype = combination
+        print(json.dumps({"selection": "combination",
+                          "branch": branch, "input_dtype": input_dtype,
+                          "output_dtype": output_dtype, "selected": counts[combination],
+                          "target": args.quota}, separators=(",", ":")), file=sys.stderr)
+
+    order = {combination: index for index, combination in enumerate(ALL_IO_COMBINATIONS)}
+    selected.sort(key=lambda item: (
+        order[(item[6], item[0], item[1])], item[3] * item[4] * item[5],
+        item[3], item[4], item[5]))
+    write_all_io_selected(args.selected, selected)
+    missing = {
+        f"{branch}:{input_dtype}->{output_dtype}": args.quota - counts[(branch, input_dtype, output_dtype)]
+        for branch, input_dtype, output_dtype in ALL_IO_COMBINATIONS
+        if counts[(branch, input_dtype, output_dtype)] < args.quota
+    }
+    print(json.dumps({"all_io_selection": "complete" if not missing else "partial",
+                      "combinations": len(ALL_IO_COMBINATIONS),
+                      "selected_shapes": len(selected), "missing": missing},
+                     separators=(",", ":")), file=sys.stderr)
+    # Preserve all successfully discovered work even if an official selector
+    # pocket is sparser than its source-level support declaration.
+    return 0 if selected else 4
+
+
 def select_shrink(args):
     #NEW: First ask the real host tiler which route each candidate reaches,
     # with the production shrink hook enabled.  This is metadata-only: no NPU
@@ -994,6 +1316,7 @@ def expand_witness(pool, queued, item, branch):
 def runner_env(base, dtype, layout, mode, requested_core=None, discovery=False):
     env = dict(base)
     env["MATMUL_DATA_TYPE"] = dtype
+    env["MATMUL_OUTPUT_DATA_TYPE"] = dtype
     env["MATMUL_A_TRANSPOSE"] = "1" if layout[0] == "T" else "0"
     env["MATMUL_B_TRANSPOSE"] = "1" if layout[1] == "T" else "0"
     env["MATMUL_V3_MEASUREMENT_MODE"] = mode
@@ -1198,6 +1521,160 @@ def append_checkpoint(path, records):
         for record in records:
             stream.write(json.dumps(record, separators=(",", ":")) + "\n")
         stream.flush()
+
+
+def all_io_measurement_key(record):
+    return (record.get("shape"), record.get("input_dtype", record.get("dtype")),
+            record.get("output_dtype"), record.get("layout"),
+            record.get("mode"), record.get("requested_core"))
+
+
+def load_all_io_checkpoint(path):
+    records = {}
+    if not path or not os.path.isfile(path):
+        return records
+    with open(path, encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict) or not record.get("shape"):
+                continue
+            records[all_io_measurement_key(record)] = record
+    return records
+
+
+def measure_all_io_core_sweep(args):
+    """Measure one complete 4..20 response curve before changing shape."""
+    selected = read_all_io_selected(args.selected)
+    order = {combination: index for index, combination in enumerate(ALL_IO_COMBINATIONS)}
+    selected.sort(key=lambda item: (
+        order[(item[6], item[0], item[1])], item[3] * item[4] * item[5],
+        item[3], item[4], item[5]))
+    checkpoint = load_all_io_checkpoint(args.checkpoint)
+    attempted = collections.Counter()
+    succeeded = collections.Counter()
+    failed = collections.Counter()
+
+    def store(record, combination):
+        checkpoint[all_io_measurement_key(record)] = record
+        append_checkpoint(args.checkpoint, [record])
+        print(json.dumps(record, separators=(",", ":")), flush=True)
+        attempted[combination] += 1
+        if record.get("status") == "OK" and record.get("correctness") == "PASS":
+            succeeded[combination] += 1
+        else:
+            failed[combination] += 1
+
+    def synthetic_error(shape, input_dtype, output_dtype, layout, branch,
+                        mode, core, rc, stderr):
+        return {
+            "shape": shape,
+            "dtype": input_dtype,
+            "input_dtype": input_dtype,
+            "output_dtype": output_dtype,
+            "layout": layout,
+            "branch": branch,
+            "mode": mode,
+            "experiment": "fixed_tiling_core_sweep",
+            "requested_core": core,
+            "latency_ms": None,
+            "status": "RUNNER_ERROR",
+            "correctness": "NOT_CHECKED",
+            "failure_stage": "runner_no_record",
+            "rc": rc,
+            "detail": " ".join(stderr.strip().split())[-1000:],
+        }
+
+    for item in selected:
+        input_dtype, output_dtype, layout, m, n, k, expected_branch = item
+        combination = (expected_branch, input_dtype, output_dtype)
+        shape = f"M{m}_N{n}_K{k}_{layout}"
+        # Official samples bracket the requested 4..20 curve.  Each token is
+        # launched in a separate process, so a failed core cannot poison the
+        # stream, executor, or ACL state used by any later core.
+        modes = [("official_pre", None)] + [
+            ("core_sweep", core) for core in range(4, 21)
+        ] + [("official_post", None)]
+        pending = [(mode, core) for mode, core in modes
+                   if (shape, input_dtype, output_dtype, layout, mode, core) not in checkpoint]
+        if not pending:
+            continue
+
+        # Fast path: one process executes the complete ordered curve.  The
+        # C++ loop emits an independent record for every core and continues
+        # after ordinary measurement errors.
+        env = all_io_runner_env(
+            os.environ, input_dtype, output_dtype, layout, "core_response")
+        env["MATMUL_V3_MEASUREMENT_PLAN"] = ",".join(
+            mode if core is None else str(core) for mode, core in pending)
+        rc, records, stderr = invoke(
+            args.runner, env, [(input_dtype, layout, m, n, k)], args.run_log)
+        by_key = {}
+        for record in records:
+            if record.get("shape") != shape:
+                continue
+            key = (record.get("mode"), record.get("requested_core"))
+            by_key[key] = record
+
+        retry = []
+        for mode, core in pending:
+            record = by_key.get((mode, core))
+            if (record is None or record.get("status") != "OK" or
+                    record.get("correctness") != "PASS"):
+                retry.append((mode, core, record))
+                continue
+            if record.get("branch") != expected_branch:
+                record["expected_branch"] = expected_branch
+                record["status"] = "ROUTE_CHANGED"
+                retry.append((mode, core, record))
+                continue
+            store(record, combination)
+
+        # Slow recovery path: every missing/failed core gets a fresh process.
+        # A repeated failure is checkpointed as that core's final skipped
+        # result, then the next core of the same shape still runs.
+        for mode, core, first_record in retry:
+            token = mode if core is None else str(core)
+            retry_env = all_io_runner_env(
+                os.environ, input_dtype, output_dtype, layout, "core_response")
+            retry_env["MATMUL_V3_MEASUREMENT_PLAN"] = token
+            retry_rc, retry_records, retry_stderr = invoke(
+                args.runner, retry_env, [(input_dtype, layout, m, n, k)], args.run_log)
+            matching = [record for record in retry_records
+                        if record.get("shape") == shape and record.get("mode") == mode and
+                        record.get("requested_core") == core]
+            if matching:
+                record = matching[-1]
+            elif first_record is not None:
+                record = first_record
+            else:
+                record = synthetic_error(
+                    shape, input_dtype, output_dtype, layout, expected_branch,
+                    mode, core, retry_rc if retry_rc != 0 else rc,
+                    retry_stderr or stderr)
+            if record.get("branch") not in (expected_branch, "UNKNOWN", None):
+                record["expected_branch"] = expected_branch
+                record["status"] = "ROUTE_CHANGED"
+            store(record, combination)
+
+    summary = {}
+    for branch, input_dtype, output_dtype in ALL_IO_COMBINATIONS:
+        combination = (branch, input_dtype, output_dtype)
+        prefix = f"{branch}:{input_dtype}->{output_dtype}"
+        summary[prefix] = {
+            "selected_shapes": sum(
+                1 for item in selected
+                if (item[6], item[0], item[1]) == combination),
+            "new_attempts": attempted[combination],
+            "new_successes": succeeded[combination],
+            "new_failures": failed[combination],
+        }
+    print(json.dumps({"all_io_core_sweep": "finished_available_shapes",
+                      "combinations": len(ALL_IO_COMBINATIONS),
+                      "summary": summary}, separators=(",", ":")), file=sys.stderr)
+    return 0
 
 
 def measure(args):
@@ -1519,6 +1996,11 @@ def main():
     core_compare_parser = sub.add_parser("compare-core-validation", parents=[common])
     core_compare_parser.add_argument("--quota", type=int, default=30)
     core_compare_parser.add_argument("--batch-size", type=int, default=8)
+    all_io_select_parser = sub.add_parser("select-all-io-core-sweep", parents=[common])
+    all_io_select_parser.add_argument("--quota", type=int, default=50)
+    all_io_select_parser.add_argument("--discovery-batch", type=int, default=64)
+    all_io_measure_parser = sub.add_parser("measure-all-io-core-sweep", parents=[common])
+    all_io_measure_parser.add_argument("--checkpoint", required=True)
     args = parser.parse_args()
     if args.command == "discover":
         return discover(args)
@@ -1534,6 +2016,10 @@ def main():
         return measure_remaining(args)
     if args.command == "compare-core-validation":
         return compare_core_validation(args)
+    if args.command == "select-all-io-core-sweep":
+        return select_all_io_core_sweep(args)
+    if args.command == "measure-all-io-core-sweep":
+        return measure_all_io_core_sweep(args)
     return compare(args)
 
 
