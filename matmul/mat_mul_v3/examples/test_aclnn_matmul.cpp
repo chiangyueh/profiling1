@@ -294,10 +294,10 @@ std::string ReadEnvironment(const char* name) {
 }
 
 //NEW
-uint32_t ReadEnvironmentUint(const char* name) {
+uint32_t ReadEnvironmentUint(const char* name, uint32_t defaultValue = 0) {
   const char* value = std::getenv(name);
   if (value == nullptr || value[0] == '\0') {
-    return 0;
+    return defaultValue;
   }
   return static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
 }
@@ -555,8 +555,12 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   // CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSynchronizeStream failed. ERROR: %d\n", ret); return ret);
 
   //NEW
-  constexpr int warmup = 10;
-  constexpr int repeat = 100;
+  //NEW: Keep the sampling depth configurable so a broad 30-combination
+  // campaign does not spend 110 launches on every one of 25,500 points.
+  // The defaults preserve the original standalone runner behaviour.
+  const int warmup = static_cast<int>(ReadEnvironmentUint("MATMUL_V3_WARMUP", 10));
+  const int repeat = static_cast<int>(ReadEnvironmentUint("MATMUL_V3_REPEATS", 100));
+  CHECK_RET(warmup >= 0 && repeat > 0, return 2);
 
   *failedStage = "warmup_submit";
   for (int i = 0; i < warmup; ++i) {
@@ -675,7 +679,9 @@ void PrintMeasurementResult(const MeasurementResult& result) {
       layout.c_str(), SelectedDataTypeName(), SelectedDataTypeName(), SelectedOutputDataTypeName(),
       layout.c_str(), soc.c_str(), branch.c_str(), mode.c_str(),
       requestedCore.c_str(), result.officialCore, result.actualCore, latency.c_str(),
-      static_cast<unsigned long long>(result.workspaceBytes), discovery ? 0 : 10, discovery ? 0 : 100,
+      static_cast<unsigned long long>(result.workspaceBytes),
+      discovery ? 0 : static_cast<int>(ReadEnvironmentUint("MATMUL_V3_WARMUP", 10)),
+      discovery ? 0 : static_cast<int>(ReadEnvironmentUint("MATMUL_V3_REPEATS", 100)),
       status, correctness,
       failedStage.c_str(), tiling.c_str());
 }

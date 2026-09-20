@@ -1618,20 +1618,26 @@ def measure_all_io_core_sweep(args):
         retry = []
         for mode, core in pending:
             record = by_key.get((mode, core))
-            if (record is None or record.get("status") != "OK" or
-                    record.get("correctness") != "PASS"):
+            # A concrete failure record already identifies the exact core.
+            # Persist it and continue; retry only a core for which a crashed
+            # process emitted no record at all.
+            if record is None:
                 retry.append((mode, core, record))
+                continue
+            if (record.get("status") != "OK" or
+                    record.get("correctness") != "PASS"):
+                store(record, combination)
                 continue
             if record.get("branch") != expected_branch:
                 record["expected_branch"] = expected_branch
                 record["status"] = "ROUTE_CHANGED"
-                retry.append((mode, core, record))
+                store(record, combination)
                 continue
             store(record, combination)
 
-        # Slow recovery path: every missing/failed core gets a fresh process.
-        # A repeated failure is checkpointed as that core's final skipped
-        # result, then the next core of the same shape still runs.
+        # Slow recovery path: only a core missing because the batch process
+        # stopped before emitting its record gets a fresh process.  A failed
+        # core that did emit a record was already checkpointed above.
         for mode, core, first_record in retry:
             token = mode if core is None else str(core)
             retry_env = all_io_runner_env(
