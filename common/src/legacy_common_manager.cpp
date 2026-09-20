@@ -13,7 +13,6 @@
 #include <dlfcn.h>
 #include <dirent.h>
 #include <limits.h>
-#include <cstdlib> //NEW
 #include "log/log.h"
 
 // 兼容opp整包场景：整包不编译本文件，仅子包编译
@@ -58,20 +57,6 @@ LegacyCommonMgr::~LegacyCommonMgr()
 
 bool LegacyCommonMgr::GetLegacyCommonSoPath(std::string& soPath) const
 {
-    //NEW
-    // Repository-local host libraries are outside the installed OPP layout.
-    // Use the matching official 8.5 legacy library supplied by run_npu.sh.
-    const char* explicitLegacySo = std::getenv("MATMUL_LEGACY_COMMON_LIBRARY");
-    if (explicitLegacySo != nullptr && explicitLegacySo[0] != '\0') {
-        char explicitRealPath[PATH_MAX] = {0};
-        if (realpath(explicitLegacySo, explicitRealPath) == nullptr) {
-            OP_LOGW("LegacyCommonMgr", "Fail to get realpath of explicit legacy so [%s].", explicitLegacySo);
-            return false;
-        }
-        soPath.assign(explicitRealPath);
-        return true;
-    }
-
     std::string parentPath;
     std::string currSoName;
     if (!GetParentPath(parentPath, currSoName)) {
