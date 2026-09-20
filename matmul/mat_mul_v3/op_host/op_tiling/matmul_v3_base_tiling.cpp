@@ -14,11 +14,11 @@
  */
 
 #include <cinttypes>
-//NEW BEGIN: core-shrink comparison support
+//NEW BEGIN
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
-//NEW END: core-shrink comparison support
+//NEW END
 #include "matmul_v3_base_tiling.h"
 #include "../../op_kernel/mat_mul_v3_tiling_key.h"
 
@@ -2673,7 +2673,7 @@ bool MatmulV3BaseTiling::CheckMMTilingDataIsVaild()
         CheckNumberIsValid(runInfo_.l2Info.nTileBlock, args_.opName, "runInfo_.l2Info.nTileBlock"));
 }
 
-//NEW BEGIN: core-shrink formulas preserved from 88fb714
+//NEW BEGIN
 bool MatmulV3BaseTiling::ShrinkIdleCores()
 {
     auto &matmul = tilingData_.matmulTiling;
@@ -2689,18 +2689,10 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
     const uint64_t m = static_cast<uint64_t>(matmul.M);
     const uint64_t n = static_cast<uint64_t>(matmul.N);
 
-    // Fresh result26 validation showed that preserving the K-wave count
-    // is not sufficient: plain deterministic Split-K lost on 32/37 shapes,
-    // and A-head ND2NZ lost on all 50 shapes across FP32/FP16/BF16.  The
-    // reduction/ND2NZ critical path needs all official producers, so the
-    // deterministic family now deliberately retains the official core count.
     if (tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::DETERMINISTIC_SPLIT_K) {
         return false;
     }
 
-    // The remaining Split-K routes keep the official core count.  The
-    // measured single-core routes select 20, while the other ownership-
-    // changing packets do not yet have a safe closed-form reduction rule.
     if (tilingEnable_.tilingEnableSplitCore != TilingEnableSplitCore::BASE) {
         return false;
     }
@@ -2708,9 +2700,6 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
     const uint64_t mTotal = ops::CeilDiv(static_cast<uint64_t>(matmul.M), singleCoreM);
     const uint64_t nTotal = ops::CeilDiv(static_cast<uint64_t>(matmul.N), singleCoreN);
 
-    // AL1_FULL_LOAD copies the whole A operand before block ownership is
-    // checked.  A block beyond this single L2 window's N-tile count therefore
-    // performs only a redundant A1 startup and owns no output tile.
     if (tilingEnable_.tilingEnableFullLoad == TilingEnableFullLoad::AL1_FULL_LOAD) {
         if (tilingEnable_.tilingEnableFixOpti != TilingEnableFixOpti::BASE ||
             tilingEnable_.tilingEnableSpecialOpti != TilingEnableSpecialOpti::BASE ||
@@ -2732,14 +2721,7 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
     }
 
     if (tilingEnable_.tilingEnableFullLoad == TilingEnableFullLoad::BL1_FULL_LOAD) {
-        // Fixpipe duplicates a resident B1/Fixpipe producer per active
-        // AIC.  Permit one extra M-body wave only in the bounded domains where
-        // that producer reduction dominates; otherwise retain the official
-        // count.  The count is derived from body tasks, not from a lookup.
         if (tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE_ENABLE_ALIGNOUT) {
-            // Plain Fixpipe lost on 10/12 fresh result26 shapes.  Keep
-            // the official count there; the independently validated A-head
-            // ND2NZ Fixpipe packet remains eligible below.
             if (GetMixNd2nzType() == MixNd2NzType::NO_ND2NZ &&
                 run.nd2nzA == 0 && run.nd2nzB == 0) {
                 return false;
@@ -2789,9 +2771,6 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
             return true;
         }
 
-        // BL1_FULL_LOAD_VEC_NZ2ND balances duplicated private-B1 fills
-        // against the coupled 1-AIC:2-AIV output pipeline.  Every condition
-        // outside the source-derived packet domain falls back to official.
         if (tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::VEC_NZ2ND_UNALIGNOUT) {
             const uint64_t k = static_cast<uint64_t>(matmul.singleCoreK);
             const uint64_t baseM = static_cast<uint64_t>(matmul.baseM);
@@ -2867,10 +2846,6 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
             return true;
         }
 
-        // BL1_FULL_LOAD_ND2NZ has a serialized A-head conversion followed
-        // by a one-dimensional M-tile body. Shrink only inside the official
-        // head/body wave plateaus: neither the busiest AIV nor the busiest AIC
-        // may receive one more non-empty work item after shrinking.
         const bool isBl1FullLoadNd2Nz =
             tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE &&
             tilingEnable_.tilingEnableSpecialOpti == TilingEnableSpecialOpti::BASE &&
@@ -2905,9 +2880,6 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
             return false;
         }
 
-        // MatmulBaseBlock uses ceil(totalTiles/core) body rounds.  At
-        // least three body waves amortize the duplicated resident-B1 startup;
-        // above that point the official wave count is preserved.
         const uint64_t officialBodyWaves = ops::CeilDiv(totalTiles, oldUsedCoreNum);
         if (officialBodyWaves == 0) {
             return false;
@@ -2952,16 +2924,10 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
         if (oldHeadWaves == 0 || oldHeadWaves > UINT64_MAX / NUMBER_TWO) {
             return false;
         }
-        // Each AIC owns two AIVs.  Keep at least two complete head waves
-        // so fewer AICs can amortize the serialized VNCHW startup; once the
-        // official packet already needs two waves, do not add another.
         const uint64_t headWaves = std::max<uint64_t>(2UL, oldHeadWaves);
         const uint64_t cHead = ops::CeilDiv(headLoops, NUMBER_TWO * headWaves);
         uint64_t newUsedCoreNum = std::max(cBody, cHead);
         newUsedCoreNum = std::max<uint64_t>(1, std::min(newUsedCoreNum, oldUsedCoreNum));
-        // Fresh validation supports the 16/17-core plateaus.  The
-        // 18/19-core plateaus were weak and included a severe 18-core
-        // regression, so they retain the official count.
         if (newUsedCoreNum >= oldUsedCoreNum || newUsedCoreNum > 17UL) {
             return false;
         }
@@ -2969,9 +2935,6 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
         return true;
     }
 
-    // BASE_ND2NZ, CVP parallel, K-shift, and other special routes retain
-    // the official core count because their conversion/L2 packets were built
-    // for that count and are not recomputed by this post-tiling hook.
     const bool pureBaseNoNd2Nz =
         tilingEnable_.tilingEnableFullLoad == TilingEnableFullLoad::BASE &&
         tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE &&
@@ -2999,7 +2962,7 @@ bool MatmulV3BaseTiling::ShrinkIdleCores()
     matmul.usedCoreNum = static_cast<uint32_t>(newUsedCoreNum);
     return true;
 }
-//NEW END: core-shrink formulas preserved from 88fb714
+//NEW END
 
 
 ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
@@ -3040,19 +3003,27 @@ ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
     L2Cache l2Cache(args_, tilingData_);
     l2Cache.SetL2CacheFlag(tilingEnable_, compileInfo_.l2Size, l2CacheFlag_);
 
-    //NEW BEGIN: one switch, one shrink call, and two values for the comparison runner
+    //NEW BEGIN
     const char *shrink = std::getenv("MATMUL_V3_SHRINK_IDLE_CORES");
     if (shrink != nullptr && shrink[0] == '1' && shrink[1] == '\0') {
         (void)ShrinkIdleCores();
     }
-    char tilingText[32] = {};
+    const char *tilingName = "SKIP";
+    if (tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::BASE) {
+        if (tilingEnable_.tilingEnableFullLoad == TilingEnableFullLoad::AL1_FULL_LOAD) {
+            tilingName = "AL1_FULL_LOAD";
+        } else if (tilingEnable_.tilingEnableFullLoad == TilingEnableFullLoad::BL1_FULL_LOAD) {
+            tilingName = "BL1_FULL_LOAD";
+        } else if (tilingEnable_.tilingEnableFullLoad == TilingEnableFullLoad::BASE) {
+            tilingName = "BASE";
+        }
+    }
     char coreText[16] = {};
-    (void)snprintf(tilingText, sizeof(tilingText), "0x%" PRIx64, tilingKey_);
     (void)snprintf(coreText, sizeof(coreText), "%u",
                    static_cast<uint32_t>(tilingData_.matmulTiling.usedCoreNum));
-    (void)::setenv("MATMUL_V3_COMPARE_TILING", tilingText, 1);
+    (void)::setenv("MATMUL_V3_COMPARE_TILING", tilingName, 1);
     (void)::setenv("MATMUL_V3_COMPARE_CORE", coreText, 1);
-    //NEW END: one switch, one shrink call, and two values for the comparison runner
+    //NEW END
     return ge::GRAPH_SUCCESS;
 }
 

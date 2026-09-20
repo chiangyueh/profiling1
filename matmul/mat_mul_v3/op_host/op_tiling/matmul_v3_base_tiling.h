@@ -77,9 +77,9 @@ protected:
     void DoTilingKey();
     uint64_t GetDeterministicSplitKWorkspaceSize(uint64_t alignedM, uint64_t alignedN);
     void DoBasicTiling();
-    //NEW BEGIN: the only added tiling decision function
+    //NEW BEGIN
     bool ShrinkIdleCores();
-    //NEW END: the only added tiling decision function
+    //NEW END
     void FormulaicBaseBlockTiling();
     void FormulaicTilingNoTrans();
     void CalL1TilingV200();
