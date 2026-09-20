@@ -15,6 +15,7 @@
 //NEW BEGIN
 #include <cstdio>
 #include <cstdlib>
+#include <dlfcn.h>
 #include <string>
 #include "aclnn/acl_meta.h"
 //NEW END
@@ -98,6 +99,21 @@ struct Event {
 };
 
 constexpr int kSkip = 10001;
+
+int EnableLocalTiling() {
+  using Loader = uint32_t (*)(const char*);
+  auto loader = reinterpret_cast<Loader>(dlsym(RTLD_DEFAULT, "TbeLoadSoAndSaveToRegistry"));
+  if (loader == nullptr) {
+    (void)dlopen("libregister.so", RTLD_NOW | RTLD_GLOBAL);
+    (void)dlopen("libopp_registry.so", RTLD_NOW | RTLD_GLOBAL);
+    loader = reinterpret_cast<Loader>(dlsym(RTLD_DEFAULT, "TbeLoadSoAndSaveToRegistry"));
+  }
+  const char* library = std::getenv("MATMUL_V3_HOST_LIBRARY");
+  if (loader == nullptr || library == nullptr || library[0] == '\0') {
+    return 1;
+  }
+  return loader(library) == 0U ? ACL_SUCCESS : 1;
+}
 
 int CreateMat2Tensor(const std::vector<float>& hostData, int64_t k, int64_t n, bool transposeB,
                      void** deviceAddr, aclTensor** tensor) {
@@ -296,6 +312,14 @@ int main() {
   if (ret != ACL_SUCCESS) {
     return ret;
   }
+  ret = EnableLocalTiling();
+  if (ret != ACL_SUCCESS) {
+    LOG_PRINT("local MatMulV3 tiling registration failed\n");
+    (void)aclrtDestroyStream(stream);
+    (void)aclrtResetDevice(deviceId);
+    (void)aclFinalize();
+    return ret;
+  }
 
   int completed = 0;
   for (const auto& shape : shapes) {
@@ -305,6 +329,9 @@ int main() {
   (void)aclrtDestroyStream(stream);
   (void)aclrtResetDevice(deviceId);
   (void)aclFinalize();
+  if (completed == 0) {
+    LOG_PRINT("no eligible MatMulV3 shape reached the local tiler\n");
+  }
   return completed == 0 ? 1 : 0;
 }
 //NEW END
