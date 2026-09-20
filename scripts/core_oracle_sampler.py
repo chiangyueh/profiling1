@@ -807,7 +807,8 @@ def select_shrink_core_validation(args):
         if missing_for_branch:
             dtype_missing[branch] = missing_for_branch
     complete = not missing and not dtype_missing
-    print(json.dumps({"core_validation_selection": "complete" if complete else "incomplete_no_npu_run",
+    selection_status = "complete" if complete else "incomplete_continuing_with_available"
+    print(json.dumps({"core_validation_selection": selection_status,
                       "counts": {branch: counts[branch] for branch in SHRINK_ENABLED_BRANCHES},
                       "dtype_counts": {
                           branch: {dtype: selected_dtype_counts[(branch, dtype)]
@@ -818,7 +819,11 @@ def select_shrink_core_validation(args):
                       "reserve_target_per_branch": SHRINK_CORE_VALIDATION_RESERVE,
                       "missing": missing, "dtype_missing": dtype_missing},
                      separators=(",", ":")), file=sys.stderr)
-    return 0 if complete else 4
+    # Do not discard valid work from seven branches because one branch or
+    # dtype pocket missed its reserve.  compare-core-validation preserves the
+    # per-branch/per-dtype targets, measures only discovered candidates, and
+    # still returns incomplete at the end when any target remains unmet.
+    return 0 if selected else 4
 
 
 def select_remaining(args):
