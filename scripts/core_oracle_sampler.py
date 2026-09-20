@@ -1591,12 +1591,9 @@ def measure_all_io_core_sweep(args):
         input_dtype, output_dtype, layout, m, n, k, expected_branch = item
         combination = (expected_branch, input_dtype, output_dtype)
         shape = f"M{m}_N{n}_K{k}_{layout}"
-        # Official samples bracket the requested 4..20 curve.  Each token is
-        # launched in a separate process, so a failed core cannot poison the
-        # stream, executor, or ACL state used by any later core.
-        modes = [("official_pre", None)] + [
-            ("core_sweep", core) for core in range(4, 21)
-        ] + [("official_post", None)]
+        # Core 20 is the unchanged official-count reference.  Measure exactly
+        # the requested 4..20 curve without adding redundant pre/post runs.
+        modes = [("core_sweep", core) for core in range(4, 21)]
         pending = [(mode, core) for mode, core in modes
                    if (shape, input_dtype, output_dtype, layout, mode, core) not in checkpoint]
         if not pending:
