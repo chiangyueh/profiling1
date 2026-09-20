@@ -36,57 +36,59 @@ TARGET_BRANCHES = (
     "MULTI_CORE_SPLIT_K",
 )
 
-# The Ascend910B3 host selector has eight reachable non-Split-K routes.  The
-# tuples below are the complete input/output dtype combinations accepted by
-# the official MatMulV3 implementation for each route.  A and B always share
-# the input dtype; the output may retain that dtype or accumulate to FP32.
-ALL_IO_ROUTE_DTYPES = {
-    "BASE": (
-        ("fp16", "fp16"), ("fp16", "fp32"),
-        ("bf16", "bf16"), ("bf16", "fp32"), ("fp32", "fp32"),
-    ),
-    "BASE_ND2NZ": (
-        ("fp16", "fp16"), ("fp16", "fp32"),
-        ("bf16", "bf16"), ("bf16", "fp32"), ("fp32", "fp32"),
-    ),
+API_DTYPE_PAIRS = (
+    ("fp16", "fp16"), ("fp16", "fp32"),
+    ("bf16", "bf16"), ("bf16", "fp32"), ("fp32", "fp32"),
+)
+HALF_INPUT_DTYPE_PAIRS = API_DTYPE_PAIRS[:4]
+
+# Every public MatMulV3 route is present in this matrix.  Discovery still has
+# to prove the exact route for every shape; a declared pair never fabricates a
+# route.  The restricted entries follow explicit source checks in 8.5.
+ALL_ROUTE_IO_DTYPES = {
+    branch: API_DTYPE_PAIRS for branch in TARGET_BRANCHES
+}
+ALL_ROUTE_IO_DTYPES.update({
     "AL1_FULL_LOAD": (("fp32", "fp32"),),
-    "BL1_FULL_LOAD": (
-        ("fp16", "fp16"), ("fp16", "fp32"),
-        ("bf16", "bf16"), ("bf16", "fp32"), ("fp32", "fp32"),
-    ),
-    "BL1_FULL_LOAD_ND2NZ": (
-        ("fp16", "fp16"), ("fp16", "fp32"),
-        ("bf16", "bf16"), ("bf16", "fp32"), ("fp32", "fp32"),
-    ),
-    "BL1_FULL_LOAD_FIXPIPE": (
-        ("fp16", "fp16"), ("fp16", "fp32"),
-        ("bf16", "bf16"), ("bf16", "fp32"), ("fp32", "fp32"),
-    ),
-    "BL1_FULL_LOAD_FIXPIPE_ND2NZ": (
-        ("fp16", "fp32"), ("bf16", "fp32"), ("fp32", "fp32"),
-    ),
     "BL1_FULL_LOAD_VEC_NZ2ND": (("fp32", "fp32"),),
+    "BASE_K_SHIFT": (("fp16", "fp16"), ("bf16", "bf16")),
+    "SINGLE_CORE_SPLIT_K_GM_TO_L1": HALF_INPUT_DTYPE_PAIRS,
+    "SINGLE_CORE_SPLIT_K_GM_TO_L1_ND2NZ": HALF_INPUT_DTYPE_PAIRS,
+    "MULTI_CORE_SPLIT_K": (("fp32", "fp32"),),
+})
+
+FRESH_FORMULA_UNREACHABLE_BRANCHES = (
+    "BL1_FULL_LOAD_CVP_PARALLEL",
+    "BASE_CVP_PARALLEL",
+    "BASE_K_SHIFT",
+    "MULTI_CORE_SPLIT_K",
+)
+FRESH_REACHABLE_BRANCHES = tuple(
+    branch for branch in TARGET_BRANCHES
+    if branch not in FRESH_FORMULA_UNREACHABLE_BRANCHES
+)
+UNREACHABLE_BRANCH_REASONS = {
+    "BL1_FULL_LOAD_CVP_PARALLEL":
+        "8.5 fresh formula path cannot produce V_PARALELL_ND2NZ",
+    "BASE_CVP_PARALLEL":
+        "8.5 fresh formula path cannot produce V_PARALELL_ND2NZ",
+    "BASE_K_SHIFT":
+        "source optimization requires 24 AIC; this Ascend910B3 exposes 20 AIC",
+    "MULTI_CORE_SPLIT_K":
+        "route is accepted only from the tiling repository/AOE packet path",
+}
+
+ALL_IO_ROUTE_DTYPES = {
+    branch: ALL_ROUTE_IO_DTYPES[branch] for branch in FRESH_REACHABLE_BRANCHES
 }
 ALL_IO_COMBINATIONS = tuple(
     (branch, input_dtype, output_dtype)
     for branch, dtype_pairs in ALL_IO_ROUTE_DTYPES.items()
     for input_dtype, output_dtype in dtype_pairs
 )
-assert len(ALL_IO_COMBINATIONS) == 30
+assert len(ALL_IO_COMBINATIONS) == 75
 
-# The current pass is intentionally restricted to non-Split-K routes.  The
-# completed Split-K response curves remain in the checkpoint, but are neither
-# selected nor printed again.
-MEASUREMENT_BRANCHES = (
-    "BASE",
-    "BASE_ND2NZ",
-    "AL1_FULL_LOAD",
-    "BL1_FULL_LOAD",
-    "BL1_FULL_LOAD_ND2NZ",
-    "BL1_FULL_LOAD_FIXPIPE",
-    "BL1_FULL_LOAD_FIXPIPE_ND2NZ",
-    "BL1_FULL_LOAD_VEC_NZ2ND",
-)
+MEASUREMENT_BRANCHES = FRESH_REACHABLE_BRANCHES
 
 # Official-dispatch discovery on CANN 8.5 found no reachable plain
 # BL1_FULL_LOAD packet and AL1 occupies a very narrow selector pocket.  Those
@@ -157,13 +159,6 @@ def valid_core_decision(branch, official_core, actual_core):
 
 REMAINING_CORE_SWEEP_BRANCHES = tuple(
     branch for branch in TARGET_BRANCHES if branch not in SHRINK_ENABLED_BRANCHES
-)
-
-FRESH_FORMULA_UNREACHABLE_BRANCHES = (
-    "BL1_FULL_LOAD_CVP_PARALLEL",
-    "BASE_CVP_PARALLEL",
-    "BASE_K_SHIFT",
-    "MULTI_CORE_SPLIT_K",
 )
 
 REPO_ONLY_BRANCHES = ("BASE_K_SHIFT", "MULTI_CORE_SPLIT_K")
@@ -638,7 +633,7 @@ def remaining_validation_shapes():
 
 
 def all_io_core_sweep_candidates():
-    """Source-directed candidates for all 30 reachable route/dtype pairs."""
+    """Source-directed candidates for every fresh-reachable route/I/O pair."""
     selected = []
     seen = set()
 
@@ -748,6 +743,79 @@ def all_io_core_sweep_candidates():
              112, 127, 143, 160, 175, 191)[(i * 7 + i // 41) % 16]
         k = (24, 40, 64, 80, 96, 112, 128)[(i * 5 + i // 43) % 7]
         put("BL1_FULL_LOAD_VEC_NZ2ND", "fp32", "fp32", "NN", m, n, k)
+
+    # Reuse the source-derived geometries for the remaining Split-K routes,
+    # but independently exercise every API-legal output type.  The official
+    # discovery callback, not the requested target, decides what is admitted.
+    for source_dtype, layout, m, n, k, branch in remaining_validation_shapes():
+        if branch not in ALL_IO_ROUTE_DTYPES or branch in (
+                "BASE", "BASE_ND2NZ", "AL1_FULL_LOAD", "BL1_FULL_LOAD",
+                "BL1_FULL_LOAD_ND2NZ", "BL1_FULL_LOAD_FIXPIPE",
+                "BL1_FULL_LOAD_FIXPIPE_ND2NZ", "BL1_FULL_LOAD_VEC_NZ2ND"):
+            continue
+        for input_dtype, output_dtype in ALL_IO_ROUTE_DTYPES[branch]:
+            # Preserve the half-input-only GM-to-L1 restriction.  Other
+            # families deliberately receive dtype-substituted geometry so a
+            # legal but previously unobserved I/O packet cannot be omitted.
+            if (branch.startswith("SINGLE_CORE_SPLIT_K_GM_TO_L1") and
+                    input_dtype not in ("fp16", "bf16")):
+                continue
+            put(branch, input_dtype, output_dtype, layout, m, n, k)
+
+    # Generic MKN Single-Core Split-K is distinct from both the K=1536 route
+    # and the aligned-N GM-to-L1 route.  An unaligned N keeps the latter from
+    # masking it and supplies an executable FP32 search region below 320 MiB.
+    for input_dtype, output_dtype in ALL_IO_ROUTE_DTYPES["SINGLE_CORE_SPLIT_K"]:
+        for i in range(1200):
+            m = 513 + 64 * (i % 41)
+            n = 641 + 128 * ((i * 7 + i // 23) % 31) + 2 * (i % 17)
+            if n % 128 == 0:
+                n += 1
+            k = 27392 + 128 * ((i * 11 + i // 29) % 191)
+            put("SINGLE_CORE_SPLIT_K", input_dtype, output_dtype, "NT", m, n, k)
+    for i in range(1200):
+        m = 385 + 64 * (i % 29)
+        n = 513 + 128 * ((i * 5 + i // 19) % 23) + 2 * (i % 13)
+        if n % 2 == 0:
+            n += 1
+        k = 24576 + 128 * ((i * 7 + i // 31) % 113)
+        put("SINGLE_CORE_SPLIT_K_ND2NZ", "fp32", "fp32", "NN", m, n, k)
+
+    # FP32 has a separate NKM selector window; it cannot be reached by merely
+    # changing the dtype of the K=1536 half-input path.
+    for m in range(1920, 2817, 16):
+        for n in (8, 16, 24, 32, 40, 48, 56, 64):
+            for k in (27392, 28032, 28672, 29696, 30336, 31616, 32768):
+                put("SINGLE_CORE_NKM_SPLIT_K", "fp32", "fp32", "NT", m, n, k)
+
+    # Plain deterministic Split-K and its head-ND2NZ companion were already
+    # observed for all three input types.  These grids extend that evidence to
+    # both legal half-output choices while retaining independent M/N/K axes.
+    for input_dtype, output_dtype in ALL_IO_ROUTE_DTYPES["DETERMINISTIC_SPLIT_K"]:
+        if input_dtype == "fp32":
+            for i in range(1200):
+                layout = ("NN", "NT", "TN")[i % 3]
+                m = (17, 24, 31, 32, 47, 48, 63, 64, 80, 96, 112, 128)[
+                    (i * 5 + i // 31) % 12]
+                n = (16, 24, 32, 48, 64, 80, 96, 112)[(i * 7 + i // 37) % 8]
+                k = 8320 + 128 * ((i * 11 + i // 41) % 417)
+                put("DETERMINISTIC_SPLIT_K", input_dtype, output_dtype, layout, m, n, k)
+        else:
+            for i in range(1800):
+                m = 577 + 64 * (i % 47)
+                n = (512, 640, 896, 1024, 1152, 1536, 1792, 2048)[
+                    (i * 5 + i // 29) % 8]
+                k = 27392 + 128 * ((i * 7 + i // 31) % 267)
+                put("DETERMINISTIC_SPLIT_K", input_dtype, output_dtype, "NT", m, n, k)
+
+    for input_dtype, output_dtype in ALL_IO_ROUTE_DTYPES["DETERMINISTIC_SPLIT_K_ND2NZ"]:
+        for i in range(1800):
+            layout = ("NN", "TN", "TT")[(i + i // 31) % 3]
+            m = 17 + (i * 7 + i // 37) % 175
+            n = 17 + (i * 11 + i // 41) % 367
+            k = 9217 + 128 * ((i * 13 + i // 43) % 401)
+            put("DETERMINISTIC_SPLIT_K_ND2NZ", input_dtype, output_dtype,
+                layout, m, n, k)
     return selected
 
 
@@ -785,7 +853,7 @@ def write_all_io_selected(path, selected):
 
 
 def select_all_io_core_sweep(args):
-    """Discover 50 real official packets for each of the 30 combinations."""
+    """Discover real official packets for every fresh-reachable route/I/O pair."""
     candidate_groups = collections.defaultdict(list)
     for item in all_io_core_sweep_candidates():
         candidate_groups[(item[6], item[0], item[1])].append(item)
@@ -912,9 +980,31 @@ def select_all_io_core_sweep(args):
         for branch, input_dtype, output_dtype in ALL_IO_COMBINATIONS
         if counts[(branch, input_dtype, output_dtype)] < args.quota
     }
+    branch_inventory = {}
+    for branch in TARGET_BRANCHES:
+        if branch in FRESH_FORMULA_UNREACHABLE_BRANCHES:
+            branch_inventory[branch] = {
+                "status": "UNREACHABLE",
+                "reason": UNREACHABLE_BRANCH_REASONS[branch],
+                "selected_shapes": 0,
+            }
+            continue
+        combinations = [(branch, input_dtype, output_dtype)
+                        for input_dtype, output_dtype in ALL_IO_ROUTE_DTYPES[branch]]
+        selected_count = sum(counts[combination] for combination in combinations)
+        branch_inventory[branch] = {
+            "status": "COMPLETE" if all(
+                counts[combination] >= args.quota for combination in combinations
+            ) else "MISSING",
+            "selected_shapes": selected_count,
+            "io_combinations": len(combinations),
+        }
     print(json.dumps({"all_io_selection": "complete" if not missing else "partial",
+                      "branches_declared": len(TARGET_BRANCHES),
+                      "branches_fresh_reachable": len(FRESH_REACHABLE_BRANCHES),
                       "combinations": len(ALL_IO_COMBINATIONS),
-                      "selected_shapes": len(selected), "missing": missing},
+                      "selected_shapes": len(selected), "missing": missing,
+                      "branch_inventory": branch_inventory},
                      separators=(",", ":")), file=sys.stderr)
     # Preserve all successfully discovered work even if an official selector
     # pocket is sparser than its source-level support declaration.
@@ -1530,27 +1620,39 @@ def all_io_measurement_key(record):
             record.get("mode"), record.get("requested_core"))
 
 
+def all_io_measurement_fingerprint(
+        branch, input_dtype, output_dtype, layout, shape, mode, requested_core):
+    identity = "\x1f".join((
+        branch, input_dtype, output_dtype, layout, shape, mode,
+        str(requested_core),
+    ))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
 def all_io_shape_fingerprint(branch, input_dtype, output_dtype, layout, shape):
     identity = "\x1f".join((branch, input_dtype, output_dtype, layout, shape))
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-def load_all_io_completed_shapes():
+def load_all_io_completed_measurements():
     path = os.path.join(os.path.dirname(__file__), "all_io_core_sweep_resume.json")
     if not os.path.isfile(path):
-        return set()
+        return set(), set()
     with open(path, encoding="utf-8") as stream:
         payload = json.load(stream)
-    if (payload.get("schema") != 1 or
-            payload.get("complete_core_range") != [4, 20] or
-            not isinstance(payload.get("shape_sha256"), list)):
+    if (payload.get("schema") != 2 or
+            payload.get("core_range") != [4, 20] or
+            not isinstance(payload.get("complete_shape_sha256"), list) or
+            not isinstance(payload.get("measurement_sha256"), list)):
         raise RuntimeError("invalid all-I/O core-sweep resume manifest")
-    fingerprints = set(payload["shape_sha256"])
-    if (len(fingerprints) != len(payload["shape_sha256"]) or
+    shapes = set(payload["complete_shape_sha256"])
+    measurements = set(payload["measurement_sha256"])
+    if (len(shapes) != len(payload["complete_shape_sha256"]) or
+            len(measurements) != len(payload["measurement_sha256"]) or
             any(not isinstance(value, str) or len(value) != 64
-                for value in fingerprints)):
-        raise RuntimeError("invalid all-I/O completed-shape fingerprint")
-    return fingerprints
+                for value in shapes | measurements)):
+        raise RuntimeError("invalid all-I/O completed-measurement fingerprint")
+    return shapes, measurements
 
 
 def load_all_io_checkpoint(path):
@@ -1577,10 +1679,27 @@ def measure_all_io_core_sweep(args):
         order[(item[6], item[0], item[1])], item[3] * item[4] * item[5],
         item[3], item[4], item[5]))
     checkpoint = load_all_io_checkpoint(args.checkpoint)
-    completed_shapes = load_all_io_completed_shapes()
+    completed_shapes, completed_measurements = load_all_io_completed_measurements()
     attempted = collections.Counter()
     succeeded = collections.Counter()
     failed = collections.Counter()
+    historical_skips = collections.Counter()
+
+    selected_branch_counts = collections.Counter(item[6] for item in selected)
+    for branch in TARGET_BRANCHES:
+        inventory = {
+            "record_type": "branch_inventory",
+            "branch": branch,
+            "branch_status": "SELECTED" if selected_branch_counts[branch] else "MISSING",
+            "selected_shapes": selected_branch_counts[branch],
+            "npu_runs": 0 if branch in FRESH_FORMULA_UNREACHABLE_BRANCHES else None,
+        }
+        if branch in FRESH_FORMULA_UNREACHABLE_BRANCHES:
+            inventory["branch_status"] = "UNREACHABLE"
+            inventory["reason"] = UNREACHABLE_BRANCH_REASONS[branch]
+        else:
+            inventory["io_combinations"] = len(ALL_IO_ROUTE_DTYPES[branch])
+        print(json.dumps(inventory, separators=(",", ":")), flush=True)
 
     def store(record, combination):
         checkpoint[all_io_measurement_key(record)] = record
@@ -1616,15 +1735,26 @@ def measure_all_io_core_sweep(args):
         input_dtype, output_dtype, layout, m, n, k, expected_branch = item
         combination = (expected_branch, input_dtype, output_dtype)
         shape = f"M{m}_N{n}_K{k}_{layout}"
-        fingerprint = all_io_shape_fingerprint(
+        shape_fingerprint = all_io_shape_fingerprint(
             expected_branch, input_dtype, output_dtype, layout, shape)
-        if fingerprint in completed_shapes:
+        if shape_fingerprint in completed_shapes:
+            historical_skips[combination] += 17
             continue
         # Core 20 is the unchanged official-count reference.  Measure exactly
         # the requested 4..20 curve without adding redundant pre/post runs.
         modes = [("core_sweep", core) for core in range(4, 21)]
-        pending = [(mode, core) for mode, core in modes
-                   if (shape, input_dtype, output_dtype, layout, mode, core) not in checkpoint]
+        pending = []
+        for mode, core in modes:
+            key = (shape, input_dtype, output_dtype, layout, mode, core)
+            fingerprint = all_io_measurement_fingerprint(
+                expected_branch, input_dtype, output_dtype, layout,
+                shape, mode, core)
+            if key in checkpoint:
+                continue
+            if fingerprint in completed_measurements:
+                historical_skips[combination] += 1
+                continue
+            pending.append((mode, core))
         if not pending:
             continue
 
@@ -1702,8 +1832,15 @@ def measure_all_io_core_sweep(args):
             "new_attempts": attempted[combination],
             "new_successes": succeeded[combination],
             "new_failures": failed[combination],
+            "historical_core_records_skipped": historical_skips[combination],
         }
     print(json.dumps({"all_io_core_sweep": "finished_available_shapes",
+                      "branches_declared": len(TARGET_BRANCHES),
+                      "branches_fresh_reachable": len(FRESH_REACHABLE_BRANCHES),
+                      "branches_unreachable": {
+                          branch: UNREACHABLE_BRANCH_REASONS[branch]
+                          for branch in FRESH_FORMULA_UNREACHABLE_BRANCHES
+                      },
                       "combinations": len(ALL_IO_COMBINATIONS),
                       "summary": summary}, separators=(",", ":")), file=sys.stderr)
     return 0

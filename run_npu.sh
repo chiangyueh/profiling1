@@ -150,7 +150,7 @@ export LD_LIBRARY_PATH="${runtime_path}"
 #NEW
 if [[ -z "${MATMUL_V3_CAMPAIGN:-}" || "${MATMUL_V3_CAMPAIGN:-}" == "all_io_core_sweep" ]]; then
     if [[ "$#" -ne 0 ]]; then
-        echo "fatal: all-I/O core sweep uses its own branch-directed shapes" >&2
+        echo "fatal: all-route/I-O core sweep uses its own branch-directed shapes" >&2
         exit 2
     fi
     all_io_selected="${host_build}/all_io_core_sweep_v1_selected.tsv"
