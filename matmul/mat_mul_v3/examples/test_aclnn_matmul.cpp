@@ -562,10 +562,13 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   //NEW
   std::unique_ptr<aclOpExecutor, aclnnStatus (*)(aclOpExecutor*)> executorPtr(
       executor, aclDestroyAclOpExecutor);
-  *failedStage = "make_executor_repeatable";
-  ret = aclSetAclOpExecutorRepeatable(executor);
-  CHECK_RET(ret == ACL_SUCCESS,
-            LOG_PRINT("aclSetAclOpExecutorRepeatable failed. ERROR: %d\n", ret); return ret);
+  const bool directVectorKernel = ReadEnvironment("MATMUL_V3_MEASUREMENT_MODE") == "vector_split_k_dot";
+  if (!directVectorKernel) {
+    *failedStage = "make_executor_repeatable";
+    ret = aclSetAclOpExecutorRepeatable(executor);
+    CHECK_RET(ret == ACL_SUCCESS,
+              LOG_PRINT("aclSetAclOpExecutorRepeatable failed. ERROR: %d\n", ret); return ret);
+  }
   // 根据第一段接口计算出的workspaceSize申请device内存
   void* workspaceAddr = nullptr;
   if (workspaceSize > 0) {
@@ -574,6 +577,79 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
     CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("allocate workspace failed. ERROR: %d\n", ret); return ret);
     executorAddrPtr.reset(workspaceAddr);
   }
+
+  aclrtBinHandle directBinary = nullptr;
+  aclrtFuncHandle directFunction = nullptr;
+  aclrtArgsHandle directArguments = nullptr;
+  void* tilingDeviceAddr = nullptr;
+  std::unique_ptr<void, aclError (*)(void*)> tilingDeviceAddrPtr(nullptr, aclrtFree);
+  if (directVectorKernel) {
+    const std::string binaryPath = ReadEnvironment("MATMUL_V3_VECTOR_BINARY");
+    const std::string tilingHex = ReadEnvironment("MATMUL_V3_TILING_HEX");
+    if (branch->compare("VECTOR_SPLIT_K_DOT") != 0 || binaryPath.empty() ||
+        tilingHex.empty() || (tilingHex.size() & 1U) != 0U) {
+      *failedStage = "direct_vector_inputs";
+      *failureDetail = "missing vector binary or exact host tiling packet";
+      return 4;
+    }
+    std::vector<uint8_t> tilingBytes(tilingHex.size() / 2U, 0U);
+    for (size_t index = 0; index < tilingBytes.size(); ++index) {
+      const char high = tilingHex[index * 2U];
+      const char low = tilingHex[index * 2U + 1U];
+      const auto nibble = [](char value) -> int {
+        if (value >= '0' && value <= '9') return value - '0';
+        if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+        if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+        return -1;
+      };
+      const int highValue = nibble(high);
+      const int lowValue = nibble(low);
+      if (highValue < 0 || lowValue < 0) {
+        *failedStage = "direct_vector_tiling_decode";
+        *failureDetail = "host tiling packet is not valid hexadecimal";
+        return 4;
+      }
+      tilingBytes[index] = static_cast<uint8_t>((highValue << 4) | lowValue);
+    }
+    *failedStage = "direct_vector_load_binary";
+    ret = aclrtBinaryLoadFromFile(binaryPath.c_str(), nullptr, &directBinary);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    *failedStage = "direct_vector_get_function";
+    ret = aclrtBinaryGetFunction(
+        directBinary, "MatMulV3_VectorSplitKDot_2162688", &directFunction);
+    CHECK_RET(ret == ACL_SUCCESS, aclrtBinaryUnLoad(directBinary); return ret);
+    *failedStage = "direct_vector_alloc_tiling";
+    ret = aclrtMalloc(&tilingDeviceAddr, tilingBytes.size(), ACL_MEM_MALLOC_HUGE_FIRST);
+    CHECK_RET(ret == ACL_SUCCESS, aclrtBinaryUnLoad(directBinary); return ret);
+    tilingDeviceAddrPtr.reset(tilingDeviceAddr);
+    *failedStage = "direct_vector_copy_tiling";
+    ret = aclrtMemcpy(tilingDeviceAddr, tilingBytes.size(), tilingBytes.data(), tilingBytes.size(),
+                      ACL_MEMCPY_HOST_TO_DEVICE);
+    CHECK_RET(ret == ACL_SUCCESS, aclrtBinaryUnLoad(directBinary); return ret);
+    *failedStage = "direct_vector_args_init";
+    ret = aclrtKernelArgsInit(directFunction, &directArguments);
+    CHECK_RET(ret == ACL_SUCCESS, aclrtBinaryUnLoad(directBinary); return ret);
+    void* biasDeviceAddr = nullptr;
+    void* offsetDeviceAddr = nullptr;
+    void* directArgs[] = {selfDeviceAddr, mat2DeviceAddr, biasDeviceAddr, offsetDeviceAddr,
+                          outDeviceAddr, workspaceAddr, tilingDeviceAddr};
+    for (void* &argument : directArgs) {
+      aclrtParamHandle parameter = nullptr;
+      *failedStage = "direct_vector_args_append";
+      ret = aclrtKernelArgsAppend(directArguments, &argument, sizeof(argument), &parameter);
+      CHECK_RET(ret == ACL_SUCCESS, aclrtBinaryUnLoad(directBinary); return ret);
+    }
+    *failedStage = "direct_vector_args_finalize";
+    ret = aclrtKernelArgsFinalize(directArguments);
+    CHECK_RET(ret == ACL_SUCCESS, aclrtBinaryUnLoad(directBinary); return ret);
+  }
+
+  const auto submitKernel = [&]() -> aclError {
+    if (directVectorKernel) {
+      return aclrtLaunchKernelWithConfig(directFunction, *actualCore, stream, nullptr, directArguments, nullptr);
+    }
+    return aclnnMatmul(workspaceAddr, workspaceSize, executor, stream);
+  };
   //NEW
   // // 调用aclnnMatmul第二段接口
   // ret = aclnnMatmul(workspaceAddr, workspaceSize, executor, stream);
@@ -593,12 +669,14 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
 
   *failedStage = "warmup_submit";
   for (int i = 0; i < warmup; ++i) {
-    ret = aclnnMatmul(workspaceAddr, workspaceSize, executor, stream);
-    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    ret = submitKernel();
+    CHECK_RET(ret == ACL_SUCCESS,
+              if (directBinary != nullptr) aclrtBinaryUnLoad(directBinary); return ret);
   }
   *failedStage = "warmup_sync";
   ret = aclrtSynchronizeStream(stream);
-  CHECK_RET(ret == ACL_SUCCESS, return ret);
+  CHECK_RET(ret == ACL_SUCCESS,
+            if (directBinary != nullptr) aclrtBinaryUnLoad(directBinary); return ret);
   aclrtEvent startEvent = nullptr;
   aclrtEvent endEvent = nullptr;
   *failedStage = "create_start_event";
@@ -613,15 +691,17 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   CHECK_RET(ret == ACL_SUCCESS, return ret);
   *failedStage = "timed_submit";
   for (int i = 0; i < repeat; ++i) {
-    ret = aclnnMatmul(workspaceAddr, workspaceSize, executor, stream);
-    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    ret = submitKernel();
+    CHECK_RET(ret == ACL_SUCCESS,
+              if (directBinary != nullptr) aclrtBinaryUnLoad(directBinary); return ret);
   }
   *failedStage = "record_end_event";
   ret = aclrtRecordEvent(endEvent, stream);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
   *failedStage = "timed_sync";
   ret = aclrtSynchronizeEvent(endEvent);
-  CHECK_RET(ret == ACL_SUCCESS, return ret);
+  CHECK_RET(ret == ACL_SUCCESS,
+            if (directBinary != nullptr) aclrtBinaryUnLoad(directBinary); return ret);
 
   float totalMs = 0.0F;
   *failedStage = "elapsed_time";
@@ -629,6 +709,12 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   CHECK_RET(ret == ACL_SUCCESS, return ret);
   *averageMs = totalMs / repeat;
   *timingComplete = true;
+
+  if (directBinary != nullptr) {
+    ret = aclrtBinaryUnLoad(directBinary);
+    directBinary = nullptr;
+    CHECK_RET(ret == ACL_SUCCESS, *failedStage = "direct_vector_unload_binary"; return ret);
+  }
 
   aclrtDestroyEvent(endEvent);
   aclrtDestroyEvent(startEvent);

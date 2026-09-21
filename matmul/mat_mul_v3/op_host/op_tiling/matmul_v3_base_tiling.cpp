@@ -3173,6 +3173,15 @@ void MatmulV3BaseTiling::ExportCoreOracleTiling(uint32_t officialCoreNum, uint32
     } else {
         (void)::unsetenv("MATMUL_V3_TILING_JSON");
     }
+
+    const auto *tilingBytes = reinterpret_cast<const uint8_t *>(&tilingData_);
+    char tilingHex[sizeof(MatmulTilingData) * 2 + 1] = {};
+    constexpr char hexDigits[] = "0123456789abcdef";
+    for (size_t index = 0; index < sizeof(MatmulTilingData); ++index) {
+        tilingHex[index * 2] = hexDigits[tilingBytes[index] >> 4];
+        tilingHex[index * 2 + 1] = hexDigits[tilingBytes[index] & 0x0f];
+    }
+    (void)::setenv("MATMUL_V3_TILING_HEX", tilingHex, 1);
 }
 
 ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()

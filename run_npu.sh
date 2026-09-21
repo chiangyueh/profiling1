@@ -150,26 +150,22 @@ export LD_LIBRARY_PATH="${runtime_path}"
 #NEW
 build_vector_split_k_dot_kernel() {
     local kernel_name="MatMulV3_VectorSplitKDot"
-    local kernel_bin_dir="${host_build}/vector_split_k_dot_v3_bin"
-    local custom_opp="${host_build}/vector_split_k_dot_v3_opp"
-    local custom_kernel_dir="${custom_opp}/op_impl/ai_core/tbe/kernel/ascend910b/mat_mul_v3"
-    local custom_config_root="${custom_opp}/op_impl/ai_core/tbe/kernel"
-    local custom_object="${custom_kernel_dir}/${kernel_name}.o"
-    local custom_json="${custom_kernel_dir}/${kernel_name}.json"
+    local kernel_bin_dir="${host_build}/vector_split_k_dot_v4_bin"
+    local custom_object="${kernel_bin_dir}/${kernel_name}.o"
+    local custom_json="${kernel_bin_dir}/${kernel_name}.json"
 
-    if [[ -f "${custom_object}" && -f "${custom_json}" &&
-          -f "${custom_config_root}/config/ascend910b/binary_info_config.json" ]] &&
+    if [[ -f "${custom_object}" && -f "${custom_json}" ]] &&
        ! find matmul/mat_mul_v3/op_kernel -type f -newer "${custom_object}" -print -quit | grep -q .; then
-        printf '%s\n' "${custom_opp}"
+        printf '%s\n' "${custom_object}"
         return 0
     fi
 
     local tbe_ascendc="${host_build}/tbe/ascendc"
     local tbe_dynamic="${host_build}/tbe/dynamic"
-    local param_dir="${host_build}/vector_split_k_dot_v3_params"
-    rm -rf -- "${kernel_bin_dir}" "${custom_opp}" "${param_dir}" \
+    local param_dir="${host_build}/vector_split_k_dot_v4_params"
+    rm -rf -- "${kernel_bin_dir}" "${param_dir}" \
         "${tbe_ascendc}/mat_mul_v3"
-    mkdir -p -- "${kernel_bin_dir}" "${custom_kernel_dir}" "${tbe_ascendc}/mat_mul_v3" \
+    mkdir -p -- "${kernel_bin_dir}" "${tbe_ascendc}/mat_mul_v3" \
         "${tbe_ascendc}/common/act" "${tbe_ascendc}/common/matmul_act" \
         "${tbe_dynamic}" "${param_dir}"
     cp -a matmul/mat_mul_v3/op_kernel/. "${tbe_ascendc}/mat_mul_v3/"
@@ -233,8 +229,6 @@ PY
         echo "fatal: VECTOR_SPLIT_K_DOT single-key kernel was not generated" >&2
         return 1
     fi
-    cp -a "${kernel_bin_dir}/${kernel_name}.o" "${kernel_bin_dir}/${kernel_name}.json" \
-        "${custom_kernel_dir}/"
     if ! python3 - "${custom_json}" <<'PY'
 import json
 import sys
@@ -259,31 +253,7 @@ PY
         echo "fatal: VECTOR_SPLIT_K_DOT ELF entry is missing" >&2
         return 1
     fi
-    mkdir -p -- "${custom_config_root}/config/ascend910b"
-    python3 scripts/kernel/binary_script/gen_binary_info_config.py \
-        "${custom_config_root}" ascend910b >>"${build_log}" 2>&1
-    if [[ ! -f "${custom_config_root}/config/ascend910b/binary_info_config.json" ]]; then
-        echo "fatal: VECTOR_SPLIT_K_DOT custom OPP metadata was not generated" >&2
-        return 1
-    fi
-    if ! python3 - "${custom_config_root}/config/ascend910b/binary_info_config.json" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as stream:
-    config = json.load(stream)
-binaries = config.get("MatMulV3", {}).get("binaryList", [])
-if not any(item.get("coreType") == 2 and
-           item.get("binPath", "").endswith("/MatMulV3_VectorSplitKDot.o") and
-           item.get("jsonPath", "").endswith("/MatMulV3_VectorSplitKDot.json")
-           for item in binaries):
-    raise SystemExit(1)
-PY
-    then
-        echo "fatal: VECTOR_SPLIT_K_DOT binary config does not select the AIV binary" >&2
-        return 1
-    fi
-    printf '%s\n' "${custom_opp}"
+    printf '%s\n' "${custom_object}"
 }
 
 #NEW
@@ -292,7 +262,7 @@ if [[ "${MATMUL_V3_CAMPAIGN:-vector_split_k_dot}" == "vector_split_k_dot" ]]; th
         echo "fatal: VECTOR_SPLIT_K_DOT validation uses its own theory-directed shapes" >&2
         exit 2
     fi
-    custom_opp="$(build_vector_split_k_dot_kernel)" || {
+    vector_binary="$(build_vector_split_k_dot_kernel)" || {
         cat "${build_log}" >&2
         exit 1
     }
@@ -336,8 +306,8 @@ PY
         echo "fatal: none of the theory-directed shapes reached the official BASE fallback" >&2
         exit 1
     fi
-    env -u MATMUL_V3_FORCE_CORE_NUM -u MATMUL_V3_MEASUREMENT_PLAN \
-        "${common_measurement_env[@]}" ASCEND_CUSTOM_OPP_PATH="${custom_opp}" \
+    env -u ASCEND_CUSTOM_OPP_PATH -u MATMUL_V3_FORCE_CORE_NUM -u MATMUL_V3_MEASUREMENT_PLAN \
+        "${common_measurement_env[@]}" MATMUL_V3_VECTOR_BINARY="${vector_binary}" \
         MATMUL_V3_SKIP_ROUTE_PREFILTER=1 \
         MATMUL_V3_DISABLE_REPO_LOOKUP=1 \
         MATMUL_V3_DISABLE_VECTOR_SPLIT_K_DOT=0 MATMUL_V3_MEASUREMENT_MODE=vector_split_k_dot \
