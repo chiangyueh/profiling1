@@ -768,22 +768,22 @@ int main(int argc, char** argv) {
         (void)::setenv("MATMUL_V3_MEASUREMENT_MODE", planItem.c_str(), 1);
         (void)::unsetenv("MATMUL_V3_FORCE_CORE_NUM");
         (void)::setenv("MATMUL_V3_SHRINK_IDLE_CORES", "0", 1);
-        (void)::setenv("MATMUL_V3_ENABLE_WAVE_EXACT_ND2NZ", "0", 1);
+        (void)::setenv("MATMUL_V3_ENABLE_WAVE_BALANCED_HEAD_ND2NZ", "0", 1);
       } else if (planItem == "shrink" || planItem == "shrink_pre" || planItem == "shrink_post") {
         (void)::setenv("MATMUL_V3_MEASUREMENT_MODE", planItem.c_str(), 1);
         (void)::unsetenv("MATMUL_V3_FORCE_CORE_NUM");
         (void)::setenv("MATMUL_V3_SHRINK_IDLE_CORES", "1", 1);
-        (void)::setenv("MATMUL_V3_ENABLE_WAVE_EXACT_ND2NZ", "0", 1);
+        (void)::setenv("MATMUL_V3_ENABLE_WAVE_BALANCED_HEAD_ND2NZ", "0", 1);
       } else if (planItem == "wave_exact_pre" || planItem == "wave_exact_post") {
         (void)::setenv("MATMUL_V3_MEASUREMENT_MODE", planItem.c_str(), 1);
         (void)::unsetenv("MATMUL_V3_FORCE_CORE_NUM");
         (void)::setenv("MATMUL_V3_SHRINK_IDLE_CORES", "0", 1);
-        (void)::setenv("MATMUL_V3_ENABLE_WAVE_EXACT_ND2NZ", "1", 1);
+        (void)::setenv("MATMUL_V3_ENABLE_WAVE_BALANCED_HEAD_ND2NZ", "1", 1);
       } else if (!planItem.empty()) {
         (void)::setenv("MATMUL_V3_MEASUREMENT_MODE", "core_sweep", 1);
         (void)::setenv("MATMUL_V3_FORCE_CORE_NUM", planItem.c_str(), 1);
         (void)::setenv("MATMUL_V3_SHRINK_IDLE_CORES", "0", 1);
-        (void)::setenv("MATMUL_V3_ENABLE_WAVE_EXACT_ND2NZ", "0", 1);
+        (void)::setenv("MATMUL_V3_ENABLE_WAVE_BALANCED_HEAD_ND2NZ", "0", 1);
       }
 
       MeasurementResult result;

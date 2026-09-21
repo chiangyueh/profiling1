@@ -8,7 +8,7 @@ import os
 from core_oracle_sampler import invoke, runner_env
 
 
-TARGET_BRANCH = "WAVE_EXACT_BASE_ND2NZ"
+TARGET_BRANCH = "WAVE_BALANCED_HEAD_ND2NZ"
 
 
 def candidates():
@@ -44,7 +44,7 @@ def discover(args):
         for offset in range(0, len(values), args.discovery_batch):
             batch = values[offset:offset + args.discovery_batch]
             env = runner_env(os.environ, dtype, layout, "wave_exact_discovery", discovery=True)
-            env["MATMUL_V3_ENABLE_WAVE_EXACT_ND2NZ"] = "1"
+            env["MATMUL_V3_ENABLE_WAVE_BALANCED_HEAD_ND2NZ"] = "1"
             rc, records, _stderr = invoke(args.runner, env, batch, args.run_log)
             if rc != 0:
                 continue
