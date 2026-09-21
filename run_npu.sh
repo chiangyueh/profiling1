@@ -269,25 +269,25 @@ if [[ "${MATMUL_V3_CAMPAIGN:-vector_split_k_dot}" == "vector_split_k_dot" ]]; th
         exit 1
     }
     vector_shapes=()
-    vector_mn_pairs=(
-        1 17  1 32  1 48  1 64  1 96  1 128  1 192  1 256  1 384  1 512  1 768  1 1024
-        2 17  2 32  2 48  2 64  2 96  2 128  2 192  2 256  2 384  2 512
-        3 17  3 20  3 24  3 32  3 48  3 64  3 96  3 128
-        4 17  4 24  4 32  4 48  4 64  4 96
-        8 17  8 24  8 32  8 48
+    vector_m_values=(1 2 3 4 5 6 7 8 10 12 15 16 17 20 24 28 31 32)
+    vector_n_values=(
+        17 18 19 20 23 24 31 32 33 40 47 48 63 64 65 80 95 96
+        112 127 128 160 192 224 255 256 257 320 384 512 640 768 1024
     )
-    for vector_k in 4096 16384; do
-        for ((pair_index = 0; pair_index < ${#vector_mn_pairs[@]}; pair_index += 2)); do
-            vector_shapes+=("${vector_mn_pairs[pair_index]}" "${vector_mn_pairs[pair_index + 1]}" "${vector_k}")
+    for vector_k in 2048 4096 8192 16384; do
+        for vector_m in "${vector_m_values[@]}"; do
+            for vector_n in "${vector_n_values[@]}"; do
+                vector_shapes+=("${vector_m}" "${vector_n}" "${vector_k}")
+            done
         done
     done
-    vector_shapes+=(
-        1 48 2048  2 32 2048  3 18 2048  4 32 2048
-        1 48 8192  2 32 8192  3 18 8192  4 32 8192
-        1 48 32768 2 32 32768 3 18 32768 4 32 32768
-        12 17 8192 12 32 8192 16 17 8192 16 32 8192
-        24 17 8192 24 32 8192 32 17 8192 32 32 8192
-    )
+    for vector_k in 1024 32768; do
+        for vector_m in 1 2 3 4 5 6 7 8; do
+            for vector_n in 17 32 64 128 256 512 1024; do
+                vector_shapes+=("${vector_m}" "${vector_n}" "${vector_k}")
+            done
+        done
+    done
     common_measurement_env=(
         MATMUL_DATA_TYPE=fp32 MATMUL_OUTPUT_DATA_TYPE=fp32
         MATMUL_A_TRANSPOSE=0 MATMUL_B_TRANSPOSE=1 MATMUL_V3_ONLY=1

@@ -1400,7 +1400,7 @@ bool MatmulV3BaseTiling::DoVectorSplitKDotTiling()
         args_.mValue == 0 || args_.nValue <= BASIC_ALIGN_16 || args_.kValue == 0 ||
         args_.mValue > (crossoverSweep ? 32UL : BASIC_ALIGN_16) ||
         args_.nValue > (crossoverSweep ? 1024UL : BASIC_ALIGN_16 * compileInfo_.aicNum) ||
-        args_.kValue < (crossoverSweep ? 2048UL : 4096UL) ||
+        args_.kValue < (crossoverSweep ? 1024UL : 4096UL) ||
         args_.kValue % (BLOCK_BYTE_SIZE / DATA_SIZE_FP32) != 0) {
         return false;
     }
