@@ -44,7 +44,6 @@ def discover(args):
         for offset in range(0, len(values), args.discovery_batch):
             batch = values[offset:offset + args.discovery_batch]
             env = runner_env(os.environ, dtype, layout, "wave_exact_discovery", discovery=True)
-            env["MATMUL_V3_DISABLE_TILING_REPO"] = "1"
             env["MATMUL_V3_ENABLE_WAVE_BALANCED_HEAD_ND2NZ"] = "1"
             rc, records, _stderr = invoke(args.runner, env, batch, args.run_log)
             if rc != 0:
@@ -150,7 +149,6 @@ def measure(args, selected):
         for offset in range(0, len(values), args.batch_size):
             batch = values[offset:offset + args.batch_size]
             env = runner_env(os.environ, dtype, layout, "wave_exact_compare")
-            env["MATMUL_V3_DISABLE_TILING_REPO"] = "1"
             env["MATMUL_V3_WARMUP"] = str(args.warmup)
             env["MATMUL_V3_REPEATS"] = str(args.repeats)
             env["MATMUL_V3_MEASUREMENT_PLAN"] = \

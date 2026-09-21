@@ -879,9 +879,7 @@ ge::graphStatus MatmulV3BaseTiling::DoOpTiling()
     }
     SetRunInfo();
     SetParamsV310();
-    const char *disableRepo = std::getenv("MATMUL_V3_DISABLE_TILING_REPO");
-    const bool repoDisabled = disableRepo != nullptr && disableRepo[0] == '1' && disableRepo[1] == '\0';
-    if (!repoDisabled && GetTilingFromRepo()) {
+    if (GetTilingFromRepo()) {
         DoNd2NzVectorTiling();
         SetNd2NzInfo();
         if (args_.hasBias) {
