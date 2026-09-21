@@ -741,7 +741,8 @@ int main(int argc, char** argv) {
       }
       if (token != "official_pre" && token != "official_post" &&
           token != "original" && token != "shrink" &&
-          token != "shrink_pre" && token != "shrink_post") {
+          token != "shrink_pre" && token != "shrink_post" &&
+          token != "wave_exact_pre" && token != "wave_exact_post") {
         char* end = nullptr;
         const unsigned long core = std::strtoul(token.c_str(), &end, 10);
         if (end == token.c_str() || *end != '\0' || core < 4UL || core > 20UL) {
@@ -767,14 +768,22 @@ int main(int argc, char** argv) {
         (void)::setenv("MATMUL_V3_MEASUREMENT_MODE", planItem.c_str(), 1);
         (void)::unsetenv("MATMUL_V3_FORCE_CORE_NUM");
         (void)::setenv("MATMUL_V3_SHRINK_IDLE_CORES", "0", 1);
+        (void)::setenv("MATMUL_V3_ENABLE_WAVE_EXACT_ND2NZ", "0", 1);
       } else if (planItem == "shrink" || planItem == "shrink_pre" || planItem == "shrink_post") {
         (void)::setenv("MATMUL_V3_MEASUREMENT_MODE", planItem.c_str(), 1);
         (void)::unsetenv("MATMUL_V3_FORCE_CORE_NUM");
         (void)::setenv("MATMUL_V3_SHRINK_IDLE_CORES", "1", 1);
+        (void)::setenv("MATMUL_V3_ENABLE_WAVE_EXACT_ND2NZ", "0", 1);
+      } else if (planItem == "wave_exact_pre" || planItem == "wave_exact_post") {
+        (void)::setenv("MATMUL_V3_MEASUREMENT_MODE", planItem.c_str(), 1);
+        (void)::unsetenv("MATMUL_V3_FORCE_CORE_NUM");
+        (void)::setenv("MATMUL_V3_SHRINK_IDLE_CORES", "0", 1);
+        (void)::setenv("MATMUL_V3_ENABLE_WAVE_EXACT_ND2NZ", "1", 1);
       } else if (!planItem.empty()) {
         (void)::setenv("MATMUL_V3_MEASUREMENT_MODE", "core_sweep", 1);
         (void)::setenv("MATMUL_V3_FORCE_CORE_NUM", planItem.c_str(), 1);
         (void)::setenv("MATMUL_V3_SHRINK_IDLE_CORES", "0", 1);
+        (void)::setenv("MATMUL_V3_ENABLE_WAVE_EXACT_ND2NZ", "0", 1);
       }
 
       MeasurementResult result;
@@ -793,7 +802,8 @@ int main(int argc, char** argv) {
       // exactly this core without discarding the rest of the shape curve.
       if (!planItem.empty() && planItem != "official_pre" && planItem != "official_post" &&
           planItem != "original" && planItem != "shrink" && planItem != "shrink_pre" &&
-          planItem != "shrink_post" && result.requestedCore == 0) {
+          planItem != "shrink_post" && planItem != "wave_exact_pre" &&
+          planItem != "wave_exact_post" && result.requestedCore == 0) {
         result.requestedCore = static_cast<uint32_t>(std::strtoul(planItem.c_str(), nullptr, 10));
       }
       if (ret == kSkipNotMatMulV3) {
