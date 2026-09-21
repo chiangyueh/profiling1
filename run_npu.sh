@@ -220,6 +220,7 @@ PY
     fi
     cp -a "${kernel_bin_dir}/${kernel_name}.o" "${kernel_bin_dir}/${kernel_name}.json" \
         "${custom_kernel_dir}/"
+    mkdir -p -- "${custom_config_root}/config/ascend910b"
     python3 scripts/kernel/binary_script/gen_binary_info_config.py \
         "${custom_config_root}" ascend910b >>"${build_log}" 2>&1
     if [[ ! -f "${custom_config_root}/config/ascend910b/binary_info_config.json" ]]; then
