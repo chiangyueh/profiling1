@@ -57,47 +57,48 @@ __aicore__ inline void MatMulVectorSplitKDot(
         SyncAll();
     }
 
-    const uint64_t outputIndex = worker % outputDots;
-    const uint64_t lane = worker / outputDots;
-    const uint64_t lanesForOutput = (workers - 1 - outputIndex) / outputDots + 1;
+    const bool outputParallel = outputDots > workers;
+    const uint64_t firstOutput = outputParallel ? worker : worker % outputDots;
+    const uint64_t outputStride = outputParallel ? workers : outputDots;
+    const uint64_t lane = outputParallel ? 0 : worker / outputDots;
+    const uint64_t lanesForOutput = outputParallel ? 1 : workers / outputDots;
     const uint64_t kBlocks = k / (BLOCK_BYTE_SIZE / sizeof(float));
     const uint64_t blocksPerLane = (kBlocks + lanesForOutput - 1) / lanesForOutput;
     const uint64_t firstBlock = lane * blocksPerLane;
     const uint64_t lastBlock = min(kBlocks, firstBlock + blocksPerLane);
-    if (firstBlock >= lastBlock) {
-        return;
-    }
 
-    const uint64_t row = outputIndex / n;
-    const uint64_t column = outputIndex % n;
-    const uint64_t firstK = firstBlock * (BLOCK_BYTE_SIZE / sizeof(float));
-    const uint64_t lastK = lastBlock * (BLOCK_BYTE_SIZE / sizeof(float));
-    float partial = 0.0f;
-    for (uint64_t kOffset = firstK; kOffset < lastK; kOffset += VECTOR_DOT_CHUNK) {
-        const uint64_t count = min(VECTOR_DOT_CHUNK, lastK - kOffset);
-        DataCopy(aLocal, aGlobal[row * k + kOffset], count);
-        DataCopy(bLocal, bGlobal[column * k + kOffset], count);
-        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        Mul(productLocal, aLocal, bLocal, count);
-        PipeBarrier<PIPE_V>();
-        const uint32_t reduceShape[2] = {1, static_cast<uint32_t>(count)};
-        ReduceSum<float, Pattern::Reduce::AR, false>(
-            sumLocal, productLocal, reduceTmp, reduceShape, true);
-        PipeBarrier<PIPE_ALL>();
-        partial += sumLocal.GetValue(0);
-    }
+    for (uint64_t outputIndex = firstOutput; outputIndex < outputDots; outputIndex += outputStride) {
+        const uint64_t row = outputIndex / n;
+        const uint64_t column = outputIndex % n;
+        const uint64_t firstK = firstBlock * (BLOCK_BYTE_SIZE / sizeof(float));
+        const uint64_t lastK = lastBlock * (BLOCK_BYTE_SIZE / sizeof(float));
+        float partial = 0.0f;
+        for (uint64_t kOffset = firstK; kOffset < lastK; kOffset += VECTOR_DOT_CHUNK) {
+            const uint64_t count = min(VECTOR_DOT_CHUNK, lastK - kOffset);
+            DataCopy(aLocal, aGlobal[row * k + kOffset], count);
+            DataCopy(bLocal, bGlobal[column * k + kOffset], count);
+            SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            Mul(productLocal, aLocal, bLocal, count);
+            PipeBarrier<PIPE_V>();
+            const uint32_t reduceShape[2] = {1, static_cast<uint32_t>(count)};
+            ReduceSum<float, Pattern::Reduce::AR, false>(
+                sumLocal, productLocal, reduceTmp, reduceShape, true);
+            PipeBarrier<PIPE_ALL>();
+            partial += sumLocal.GetValue(0);
+        }
 
-    sumLocal.SetValue(0, partial);
-    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
-    WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-    DataCopyExtParams outputParams{1, static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
-    if (splitK) {
-        SetAtomicAdd<float>();
-    }
-    DataCopyPad(cGlobal[outputIndex], sumLocal, outputParams);
-    if (splitK) {
-        SetAtomicNone();
+        sumLocal.SetValue(0, partial);
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        DataCopyExtParams outputParams{1, static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
+        if (splitK) {
+            SetAtomicAdd<float>();
+        }
+        DataCopyPad(cGlobal[outputIndex], sumLocal, outputParams);
+        if (splitK) {
+            SetAtomicNone();
+        }
     }
 }
 

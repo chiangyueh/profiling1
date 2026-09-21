@@ -240,9 +240,9 @@ if [[ "${MATMUL_V3_CAMPAIGN:-vector_split_k_dot}" == "vector_split_k_dot" ]]; th
         exit 1
     }
     vector_shapes=(
-        1 17 4096  1 18 5120  1 19 6144  1 20 7168
-        1 17 8192  1 18 10240 1 19 12288 1 20 16384
-        1 17 24576 1 18 28672 1 19 32768 1 20 49152
+        1 48 8192  1 64 10240 1 96 12288 1 128 14336
+        2 32 8192  2 48 10240 2 64 12288 2 80 14336
+        3 17 8192  3 18 10240 3 19 12288 3 20 14336
     )
     common_measurement_env=(
         MATMUL_DATA_TYPE=fp32 MATMUL_OUTPUT_DATA_TYPE=fp32
@@ -253,10 +253,34 @@ if [[ "${MATMUL_V3_CAMPAIGN:-vector_split_k_dot}" == "vector_split_k_dot" ]]; th
     env -u ASCEND_CUSTOM_OPP_PATH -u MATMUL_V3_FORCE_CORE_NUM -u MATMUL_V3_MEASUREMENT_PLAN \
         "${common_measurement_env[@]}" MATMUL_V3_DISABLE_VECTOR_SPLIT_K_DOT=1 \
         MATMUL_V3_MEASUREMENT_MODE=official "${example_binary}" "${vector_shapes[@]}" | tee "${run_log}"
+    candidate_shapes=()
+    while read -r candidate_m candidate_n candidate_k; do
+        candidate_shapes+=("${candidate_m}" "${candidate_n}" "${candidate_k}")
+    done < <(python3 - "${run_log}" <<'PY'
+import json
+import re
+import sys
+
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if row.get("mode") != "official" or row.get("branch") != "BASE" or row.get("status") != "OK":
+        continue
+    match = re.fullmatch(r"M(\d+)_N(\d+)_K(\d+)_NT", row.get("shape", ""))
+    if match:
+        print(*match.groups())
+PY
+)
+    if [[ "${#candidate_shapes[@]}" -eq 0 ]]; then
+        echo "fatal: none of the theory-directed shapes reached the official BASE fallback" >&2
+        exit 1
+    fi
     env -u MATMUL_V3_FORCE_CORE_NUM -u MATMUL_V3_MEASUREMENT_PLAN \
         "${common_measurement_env[@]}" ASCEND_CUSTOM_OPP_PATH="${custom_opp}" \
         MATMUL_V3_DISABLE_VECTOR_SPLIT_K_DOT=0 MATMUL_V3_MEASUREMENT_MODE=vector_split_k_dot \
-        "${example_binary}" "${vector_shapes[@]}" | tee -a "${run_log}"
+        "${example_binary}" "${candidate_shapes[@]}" | tee -a "${run_log}"
     if ! grep -q '"branch":"VECTOR_SPLIT_K_DOT".*"status":"OK"' "${run_log}"; then
         echo "fatal: VECTOR_SPLIT_K_DOT produced no correct NPU measurement" >&2
         exit 1

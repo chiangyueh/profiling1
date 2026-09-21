@@ -1355,7 +1355,6 @@ void MatmulV3BaseTiling::DoSelectTiling()
 {
     switch (tilingSelect_) {
         case TilingCalcSelect::ALL:
-            DO_CACL_TILING_ENABLE(DoVectorSplitKDotTiling())
             DO_CACL_TILING_ENABLE(DoBL1FullloadWithFixpipeTiling())
             DO_CACL_TILING_ENABLE(DoAL1FullLoadTiling())
             DO_CACL_TILING_ENABLE(DoBL1FullLoadTiling())
@@ -1363,6 +1362,7 @@ void MatmulV3BaseTiling::DoSelectTiling()
             DO_CACL_TILING_ENABLE(DoSingleCoreSplitKTiling())
             DO_CACL_TILING_ENABLE(DoDeterministicMultiCoreSplitKTiling())
             DO_CACL_TILING_ENABLE(DoL2CacheTiling310P())
+            DO_CACL_TILING_ENABLE(DoVectorSplitKDotTiling())
             break;
         case TilingCalcSelect::BASE:
             DO_CACL_TILING_ENABLE(DoL2CacheTiling())
@@ -1391,6 +1391,8 @@ bool MatmulV3BaseTiling::DoVectorSplitKDotTiling()
         args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
         args_.nd2nzA || args_.nd2nzB || args_.isNzA || args_.isNzB ||
         args_.mValue == 0 || args_.nValue == 0 || args_.kValue == 0 ||
+        args_.mValue > BASIC_ALIGN_16 || args_.nValue <= BASIC_ALIGN_16 ||
+        args_.nValue > BASIC_ALIGN_16 * compileInfo_.aicNum || args_.kValue < 4096 ||
         args_.kValue % (BLOCK_BYTE_SIZE / DATA_SIZE_FP32) != 0) {
         return false;
     }
@@ -1399,7 +1401,7 @@ bool MatmulV3BaseTiling::DoVectorSplitKDotTiling()
     if (args_.mValue != 0 && outputDots / args_.mValue != args_.nValue) {
         return false;
     }
-    if (outputDots == 0 || outputDots > compileInfo_.aicNum) {
+    if (outputDots == 0) {
         return false;
     }
 
@@ -1411,15 +1413,19 @@ bool MatmulV3BaseTiling::DoVectorSplitKDotTiling()
     }
 
     constexpr uint64_t targetElementsPerWorker = 4096;
-    const uint64_t maxWorkersPerDot = compileInfo_.aivNum / outputDots;
-    const uint64_t usefulWorkersPerDot = ops::CeilDiv(args_.kValue, targetElementsPerWorker);
-    const uint64_t workersPerDot = std::max(1UL, std::min(maxWorkersPerDot, usefulWorkersPerDot));
+    uint64_t usedCoreNum = compileInfo_.aivNum;
+    if (outputDots <= compileInfo_.aivNum) {
+        const uint64_t maxWorkersPerDot = compileInfo_.aivNum / outputDots;
+        const uint64_t usefulWorkersPerDot = ops::CeilDiv(args_.kValue, targetElementsPerWorker);
+        const uint64_t workersPerDot = std::max(1UL, std::min(maxWorkersPerDot, usefulWorkersPerDot));
+        usedCoreNum = outputDots * workersPerDot;
+    }
 
     tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
     tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::BASE;
     tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
     tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::VECTOR_SPLIT_K_DOT;
-    runInfo_.usedCoreNum = outputDots * workersPerDot;
+    runInfo_.usedCoreNum = usedCoreNum;
     runInfo_.needUpdate = true;
     return true;
 }
