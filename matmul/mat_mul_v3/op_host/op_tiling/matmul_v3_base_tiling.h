@@ -77,7 +77,6 @@ protected:
     void DoTilingKey();
     uint64_t GetDeterministicSplitKWorkspaceSize(uint64_t alignedM, uint64_t alignedN);
     void DoBasicTiling();
-    bool DoWaveExactBaseNd2NzTiling();
     //NEW
     bool ShrinkIdleCores();
     //NEW
@@ -174,7 +173,6 @@ protected:
     uint32_t l2CacheFlag_{0};
     bool compileInfoInit_{false};
     TilingCalcSelect tilingSelect_ = TilingCalcSelect::ALL;
-    bool waveExactBaseNd2NzSelected_{false};
 };
 }
 }

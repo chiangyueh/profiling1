@@ -148,22 +148,7 @@ export MATMUL_LEGACY_COMMON_LIBRARY="${official_legacy_common_library}"
 export LD_LIBRARY_PATH="${runtime_path}"
 
 #NEW
-if [[ -z "${MATMUL_V3_CAMPAIGN:-}" || "${MATMUL_V3_CAMPAIGN:-}" == "wave_exact_nd2nz" ]]; then
-    if [[ "$#" -ne 0 ]]; then
-        echo "fatal: wave-exact validation discovers its own unique BASE_ND2NZ shapes" >&2
-        exit 2
-    fi
-    export MATMUL_V3_RUNNER_IDLE_TIMEOUT_SECONDS="${MATMUL_V3_RUNNER_IDLE_TIMEOUT_SECONDS:-180}"
-    python3 scripts/wave_exact_validation.py \
-        --runner "${example_binary}" --run-log "${run_log}" \
-        --quota "${MATMUL_V3_WAVE_EXACT_QUOTA:-24}" \
-        --warmup "${MATMUL_V3_WARMUP:-1}" \
-        --repeats "${MATMUL_V3_REPEATS:-10}"
-    exit 0
-fi
-
-#NEW
-if [[ "${MATMUL_V3_CAMPAIGN:-}" == "all_io_core_sweep" ]]; then
+if [[ -z "${MATMUL_V3_CAMPAIGN:-}" || "${MATMUL_V3_CAMPAIGN:-}" == "all_io_core_sweep" ]]; then
     if [[ "$#" -ne 0 ]]; then
         echo "fatal: all-route/I-O core sweep uses its own branch-directed shapes" >&2
         exit 2
