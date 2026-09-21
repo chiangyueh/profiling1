@@ -671,8 +671,30 @@ struct MeasurementResult {
   bool timingComplete = false;
   int resultCode = 0;
   std::string failedStage;
+  std::string failureDetail;
   bool complete = false;
 };
+
+//NEW
+std::string JsonEscape(const std::string& value) {
+  std::string escaped;
+  escaped.reserve(value.size());
+  for (const char ch : value) {
+    switch (ch) {
+      case '\\': escaped += "\\\\"; break;
+      case '"': escaped += "\\\""; break;
+      case '\n': escaped += "\\n"; break;
+      case '\r': escaped += "\\r"; break;
+      case '\t': escaped += "\\t"; break;
+      default:
+        if (static_cast<unsigned char>(ch) >= 0x20U) {
+          escaped += ch;
+        }
+        break;
+    }
+  }
+  return escaped;
+}
 
 //NEW
 void PrintMeasurementResult(const MeasurementResult& result) {
@@ -695,6 +717,8 @@ void PrintMeasurementResult(const MeasurementResult& result) {
   const std::string latency = result.timingComplete ? latencyText : "null";
   const std::string tiling = result.tilingJson.empty() ? "null" : result.tilingJson;
   const std::string failedStage = result.failedStage.empty() ? "null" : "\"" + result.failedStage + "\"";
+  const std::string failureDetail = result.failureDetail.empty() ? "null" :
+      "\"" + JsonEscape(result.failureDetail) + "\"";
   const std::string branch = result.branch.empty() ? "UNKNOWN" : result.branch;
   LOG_PRINT(
       "{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"dtype\":\"%s\","
@@ -704,7 +728,8 @@ void PrintMeasurementResult(const MeasurementResult& result) {
       "\"override_scope\":\"used_core_num_block_dim_workspace\",\"requested_core\":%s,"
       "\"official_core\":%u,\"actual_core\":%u,\"latency_ms\":%s,"
       "\"workspace_bytes\":%llu,\"warmup\":%d,\"repeats\":%d,"
-      "\"status\":\"%s\",\"correctness\":\"%s\",\"failure_stage\":%s,\"tiling\":%s}\n",
+      "\"status\":\"%s\",\"correctness\":\"%s\",\"result_code\":%d,"
+      "\"failure_stage\":%s,\"failure_detail\":%s,\"tiling\":%s}\n",
       static_cast<long>(result.m), static_cast<long>(result.n), static_cast<long>(result.k),
       layout.c_str(), SelectedDataTypeName(), SelectedDataTypeName(), SelectedOutputDataTypeName(),
       layout.c_str(), soc.c_str(), branch.c_str(), mode.c_str(),
@@ -712,8 +737,8 @@ void PrintMeasurementResult(const MeasurementResult& result) {
       static_cast<unsigned long long>(result.workspaceBytes),
       discovery ? 0 : static_cast<int>(ReadEnvironmentUint("MATMUL_V3_WARMUP", 10)),
       discovery ? 0 : static_cast<int>(ReadEnvironmentUint("MATMUL_V3_REPEATS", 100)),
-      status, correctness,
-      failedStage.c_str(), tiling.c_str());
+      status, correctness, result.resultCode,
+      failedStage.c_str(), failureDetail.c_str(), tiling.c_str());
 }
 
 //NEW
@@ -812,11 +837,20 @@ int main(int argc, char** argv) {
       result.n = seed.n;
       result.k = seed.k;
       ClearSelectedBranch();
-      std::string failureDetail;
       ret = MeasureShape(result.m, result.n, result.k, stream, &result.averageMs, &result.branch,
                          &result.workspaceBytes, &result.tilingJson, &result.officialCore,
                          &result.requestedCore, &result.actualCore, &result.timingComplete,
-                         &result.failedStage, &failureDetail);
+                         &result.failedStage, &result.failureDetail);
+      if (ret != ACL_SUCCESS && result.failureDetail.empty()) {
+        const char* recentError = aclGetRecentErrMsg();
+        if (recentError != nullptr) {
+          result.failureDetail = recentError;
+          constexpr size_t kMaxFailureDetail = 512;
+          if (result.failureDetail.size() > kMaxFailureDetail) {
+            result.failureDetail.resize(kMaxFailureDetail);
+          }
+        }
+      }
       //NEW
       // Preserve the requested core even when an error happens before the
       // tiling callback can export it.  The campaign can then retry or skip

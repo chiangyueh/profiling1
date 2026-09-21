@@ -347,6 +347,9 @@ for candidate in candidates:
         "candidate_latency_ms": candidate_latency,
         "delta_pct": delta,
         "correctness": candidate.get("correctness"),
+        "candidate_result_code": candidate.get("result_code"),
+        "candidate_failure_stage": candidate.get("failure_stage"),
+        "candidate_failure_detail": candidate.get("failure_detail"),
         "status": "OK" if valid else "INVALID_CANDIDATE"
     }, separators=(",", ":")))
 
