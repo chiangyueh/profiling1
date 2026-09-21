@@ -150,8 +150,8 @@ export LD_LIBRARY_PATH="${runtime_path}"
 #NEW
 build_vector_split_k_dot_kernel() {
     local kernel_name="MatMulV3_03c4f1b0152d64e5e408cb4b2171ff12"
-    local kernel_bin_dir="${host_build}/vector_split_k_dot_bin"
-    local custom_opp="${host_build}/vector_split_k_dot_opp"
+    local kernel_bin_dir="${host_build}/vector_split_k_dot_v2_bin"
+    local custom_opp="${host_build}/vector_split_k_dot_v2_opp"
     local custom_kernel_dir="${custom_opp}/op_impl/ai_core/tbe/kernel/ascend910b/mat_mul_v3"
     local custom_config_root="${custom_opp}/op_impl/ai_core/tbe/kernel"
     local custom_object="${custom_kernel_dir}/${kernel_name}.o"
@@ -166,7 +166,7 @@ build_vector_split_k_dot_kernel() {
 
     local tbe_ascendc="${host_build}/tbe/ascendc"
     local tbe_dynamic="${host_build}/tbe/dynamic"
-    local param_dir="${host_build}/vector_split_k_dot_params"
+    local param_dir="${host_build}/vector_split_k_dot_v2_params"
     rm -rf -- "${kernel_bin_dir}" "${custom_opp}" "${param_dir}" \
         "${tbe_ascendc}/mat_mul_v3"
     mkdir -p -- "${kernel_bin_dir}" "${custom_kernel_dir}" "${tbe_ascendc}/mat_mul_v3" \
@@ -213,13 +213,27 @@ PY
     asc_opc "${tbe_dynamic}/mat_mul_v3.py" --main_func=mat_mul_v3 \
         --input_param="${fp32_param}" --soc_version=Ascend910B1 --output="${kernel_bin_dir}" \
         --impl_mode=high_performance,optional --simplified_key_mode=0 --op_mode=dynamic \
-        --deterministic=false --tiling_key=65568 >>"${build_log}" 2>&1
+        --deterministic=false --tiling_key=2162688 >>"${build_log}" 2>&1
     if [[ ! -f "${kernel_bin_dir}/${kernel_name}.o" || ! -f "${kernel_bin_dir}/${kernel_name}.json" ]]; then
         echo "fatal: VECTOR_SPLIT_K_DOT single-key kernel was not generated" >&2
         return 1
     fi
     cp -a "${kernel_bin_dir}/${kernel_name}.o" "${kernel_bin_dir}/${kernel_name}.json" \
         "${custom_kernel_dir}/"
+    if ! python3 - "${custom_json}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    metadata = json.load(stream)
+keys = metadata.get("supportInfo", {}).get("tilingKey", [])
+if metadata.get("core_type") != "AIV" or "2162688" not in keys:
+    raise SystemExit(1)
+PY
+    then
+        echo "fatal: VECTOR_SPLIT_K_DOT kernel metadata has the wrong core type or tiling key" >&2
+        return 1
+    fi
     mkdir -p -- "${custom_config_root}/config/ascend910b"
     python3 scripts/kernel/binary_script/gen_binary_info_config.py \
         "${custom_config_root}" ascend910b >>"${build_log}" 2>&1
@@ -252,8 +266,10 @@ if [[ "${MATMUL_V3_CAMPAIGN:-vector_split_k_dot}" == "vector_split_k_dot" ]]; th
         MATMUL_V3_SHRINK_IDLE_CORES=0 MATMUL_V3_WARMUP=3 MATMUL_V3_REPEATS=30
     )
     env -u ASCEND_CUSTOM_OPP_PATH -u MATMUL_V3_FORCE_CORE_NUM -u MATMUL_V3_MEASUREMENT_PLAN \
-        "${common_measurement_env[@]}" MATMUL_V3_DISABLE_VECTOR_SPLIT_K_DOT=1 \
-        MATMUL_V3_MEASUREMENT_MODE=official "${example_binary}" "${vector_shapes[@]}" | tee "${run_log}"
+        "${common_measurement_env[@]}" MATMUL_V3_SKIP_ROUTE_PREFILTER=0 \
+        MATMUL_V3_DISABLE_REPO_LOOKUP=0 \
+        MATMUL_V3_DISABLE_VECTOR_SPLIT_K_DOT=1 \
+        MATMUL_V3_MEASUREMENT_MODE=official "${example_binary}" "${vector_shapes[@]}" >"${run_log}"
     candidate_shapes=()
     while read -r candidate_m candidate_n candidate_k; do
         candidate_shapes+=("${candidate_m}" "${candidate_n}" "${candidate_k}")
@@ -281,9 +297,62 @@ PY
     env -u MATMUL_V3_FORCE_CORE_NUM -u MATMUL_V3_MEASUREMENT_PLAN \
         "${common_measurement_env[@]}" ASCEND_CUSTOM_OPP_PATH="${custom_opp}" \
         MATMUL_V3_SKIP_ROUTE_PREFILTER=1 \
+        MATMUL_V3_DISABLE_REPO_LOOKUP=1 \
         MATMUL_V3_DISABLE_VECTOR_SPLIT_K_DOT=0 MATMUL_V3_MEASUREMENT_MODE=vector_split_k_dot \
-        "${example_binary}" "${candidate_shapes[@]}" | tee -a "${run_log}"
-    if ! grep -q '"branch":"VECTOR_SPLIT_K_DOT".*"status":"OK"' "${run_log}"; then
+        "${example_binary}" "${candidate_shapes[@]}" >>"${run_log}"
+    if ! python3 - "${run_log}" <<'PY'
+import json
+import sys
+
+official = {}
+candidates = []
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if row.get("mode") == "official" and row.get("branch") == "BASE" and row.get("status") == "OK":
+        official[row["shape"]] = row
+    elif row.get("mode") == "vector_split_k_dot":
+        candidates.append(row)
+
+passed = 0
+for candidate in candidates:
+    reference = official.get(candidate.get("shape"))
+    candidate_tiling = candidate.get("tiling") if isinstance(candidate.get("tiling"), dict) else {}
+    reference_tiling = reference.get("tiling") if reference and isinstance(reference.get("tiling"), dict) else {}
+    valid = (
+        reference is not None
+        and candidate.get("branch") == "VECTOR_SPLIT_K_DOT"
+        and candidate.get("status") == "OK"
+        and candidate.get("correctness") == "PASS"
+        and candidate_tiling.get("tiling_key") == 2162688
+    )
+    if valid:
+        passed += 1
+    official_latency = reference.get("latency_ms") if reference else None
+    candidate_latency = candidate.get("latency_ms")
+    delta = None
+    if official_latency not in (None, 0) and candidate_latency is not None:
+        delta = round((candidate_latency / official_latency - 1.0) * 100.0, 3)
+    print(json.dumps({
+        "shape": candidate.get("shape"),
+        "official_branch": reference.get("branch") if reference else None,
+        "candidate_branch": candidate.get("branch"),
+        "official_tiling_key": reference_tiling.get("tiling_key"),
+        "candidate_tiling_key": candidate_tiling.get("tiling_key"),
+        "official_core": reference.get("actual_core") if reference else None,
+        "candidate_core": candidate.get("actual_core"),
+        "official_latency_ms": official_latency,
+        "candidate_latency_ms": candidate_latency,
+        "delta_pct": delta,
+        "correctness": candidate.get("correctness"),
+        "status": "OK" if valid else "INVALID_CANDIDATE"
+    }, separators=(",", ":")))
+
+raise SystemExit(0 if passed > 0 else 1)
+PY
+    then
         echo "fatal: VECTOR_SPLIT_K_DOT produced no correct NPU measurement" >&2
         exit 1
     fi

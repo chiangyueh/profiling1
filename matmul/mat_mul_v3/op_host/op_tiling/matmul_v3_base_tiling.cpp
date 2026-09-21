@@ -907,6 +907,11 @@ void MatmulV3BaseTiling::SetRunInfo()
 
 bool MatmulV3BaseTiling::GetTilingFromRepo()
 {
+    //NEW
+    const char *disableRepo = std::getenv("MATMUL_V3_DISABLE_REPO_LOOKUP");
+    if (disableRepo != nullptr && disableRepo[0] == '1' && disableRepo[1] == '\0') {
+        return false;
+    }
     OP_LOGI(args_.opName, "start get tiling from repo.");
     std::shared_ptr<tuningtiling::TuningTilingDef> tuningTiling = nullptr;
     std::shared_ptr<void> inputArgs = nullptr;
