@@ -149,9 +149,9 @@ export LD_LIBRARY_PATH="${runtime_path}"
 
 #NEW
 build_vector_split_k_dot_kernel() {
-    local kernel_name="MatMulV3_03c4f1b0152d64e5e408cb4b2171ff12"
-    local kernel_bin_dir="${host_build}/vector_split_k_dot_v2_bin"
-    local custom_opp="${host_build}/vector_split_k_dot_v2_opp"
+    local kernel_name="MatMulV3_VectorSplitKDot"
+    local kernel_bin_dir="${host_build}/vector_split_k_dot_v3_bin"
+    local custom_opp="${host_build}/vector_split_k_dot_v3_opp"
     local custom_kernel_dir="${custom_opp}/op_impl/ai_core/tbe/kernel/ascend910b/mat_mul_v3"
     local custom_config_root="${custom_opp}/op_impl/ai_core/tbe/kernel"
     local custom_object="${custom_kernel_dir}/${kernel_name}.o"
@@ -166,7 +166,7 @@ build_vector_split_k_dot_kernel() {
 
     local tbe_ascendc="${host_build}/tbe/ascendc"
     local tbe_dynamic="${host_build}/tbe/dynamic"
-    local param_dir="${host_build}/vector_split_k_dot_v2_params"
+    local param_dir="${host_build}/vector_split_k_dot_v3_params"
     rm -rf -- "${kernel_bin_dir}" "${custom_opp}" "${param_dir}" \
         "${tbe_ascendc}/mat_mul_v3"
     mkdir -p -- "${kernel_bin_dir}" "${custom_kernel_dir}" "${tbe_ascendc}/mat_mul_v3" \
@@ -210,6 +210,21 @@ PY
         return 1
     fi
 
+    python3 - "${fp32_param}" "${kernel_name}" <<'PY'
+import json
+import sys
+
+path, kernel_name = sys.argv[1:]
+with open(path, encoding="utf-8") as stream:
+    data = json.load(stream)
+nodes = data.get("op_list", [])
+if len(nodes) != 1:
+    raise SystemExit("expected one MatMulV3 compile node")
+nodes[0]["bin_filename"] = kernel_name
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(data, stream, separators=(",", ":"))
+PY
+
     asc_opc "${tbe_dynamic}/mat_mul_v3.py" --main_func=mat_mul_v3 \
         --input_param="${fp32_param}" --soc_version=Ascend910B1 --output="${kernel_bin_dir}" \
         --impl_mode=high_performance,optional --simplified_key_mode=0 --op_mode=dynamic \
@@ -227,11 +242,21 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     metadata = json.load(stream)
 keys = metadata.get("supportInfo", {}).get("tilingKey", [])
-if metadata.get("core_type") != "AIV" or "2162688" not in keys:
+kernel_name = "MatMulV3_VectorSplitKDot"
+kernel_list = metadata.get("kernelList", [])
+if (metadata.get("core_type") != "AIV" or "2162688" not in keys or
+        metadata.get("binFileName") != kernel_name or
+        metadata.get("kernelName") != kernel_name or
+        not any(item.get("kernelName") == kernel_name + "_2162688" for item in kernel_list)):
     raise SystemExit(1)
 PY
     then
         echo "fatal: VECTOR_SPLIT_K_DOT kernel metadata has the wrong core type or tiling key" >&2
+        return 1
+    fi
+    if ! readelf -Ws "${custom_object}" | awk \
+        '$4 == "FUNC" && $5 == "GLOBAL" && $8 == "MatMulV3_VectorSplitKDot_2162688" {found=1} END {exit !found}'; then
+        echo "fatal: VECTOR_SPLIT_K_DOT ELF entry is missing" >&2
         return 1
     fi
     mkdir -p -- "${custom_config_root}/config/ascend910b"
@@ -239,6 +264,23 @@ PY
         "${custom_config_root}" ascend910b >>"${build_log}" 2>&1
     if [[ ! -f "${custom_config_root}/config/ascend910b/binary_info_config.json" ]]; then
         echo "fatal: VECTOR_SPLIT_K_DOT custom OPP metadata was not generated" >&2
+        return 1
+    fi
+    if ! python3 - "${custom_config_root}/config/ascend910b/binary_info_config.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    config = json.load(stream)
+binaries = config.get("MatMulV3", {}).get("binaryList", [])
+if not any(item.get("coreType") == 2 and
+           item.get("binPath", "").endswith("/MatMulV3_VectorSplitKDot.o") and
+           item.get("jsonPath", "").endswith("/MatMulV3_VectorSplitKDot.json")
+           for item in binaries):
+    raise SystemExit(1)
+PY
+    then
+        echo "fatal: VECTOR_SPLIT_K_DOT binary config does not select the AIV binary" >&2
         return 1
     fi
     printf '%s\n' "${custom_opp}"
