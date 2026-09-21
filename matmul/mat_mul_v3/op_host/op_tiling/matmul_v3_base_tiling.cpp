@@ -653,6 +653,7 @@ void MatmulV3BaseTiling::DoBasicTiling()
     DoIncreTiling();
     OptimizeLoadBalanceBasicKernel();
     DoSelectTiling();
+    DoWaveExactBaseNd2NzTiling();
     // add nd2nz tiling here
     DoNd2NzVectorTiling();
     if (args_.hasBias) {
@@ -664,108 +665,96 @@ void MatmulV3BaseTiling::DoBasicTiling()
     }
 }
 
-bool MatmulV3BaseTiling::DoWaveBalancedHeadNd2NzTiling()
+bool MatmulV3BaseTiling::DoWaveExactBaseNd2NzTiling()
 {
-    waveBalancedHeadNd2NzSelected_ = false;
-    const char *enable = std::getenv("MATMUL_V3_ENABLE_WAVE_BALANCED_HEAD_ND2NZ");
+    waveExactBaseNd2NzSelected_ = false;
+    const char *enable = std::getenv("MATMUL_V3_ENABLE_WAVE_EXACT_ND2NZ");
     if (enable == nullptr || enable[0] != '1' || enable[1] != '\0') {
         return false;
     }
 
-    // This is an independent family at the end of the specialized selector
-    // chain and before the implicit BASE fallback.  No official BASE tiling
-    // field is used as an input or a bound.
+    // This rule runs after every higher-priority official selector.  Requiring
+    // all three mutually-exclusive selector fields to remain BASE proves that
+    // it cannot steal AL1, BL1, Fixpipe, or any Split-K packet.
     if (tilingSelect_ != TilingCalcSelect::ALL || !compileInfo_.supportL0c2out ||
         compileInfo_.supportL12BtBf16 || compileInfo_.aicNum != 20UL || args_.hasBias ||
         args_.aFormat != ge::FORMAT_ND || args_.bFormat != ge::FORMAT_ND ||
-        args_.outFormat != ge::FORMAT_ND || aDtypeSize_ == 0UL || bDtypeSize_ == 0UL ||
+        args_.outFormat != ge::FORMAT_ND ||
+        tilingEnable_.tilingEnableFullLoad != TilingEnableFullLoad::BASE ||
+        tilingEnable_.tilingEnableSplitCore != TilingEnableSplitCore::BASE ||
+        tilingEnable_.tilingEnableFixOpti != TilingEnableFixOpti::BASE ||
+        tilingEnable_.tilingEnableSpecialOpti != TilingEnableSpecialOpti::BASE ||
         GetMixNd2nzType() != MixNd2NzType::V_HEAD_ND2NZ) {
         return false;
     }
 
     constexpr uint64_t align = BASIC_ALIGN_16;
     constexpr uint64_t minBase = 64UL;
-    constexpr uint64_t maxBase = BASIC_BLOCK_SIZE_256;
     constexpr uint64_t l0AccumulatorBytes = DATA_SIZE_FP32;
     const uint64_t cores = compileInfo_.aicNum;
-    uint64_t baseK = std::min(args_.kValue, BASIC_BLOCK_K_128_BYTE / aDtypeSize_);
-    baseK = ops::FloorAlign(baseK, align);
-    if (baseK == 0UL || MathUtil::CeilDivision(args_.kValue, baseK) < 8UL) {
+    const uint64_t oldBaseM = runInfo_.baseM;
+    const uint64_t oldBaseN = runInfo_.baseN;
+    if (oldBaseM < minBase || oldBaseN < minBase || runInfo_.baseK == 0UL ||
+        runInfo_.dbL0c == 0UL) {
         return false;
     }
 
-    struct TileChoice {
-        uint64_t baseM = 0UL;
-        uint64_t baseN = 0UL;
-        uint64_t tasks = 0UL;
-        uint64_t waves = 0UL;
-        unsigned __int128 area = 0;
-        unsigned __int128 criticalCompute = 0;
-        unsigned __int128 criticalLoad = 0;
-        unsigned __int128 paddedCompute = 0;
-    } canonical;
+    const uint64_t oldMCnt = MathUtil::CeilDivision(args_.mValue, oldBaseM);
+    const uint64_t oldNCnt = MathUtil::CeilDivision(args_.nValue, oldBaseN);
+    const uint64_t oldTasks = oldMCnt * oldNCnt;
+    const uint64_t oldTail = oldTasks % cores;
+    if (oldTasks <= cores || oldTail == 0UL || oldTail > cores / NUMBER_TWO) {
+        return false;
+    }
+    const uint64_t oldWaves = MathUtil::CeilDivision(oldTasks, cores);
+    const unsigned __int128 oldCriticalCompute =
+        static_cast<unsigned __int128>(oldWaves) * oldBaseM * oldBaseN;
+    const unsigned __int128 oldCriticalLoad = static_cast<unsigned __int128>(oldWaves) *
+        (oldBaseM * aDtypeSize_ + oldBaseN * bDtypeSize_);
+    const unsigned __int128 oldPaddedCompute =
+        static_cast<unsigned __int128>(oldTasks) * oldBaseM * oldBaseN;
 
-    const uint64_t maxLegalM = std::min(maxBase, ops::CeilAlign(args_.mValue, align));
-    const uint64_t maxLegalN = std::min(maxBase, ops::CeilAlign(args_.nValue, align));
-    for (uint64_t baseM = minBase; baseM <= maxLegalM; baseM += align) {
-        for (uint64_t baseN = minBase; baseN <= maxLegalN; baseN += align) {
-            if (!CheckBTSize(baseN)) {
-                continue;
-            }
-            const unsigned __int128 l0ABytes = static_cast<unsigned __int128>(baseM) *
-                baseK * aDtypeSize_ * DB_SIZE;
-            const unsigned __int128 l0BBytes = static_cast<unsigned __int128>(baseN) *
-                baseK * bDtypeSize_ * DB_SIZE;
-            const unsigned __int128 l0CBytes = static_cast<unsigned __int128>(baseM) *
-                baseN * l0AccumulatorBytes;
-            if (l0ABytes > compileInfo_.l0ASize || l0BBytes > compileInfo_.l0BSize ||
-                l0CBytes > compileInfo_.l0CSize) {
-                continue;
-            }
-            const uint64_t tasks = MathUtil::CeilDivision(args_.mValue, baseM) *
-                MathUtil::CeilDivision(args_.nValue, baseN);
-            const uint64_t waves = MathUtil::CeilDivision(tasks, cores);
-            const unsigned __int128 area = static_cast<unsigned __int128>(baseM) * baseN;
-            const unsigned __int128 padded = static_cast<unsigned __int128>(tasks) * area;
-            const unsigned __int128 load = static_cast<unsigned __int128>(waves) *
-                (baseM * aDtypeSize_ + baseN * bDtypeSize_);
-            if (area > canonical.area ||
-                (area == canonical.area && padded < canonical.paddedCompute) ||
-                (area == canonical.area && padded == canonical.paddedCompute &&
-                 load < canonical.criticalLoad)) {
-                canonical = {baseM, baseN, tasks, waves, area, waves * area, load, padded};
-            }
+    uint64_t bestBaseM = 0UL;
+    uint64_t bestBaseN = 0UL;
+    uint64_t bestTasks = 0UL;
+    unsigned __int128 bestCriticalCompute = ~static_cast<unsigned __int128>(0);
+    unsigned __int128 bestCriticalLoad = ~static_cast<unsigned __int128>(0);
+    unsigned __int128 bestPaddedCompute = ~static_cast<unsigned __int128>(0);
+
+    const uint64_t maxMCnt = std::min(
+        MathUtil::CeilDivision(args_.mValue, minBase), oldMCnt + cores);
+    const uint64_t maxNCnt = std::min(
+        MathUtil::CeilDivision(args_.nValue, minBase), oldNCnt + cores);
+    for (uint64_t requestedMCnt = oldMCnt; requestedMCnt <= maxMCnt; ++requestedMCnt) {
+        const uint64_t baseM = ops::CeilAlign(
+            MathUtil::CeilDivision(args_.mValue, requestedMCnt), align);
+        if (baseM < minBase || baseM > oldBaseM) {
+            continue;
         }
-    }
-    if (canonical.baseM == 0UL || canonical.tasks <= cores ||
-        canonical.tasks % cores == 0UL || canonical.tasks % cores > cores / NUMBER_TWO) {
-        return false;
-    }
-
-    TileChoice best;
-    best.criticalCompute = ~static_cast<unsigned __int128>(0);
-    best.criticalLoad = ~static_cast<unsigned __int128>(0);
-    best.paddedCompute = ~static_cast<unsigned __int128>(0);
-    for (uint64_t baseM = minBase; baseM <= maxLegalM; baseM += align) {
-        for (uint64_t baseN = minBase; baseN <= maxLegalN; baseN += align) {
-            if (!CheckBTSize(baseN)) {
+        const uint64_t mCnt = MathUtil::CeilDivision(args_.mValue, baseM);
+        for (uint64_t requestedNCnt = oldNCnt; requestedNCnt <= maxNCnt; ++requestedNCnt) {
+            const uint64_t baseN = ops::CeilAlign(
+                MathUtil::CeilDivision(args_.nValue, requestedNCnt), align);
+            if (baseN < minBase || baseN > oldBaseN || !CheckBTSize(baseN)) {
                 continue;
             }
+            const uint64_t nCnt = MathUtil::CeilDivision(args_.nValue, baseN);
+            const uint64_t tasks = mCnt * nCnt;
+            if (tasks <= oldTasks || tasks > oldWaves * cores) {
+                continue;
+            }
+
             const unsigned __int128 l0ABytes = static_cast<unsigned __int128>(baseM) *
-                baseK * aDtypeSize_ * DB_SIZE;
+                runInfo_.baseK * aDtypeSize_ * DB_SIZE;
             const unsigned __int128 l0BBytes = static_cast<unsigned __int128>(baseN) *
-                baseK * bDtypeSize_ * DB_SIZE;
+                runInfo_.baseK * bDtypeSize_ * DB_SIZE;
             const unsigned __int128 l0CBytes = static_cast<unsigned __int128>(baseM) *
-                baseN * l0AccumulatorBytes;
+                baseN * l0AccumulatorBytes * runInfo_.dbL0c;
             if (l0ABytes > compileInfo_.l0ASize || l0BBytes > compileInfo_.l0BSize ||
                 l0CBytes > compileInfo_.l0CSize) {
                 continue;
             }
-            const uint64_t tasks = MathUtil::CeilDivision(args_.mValue, baseM) *
-                MathUtil::CeilDivision(args_.nValue, baseN);
-            if (tasks <= canonical.tasks || tasks > canonical.waves * cores) {
-                continue;
-            }
+
             const uint64_t waves = MathUtil::CeilDivision(tasks, cores);
             const unsigned __int128 criticalCompute =
                 static_cast<unsigned __int128>(waves) * baseM * baseN;
@@ -774,40 +763,35 @@ bool MatmulV3BaseTiling::DoWaveBalancedHeadNd2NzTiling()
             const unsigned __int128 paddedCompute =
                 static_cast<unsigned __int128>(tasks) * baseM * baseN;
 
-            if (criticalCompute * 100U > canonical.criticalCompute * 90U ||
-                criticalLoad > canonical.criticalLoad ||
-                paddedCompute * 100U > canonical.paddedCompute * 110U) {
+            // Admission is a hardware Pareto proof, not a learned score: the
+            // busiest AIC loses at least 10% Cube work, its A/B traffic cannot
+            // increase, and global padded Cube work may grow by at most 10%.
+            if (criticalCompute * 100U > oldCriticalCompute * 90U ||
+                criticalLoad > oldCriticalLoad ||
+                paddedCompute * 100U > oldPaddedCompute * 110U) {
                 continue;
             }
-            if (criticalCompute < best.criticalCompute ||
-                (criticalCompute == best.criticalCompute && criticalLoad < best.criticalLoad) ||
-                (criticalCompute == best.criticalCompute && criticalLoad == best.criticalLoad &&
-                 paddedCompute < best.paddedCompute)) {
-                best = {baseM, baseN, tasks, waves,
-                    static_cast<unsigned __int128>(baseM) * baseN,
-                    criticalCompute, criticalLoad, paddedCompute};
+            if (criticalCompute < bestCriticalCompute ||
+                (criticalCompute == bestCriticalCompute && criticalLoad < bestCriticalLoad) ||
+                (criticalCompute == bestCriticalCompute && criticalLoad == bestCriticalLoad &&
+                 paddedCompute < bestPaddedCompute)) {
+                bestBaseM = baseM;
+                bestBaseN = baseN;
+                bestTasks = tasks;
+                bestCriticalCompute = criticalCompute;
+                bestCriticalLoad = criticalLoad;
+                bestPaddedCompute = paddedCompute;
             }
         }
     }
-    if (best.baseM == 0UL || best.baseN == 0UL) {
+    if (bestBaseM == 0UL || bestBaseN == 0UL) {
         return false;
     }
 
-    MatmulV3RunInfo independent{};
-    independent.needUpdate = true;
-    independent.usedCoreNum = cores;
-    independent.singleCoreM = best.baseM;
-    independent.singleCoreN = best.baseN;
-    independent.singleCoreK = args_.kValue;
-    independent.baseM = best.baseM;
-    independent.baseN = best.baseN;
-    independent.baseK = baseK;
-    independent.stepM = 1UL;
-    independent.stepN = 1UL;
-    independent.iterateOrder = best.baseM * aDtypeSize_ >= best.baseN * bDtypeSize_ ?
-        ITER_ROW_FIRST : ITER_COL_FIRST;
-    independent.dbL0c = 1UL;
-    runInfo_ = independent;
+    runInfo_.baseM = bestBaseM;
+    runInfo_.baseN = bestBaseN;
+    runInfo_.singleCoreM = bestBaseM;
+    runInfo_.singleCoreN = bestBaseN;
     CalL1Tiling();
 
     // Jointly solve the launch width.  Start at the smallest AIC count that
@@ -815,8 +799,8 @@ bool MatmulV3BaseTiling::DoWaveBalancedHeadNd2NzTiling()
     // preserve the ND2NZ producer-wave count as well.  The conversion chunks
     // are regenerated for each proposed width, so this is part of tiling
     // construction rather than a post-tiling core override.
-    const uint64_t fullCubeWaves = MathUtil::CeilDivision(best.tasks, cores);
-    uint64_t selectedCores = MathUtil::CeilDivision(best.tasks, fullCubeWaves);
+    const uint64_t fullCubeWaves = MathUtil::CeilDivision(bestTasks, cores);
+    uint64_t selectedCores = MathUtil::CeilDivision(bestTasks, fullCubeWaves);
     auto conversionWaves = [&](uint64_t candidateCores) -> uint64_t {
         runInfo_.usedCoreNum = candidateCores;
         uint64_t jobs = 0UL;
@@ -853,16 +837,12 @@ bool MatmulV3BaseTiling::DoWaveBalancedHeadNd2NzTiling()
         ++selectedCores;
     }
     runInfo_.usedCoreNum = selectedCores;
-    tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
-    tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::BASE;
-    tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
-    tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::BASE;
     enableCache_ = true;
     (void)DoL2CacheTiling();
-    waveBalancedHeadNd2NzSelected_ = true;
+    waveExactBaseNd2NzSelected_ = true;
     OP_LOGI(args_.opName,
-        "Selected WAVE_BALANCED_HEAD_ND2NZ baseM=%lu baseN=%lu tasks=%lu cores=%lu",
-        runInfo_.baseM, runInfo_.baseN, best.tasks, runInfo_.usedCoreNum);
+        "Selected WAVE_EXACT_BASE_ND2NZ baseM=%lu baseN=%lu tasks=%lu cores=%lu",
+        runInfo_.baseM, runInfo_.baseN, bestTasks, runInfo_.usedCoreNum);
     return true;
 }
 
@@ -1564,7 +1544,6 @@ void MatmulV3BaseTiling::DoSelectTiling()
             DO_CACL_TILING_ENABLE(DoSingleCoreSplitKTiling())
             DO_CACL_TILING_ENABLE(DoDeterministicMultiCoreSplitKTiling())
             DO_CACL_TILING_ENABLE(DoL2CacheTiling310P())
-            DO_CACL_TILING_ENABLE(DoWaveBalancedHeadNd2NzTiling())
             break;
         case TilingCalcSelect::BASE:
             DO_CACL_TILING_ENABLE(DoL2CacheTiling())
@@ -2878,8 +2857,8 @@ bool MatmulV3BaseTiling::CheckMMTilingDataIsVaild()
 //NEW
 const char *MatmulV3BaseTiling::GetSelectedBranchName()
 {
-    if (waveBalancedHeadNd2NzSelected_) {
-        return "WAVE_BALANCED_HEAD_ND2NZ";
+    if (waveExactBaseNd2NzSelected_) {
+        return "WAVE_EXACT_BASE_ND2NZ";
     }
     const auto mix = GetMixNd2nzType();
     switch (tilingEnable_.tilingEnableSplitCore) {
