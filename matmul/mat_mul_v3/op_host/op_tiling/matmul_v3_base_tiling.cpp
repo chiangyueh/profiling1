@@ -148,7 +148,7 @@ bool MatmulV3BaseTiling::CheckAoeTilingEnable(uint32_t aoeTilingEnable, const st
     tilingEnable_.tilingEnableFixOpti = static_cast<TilingEnableFixOpti>(tilingFixOpti);
 
     uint32_t tilingSpecOpti = (aoeTilingEnable / 10000U) % 10U; // aoe 的tilingEnable的万位
-    if (tilingSpecOpti > static_cast<uint32_t>(TilingEnableSpecialOpti::ENABLE_K_SHIFT)) {
+    if (tilingSpecOpti > static_cast<uint32_t>(TilingEnableSpecialOpti::VECTOR_SPLIT_K_DOT)) {
         OP_LOGW(opName, "Invalid tilingEnable which the bit of spec-Opti %d is undefined", tilingSpecOpti);
         return false;
     }
@@ -1355,6 +1355,7 @@ void MatmulV3BaseTiling::DoSelectTiling()
 {
     switch (tilingSelect_) {
         case TilingCalcSelect::ALL:
+            DO_CACL_TILING_ENABLE(DoVectorSplitKDotTiling())
             DO_CACL_TILING_ENABLE(DoBL1FullloadWithFixpipeTiling())
             DO_CACL_TILING_ENABLE(DoAL1FullLoadTiling())
             DO_CACL_TILING_ENABLE(DoBL1FullLoadTiling())
@@ -1376,6 +1377,51 @@ void MatmulV3BaseTiling::DoSelectTiling()
         default:
             break;
     }
+}
+
+bool MatmulV3BaseTiling::DoVectorSplitKDotTiling()
+{
+    const char *disable = std::getenv("MATMUL_V3_DISABLE_VECTOR_SPLIT_K_DOT");
+    if (disable != nullptr && disable[0] == '1' && disable[1] == '\0') {
+        return false;
+    }
+    if (!compileInfo_.supportL0c2out || compileInfo_.aivNum == 0 || args_.hasBias ||
+        args_.aType != ge::DT_FLOAT || args_.bType != ge::DT_FLOAT || args_.cType != ge::DT_FLOAT ||
+        args_.isATrans || !args_.isBTrans || args_.aFormat != ge::FORMAT_ND ||
+        args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
+        args_.nd2nzA || args_.nd2nzB || args_.isNzA || args_.isNzB ||
+        args_.mValue == 0 || args_.nValue == 0 || args_.kValue == 0 ||
+        args_.kValue % (BLOCK_BYTE_SIZE / DATA_SIZE_FP32) != 0) {
+        return false;
+    }
+
+    const uint64_t outputDots = args_.mValue * args_.nValue;
+    if (args_.mValue != 0 && outputDots / args_.mValue != args_.nValue) {
+        return false;
+    }
+    if (outputDots == 0 || outputDots > compileInfo_.aicNum) {
+        return false;
+    }
+
+    const uint64_t paddedDots = ops::CeilAlign(args_.mValue, BASIC_ALIGN_16) *
+                                ops::CeilAlign(args_.nValue, BASIC_ALIGN_16);
+    constexpr uint64_t minPaddingElimination = 8;
+    if (paddedDots < minPaddingElimination * outputDots) {
+        return false;
+    }
+
+    constexpr uint64_t targetElementsPerWorker = 4096;
+    const uint64_t maxWorkersPerDot = compileInfo_.aivNum / outputDots;
+    const uint64_t usefulWorkersPerDot = ops::CeilDiv(args_.kValue, targetElementsPerWorker);
+    const uint64_t workersPerDot = std::max(1UL, std::min(maxWorkersPerDot, usefulWorkersPerDot));
+
+    tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
+    tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::BASE;
+    tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
+    tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::VECTOR_SPLIT_K_DOT;
+    runInfo_.usedCoreNum = outputDots * workersPerDot;
+    runInfo_.needUpdate = true;
+    return true;
 }
 
 void MatmulV3BaseTiling::FormulateBasicBlockDavid()
@@ -2676,6 +2722,9 @@ bool MatmulV3BaseTiling::CheckMMTilingDataIsVaild()
 const char *MatmulV3BaseTiling::GetSelectedBranchName()
 {
     const auto mix = GetMixNd2nzType();
+    if (tilingEnable_.tilingEnableSpecialOpti == TilingEnableSpecialOpti::VECTOR_SPLIT_K_DOT) {
+        return "VECTOR_SPLIT_K_DOT";
+    }
     switch (tilingEnable_.tilingEnableSplitCore) {
         case TilingEnableSplitCore::SINGLE_CORE_SPLIT_K:
             return mix == MixNd2NzType::V_HEAD_ND2NZ ?

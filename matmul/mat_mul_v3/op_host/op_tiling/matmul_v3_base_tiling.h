@@ -108,6 +108,7 @@ protected:
     void SetBaseBlockTiling();
     void DoSmallShapeTiling();
     void DoSelectTiling();
+    bool DoVectorSplitKDotTiling();
     bool IsSupportSingleCoreSplitSmallK(uint64_t xDim, uint64_t yDim) const;
     bool IsSupportSingleCoreSplitK() const;
     bool DoSingleCoreSplitKTiling();

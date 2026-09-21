@@ -148,6 +148,123 @@ export MATMUL_LEGACY_COMMON_LIBRARY="${official_legacy_common_library}"
 export LD_LIBRARY_PATH="${runtime_path}"
 
 #NEW
+build_vector_split_k_dot_kernel() {
+    local kernel_name="MatMulV3_03c4f1b0152d64e5e408cb4b2171ff12"
+    local kernel_bin_dir="${host_build}/vector_split_k_dot_bin"
+    local custom_opp="${host_build}/vector_split_k_dot_opp"
+    local custom_kernel_dir="${custom_opp}/op_impl/ai_core/tbe/kernel/ascend910b/mat_mul_v3"
+    local custom_config_root="${custom_opp}/op_impl/ai_core/tbe/kernel"
+    local custom_object="${custom_kernel_dir}/${kernel_name}.o"
+    local custom_json="${custom_kernel_dir}/${kernel_name}.json"
+
+    if [[ -f "${custom_object}" && -f "${custom_json}" &&
+          -f "${custom_config_root}/config/ascend910b/binary_info_config.json" ]] &&
+       ! find matmul/mat_mul_v3/op_kernel -type f -newer "${custom_object}" -print -quit | grep -q .; then
+        printf '%s\n' "${custom_opp}"
+        return 0
+    fi
+
+    local tbe_ascendc="${host_build}/tbe/ascendc"
+    local tbe_dynamic="${host_build}/tbe/dynamic"
+    local param_dir="${host_build}/vector_split_k_dot_params"
+    rm -rf -- "${kernel_bin_dir}" "${custom_opp}" "${param_dir}" \
+        "${tbe_ascendc}/mat_mul_v3"
+    mkdir -p -- "${kernel_bin_dir}" "${custom_kernel_dir}" "${tbe_ascendc}/mat_mul_v3" \
+        "${tbe_ascendc}/common/act" "${tbe_ascendc}/common/matmul_act" \
+        "${tbe_dynamic}" "${param_dir}"
+    cp -a matmul/mat_mul_v3/op_kernel/. "${tbe_ascendc}/mat_mul_v3/"
+    cp -a common/act/. "${tbe_ascendc}/common/act/"
+    cp -a matmul/common/matmul_act/. "${tbe_ascendc}/common/matmul_act/"
+
+    local ops_info="${host_build}/autogen/exc/aic-ascend910b-ops-info.ini"
+    local opc_options="${host_build}/autogen/custom_opc_options.ini"
+    if [[ ! -f "${ops_info}" || ! -f "${opc_options}" ]]; then
+        echo "fatal: MatMulV3 kernel metadata was not generated" >&2
+        return 1
+    fi
+    python3 scripts/util/ascendc_impl_build.py "${ops_info}" "" "" \
+        "${tbe_ascendc}" "${tbe_dynamic}" "${host_build}/autogen" >>"${build_log}" 2>&1
+    python3 scripts/util/ascendc_bin_param_build.py "${ops_info}" "${param_dir}" ascend910b \
+        --opc-config-file "${opc_options}" --ops MatMulV3 >>"${build_log}" 2>&1
+
+    local fp32_param
+    fp32_param="$(python3 - "${param_dir}" <<'PY'
+import glob
+import json
+import os
+import sys
+
+for path in sorted(glob.glob(os.path.join(sys.argv[1], "*_param.json"))):
+    with open(path, encoding="utf-8") as stream:
+        node = json.load(stream)["op_list"][0]
+    required = [item for item in node["inputs"] if item.get("paramType") == "required"]
+    outputs = [item for item in node["outputs"] if item.get("paramType") == "required"]
+    if (len(required) == 2 and len(outputs) == 1 and
+            all(item.get("dtype") == "float32" and item.get("format") == "ND" for item in required + outputs)):
+        print(path)
+        break
+PY
+)"
+    if [[ -z "${fp32_param}" || ! -f "${fp32_param}" || ! -f "${tbe_dynamic}/mat_mul_v3.py" ]]; then
+        echo "fatal: FP32/ND MatMulV3 kernel input was not generated" >&2
+        return 1
+    fi
+
+    asc_opc "${tbe_dynamic}/mat_mul_v3.py" --main_func=mat_mul_v3 \
+        --input_param="${fp32_param}" --soc_version=Ascend910B1 --output="${kernel_bin_dir}" \
+        --impl_mode=high_performance,optional --simplified_key_mode=0 --op_mode=dynamic \
+        --deterministic=false --tiling_key=65568 >>"${build_log}" 2>&1
+    if [[ ! -f "${kernel_bin_dir}/${kernel_name}.o" || ! -f "${kernel_bin_dir}/${kernel_name}.json" ]]; then
+        echo "fatal: VECTOR_SPLIT_K_DOT single-key kernel was not generated" >&2
+        return 1
+    fi
+    cp -a "${kernel_bin_dir}/${kernel_name}.o" "${kernel_bin_dir}/${kernel_name}.json" \
+        "${custom_kernel_dir}/"
+    python3 scripts/kernel/binary_script/gen_binary_info_config.py \
+        "${custom_config_root}" ascend910b >>"${build_log}" 2>&1
+    if [[ ! -f "${custom_config_root}/config/ascend910b/binary_info_config.json" ]]; then
+        echo "fatal: VECTOR_SPLIT_K_DOT custom OPP metadata was not generated" >&2
+        return 1
+    fi
+    printf '%s\n' "${custom_opp}"
+}
+
+#NEW
+if [[ "${MATMUL_V3_CAMPAIGN:-vector_split_k_dot}" == "vector_split_k_dot" ]]; then
+    if [[ "$#" -ne 0 ]]; then
+        echo "fatal: VECTOR_SPLIT_K_DOT validation uses its own theory-directed shapes" >&2
+        exit 2
+    fi
+    custom_opp="$(build_vector_split_k_dot_kernel)" || {
+        cat "${build_log}" >&2
+        exit 1
+    }
+    vector_shapes=(
+        1 17 4096  1 18 5120  1 19 6144  1 20 7168
+        1 17 8192  1 18 10240 1 19 12288 1 20 16384
+        1 17 24576 1 18 28672 1 19 32768 1 20 49152
+    )
+    common_measurement_env=(
+        MATMUL_DATA_TYPE=fp32 MATMUL_OUTPUT_DATA_TYPE=fp32
+        MATMUL_A_TRANSPOSE=0 MATMUL_B_TRANSPOSE=1 MATMUL_V3_ONLY=1
+        MATMUL_TRANSPOSED_COLUMN_PATTERN=1
+        MATMUL_V3_SHRINK_IDLE_CORES=0 MATMUL_V3_WARMUP=3 MATMUL_V3_REPEATS=30
+    )
+    env -u ASCEND_CUSTOM_OPP_PATH -u MATMUL_V3_FORCE_CORE_NUM -u MATMUL_V3_MEASUREMENT_PLAN \
+        "${common_measurement_env[@]}" MATMUL_V3_DISABLE_VECTOR_SPLIT_K_DOT=1 \
+        MATMUL_V3_MEASUREMENT_MODE=official "${example_binary}" "${vector_shapes[@]}" | tee "${run_log}"
+    env -u MATMUL_V3_FORCE_CORE_NUM -u MATMUL_V3_MEASUREMENT_PLAN \
+        "${common_measurement_env[@]}" ASCEND_CUSTOM_OPP_PATH="${custom_opp}" \
+        MATMUL_V3_DISABLE_VECTOR_SPLIT_K_DOT=0 MATMUL_V3_MEASUREMENT_MODE=vector_split_k_dot \
+        "${example_binary}" "${vector_shapes[@]}" | tee -a "${run_log}"
+    if ! grep -q '"branch":"VECTOR_SPLIT_K_DOT".*"status":"OK"' "${run_log}"; then
+        echo "fatal: VECTOR_SPLIT_K_DOT produced no correct NPU measurement" >&2
+        exit 1
+    fi
+    exit 0
+fi
+
+#NEW
 if [[ -z "${MATMUL_V3_CAMPAIGN:-}" || "${MATMUL_V3_CAMPAIGN:-}" == "all_io_core_sweep" ]]; then
     if [[ "$#" -ne 0 ]]; then
         echo "fatal: all-route/I-O core sweep uses its own branch-directed shapes" >&2

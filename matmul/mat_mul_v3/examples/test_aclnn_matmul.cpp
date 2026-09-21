@@ -139,6 +139,26 @@ void FillOnes(std::vector<uint8_t>* bytes) {
 }
 
 //NEW
+bool UseTransposedColumnPattern() {
+  const char* value = std::getenv("MATMUL_TRANSPOSED_COLUMN_PATTERN");
+  return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+//NEW
+void FillTransposedColumnPattern(std::vector<uint8_t>* bytes, int64_t n, int64_t k) {
+  if (!UseTransposedColumnPattern() || SelectedAclDataType() != aclDataType::ACL_FLOAT) {
+    return;
+  }
+  for (int64_t column = 0; column < n; ++column) {
+    const float value = static_cast<float>(column + 1);
+    for (int64_t index = 0; index < k; ++index) {
+      const size_t offset = static_cast<size_t>(column * k + index) * sizeof(value);
+      std::memcpy(bytes->data() + offset, &value, sizeof(value));
+    }
+  }
+}
+
+//NEW
 float HalfToFloat(uint16_t value) {
   const uint32_t sign = static_cast<uint32_t>(value & 0x8000U) << 16U;
   uint32_t exponent = (value >> 10U) & 0x1fU;
@@ -466,6 +486,9 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
     outHostData.resize(static_cast<size_t>(GetShapeSize(outShape)) * outputElementSize, 0);
     FillOnes(&selfHostData);
     FillOnes(&mat2HostData);
+    if (transposeB) {
+      FillTransposedColumnPattern(&mat2HostData, n, k);
+    }
   }
   // 创建self aclTensor
   *failedStage = "create_self";
@@ -616,7 +639,8 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   *failedStage = "validate_output";
   for (int64_t i = 0; i < size; i++) {
     const float value = DecodeOutputValue(resultData.data() + static_cast<size_t>(i) * outputElementSize);
-    const float expected = static_cast<float>(k);
+    const float expected = static_cast<float>(k) *
+        (UseTransposedColumnPattern() ? static_cast<float>(i % n + 1) : 1.0F);
     const float tolerance = SelectedOutputAclDataType() == aclDataType::ACL_FLOAT ? 0.0F :
         std::max(2.0F, std::fabs(expected) * 0.02F);
     CHECK_RET(std::isfinite(value) && std::fabs(value - expected) <= tolerance, return 3);
