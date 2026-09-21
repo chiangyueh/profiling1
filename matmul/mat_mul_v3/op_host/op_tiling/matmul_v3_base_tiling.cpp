@@ -1390,14 +1390,17 @@ bool MatmulV3BaseTiling::DoVectorSplitKDotTiling()
     if (disable != nullptr && disable[0] == '1' && disable[1] == '\0') {
         return false;
     }
+    const char *sweepMode = std::getenv("MATMUL_V3_VECTOR_CROSSOVER_SWEEP");
+    const bool crossoverSweep = sweepMode != nullptr && sweepMode[0] == '1' && sweepMode[1] == '\0';
     if (!compileInfo_.supportL0c2out || compileInfo_.aivNum == 0 || args_.hasBias ||
         args_.aType != ge::DT_FLOAT || args_.bType != ge::DT_FLOAT || args_.cType != ge::DT_FLOAT ||
         args_.isATrans || !args_.isBTrans || args_.aFormat != ge::FORMAT_ND ||
         args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
         args_.nd2nzA || args_.nd2nzB || args_.isNzA || args_.isNzB ||
-        args_.mValue == 0 || args_.nValue == 0 || args_.kValue == 0 ||
-        args_.mValue > BASIC_ALIGN_16 || args_.nValue <= BASIC_ALIGN_16 ||
-        args_.nValue > BASIC_ALIGN_16 * compileInfo_.aicNum || args_.kValue < 4096 ||
+        args_.mValue == 0 || args_.nValue <= BASIC_ALIGN_16 || args_.kValue == 0 ||
+        args_.mValue > (crossoverSweep ? 32UL : BASIC_ALIGN_16) ||
+        args_.nValue > (crossoverSweep ? 1024UL : BASIC_ALIGN_16 * compileInfo_.aicNum) ||
+        args_.kValue < (crossoverSweep ? 2048UL : 4096UL) ||
         args_.kValue % (BLOCK_BYTE_SIZE / DATA_SIZE_FP32) != 0) {
         return false;
     }
@@ -1413,7 +1416,7 @@ bool MatmulV3BaseTiling::DoVectorSplitKDotTiling()
     const uint64_t paddedDots = ops::CeilAlign(args_.mValue, BASIC_ALIGN_16) *
                                 ops::CeilAlign(args_.nValue, BASIC_ALIGN_16);
     constexpr uint64_t minPaddingElimination = 8;
-    if (paddedDots < minPaddingElimination * outputDots) {
+    if (!crossoverSweep && paddedDots < minPaddingElimination * outputDots) {
         return false;
     }
 

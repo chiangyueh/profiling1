@@ -7,6 +7,7 @@ export ASCEND_RT_VISIBLE_DEVICES=2
 export ASCEND_GLOBAL_LOG_LEVEL=3
 export ASCEND_SLOG_PRINT_TO_STDOUT=0
 unset ASCEND_CUSTOM_OPP_PATH
+unset MATMUL_V3_VECTOR_CROSSOVER_SWEEP
 
 host_build="${PWD}/build"
 build_log="$(mktemp)"
@@ -208,6 +209,7 @@ PY
 
     python3 - "${fp32_param}" "${kernel_name}" <<'PY'
 import json
+import re
 import sys
 
 path, kernel_name = sys.argv[1:]
@@ -266,10 +268,25 @@ if [[ "${MATMUL_V3_CAMPAIGN:-vector_split_k_dot}" == "vector_split_k_dot" ]]; th
         cat "${build_log}" >&2
         exit 1
     }
-    vector_shapes=(
-        1 48 8192  1 64 10240 1 96 12288 1 128 14336
-        2 32 8192  2 48 10240 2 64 12288 2 80 14336
-        3 17 8192  3 18 10240 3 19 12288 3 20 14336
+    vector_shapes=()
+    vector_mn_pairs=(
+        1 17  1 32  1 48  1 64  1 96  1 128  1 192  1 256  1 384  1 512  1 768  1 1024
+        2 17  2 32  2 48  2 64  2 96  2 128  2 192  2 256  2 384  2 512
+        3 17  3 20  3 24  3 32  3 48  3 64  3 96  3 128
+        4 17  4 24  4 32  4 48  4 64  4 96
+        8 17  8 24  8 32  8 48
+    )
+    for vector_k in 4096 16384; do
+        for ((pair_index = 0; pair_index < ${#vector_mn_pairs[@]}; pair_index += 2)); do
+            vector_shapes+=("${vector_mn_pairs[pair_index]}" "${vector_mn_pairs[pair_index + 1]}" "${vector_k}")
+        done
+    done
+    vector_shapes+=(
+        1 48 2048  2 32 2048  3 18 2048  4 32 2048
+        1 48 8192  2 32 8192  3 18 8192  4 32 8192
+        1 48 32768 2 32 32768 3 18 32768 4 32 32768
+        12 17 8192 12 32 8192 16 17 8192 16 32 8192
+        24 17 8192 24 32 8192 32 17 8192 32 32 8192
     )
     common_measurement_env=(
         MATMUL_DATA_TYPE=fp32 MATMUL_OUTPUT_DATA_TYPE=fp32
@@ -310,10 +327,12 @@ PY
         "${common_measurement_env[@]}" MATMUL_V3_VECTOR_BINARY="${vector_binary}" \
         MATMUL_V3_SKIP_ROUTE_PREFILTER=1 \
         MATMUL_V3_DISABLE_REPO_LOOKUP=1 \
+        MATMUL_V3_VECTOR_CROSSOVER_SWEEP=1 \
         MATMUL_V3_DISABLE_VECTOR_SPLIT_K_DOT=0 MATMUL_V3_MEASUREMENT_MODE=vector_split_k_dot \
         "${example_binary}" "${candidate_shapes[@]}" >>"${run_log}"
     if ! python3 - "${run_log}" <<'PY'
 import json
+import re
 import sys
 
 official = {}
@@ -347,14 +366,23 @@ for candidate in candidates:
     delta = None
     if official_latency not in (None, 0) and candidate_latency is not None:
         delta = round((candidate_latency / official_latency - 1.0) * 100.0, 3)
+    match = re.fullmatch(r"M(\d+)_N(\d+)_K(\d+)_NT", candidate.get("shape", ""))
+    m, n, k = (map(int, match.groups()) if match else (0, 0, 0))
+    output_dots = m * n
+    padded_dots = ((m + 15) // 16 * 16) * ((n + 15) // 16 * 16) if output_dots else 0
+    candidate_core = candidate.get("actual_core")
     print(json.dumps({
         "shape": candidate.get("shape"),
+        "output_dots": output_dots,
+        "cube_padding_ratio": round(padded_dots / output_dots, 3) if output_dots else None,
+        "vector_partition": ("split_k" if candidate_core and candidate_core > output_dots
+                             else "output_parallel"),
         "official_branch": reference.get("branch") if reference else None,
         "candidate_branch": candidate.get("branch"),
         "official_tiling_key": reference_tiling.get("tiling_key"),
         "candidate_tiling_key": candidate_tiling.get("tiling_key"),
         "official_core": reference.get("actual_core") if reference else None,
-        "candidate_core": candidate.get("actual_core"),
+        "candidate_core": candidate_core,
         "official_latency_ms": official_latency,
         "candidate_latency_ms": candidate_latency,
         "delta_pct": delta,
