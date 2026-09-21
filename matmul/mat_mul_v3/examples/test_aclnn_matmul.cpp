@@ -341,6 +341,12 @@ bool DiscoveryOnly() {
 }
 
 //NEW
+bool SkipV3RoutePrefilter() {
+  const char* value = std::getenv("MATMUL_V3_SKIP_ROUTE_PREFILTER");
+  return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+//NEW
 void ClearSelectedBranch() {
   (void)::unsetenv("MATMUL_SELECTED_BRANCH");
   (void)::unsetenv("MATMUL_V3_SELECTED_BRANCH");
@@ -447,7 +453,7 @@ int MeasureShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, float* ave
   //NEW
   // Reject official MatMulV2 routes before allocating or copying any tensor.
   const char* v3Only = std::getenv("MATMUL_V3_ONLY");
-  if (v3Only != nullptr && v3Only[0] == '1' && v3Only[1] == '\0') {
+  if (v3Only != nullptr && v3Only[0] == '1' && v3Only[1] == '\0' && !SkipV3RoutePrefilter()) {
     const int selectedRoute = SelectOfficialMatMulV3Route(m, n, k, transposeA, transposeB, failureDetail);
     if (selectedRoute < 0) {
       *failedStage = "official_v3_route_selection";

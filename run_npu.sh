@@ -280,6 +280,7 @@ PY
     fi
     env -u MATMUL_V3_FORCE_CORE_NUM -u MATMUL_V3_MEASUREMENT_PLAN \
         "${common_measurement_env[@]}" ASCEND_CUSTOM_OPP_PATH="${custom_opp}" \
+        MATMUL_V3_SKIP_ROUTE_PREFILTER=1 \
         MATMUL_V3_DISABLE_VECTOR_SPLIT_K_DOT=0 MATMUL_V3_MEASUREMENT_MODE=vector_split_k_dot \
         "${example_binary}" "${candidate_shapes[@]}" | tee -a "${run_log}"
     if ! grep -q '"branch":"VECTOR_SPLIT_K_DOT".*"status":"OK"' "${run_log}"; then
