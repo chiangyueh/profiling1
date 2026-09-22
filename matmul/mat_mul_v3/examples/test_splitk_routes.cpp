@@ -54,6 +54,11 @@ struct TilingSnapshot {
     uint32_t stepKb = 0;
     uint32_t depthA1 = 0;
     uint32_t depthB1 = 0;
+    uint32_t l2MTile = 0;
+    uint32_t l2NTile = 0;
+    uint32_t l2MBlock = 0;
+    uint32_t l2NBlock = 0;
+    uint32_t l2Order = 0;
 };
 
 struct RunCounts {
@@ -88,6 +93,11 @@ TilingSnapshot ReadTilingSnapshot()
     value.stepKb = static_cast<uint32_t>(ReadEnvUnsigned("MATMUL_OBSERVED_STEP_KB"));
     value.depthA1 = static_cast<uint32_t>(ReadEnvUnsigned("MATMUL_OBSERVED_DEPTH_A1"));
     value.depthB1 = static_cast<uint32_t>(ReadEnvUnsigned("MATMUL_OBSERVED_DEPTH_B1"));
+    value.l2MTile = static_cast<uint32_t>(ReadEnvUnsigned("MATMUL_OBSERVED_L2_M_TILE"));
+    value.l2NTile = static_cast<uint32_t>(ReadEnvUnsigned("MATMUL_OBSERVED_L2_N_TILE"));
+    value.l2MBlock = static_cast<uint32_t>(ReadEnvUnsigned("MATMUL_OBSERVED_L2_M_BLOCK"));
+    value.l2NBlock = static_cast<uint32_t>(ReadEnvUnsigned("MATMUL_OBSERVED_L2_N_BLOCK"));
+    value.l2Order = static_cast<uint32_t>(ReadEnvUnsigned("MATMUL_OBSERVED_L2_ORDER"));
     return value;
 }
 
@@ -97,9 +107,30 @@ void ClearObservedTiling()
         "MATMUL_OBSERVED_KEY", "MATMUL_OBSERVED_CORES", "MATMUL_OBSERVED_SINGLE_M",
         "MATMUL_OBSERVED_SINGLE_N", "MATMUL_OBSERVED_SINGLE_K", "MATMUL_OBSERVED_BASE_M",
         "MATMUL_OBSERVED_BASE_N", "MATMUL_OBSERVED_BASE_K", "MATMUL_OBSERVED_STEP_KA",
-        "MATMUL_OBSERVED_STEP_KB", "MATMUL_OBSERVED_DEPTH_A1", "MATMUL_OBSERVED_DEPTH_B1"
+        "MATMUL_OBSERVED_STEP_KB", "MATMUL_OBSERVED_DEPTH_A1", "MATMUL_OBSERVED_DEPTH_B1",
+        "MATMUL_OBSERVED_L2_M_TILE", "MATMUL_OBSERVED_L2_N_TILE", "MATMUL_OBSERVED_L2_M_BLOCK",
+        "MATMUL_OBSERVED_L2_N_BLOCK", "MATMUL_OBSERVED_L2_ORDER"
     };
     for (const char *name : names) (void)::unsetenv(name);
+}
+
+std::vector<uint8_t> DecodeHex(const char *text)
+{
+    if (text == nullptr || (std::strlen(text) & 1U) != 0U) return {};
+    auto nibble = [](char value) -> int {
+        if (value >= '0' && value <= '9') return value - '0';
+        if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+        if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+        return -1;
+    };
+    std::vector<uint8_t> bytes(std::strlen(text) / 2);
+    for (size_t index = 0; index < bytes.size(); ++index) {
+        const int high = nibble(text[index * 2]);
+        const int low = nibble(text[index * 2 + 1]);
+        if (high < 0 || low < 0) return {};
+        bytes[index] = static_cast<uint8_t>((high << 4) | low);
+    }
+    return bytes;
 }
 
 bool IsDeterministicSplitK(uint64_t key)
@@ -126,9 +157,21 @@ bool IsKParallelCampaign()
     return campaign != nullptr && std::strcmp(campaign, "K_PARALLEL_SPLIT_K") == 0;
 }
 
+bool IsBaseCampaign()
+{
+    const char *campaign = std::getenv("MATMUL_CAMPAIGN");
+    return campaign != nullptr &&
+        (std::strcmp(campaign, "RECTANGULAR_CUBE") == 0 ||
+         std::strcmp(campaign, "REUSE_DIRECTED") == 0 ||
+         std::strcmp(campaign, "CUBE_VECTOR_EDGE") == 0);
+}
+
 const char *CampaignName()
 {
     if (IsRectangularCampaign()) return "RECTANGULAR_CUBE";
+    const char *campaign = std::getenv("MATMUL_CAMPAIGN");
+    if (campaign != nullptr && std::strcmp(campaign, "REUSE_DIRECTED") == 0) return "REUSE_DIRECTED";
+    if (campaign != nullptr && std::strcmp(campaign, "CUBE_VECTOR_EDGE") == 0) return "CUBE_VECTOR_EDGE";
     if (IsKParallelCampaign()) return "K_PARALLEL_SPLIT_K";
     return "INVALID";
 }
@@ -288,16 +331,20 @@ void PrintTiling(const char *name, const TilingSnapshot &value)
 {
     std::printf("\"%s\":{\"key\":%lu,\"core\":%u,\"single_m\":%u,\"single_n\":%u,"
                 "\"single_k\":%u,\"base_m\":%u,\"base_n\":%u,\"base_k\":%u,"
-                "\"step_ka\":%u,\"step_kb\":%u,\"depth_a1\":%u,\"depth_b1\":%u}",
+                "\"step_ka\":%u,\"step_kb\":%u,\"depth_a1\":%u,\"depth_b1\":%u,"
+                "\"l2_m_tile\":%u,\"l2_n_tile\":%u,\"l2_m_block\":%u,\"l2_n_block\":%u,"
+                "\"l2_order\":%u}",
                 name, static_cast<unsigned long>(value.key), value.cores, value.singleM, value.singleN,
                 value.singleK, value.baseM, value.baseN, value.baseK, value.stepKa, value.stepKb,
-                value.depthA1, value.depthB1);
+                value.depthA1, value.depthB1, value.l2MTile, value.l2NTile, value.l2MBlock,
+                value.l2NBlock, value.l2Order);
 }
 
 int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int64_t n, int64_t k,
-                aclrtStream stream, RunCounts &counts)
+                aclrtStream stream, aclrtFuncHandle edgeFunction, RunCounts &counts)
 {
-    const bool rectangularCampaign = IsRectangularCampaign();
+    const bool baseCampaign = IsBaseCampaign();
+    const bool edgeCampaign = std::strcmp(CampaignName(), "CUBE_VECTOR_EDGE") == 0;
     const bool kParallelCampaign = IsKParallelCampaign();
     ++counts.inputs;
     std::vector<uint8_t> a(static_cast<size_t>(m * k) * dtype.input.bytes);
@@ -364,7 +411,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         ReleaseTensor(aTensor);
         return rc == ACL_SUCCESS ? 4 : rc;
     }
-    const bool officialRouteMatched = rectangularCampaign ? IsPlainBase(official.key) :
+    const bool officialRouteMatched = baseCampaign ? IsPlainBase(official.key) :
         (kParallelCampaign ? (IsPlainBase(official.key) || IsDeterministicSplitK(official.key)) : false);
     if (!officialRouteMatched) {
         ++counts.nonDeterministic;
@@ -401,10 +448,11 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         return rc == ACL_SUCCESS ? 4 : rc;
     }
 
-    if (rectangularCampaign) {
+    if (baseCampaign) {
         (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE");
-        (void)::setenv("MATMUL_VECTOR_ENABLE", "1", 1);
-        (void)::setenv("MATMUL_BASE_MODE", "RECTANGULAR_CUBE", 1);
+        (void)::unsetenv("MATMUL_SPLITK_MODE");
+        (void)::setenv("MATMUL_VECTOR_ENABLE", "0", 1);
+        (void)::setenv("MATMUL_BASE_MODE", CampaignName(), 1);
         (void)::unsetenv("MATMUL_BASE_EXPERIMENT_SELECTED");
         (void)::unsetenv("MATMUL_EXPERIMENT_BRANCH");
     } else if (kParallelCampaign) {
@@ -433,15 +481,15 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
                                      &adaptiveWorkspaceSize, &adaptiveExecutor);
     const TilingSnapshot adaptive = ReadTilingSnapshot();
     const char *experimentBranch = std::getenv("MATMUL_EXPERIMENT_BRANCH");
-    const bool changed = rectangularCampaign ?
-        experimentBranch != nullptr && std::strcmp(experimentBranch, "RECTANGULAR_CUBE") == 0 :
+    const bool changed = baseCampaign ?
+        experimentBranch != nullptr && std::strcmp(experimentBranch, CampaignName()) == 0 :
         (kParallelCampaign ? experimentBranch != nullptr &&
             std::strcmp(experimentBranch, "K_PARALLEL_DETERMINISTIC_SPLIT_K") == 0 :
             ReadEnvUnsigned("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED") == 1);
     if (changed) ++counts.adaptiveSelected; else if (rc == ACL_SUCCESS) ++counts.officialPreserved;
     void *adaptiveWorkspace = nullptr;
     if (rc == ACL_SUCCESS && adaptiveExecutor == nullptr) rc = 4;
-    if ((rectangularCampaign || kParallelCampaign) && !changed) {
+    if ((baseCampaign || kParallelCampaign) && !changed) {
         if (rc != ACL_SUCCESS) {
             ++counts.failed;
             std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
@@ -449,7 +497,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
                         "\"status\":\"CANDIDATE_TILING_FAILED\",\"result_code\":%d}\n",
                         static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
                         dtype.inputName, dtype.outputName,
-                        rectangularCampaign ? "RECTANGULAR_CUBE" : "K_PARALLEL_DETERMINISTIC_SPLIT_K", rc);
+                        baseCampaign ? CampaignName() : "K_PARALLEL_DETERMINISTIC_SPLIT_K", rc);
             std::fflush(stdout);
         }
         if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
@@ -462,16 +510,41 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         ReleaseTensor(aTensor);
         return rc == ACL_SUCCESS ? ACL_SUCCESS : rc;
     }
-    const bool candidateRouteMatched = rectangularCampaign ? IsPlainBase(adaptive.key) :
-        IsDeterministicSplitK(adaptive.key);
+    const bool candidateRouteMatched = baseCampaign ? changed : IsDeterministicSplitK(adaptive.key);
     if (rc == ACL_SUCCESS && !candidateRouteMatched) rc = 4;
     if (rc == ACL_SUCCESS && adaptiveWorkspaceSize != 0) {
         rc = aclrtMalloc(&adaptiveWorkspace, adaptiveWorkspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
     }
     if (rc == ACL_SUCCESS) rc = aclrtMemset(cTensor.device, cTensor.bytes, 0, cTensor.bytes);
-    if (rc == ACL_SUCCESS) rc = aclSetAclOpExecutorRepeatable(adaptiveExecutor);
+    if (rc == ACL_SUCCESS && !edgeCampaign) rc = aclSetAclOpExecutorRepeatable(adaptiveExecutor);
     float adaptiveLatency = 0.0f;
-    if (rc == ACL_SUCCESS) {
+    void *tilingDevice = nullptr;
+    aclrtArgsHandle edgeArguments = nullptr;
+    if (rc == ACL_SUCCESS && edgeCampaign) {
+        const std::vector<uint8_t> tiling = DecodeHex(std::getenv("MATMUL_EXPERIMENT_TILING"));
+        if (edgeFunction == nullptr || tiling.empty() || adaptive.cores == 0) rc = 4;
+        if (rc == ACL_SUCCESS) rc = aclrtMalloc(&tilingDevice, tiling.size(), ACL_MEM_MALLOC_HUGE_FIRST);
+        if (rc == ACL_SUCCESS) {
+            rc = aclrtMemcpy(tilingDevice, tiling.size(), tiling.data(), tiling.size(), ACL_MEMCPY_HOST_TO_DEVICE);
+        }
+        if (rc == ACL_SUCCESS) rc = aclrtKernelArgsInit(edgeFunction, &edgeArguments);
+        void *bias = nullptr;
+        void *offset = nullptr;
+        void *values[] = {
+            aTensor.device, bTensor.device, bias, offset, cTensor.device, adaptiveWorkspace, tilingDevice
+        };
+        for (void *&value : values) {
+            aclrtParamHandle parameter = nullptr;
+            if (rc == ACL_SUCCESS) rc = aclrtKernelArgsAppend(edgeArguments, &value, sizeof(value), &parameter);
+        }
+        if (rc == ACL_SUCCESS) rc = aclrtKernelArgsFinalize(edgeArguments);
+    }
+    if (rc == ACL_SUCCESS && edgeCampaign) {
+        rc = Measure([&]() {
+            return aclrtLaunchKernelWithConfig(edgeFunction, adaptive.cores, stream, nullptr,
+                                               edgeArguments, nullptr);
+        }, stream, adaptiveLatency);
+    } else if (rc == ACL_SUCCESS) {
         rc = Measure([&]() {
             return aclnnMatmul(adaptiveWorkspace, adaptiveWorkspaceSize, adaptiveExecutor, stream);
         }, stream, adaptiveLatency);
@@ -492,31 +565,32 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
                 "\"candidate_branch\":\"%s\",\"candidate_selected\":%s,",
                 static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
                 dtype.inputName, dtype.outputName,
-                rectangularCampaign ? "RECTANGULAR_CUBE" : "K_PARALLEL_DETERMINISTIC_SPLIT_K",
+                baseCampaign ? CampaignName() : "K_PARALLEL_DETERMINISTIC_SPLIT_K",
                 changed ? "true" : "false");
     PrintTiling("official_tiling", official);
     std::printf(",");
     PrintTiling("candidate_tiling", adaptive);
-    std::printf(",\"official_core\":%u,\"candidate_core\":%u,"
-                "\"k_tiles\":%lu,\"output_tiles\":%lu,\"limit_by_k\":%lu,"
-                "\"limit_by_work\":%lu,\"limit_by_l2\":%lu,"
-                "\"m_trim_applied\":%s,\"pre_adjust_partial_bytes\":%lu,"
-                "\"m_trim_partial_bytes\":%lu,\"final_partial_bytes\":%lu,"
-                "\"partial_saved_pct\":%.6f,"
-                "\"official_workspace\":%lu,\"candidate_workspace\":%lu,"
+    std::printf(",\"official_core\":%u,\"candidate_core\":%u", official.cores, adaptive.cores);
+    if (kParallelCampaign) {
+        std::printf(",\"k_tiles\":%lu,\"output_tiles\":%lu,\"limit_by_k\":%lu,"
+                    "\"limit_by_work\":%lu,\"limit_by_l2\":%lu,"
+                    "\"m_trim_applied\":%s,\"pre_adjust_partial_bytes\":%lu,"
+                    "\"m_trim_partial_bytes\":%lu,\"final_partial_bytes\":%lu,"
+                    "\"partial_saved_pct\":%.6f",
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_K_TILES")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_OUTPUT_TILES")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_K")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_WORK")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_L2")),
+                    ReadEnvUnsigned("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED") == 1 ? "true" : "false",
+                    static_cast<unsigned long>(oldPartialBytes),
+                    static_cast<unsigned long>(trimmedPartialBytes),
+                    static_cast<unsigned long>(finalPartialBytes), partialSaved);
+    }
+    std::printf(",\"official_workspace\":%lu,\"candidate_workspace\":%lu,"
                 "\"official_latency_ms\":%.9f,\"candidate_latency_ms\":%s,"
                 "\"delta_pct\":%s,\"max_abs_diff\":%.9g,\"max_rel_diff\":%.9g,"
                 "\"correctness\":\"%s\",\"result_code\":%d}\n",
-                official.cores, adaptive.cores,
-                static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_K_TILES")),
-                static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_OUTPUT_TILES")),
-                static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_K")),
-                static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_WORK")),
-                static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_L2")),
-                ReadEnvUnsigned("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED") == 1 ? "true" : "false",
-                static_cast<unsigned long>(oldPartialBytes),
-                static_cast<unsigned long>(trimmedPartialBytes),
-                static_cast<unsigned long>(finalPartialBytes), partialSaved,
                 static_cast<unsigned long>(officialWorkspaceSize),
                 static_cast<unsigned long>(adaptiveWorkspaceSize), officialLatency,
                 correct ? std::to_string(adaptiveLatency).c_str() : "null",
@@ -525,6 +599,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     std::fflush(stdout);
 
     if (correct) ++counts.passed; else ++counts.failed;
+    if (tilingDevice != nullptr) (void)aclrtFree(tilingDevice);
     if (adaptiveWorkspace != nullptr) (void)aclrtFree(adaptiveWorkspace);
     if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
     (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE");
@@ -540,8 +615,11 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
 int main(int argc, char **argv)
 {
     if (argc < 6 || (argc - 1) % 5 != 0) return 2;
-    if (!IsRectangularCampaign() && !IsKParallelCampaign()) return 4;
-    std::printf("{\"campaign_start\":\"%s\",\"runner\":\"matmul_paired_v2\"}\n", CampaignName());
+    if (!IsBaseCampaign() && !IsKParallelCampaign()) return 4;
+    const uint64_t targetPasses = ReadEnvUnsigned("MATMUL_TARGET_PASSES");
+    std::printf("{\"campaign_start\":\"%s\",\"target_passes\":%lu,"
+                "\"runner\":\"matmul_sequential_base_v1\"}\n",
+                CampaignName(), static_cast<unsigned long>(targetPasses));
     std::fflush(stdout);
     const char *hostLibrary = std::getenv("MATMUL_HOST_LIBRARY");
     if (hostLibrary == nullptr) return 4;
@@ -550,6 +628,17 @@ int main(int argc, char **argv)
     aclrtStream stream = nullptr;
     if (rc == ACL_SUCCESS) rc = aclrtCreateStream(&stream);
     if (rc != ACL_SUCCESS || TbeLoadSoAndSaveToRegistry(hostLibrary) != 0U) return 4;
+    aclrtBinHandle edgeBinary = nullptr;
+    aclrtFuncHandle edgeFunction = nullptr;
+    if (std::strcmp(CampaignName(), "CUBE_VECTOR_EDGE") == 0) {
+        const char *path = std::getenv("MATMUL_EDGE_BINARY");
+        if (path == nullptr) return 4;
+        rc = aclrtBinaryLoadFromFile(path, nullptr, &edgeBinary);
+        if (rc == ACL_SUCCESS) {
+            rc = aclrtBinaryGetFunction(edgeBinary, "MatMulV3_CubeVectorEdge_3211264", &edgeFunction);
+        }
+        if (rc != ACL_SUCCESS) return rc;
+    }
 
     RunCounts counts;
     for (int index = 1; index < argc; index += 5) {
@@ -559,11 +648,12 @@ int main(int argc, char **argv)
         (void)RunWorkload(*dtype, *layout,
                           std::strtoll(argv[index + 2], nullptr, 10),
                           std::strtoll(argv[index + 3], nullptr, 10),
-                          std::strtoll(argv[index + 4], nullptr, 10), stream, counts);
+                          std::strtoll(argv[index + 4], nullptr, 10), stream, edgeFunction, counts);
+        if (targetPasses != 0 && counts.passed >= targetPasses) break;
     }
     std::printf("{\"summary\":true,\"campaign\":\"%s\",\"inputs\":%lu,\"non_target_route\":%lu,"
                 "\"official_target\":%lu,\"candidate_selected\":%lu,\"official_preserved\":%lu,"
-                "\"passed\":%lu,\"failed\":%lu,"
+                "\"target_passes\":%lu,\"quota_met\":%s,\"passed\":%lu,\"failed\":%lu,"
                 "\"official_failed\":%lu}\n",
                 CampaignName(),
                 static_cast<unsigned long>(counts.inputs),
@@ -571,12 +661,15 @@ int main(int argc, char **argv)
                 static_cast<unsigned long>(counts.deterministic),
                 static_cast<unsigned long>(counts.adaptiveSelected),
                 static_cast<unsigned long>(counts.officialPreserved),
+                static_cast<unsigned long>(targetPasses),
+                (targetPasses == 0 || counts.passed >= targetPasses) ? "true" : "false",
                 static_cast<unsigned long>(counts.passed),
                 static_cast<unsigned long>(counts.failed),
                 static_cast<unsigned long>(counts.officialFailed));
+    if (edgeBinary != nullptr) (void)aclrtBinaryUnLoad(edgeBinary);
     (void)aclrtDestroyStream(stream);
     (void)aclrtResetDevice(0);
     (void)aclFinalize();
-    return counts.deterministic == 0 ? 4 : 0;
+    return counts.deterministic == 0 || (targetPasses != 0 && counts.passed < targetPasses) ? 4 : 0;
 }
 // NEW END

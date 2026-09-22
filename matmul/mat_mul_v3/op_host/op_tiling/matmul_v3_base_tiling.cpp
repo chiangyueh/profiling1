@@ -1597,7 +1597,7 @@ bool MatmulV3BaseTiling::DoReuseDirectedTiling()
     tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
     tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::BASE;
     tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
-    tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::REUSE_DIRECTED;
+    tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::BASE;
     return true;
 }
 
@@ -3167,6 +3167,11 @@ void MatmulV3BaseTiling::ExportExperimentalTiling()
     exportField("MATMUL_OBSERVED_STEP_KB", tilingData_.matmulTiling.stepKb);
     exportField("MATMUL_OBSERVED_DEPTH_A1", tilingData_.matmulTiling.depthA1);
     exportField("MATMUL_OBSERVED_DEPTH_B1", tilingData_.matmulTiling.depthB1);
+    exportField("MATMUL_OBSERVED_L2_M_TILE", tilingData_.tileL2cacheTiling.mTileCntL2);
+    exportField("MATMUL_OBSERVED_L2_N_TILE", tilingData_.tileL2cacheTiling.nTileCntL2);
+    exportField("MATMUL_OBSERVED_L2_M_BLOCK", tilingData_.tileL2cacheTiling.mTileBlock);
+    exportField("MATMUL_OBSERVED_L2_N_BLOCK", tilingData_.tileL2cacheTiling.nTileBlock);
+    exportField("MATMUL_OBSERVED_L2_ORDER", tilingData_.tileL2cacheTiling.calOrder);
     const char *selected = std::getenv("MATMUL_EXPERIMENT_SELECTED");
     const char *baseSelected = std::getenv("MATMUL_BASE_EXPERIMENT_SELECTED");
     const bool splitSelected = splitMode != nullptr && splitMode[0] != '\0' &&
