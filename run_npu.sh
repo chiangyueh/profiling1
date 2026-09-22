@@ -88,7 +88,7 @@ if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
     -L "${ASCEND_HOME_PATH}/lib64" \
     -L "${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64" \
     "${opapi_nn}" "${opapi_math}" "${runtime_library}" \
-    -lnnopbase -lregister -lopp_registry -lunified_dlog -ldl \
+    -lnnopbase -lregister -lopp_registry -lunified_dlog -lmetadef -ldl \
     -Wl,-rpath,"$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}")" \
     -o "${runner}" >>"${build_log}" 2>&1; then
     cat "${build_log}" >&2
