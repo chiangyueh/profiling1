@@ -309,12 +309,11 @@ int main(int argc, char **argv)
     if (rc == ACL_SUCCESS) rc = aclrtCreateStream(&stream);
     if (rc != ACL_SUCCESS || TbeLoadSoAndSaveToRegistry(hostLibrary) != 0U) return 4;
     std::vector<Candidate> candidates = {
-        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", nullptr, nullptr, 65584},
-        {"ATOMIC_SPLIT_K", nullptr, nullptr, 65600},
-        {"TAIL_STREAM_K", "MATMUL_TAIL_BINARY", "MatMulV3_TailStream_65648", 65648},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", "MATMUL_ADAPTIVE_BINARY", "MatMulV3_Adaptive_65648", 65648},
+        {"ATOMIC_SPLIT_K", "MATMUL_ATOMIC_BINARY", "MatMulV3_Atomic_65664", 65664},
+        {"TAIL_STREAM_K", "MATMUL_TAIL_BINARY", "MatMulV3_TailStream_65680", 65680},
     };
     for (Candidate &candidate : candidates) {
-        if (candidate.binaryEnv == nullptr) continue;
         const char *path = std::getenv(candidate.binaryEnv);
         if (path == nullptr || aclrtBinaryLoadFromFile(path, nullptr, &candidate.binary) != ACL_SUCCESS ||
             aclrtBinaryGetFunction(candidate.binary, candidate.functionName, &candidate.function) != ACL_SUCCESS) {

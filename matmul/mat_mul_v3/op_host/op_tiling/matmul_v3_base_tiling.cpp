@@ -1459,7 +1459,54 @@ bool MatmulV3BaseTiling::DoAtomicSplitKTiling()
     args_.isNzA = false;
     args_.isNzB = false;
     tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
-    tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::MULTI_CORE_SPLIT_K;
+    tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::ATOMIC_SPLIT_K;
+    tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
+    tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::BASE;
+    return true;
+}
+
+bool MatmulV3BaseTiling::DoAdaptiveDeterministicSplitKTiling()
+{
+    if (!compileInfo_.supportL0c2out || compileInfo_.aicNum == 0 || args_.hasBias ||
+        args_.aType != ge::DT_FLOAT || args_.bType != ge::DT_FLOAT || args_.cType != ge::DT_FLOAT ||
+        args_.isATrans || !args_.isBTrans || args_.aFormat != ge::FORMAT_ND ||
+        args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
+        args_.mValue == 0 || args_.mValue > BASIC_BLOCK_SIZE_128 ||
+        args_.nValue == 0 || args_.nValue > BASIC_BLOCK_SIZE_128 ||
+        args_.kValue < 8192 || args_.kValue % BASIC_ALIGN_16 != 0) {
+        return false;
+    }
+    constexpr uint64_t minKPerCore = 2048;
+    const uint64_t partialBytes = args_.mValue * args_.nValue * DB_SIZE * DATA_SIZE_FP32;
+    const uint64_t byCompute = std::max(1UL, args_.kValue / minKPerCore);
+    const uint64_t byWorkspace = partialBytes == 0 ? 1UL :
+        std::max(1UL, compileInfo_.l2Size * 7UL / 10UL / partialBytes);
+    const uint64_t split = std::min({compileInfo_.aicNum, byCompute, byWorkspace});
+    if (split < NUMBER_TWO) {
+        return false;
+    }
+    runInfo_.baseM = ops::CeilAlign(args_.mValue, BASIC_ALIGN_16);
+    runInfo_.baseN = ops::CeilAlign(args_.nValue, BASIC_ALIGN_16);
+    runInfo_.baseK = BASIC_BLOCK_K_128_BYTE / DATA_SIZE_FP32;
+    runInfo_.depthA1 = DB_SIZE;
+    runInfo_.depthB1 = DB_SIZE;
+    runInfo_.stepM = 1;
+    runInfo_.stepN = 1;
+    runInfo_.stepKa = 1;
+    runInfo_.stepKb = 1;
+    runInfo_.iterateOrder = ITER_ROW_FIRST;
+    runInfo_.singleCoreM = args_.mValue;
+    runInfo_.singleCoreN = args_.nValue;
+    runInfo_.singleCoreK = 512;
+    runInfo_.usedCoreNum = split;
+    runInfo_.dbL0c = DB_SIZE;
+    runInfo_.needUpdate = true;
+    args_.nd2nzA = false;
+    args_.nd2nzB = false;
+    args_.isNzA = false;
+    args_.isNzB = false;
+    tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
+    tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::ADAPTIVE_DETERMINISTIC_SPLIT_K;
     tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
     tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::BASE;
     return true;
@@ -1526,22 +1573,12 @@ bool MatmulV3BaseTiling::DoExperimentalSplitKTiling()
         if (selected) (void)::setenv("MATMUL_EXPERIMENT_SELECTED", "1", 1);
         return selected;
     }
-    if (std::strcmp(mode, "ADAPTIVE_DETERMINISTIC_SPLIT_K") != 0 ||
-        args_.kValue < 8192 || !DoDeterministicMultiCoreSplitKTiling()) {
+    if (std::strcmp(mode, "ADAPTIVE_DETERMINISTIC_SPLIT_K") != 0) {
         return false;
     }
-    constexpr uint64_t minKPerCore = 2048;
-    const uint64_t byCompute = std::max(1UL, args_.kValue / minKPerCore);
-    const uint64_t partialBytes = runInfo_.singleCoreM * runInfo_.singleCoreN * DB_SIZE * DATA_SIZE_FP32;
-    const uint64_t byWorkspace = partialBytes == 0 ? 1UL :
-        std::max(1UL, compileInfo_.l2Size * 7UL / 10UL / partialBytes);
-    runInfo_.usedCoreNum = std::min({runInfo_.usedCoreNum, byCompute, byWorkspace});
-    if (runInfo_.usedCoreNum < NUMBER_TWO) {
-        runInfo_.usedCoreNum = NUMBER_TWO;
-    }
-    runInfo_.needUpdate = true;
-    (void)::setenv("MATMUL_EXPERIMENT_SELECTED", "1", 1);
-    return true;
+    const bool selected = DoAdaptiveDeterministicSplitKTiling();
+    if (selected) (void)::setenv("MATMUL_EXPERIMENT_SELECTED", "1", 1);
+    return selected;
 }
 // NEW END
 
@@ -2960,7 +2997,8 @@ ge::graphStatus MatmulV3BaseTiling::GetWorkspaceSize()
             RPC_WORKSIZE * MB_SIZE; // 20 means 20MB
     }
      OP_LOGI(args_.opName, "if tiling enable is deterministic splitk, workspace size is %lu", workspaceSize_);
-    if (tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::DETERMINISTIC_SPLIT_K) {
+    if (tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::DETERMINISTIC_SPLIT_K ||
+        tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::ADAPTIVE_DETERMINISTIC_SPLIT_K) {
         workspaceSize_ = GetDeterministicSplitKWorkspaceSize(alignedM, alignedN);
     }
     if (tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE_ENABLE_ALIGNOUT) {

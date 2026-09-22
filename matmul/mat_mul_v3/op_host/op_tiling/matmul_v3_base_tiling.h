@@ -105,6 +105,7 @@ protected:
     // NEW BEGIN
     bool DoVectorDotTiling();
     bool DoExperimentalSplitKTiling();
+    bool DoAdaptiveDeterministicSplitKTiling();
     bool DoAtomicSplitKTiling();
     bool DoTailStreamKTiling();
     void ExportExperimentalTiling();

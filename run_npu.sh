@@ -129,6 +129,7 @@ PY
 build_kernel() {
     local kernel_name="$1"
     local tiling_key="$2"
+    local kernel_type="$3"
     local kernel_dir="${build_dir}/splitk_bin/${kernel_name}"
     local object="${kernel_dir}/${kernel_name}.o"
     local metadata="${kernel_dir}/${kernel_name}.json"
@@ -157,9 +158,15 @@ PY
     if [[ ! -f "${object}" || ! -f "${metadata}" ]]; then
         return 1
     fi
-    if ! readelf -Ws "${object}" | awk -v symbol="${kernel_name}_${tiling_key}" \
-        '$4 == "FUNC" && $5 == "GLOBAL" && $8 == symbol {found=1} END {exit !found}'; then
-        return 1
+    if [[ "${kernel_type}" == "mix" ]]; then
+        readelf -Ws "${object}" | awk -v aic="${kernel_name}_${tiling_key}_mix_aic" \
+            -v aiv="${kernel_name}_${tiling_key}_mix_aiv" \
+            '$4 == "FUNC" && $5 == "GLOBAL" && $8 == aic {found_aic=1}
+             $4 == "FUNC" && $5 == "GLOBAL" && $8 == aiv {found_aiv=1}
+             END {exit !(found_aic && found_aiv)}' || return 1
+    else
+        readelf -Ws "${object}" | awk -v symbol="${kernel_name}_${tiling_key}" \
+            '$4 == "FUNC" && $5 == "GLOBAL" && $8 == symbol {found=1} END {exit !found}' || return 1
     fi
     printf '%s\n' "${object}"
 }
@@ -168,7 +175,9 @@ prepare_kernel_build || {
     cat "${build_log}" >&2
     exit 1
 }
-tail_binary="$(build_kernel MatMulV3_TailStream 65648)" || { cat "${build_log}" >&2; exit 1; }
+adaptive_binary="$(build_kernel MatMulV3_Adaptive 65648 mix)" || { cat "${build_log}" >&2; exit 1; }
+atomic_binary="$(build_kernel MatMulV3_Atomic 65664 aic)" || { cat "${build_log}" >&2; exit 1; }
+tail_binary="$(build_kernel MatMulV3_TailStream 65680 aic)" || { cat "${build_log}" >&2; exit 1; }
 
 shapes=(
     16 16 8192
@@ -187,6 +196,8 @@ shapes=(
 )
 
 export MATMUL_HOST_LIBRARY="${host_library}"
+export MATMUL_ADAPTIVE_BINARY="${adaptive_binary}"
+export MATMUL_ATOMIC_BINARY="${atomic_binary}"
 export MATMUL_TAIL_BINARY="${tail_binary}"
 export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"

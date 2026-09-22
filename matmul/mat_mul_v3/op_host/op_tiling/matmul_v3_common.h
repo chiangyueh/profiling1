@@ -105,7 +105,9 @@ enum class TilingEnableSplitCore : int32_t // 互斥flag, 对应不同切K模板
     SINGLE_CORE_NKM_SPLIT_K = 5,
     SINGLE_CORE_SPLIT_K_GM_TO_L1 = 6,
     // NEW BEGIN
-    TAIL_STREAM_K = 7,
+    ADAPTIVE_DETERMINISTIC_SPLIT_K = 7,
+    ATOMIC_SPLIT_K = 8,
+    TAIL_STREAM_K = 9,
     // NEW END
     MAX = 10 //模板类别不能超过10个
 };
