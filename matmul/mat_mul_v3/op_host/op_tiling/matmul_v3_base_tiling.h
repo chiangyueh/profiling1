@@ -109,7 +109,6 @@ protected:
     bool DoRectangularCubeTiling();
     bool DoReuseDirectedTiling();
     bool DoExperimentalSplitKTiling();
-    bool DoAdaptiveDeterministicSplitKTiling();
     bool DoAtomicSplitKTiling();
     bool DoTailStreamKTiling();
     void ExportExperimentalTiling();

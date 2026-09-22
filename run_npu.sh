@@ -8,6 +8,7 @@ export ASCEND_GLOBAL_LOG_LEVEL=3
 export ASCEND_SLOG_PRINT_TO_STDOUT=0
 unset ASCEND_CUSTOM_OPP_PATH
 unset MATMUL_BASE_MODE MATMUL_BASE_EXPERIMENT_SELECTED MATMUL_SPLITK_MODE
+unset MATMUL_DETERMINISTIC_ADAPTIVE MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED
 
 if [[ "$#" -ne 0 ]]; then
     exit 2
@@ -91,119 +92,32 @@ if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
     exit 1
 fi
 
-prepare_kernel_build() {
-    local ascendc_dir="${build_dir}/tbe/ascendc"
-    local dynamic_dir="${build_dir}/tbe/dynamic"
-    local param_dir="${build_dir}/splitk_params"
-    rm -rf -- "${param_dir}" "${ascendc_dir}/mat_mul_v3"
-    mkdir -p -- "${ascendc_dir}/mat_mul_v3" \
-        "${ascendc_dir}/common/act" "${ascendc_dir}/common/matmul_act" \
-        "${dynamic_dir}" "${param_dir}"
-    cp -a matmul/mat_mul_v3/op_kernel/. "${ascendc_dir}/mat_mul_v3/"
-    cp -a common/act/. "${ascendc_dir}/common/act/"
-    cp -a matmul/common/matmul_act/. "${ascendc_dir}/common/matmul_act/"
-
-    local ops_info="${build_dir}/autogen/exc/aic-ascend910b-ops-info.ini"
-    local opc_options="${build_dir}/autogen/custom_opc_options.ini"
-    python3 scripts/util/ascendc_impl_build.py "${ops_info}" "" "" \
-        "${ascendc_dir}" "${dynamic_dir}" "${build_dir}/autogen" >>"${build_log}" 2>&1
-    python3 scripts/util/ascendc_bin_param_build.py "${ops_info}" "${param_dir}" ascend910b \
-        --opc-config-file "${opc_options}" --ops MatMulV3 >>"${build_log}" 2>&1
-
-    python3 - "${param_dir}" "${build_dir}/splitk_fp32_param.json" <<'PY'
-import glob
-import json
-import os
-import shutil
-import sys
-for path in sorted(glob.glob(os.path.join(sys.argv[1], "*_param.json"))):
-    with open(path, encoding="utf-8") as stream:
-        node = json.load(stream)["op_list"][0]
-    values = [item for item in node["inputs"] + node["outputs"] if item.get("paramType") == "required"]
-    if len(values) == 3 and all(item.get("dtype") == "float32" and item.get("format") == "ND" for item in values):
-        shutil.copyfile(path, sys.argv[2])
-        raise SystemExit(0)
-raise SystemExit(1)
-PY
-}
-
-build_kernel() {
-    local kernel_name="$1"
-    local tiling_key="$2"
-    local kernel_type="$3"
-    local kernel_dir="${build_dir}/splitk_bin/${kernel_name}"
-    local object="${kernel_dir}/${kernel_name}.o"
-    local metadata="${kernel_dir}/${kernel_name}.json"
-    if [[ -f "${object}" && -f "${metadata}" ]] &&
-       ! find matmul/mat_mul_v3/op_kernel -type f -newer "${object}" -print -quit | grep -q .; then
-        printf '%s\n' "${object}"
-        return 0
-    fi
-    mkdir -p -- "${kernel_dir}"
-    local fp32_param="${kernel_dir}/param.json"
-    cp -- "${build_dir}/splitk_fp32_param.json" "${fp32_param}"
-    python3 - "${fp32_param}" "${kernel_name}" <<'PY'
-import json
-import sys
-path, name = sys.argv[1:]
-with open(path, encoding="utf-8") as stream:
-    data = json.load(stream)
-data["op_list"][0]["bin_filename"] = name
-with open(path, "w", encoding="utf-8") as stream:
-    json.dump(data, stream, separators=(",", ":"))
-PY
-    asc_opc "${build_dir}/tbe/dynamic/mat_mul_v3.py" --main_func=mat_mul_v3 \
-        --input_param="${fp32_param}" --soc_version=Ascend910B1 --output="${kernel_dir}" \
-        --impl_mode=high_performance,optional --simplified_key_mode=0 --op_mode=dynamic \
-        --deterministic=false --tiling_key="${tiling_key}" >>"${build_log}" 2>&1
-    if [[ ! -f "${object}" || ! -f "${metadata}" ]]; then
-        return 1
-    fi
-    if [[ "${kernel_type}" == "mix" ]]; then
-        readelf -Ws "${object}" | awk -v aic="${kernel_name}_${tiling_key}_mix_aic" \
-            -v aiv="${kernel_name}_${tiling_key}_mix_aiv" \
-            '$4 == "FUNC" && $5 == "GLOBAL" && $8 == aic {found_aic=1}
-             $4 == "FUNC" && $5 == "GLOBAL" && $8 == aiv {found_aiv=1}
-             END {exit !(found_aic && found_aiv)}' || return 1
-    else
-        readelf -Ws "${object}" | awk -v symbol="${kernel_name}_${tiling_key}" \
-            '$4 == "FUNC" && $5 == "GLOBAL" && $8 == symbol {found=1} END {exit !found}' || return 1
-    fi
-    printf '%s\n' "${object}"
-}
-
-adaptive_object="${build_dir}/splitk_bin/MatMulV3_Adaptive/MatMulV3_Adaptive.o"
-adaptive_metadata="${build_dir}/splitk_bin/MatMulV3_Adaptive/MatMulV3_Adaptive.json"
-if [[ ! -f "${adaptive_object}" || ! -f "${adaptive_metadata}" ]] ||
-   find matmul/mat_mul_v3/op_kernel -type f -newer "${adaptive_object}" -print -quit | grep -q .; then
-    prepare_kernel_build || {
-        cat "${build_log}" >&2
-        exit 1
-    }
-fi
-adaptive_binary="$(build_kernel MatMulV3_Adaptive 65648 mix)" || { cat "${build_log}" >&2; exit 1; }
-
+dtypes=(fp16_fp16 fp16_fp32 bf16_bf16 bf16_fp32 fp32_fp32)
+layouts=(NN NT TN TT)
 mn_pairs=(
-    "8 8" "8 32" "8 128"
-    "16 16" "16 64" "16 128"
-    "24 24" "24 96"
-    "32 16" "32 32" "32 64" "32 128"
-    "48 48" "48 96"
-    "64 32" "64 64" "64 128"
-    "96 32" "96 64"
-    "128 64" "128 128"
+    "1 1" "1 64" "1 256" "8 8" "8 128" "16 16" "16 256"
+    "32 32" "32 128" "32 512" "64 16" "64 64" "64 256"
+    "96 96" "128 32" "128 128" "128 384" "192 64" "256 16"
+    "256 64" "256 256" "384 32" "384 128" "512 16" "512 64"
+    "768 32" "1024 16"
 )
-k_values=(8192 10240 12288 14336 16384 20480 24576 32768 40960 49152 65536)
-shapes=()
-for k in "${k_values[@]}"; do
-    for pair in "${mn_pairs[@]}"; do
-        read -r m n <<<"${pair}"
-        shapes+=("${m}" "${n}" "${k}")
+k_values=(1024 1536 2048 4096 4608 6144 7680 8192 12288 16384 24576 27392 32768 49152 65536)
+workloads=()
+pair_count="${#mn_pairs[@]}"
+for dtype in "${dtypes[@]}"; do
+    for layout in "${layouts[@]}"; do
+        for k_index in "${!k_values[@]}"; do
+            k="${k_values[${k_index}]}"
+            for offset in 0 1 2 3; do
+                pair_index=$(( (k_index * 4 + offset) % pair_count ))
+                read -r m n <<<"${mn_pairs[${pair_index}]}"
+                workloads+=("${dtype}" "${layout}" "${m}" "${n}" "${k}")
+            done
+        done
     done
 done
 
 export MATMUL_HOST_LIBRARY="${host_library}"
-export MATMUL_ADAPTIVE_BINARY="${adaptive_binary}"
 export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
-exec "${runner}" "${shapes[@]}"
+exec "${runner}" "${workloads[@]}"

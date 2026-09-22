@@ -36,7 +36,6 @@
 #include "mat_mul_multi_core_splitk_kernel.h"
 // NEW BEGIN
 #include "mat_mul_tail_stream_k_kernel.h"
-#include "mat_mul_adaptive_deterministic_splitk_kernel.h"
 // NEW END
 #endif
 
@@ -292,13 +291,6 @@ __global__ __aicore__ void mat_mul_v3(
             MatMulMultiCoreSplitK, format_x1, FIXPIPE_OPT_SELECT::BASE
         );
     // NEW BEGIN
-    } else if constexpr (
-        LOADMODE == MAT_MUL_V3_BASE_FULLLOAD &&
-        SPLITCOREMODE == MAT_MUL_V3_ADAPTIVE_DETERMINISTIC_SPLIT_K &&
-        FIXOPTI == MAT_MUL_V3_BASE_FIXOPTI && MIXND2NZ == MAT_MUL_V3_MIXND2NZ_FALSE) {
-        MMV3_IMPL(
-            MatMulAdaptiveDeterministicSplitK, format_x1, FIXPIPE_OPT_SELECT::BASE
-        );
     } else if constexpr (
         LOADMODE == MAT_MUL_V3_BASE_FULLLOAD && SPLITCOREMODE == MAT_MUL_V3_ATOMIC_SPLIT_K &&
         FIXOPTI == MAT_MUL_V3_BASE_FIXOPTI && MIXND2NZ == MAT_MUL_V3_MIXND2NZ_FALSE) {

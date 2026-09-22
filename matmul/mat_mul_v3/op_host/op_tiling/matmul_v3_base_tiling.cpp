@@ -1360,9 +1360,6 @@ void MatmulV3BaseTiling::DoSelectTiling()
 {
     switch (tilingSelect_) {
         case TilingCalcSelect::ALL:
-            // NEW BEGIN
-            DO_CACL_TILING_ENABLE(DoExperimentalSplitKTiling())
-            // NEW END
             DO_CACL_TILING_ENABLE(DoBL1FullloadWithFixpipeTiling())
             DO_CACL_TILING_ENABLE(DoAL1FullLoadTiling())
             DO_CACL_TILING_ENABLE(DoBL1FullLoadTiling())
@@ -1662,53 +1659,6 @@ bool MatmulV3BaseTiling::DoAtomicSplitKTiling()
     return true;
 }
 
-bool MatmulV3BaseTiling::DoAdaptiveDeterministicSplitKTiling()
-{
-    if (!compileInfo_.supportL0c2out || compileInfo_.aicNum == 0 || args_.hasBias ||
-        args_.aType != ge::DT_FLOAT || args_.bType != ge::DT_FLOAT || args_.cType != ge::DT_FLOAT ||
-        args_.isATrans || !args_.isBTrans || args_.aFormat != ge::FORMAT_ND ||
-        args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
-        args_.mValue == 0 || args_.mValue > BASIC_BLOCK_SIZE_128 ||
-        args_.nValue == 0 || args_.nValue > BASIC_BLOCK_SIZE_128 ||
-        args_.kValue < 8192 || args_.kValue % BASIC_ALIGN_16 != 0) {
-        return false;
-    }
-    constexpr uint64_t minKPerCore = 2048;
-    const uint64_t partialBytes = args_.mValue * args_.nValue * DB_SIZE * DATA_SIZE_FP32;
-    const uint64_t byCompute = std::max(1UL, args_.kValue / minKPerCore);
-    const uint64_t byWorkspace = partialBytes == 0 ? 1UL :
-        std::max(1UL, compileInfo_.l2Size * 7UL / 10UL / partialBytes);
-    const uint64_t split = std::min({compileInfo_.aicNum, byCompute, byWorkspace});
-    if (split < NUMBER_TWO) {
-        return false;
-    }
-    runInfo_.baseM = ops::CeilAlign(args_.mValue, BASIC_ALIGN_16);
-    runInfo_.baseN = ops::CeilAlign(args_.nValue, BASIC_ALIGN_16);
-    runInfo_.baseK = BASIC_BLOCK_K_128_BYTE / DATA_SIZE_FP32;
-    runInfo_.depthA1 = DB_SIZE;
-    runInfo_.depthB1 = DB_SIZE;
-    runInfo_.stepM = 1;
-    runInfo_.stepN = 1;
-    runInfo_.stepKa = 1;
-    runInfo_.stepKb = 1;
-    runInfo_.iterateOrder = ITER_ROW_FIRST;
-    runInfo_.singleCoreM = args_.mValue;
-    runInfo_.singleCoreN = args_.nValue;
-    runInfo_.singleCoreK = 512;
-    runInfo_.usedCoreNum = split;
-    runInfo_.dbL0c = DB_SIZE;
-    runInfo_.needUpdate = true;
-    args_.nd2nzA = false;
-    args_.nd2nzB = false;
-    args_.isNzA = false;
-    args_.isNzB = false;
-    tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
-    tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::ADAPTIVE_DETERMINISTIC_SPLIT_K;
-    tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
-    tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::BASE;
-    return true;
-}
-
 bool MatmulV3BaseTiling::DoTailStreamKTiling()
 {
     if (!compileInfo_.supportL0c2out || compileInfo_.aicNum == 0 || args_.hasBias ||
@@ -1770,12 +1720,7 @@ bool MatmulV3BaseTiling::DoExperimentalSplitKTiling()
         if (selected) (void)::setenv("MATMUL_EXPERIMENT_SELECTED", "1", 1);
         return selected;
     }
-    if (std::strcmp(mode, "ADAPTIVE_DETERMINISTIC_SPLIT_K") != 0) {
-        return false;
-    }
-    const bool selected = DoAdaptiveDeterministicSplitKTiling();
-    if (selected) (void)::setenv("MATMUL_EXPERIMENT_SELECTED", "1", 1);
-    return selected;
+    return false;
 }
 // NEW END
 
@@ -2991,6 +2936,7 @@ void MatmulV3BaseTiling::OptCoreNumsDeterministicMultiCoreSplitK(){
 
 bool MatmulV3BaseTiling::DoDeterministicMultiCoreSplitKTiling()
 {
+    (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED");
     if (compileInfo_.supportL12BtBf16 || !SupportMultiSplitK()) {
         return false;
     }
@@ -3047,6 +2993,16 @@ bool MatmulV3BaseTiling::DoDeterministicMultiCoreSplitKTiling()
 
     GetMoreMultiCoreSplitKArgs();
     OptCoreNumsDeterministicMultiCoreSplitK();
+    const char *adaptive = std::getenv("MATMUL_DETERMINISTIC_ADAPTIVE");
+    if (adaptive != nullptr && adaptive[0] == '1' && adaptive[1] == '\0') {
+        const uint64_t originalSingleCoreM = runInfo_.singleCoreM;
+        const uint64_t originalSingleCoreN = runInfo_.singleCoreN;
+        runInfo_.singleCoreM = std::min(runInfo_.singleCoreM, args_.mValue);
+        runInfo_.singleCoreN = std::min(runInfo_.singleCoreN, args_.nValue);
+        const bool changed = runInfo_.singleCoreM != originalSingleCoreM ||
+            runInfo_.singleCoreN != originalSingleCoreN;
+        (void)::setenv("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED", changed ? "1" : "0", 1);
+    }
     return true;
 }
 
@@ -3128,6 +3084,21 @@ void MatmulV3BaseTiling::ExportExperimentalTiling()
     (void)snprintf(key, sizeof(key), "%lu", tilingKey_);
     (void)::setenv("MATMUL_OBSERVED_CORES", cores, 1);
     (void)::setenv("MATMUL_OBSERVED_KEY", key, 1);
+    auto exportField = [](const char *name, uint32_t value) {
+        char text[32] = {};
+        (void)snprintf(text, sizeof(text), "%u", value);
+        (void)::setenv(name, text, 1);
+    };
+    exportField("MATMUL_OBSERVED_SINGLE_M", tilingData_.matmulTiling.singleCoreM);
+    exportField("MATMUL_OBSERVED_SINGLE_N", tilingData_.matmulTiling.singleCoreN);
+    exportField("MATMUL_OBSERVED_SINGLE_K", tilingData_.matmulTiling.singleCoreK);
+    exportField("MATMUL_OBSERVED_BASE_M", tilingData_.matmulTiling.baseM);
+    exportField("MATMUL_OBSERVED_BASE_N", tilingData_.matmulTiling.baseN);
+    exportField("MATMUL_OBSERVED_BASE_K", tilingData_.matmulTiling.baseK);
+    exportField("MATMUL_OBSERVED_STEP_KA", tilingData_.matmulTiling.stepKa);
+    exportField("MATMUL_OBSERVED_STEP_KB", tilingData_.matmulTiling.stepKb);
+    exportField("MATMUL_OBSERVED_DEPTH_A1", tilingData_.matmulTiling.depthA1);
+    exportField("MATMUL_OBSERVED_DEPTH_B1", tilingData_.matmulTiling.depthB1);
     const char *selected = std::getenv("MATMUL_EXPERIMENT_SELECTED");
     const char *baseSelected = std::getenv("MATMUL_BASE_EXPERIMENT_SELECTED");
     const bool splitSelected = splitMode != nullptr && splitMode[0] != '\0' &&
@@ -3199,8 +3170,7 @@ ge::graphStatus MatmulV3BaseTiling::GetWorkspaceSize()
             RPC_WORKSIZE * MB_SIZE; // 20 means 20MB
     }
      OP_LOGI(args_.opName, "if tiling enable is deterministic splitk, workspace size is %lu", workspaceSize_);
-    if (tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::DETERMINISTIC_SPLIT_K ||
-        tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::ADAPTIVE_DETERMINISTIC_SPLIT_K) {
+    if (tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::DETERMINISTIC_SPLIT_K) {
         workspaceSize_ = GetDeterministicSplitKWorkspaceSize(alignedM, alignedN);
     }
     if (tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE_ENABLE_ALIGNOUT) {
