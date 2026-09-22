@@ -1,11 +1,6 @@
-/**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- */
-
-#ifndef __OP_KERNEL_MATMUL_V3_VECTOR_SPLIT_K_DOT_H__
-#define __OP_KERNEL_MATMUL_V3_VECTOR_SPLIT_K_DOT_H__
+// NEW BEGIN
+#ifndef MAT_MUL_VECTOR_DOT_H
+#define MAT_MUL_VECTOR_DOT_H
 
 #include "mat_mul_v3_common.h"
 #include "lib/reduce/reduce.h"
@@ -15,7 +10,7 @@ using namespace AscendC;
 constexpr uint64_t VECTOR_DOT_CHUNK = 4096;
 constexpr uint64_t VECTOR_DOT_UB_BYTES = 128 * 1024;
 
-__aicore__ inline void MatMulVectorSplitKDot(
+__aicore__ inline void MatMulVectorDot(
     GM_ADDR aGM, GM_ADDR bGM, GM_ADDR cGM, const MatmulTilingData &tilingData)
 {
     const uint64_t m = static_cast<uint64_t>(tilingData.matmulTiling.M);
@@ -36,45 +31,21 @@ __aicore__ inline void MatMulVectorSplitKDot(
     cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(cGM), outputDots);
 
     TPipe pipe;
-    TBuf<TPosition::VECCALC> ubBuf;
-    pipe.InitBuffer(ubBuf, VECTOR_DOT_UB_BYTES);
-    LocalTensor<float> ub = ubBuf.Get<float>();
+    TBuf<TPosition::VECCALC> ubBuffer;
+    pipe.InitBuffer(ubBuffer, VECTOR_DOT_UB_BYTES);
+    LocalTensor<float> ub = ubBuffer.Get<float>();
     LocalTensor<float> aLocal = ub;
     LocalTensor<float> bLocal = ub[VECTOR_DOT_CHUNK];
     LocalTensor<float> productLocal = ub[2 * VECTOR_DOT_CHUNK];
     LocalTensor<float> sumLocal = ub[3 * VECTOR_DOT_CHUNK];
     LocalTensor<uint8_t> reduceTmp = ub[3 * VECTOR_DOT_CHUNK + 16].ReinterpretCast<uint8_t>();
 
-    const bool splitK = workers > outputDots;
-    if (splitK && worker < outputDots) {
-        sumLocal.SetValue(0, 0.0f);
-        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        DataCopyExtParams clearParams{1, static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
-        DataCopyPad(cGlobal[worker], sumLocal, clearParams);
-    }
-    if (splitK) {
-        SyncAll();
-    }
-
-    const bool outputParallel = outputDots > workers;
-    const uint64_t firstOutput = outputParallel ? worker : worker % outputDots;
-    const uint64_t outputStride = outputParallel ? workers : outputDots;
-    const uint64_t lane = outputParallel ? 0 : worker / outputDots;
-    const uint64_t lanesForOutput = outputParallel ? 1 : workers / outputDots;
-    const uint64_t kBlocks = k / (BLOCK_BYTE_SIZE / sizeof(float));
-    const uint64_t blocksPerLane = (kBlocks + lanesForOutput - 1) / lanesForOutput;
-    const uint64_t firstBlock = lane * blocksPerLane;
-    const uint64_t lastBlock = min(kBlocks, firstBlock + blocksPerLane);
-
-    for (uint64_t outputIndex = firstOutput; outputIndex < outputDots; outputIndex += outputStride) {
+    for (uint64_t outputIndex = worker; outputIndex < outputDots; outputIndex += workers) {
         const uint64_t row = outputIndex / n;
         const uint64_t column = outputIndex % n;
-        const uint64_t firstK = firstBlock * (BLOCK_BYTE_SIZE / sizeof(float));
-        const uint64_t lastK = lastBlock * (BLOCK_BYTE_SIZE / sizeof(float));
-        float partial = 0.0f;
-        for (uint64_t kOffset = firstK; kOffset < lastK; kOffset += VECTOR_DOT_CHUNK) {
-            const uint64_t count = min(VECTOR_DOT_CHUNK, lastK - kOffset);
+        float sum = 0.0f;
+        for (uint64_t kOffset = 0; kOffset < k; kOffset += VECTOR_DOT_CHUNK) {
+            const uint64_t count = min(VECTOR_DOT_CHUNK, k - kOffset);
             DataCopy(aLocal, aGlobal[row * k + kOffset], count);
             DataCopy(bLocal, bGlobal[column * k + kOffset], count);
             SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
@@ -85,21 +56,15 @@ __aicore__ inline void MatMulVectorSplitKDot(
             ReduceSum<float, Pattern::Reduce::AR, false>(
                 sumLocal, productLocal, reduceTmp, reduceShape, true);
             PipeBarrier<PIPE_ALL>();
-            partial += sumLocal.GetValue(0);
+            sum += sumLocal.GetValue(0);
         }
-
-        sumLocal.SetValue(0, partial);
+        sumLocal.SetValue(0, sum);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
         DataCopyExtParams outputParams{1, static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
-        if (splitK) {
-            SetAtomicAdd<float>();
-        }
         DataCopyPad(cGlobal[outputIndex], sumLocal, outputParams);
-        if (splitK) {
-            SetAtomicNone();
-        }
     }
 }
 
 #endif
+// NEW END

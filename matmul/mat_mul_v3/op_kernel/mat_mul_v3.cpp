@@ -25,7 +25,9 @@
 #include "mat_mul_unaligned_sc_splitk_kernel_gm_to_l1.h"
 #include "mat_mul_optimized_fixpipe_algorithm.h"
 #include "mat_mul_l1_full_load.h"
-#include "mat_mul_vector_split_k_dot.h"
+// NEW BEGIN
+#include "mat_mul_vector_dot.h"
+// NEW END
 #include "mat_mul_v3_tiling_key.h"
 
 
@@ -206,12 +208,15 @@ __global__ __aicore__ void mat_mul_v3(
         );
     }
 #else
+    // NEW BEGIN
     if constexpr (
         LOADMODE == MAT_MUL_V3_BASE_FULLLOAD && SPLITCOREMODE == MAT_MUL_V3_BASE_SPLIT_K &&
         FIXOPTI == MAT_MUL_V3_BASE_FIXOPTI && MIXND2NZ == MAT_MUL_V3_MIXND2NZ_FALSE &&
-        SPECIALOPT == MAT_MUL_V3_VECTOR_SPLIT_K_DOT) {
-        MatMulVectorSplitKDot(aGM, bGM, cGM, tilingData);
-    } else if constexpr (
+        SPECIALOPT == MAT_MUL_V3_VECTOR_DOT) {
+        MatMulVectorDot(aGM, bGM, cGM, tilingData);
+    } else
+    // NEW END
+    if constexpr (
         LOADMODE == MAT_MUL_V3_BASE_FULLLOAD && SPLITCOREMODE == MAT_MUL_V3_BASE_SPLIT_K &&
         FIXOPTI == MAT_MUL_V3_BASE_FIXOPTI && MIXND2NZ == MAT_MUL_V3_MIXND2NZ_FALSE &&
         SPECIALOPT == MAT_MUL_V3_K_SHIFT) {

@@ -127,7 +127,9 @@ enum class TilingEnableSpecialOpti : int32_t // 互斥flag, 对应不同的优�
 {
     BASE = 0,
     ENABLE_K_SHIFT = 1,  // K轴错峰
-    VECTOR_SPLIT_K_DOT = 2,
+    // NEW BEGIN
+    VECTOR_DOT = 2,
+    // NEW END
     MAX = 10 //模板类别不能超过10个
 };
 

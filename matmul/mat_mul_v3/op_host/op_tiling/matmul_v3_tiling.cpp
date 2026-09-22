@@ -14,7 +14,6 @@
  */
 #include "matmul_v3_tiling.h"
 
-#include <cstdlib>
 #include <type_traits>
 
 #include "op_cache_tiling.h"
@@ -72,8 +71,6 @@ static ge::graphStatus TilingPrepareForMatmulV3(gert::TilingParseContext *contex
   compileInfoPtr->supportL0c2out = !val.empty();
   compileInfoPtr->supportL12BtBf16 = (dataMoveL12Bt.find("bf16") != std::string::npos);
   compileInfoPtr->aicNum = ascendcPlatform.GetCoreNumAic();
-  //NEW
-  compileInfoPtr->aivNum = ascendcPlatform.GetCoreNumAiv();
   compileInfoPtr->socVersion = ascendcPlatform.GetSocVersion();
   compileInfoPtr->btSize = compileInfoPtr->supportL0c2out ? 1024UL : 0UL;                       // 1024 is btSize
   compileInfoPtr->btSize = compileInfoPtr->supportL12BtBf16 ? 4096UL : compileInfoPtr->btSize;  // 4096 is btSize
@@ -84,10 +81,7 @@ static ge::graphStatus TilingPrepareForMatmulV3(gert::TilingParseContext *contex
   ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_C, compileInfoPtr->l0CSize);
   ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L2, compileInfoPtr->l2Size);
 
-  //NEW
-  const char *disableRepo = std::getenv("MATMUL_V3_DISABLE_REPO_LOOKUP");
-  const bool repoDisabled = disableRepo != nullptr && disableRepo[0] == '1' && disableRepo[1] == '\0';
-  if(!repoDisabled && !TilingPrepareForOpCache(context)) {
+  if(!TilingPrepareForOpCache(context)) {
       OP_LOGE(context->GetNodeName(), "TilingPrepareForOpCache fail");
       return ge::GRAPH_FAILED;
   }

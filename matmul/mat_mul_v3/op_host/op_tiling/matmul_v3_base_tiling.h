@@ -77,12 +77,6 @@ protected:
     void DoTilingKey();
     uint64_t GetDeterministicSplitKWorkspaceSize(uint64_t alignedM, uint64_t alignedN);
     void DoBasicTiling();
-    //NEW
-    bool ShrinkIdleCores();
-    //NEW
-    const char *GetSelectedBranchName();
-    //NEW
-    void ExportCoreOracleTiling(uint32_t officialCoreNum, uint32_t requestedCoreNum);
     void FormulaicBaseBlockTiling();
     void FormulaicTilingNoTrans();
     void CalL1TilingV200();
@@ -108,7 +102,10 @@ protected:
     void SetBaseBlockTiling();
     void DoSmallShapeTiling();
     void DoSelectTiling();
-    bool DoVectorSplitKDotTiling();
+    // NEW BEGIN
+    bool DoVectorDotTiling();
+    void ExportVectorDotTiling();
+    // NEW END
     bool IsSupportSingleCoreSplitSmallK(uint64_t xDim, uint64_t yDim) const;
     bool IsSupportSingleCoreSplitK() const;
     bool DoSingleCoreSplitKTiling();
