@@ -1527,7 +1527,7 @@ bool MatmulV3BaseTiling::DoRectangularCubeTiling()
     tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
     tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::BASE;
     tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
-    tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::RECTANGULAR_CUBE;
+    tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::BASE;
     return true;
 }
 

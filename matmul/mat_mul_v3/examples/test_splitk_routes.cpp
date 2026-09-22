@@ -107,6 +107,19 @@ bool IsDeterministicSplitK(uint64_t key)
     return ((key >> 4U) & 0xffU) == 3U;
 }
 
+bool IsPlainBase(uint64_t key)
+{
+    return (key & 0x0fU) == 0U && ((key >> 4U) & 0xffU) == 0U &&
+        ((key >> 12U) & 0x0fU) == 0U && ((key >> 16U) & 0x0fU) == 1U &&
+        ((key >> 20U) & 0x0fU) == 0U;
+}
+
+bool IsRectangularCampaign()
+{
+    const char *campaign = std::getenv("MATMUL_CAMPAIGN");
+    return campaign != nullptr && std::strcmp(campaign, "RECTANGULAR_CUBE") == 0;
+}
+
 const DTypeSpec *FindDType(const char *name)
 {
     static const DTypeSpec values[] = {
@@ -271,6 +284,7 @@ void PrintTiling(const char *name, const TilingSnapshot &value)
 int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int64_t n, int64_t k,
                 aclrtStream stream, RunCounts &counts)
 {
+    const bool rectangularCampaign = IsRectangularCampaign();
     ++counts.inputs;
     std::vector<uint8_t> a(static_cast<size_t>(m * k) * dtype.input.bytes);
     std::vector<uint8_t> b(static_cast<size_t>(n * k) * dtype.input.bytes);
@@ -313,6 +327,9 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE");
     (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED");
     (void)::unsetenv("MATMUL_SPLITK_MODE");
+    (void)::unsetenv("MATMUL_BASE_MODE");
+    (void)::unsetenv("MATMUL_BASE_EXPERIMENT_SELECTED");
+    (void)::unsetenv("MATMUL_EXPERIMENT_BRANCH");
     (void)::setenv("MATMUL_VECTOR_ENABLE", "0", 1);
     ClearObservedTiling();
     uint64_t officialWorkspaceSize = 0;
@@ -333,7 +350,9 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         ReleaseTensor(aTensor);
         return rc == ACL_SUCCESS ? 4 : rc;
     }
-    if (!IsDeterministicSplitK(official.key)) {
+    const bool officialRouteMatched = rectangularCampaign ? IsPlainBase(official.key) :
+        IsDeterministicSplitK(official.key);
+    if (!officialRouteMatched) {
         ++counts.nonDeterministic;
         (void)aclDestroyAclOpExecutor(officialExecutor);
         ReleaseTensor(cTensor);
@@ -368,19 +387,50 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         return rc == ACL_SUCCESS ? 4 : rc;
     }
 
-    (void)::setenv("MATMUL_DETERMINISTIC_ADAPTIVE", "1", 1);
-    (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED");
+    if (rectangularCampaign) {
+        (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE");
+        (void)::setenv("MATMUL_VECTOR_ENABLE", "1", 1);
+        (void)::setenv("MATMUL_BASE_MODE", "RECTANGULAR_CUBE", 1);
+        (void)::unsetenv("MATMUL_BASE_EXPERIMENT_SELECTED");
+        (void)::unsetenv("MATMUL_EXPERIMENT_BRANCH");
+    } else {
+        (void)::setenv("MATMUL_DETERMINISTIC_ADAPTIVE", "1", 1);
+        (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED");
+    }
     ClearObservedTiling();
     uint64_t adaptiveWorkspaceSize = 0;
     aclOpExecutor *adaptiveExecutor = nullptr;
     rc = aclnnMatmulGetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, 1,
                                      &adaptiveWorkspaceSize, &adaptiveExecutor);
     const TilingSnapshot adaptive = ReadTilingSnapshot();
-    const bool changed = ReadEnvUnsigned("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED") == 1;
-    if (changed) ++counts.adaptiveSelected; else ++counts.officialPreserved;
+    const char *experimentBranch = std::getenv("MATMUL_EXPERIMENT_BRANCH");
+    const bool changed = rectangularCampaign ?
+        experimentBranch != nullptr && std::strcmp(experimentBranch, "RECTANGULAR_CUBE") == 0 :
+        ReadEnvUnsigned("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED") == 1;
+    if (changed) ++counts.adaptiveSelected; else if (rc == ACL_SUCCESS) ++counts.officialPreserved;
     void *adaptiveWorkspace = nullptr;
     if (rc == ACL_SUCCESS && adaptiveExecutor == nullptr) rc = 4;
-    if (rc == ACL_SUCCESS && !IsDeterministicSplitK(adaptive.key)) rc = 4;
+    if (rectangularCampaign && !changed) {
+        if (rc != ACL_SUCCESS) {
+            ++counts.failed;
+            std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
+                        "\"output_dtype\":\"%s\",\"candidate_branch\":\"RECTANGULAR_CUBE\","
+                        "\"status\":\"CANDIDATE_TILING_FAILED\",\"result_code\":%d}\n",
+                        static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
+                        dtype.inputName, dtype.outputName, rc);
+            std::fflush(stdout);
+        }
+        if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
+        (void)::unsetenv("MATMUL_BASE_MODE");
+        (void)::unsetenv("MATMUL_VECTOR_ENABLE");
+        ReleaseTensor(cTensor);
+        ReleaseTensor(bTensor);
+        ReleaseTensor(aTensor);
+        return rc == ACL_SUCCESS ? ACL_SUCCESS : rc;
+    }
+    const bool candidateRouteMatched = rectangularCampaign ? IsPlainBase(adaptive.key) :
+        IsDeterministicSplitK(adaptive.key);
+    if (rc == ACL_SUCCESS && !candidateRouteMatched) rc = 4;
     if (rc == ACL_SUCCESS && adaptiveWorkspaceSize != 0) {
         rc = aclrtMalloc(&adaptiveWorkspace, adaptiveWorkspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
     }
@@ -400,14 +450,16 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
 
     std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
                 "\"output_dtype\":\"%s\","
-                "\"adaptive_changed\":%s,",
+                "\"candidate_branch\":\"%s\",\"candidate_selected\":%s,",
                 static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
-                dtype.inputName, dtype.outputName, changed ? "true" : "false");
+                dtype.inputName, dtype.outputName,
+                rectangularCampaign ? "RECTANGULAR_CUBE" : "ADAPTIVE_DETERMINISTIC_SPLIT_K",
+                changed ? "true" : "false");
     PrintTiling("official_tiling", official);
     std::printf(",");
-    PrintTiling("adaptive_tiling", adaptive);
-    std::printf(",\"official_workspace\":%lu,\"adaptive_workspace\":%lu,"
-                "\"official_latency_ms\":%.9f,\"adaptive_latency_ms\":%s,"
+    PrintTiling("candidate_tiling", adaptive);
+    std::printf(",\"official_workspace\":%lu,\"candidate_workspace\":%lu,"
+                "\"official_latency_ms\":%.9f,\"candidate_latency_ms\":%s,"
                 "\"delta_pct\":%s,\"max_abs_diff\":%.9g,\"max_rel_diff\":%.9g,"
                 "\"correctness\":\"%s\",\"result_code\":%d}\n",
                 static_cast<unsigned long>(officialWorkspaceSize),
@@ -421,6 +473,8 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     if (adaptiveWorkspace != nullptr) (void)aclrtFree(adaptiveWorkspace);
     if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
     (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE");
+    (void)::unsetenv("MATMUL_BASE_MODE");
+    (void)::unsetenv("MATMUL_VECTOR_ENABLE");
     ReleaseTensor(cTensor);
     ReleaseTensor(bTensor);
     ReleaseTensor(aTensor);
@@ -448,10 +502,11 @@ int main(int argc, char **argv)
                           std::strtoll(argv[index + 3], nullptr, 10),
                           std::strtoll(argv[index + 4], nullptr, 10), stream, counts);
     }
-    std::printf("{\"summary\":true,\"inputs\":%lu,\"non_deterministic\":%lu,"
-                "\"deterministic\":%lu,\"adaptive_selected\":%lu,\"official_preserved\":%lu,"
+    std::printf("{\"summary\":true,\"campaign\":\"%s\",\"inputs\":%lu,\"non_target_route\":%lu,"
+                "\"official_base\":%lu,\"rectangular_selected\":%lu,\"official_preserved\":%lu,"
                 "\"passed\":%lu,\"failed\":%lu,"
                 "\"official_failed\":%lu}\n",
+                IsRectangularCampaign() ? "RECTANGULAR_CUBE" : "ADAPTIVE_DETERMINISTIC_SPLIT_K",
                 static_cast<unsigned long>(counts.inputs),
                 static_cast<unsigned long>(counts.nonDeterministic),
                 static_cast<unsigned long>(counts.deterministic),
