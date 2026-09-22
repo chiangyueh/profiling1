@@ -7,7 +7,7 @@ export ASCEND_RT_VISIBLE_DEVICES=2
 export ASCEND_GLOBAL_LOG_LEVEL=3
 export ASCEND_SLOG_PRINT_TO_STDOUT=0
 unset ASCEND_CUSTOM_OPP_PATH
-unset MATMUL_BASE_MODE MATMUL_BASE_EXPERIMENT_SELECTED
+unset MATMUL_BASE_MODE MATMUL_BASE_EXPERIMENT_SELECTED MATMUL_SPLITK_MODE
 
 if [[ "$#" -ne 0 ]]; then
     exit 2
@@ -172,34 +172,38 @@ PY
     printf '%s\n' "${object}"
 }
 
-prepare_kernel_build || {
-    cat "${build_log}" >&2
-    exit 1
-}
+adaptive_object="${build_dir}/splitk_bin/MatMulV3_Adaptive/MatMulV3_Adaptive.o"
+adaptive_metadata="${build_dir}/splitk_bin/MatMulV3_Adaptive/MatMulV3_Adaptive.json"
+if [[ ! -f "${adaptive_object}" || ! -f "${adaptive_metadata}" ]] ||
+   find matmul/mat_mul_v3/op_kernel -type f -newer "${adaptive_object}" -print -quit | grep -q .; then
+    prepare_kernel_build || {
+        cat "${build_log}" >&2
+        exit 1
+    }
+fi
 adaptive_binary="$(build_kernel MatMulV3_Adaptive 65648 mix)" || { cat "${build_log}" >&2; exit 1; }
-atomic_binary="$(build_kernel MatMulV3_Atomic 65664 aic)" || { cat "${build_log}" >&2; exit 1; }
-tail_binary="$(build_kernel MatMulV3_TailStream 65680 aic)" || { cat "${build_log}" >&2; exit 1; }
 
-shapes=(
-    16 16 8192
-    32 32 12288
-    32 64 16384
-    48 48 24576
-    64 64 32768
-    96 32 49152
-    128 64 65536
-    384 896 8192
-    512 768 12288
-    640 640 8192
-    640 768 12288
-    768 640 16384
-    896 512 16384
+mn_pairs=(
+    "8 8" "8 32" "8 128"
+    "16 16" "16 64" "16 128"
+    "24 24" "24 96"
+    "32 16" "32 32" "32 64" "32 128"
+    "48 48" "48 96"
+    "64 32" "64 64" "64 128"
+    "96 32" "96 64"
+    "128 64" "128 128"
 )
+k_values=(8192 10240 12288 14336 16384 20480 24576 32768 40960 49152 65536)
+shapes=()
+for k in "${k_values[@]}"; do
+    for pair in "${mn_pairs[@]}"; do
+        read -r m n <<<"${pair}"
+        shapes+=("${m}" "${n}" "${k}")
+    done
+done
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_ADAPTIVE_BINARY="${adaptive_binary}"
-export MATMUL_ATOMIC_BINARY="${atomic_binary}"
-export MATMUL_TAIL_BINARY="${tail_binary}"
 export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 exec "${runner}" "${shapes[@]}"

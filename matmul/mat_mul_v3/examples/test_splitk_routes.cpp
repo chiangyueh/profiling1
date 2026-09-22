@@ -213,8 +213,16 @@ int RunShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, const std::vec
     if (officialExecutor != nullptr) (void)aclDestroyAclOpExecutor(officialExecutor);
     if (officialWorkspace != nullptr) (void)aclrtFree(officialWorkspace);
     if (!officialCorrect) {
-        std::fprintf(stderr, "skip M%ld_N%ld_K%ld_NT official_rc=%d\n",
-                     static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), rc);
+        std::printf(
+            "{\"shape\":\"M%ld_N%ld_K%ld_NT\",\"official_branch\":\"%s\","
+            "\"official_core\":%u,\"official_latency_ms\":null,"
+            "\"candidate_branch\":\"ADAPTIVE_DETERMINISTIC_SPLIT_K\",\"candidate_core\":null,"
+            "\"split_factor_min\":null,\"split_factor_max\":null,\"candidate_latency_ms\":null,"
+            "\"delta_pct\":null,\"correctness\":\"NOT_CHECKED\",\"result_code\":%d,"
+            "\"failure_stage\":\"official_measurement\"}\n",
+            static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), BranchFromKey(officialKey),
+            officialCore, rc == ACL_SUCCESS ? 3 : rc);
+        std::fflush(stdout);
         ReleaseTensor(cTensor);
         ReleaseTensor(bTensor);
         ReleaseTensor(aTensor);
@@ -236,6 +244,15 @@ int RunShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, const std::vec
         const char *coreText = std::getenv("MATMUL_EXPERIMENT_CORES");
         const char *keyText = std::getenv("MATMUL_EXPERIMENT_KEY");
         if (rc != ACL_SUCCESS || tilingText == nullptr || coreText == nullptr || keyText == nullptr) {
+            std::printf(
+                "{\"shape\":\"M%ld_N%ld_K%ld_NT\",\"official_branch\":\"%s\","
+                "\"official_core\":%u,\"official_latency_ms\":%.9f,\"candidate_branch\":\"%s\","
+                "\"candidate_core\":null,\"split_factor_min\":null,\"split_factor_max\":null,"
+                "\"candidate_latency_ms\":null,\"delta_pct\":null,\"correctness\":\"NOT_CHECKED\","
+                "\"result_code\":%d,\"failure_stage\":\"candidate_tiling\"}\n",
+                static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), BranchFromKey(officialKey),
+                officialCore, officialLatency, candidate.name, rc == ACL_SUCCESS ? 4 : rc);
+            std::fflush(stdout);
             if (candidateExecutor != nullptr) (void)aclDestroyAclOpExecutor(candidateExecutor);
             continue;
         }
@@ -243,6 +260,15 @@ int RunShape(int64_t m, int64_t n, int64_t k, aclrtStream stream, const std::vec
         const uint32_t cores = static_cast<uint32_t>(std::strtoul(coreText, nullptr, 10));
         const uint64_t key = std::strtoull(keyText, nullptr, 10);
         if (tiling.empty() || cores == 0 || key != candidate.key) {
+            std::printf(
+                "{\"shape\":\"M%ld_N%ld_K%ld_NT\",\"official_branch\":\"%s\","
+                "\"official_core\":%u,\"official_latency_ms\":%.9f,\"candidate_branch\":\"%s\","
+                "\"candidate_core\":%u,\"split_factor_min\":null,\"split_factor_max\":null,"
+                "\"candidate_latency_ms\":null,\"delta_pct\":null,\"correctness\":\"NOT_CHECKED\","
+                "\"result_code\":4,\"failure_stage\":\"candidate_packet\"}\n",
+                static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), BranchFromKey(officialKey),
+                officialCore, officialLatency, candidate.name, cores);
+            std::fflush(stdout);
             if (candidateExecutor != nullptr) (void)aclDestroyAclOpExecutor(candidateExecutor);
             continue;
         }
@@ -310,8 +336,6 @@ int main(int argc, char **argv)
     if (rc != ACL_SUCCESS || TbeLoadSoAndSaveToRegistry(hostLibrary) != 0U) return 4;
     std::vector<Candidate> candidates = {
         {"ADAPTIVE_DETERMINISTIC_SPLIT_K", "MATMUL_ADAPTIVE_BINARY", "MatMulV3_Adaptive_65648", 65648},
-        {"ATOMIC_SPLIT_K", "MATMUL_ATOMIC_BINARY", "MatMulV3_Atomic_65664", 65664},
-        {"TAIL_STREAM_K", "MATMUL_TAIL_BINARY", "MatMulV3_TailStream_65680", 65680},
     };
     for (Candidate &candidate : candidates) {
         const char *path = std::getenv(candidate.binaryEnv);
