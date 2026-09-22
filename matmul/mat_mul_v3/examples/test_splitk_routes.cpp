@@ -60,6 +60,8 @@ struct RunCounts {
     uint64_t inputs = 0;
     uint64_t nonDeterministic = 0;
     uint64_t deterministic = 0;
+    uint64_t adaptiveSelected = 0;
+    uint64_t officialPreserved = 0;
     uint64_t passed = 0;
     uint64_t failed = 0;
     uint64_t officialFailed = 0;
@@ -375,6 +377,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
                                      &adaptiveWorkspaceSize, &adaptiveExecutor);
     const TilingSnapshot adaptive = ReadTilingSnapshot();
     const bool changed = ReadEnvUnsigned("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED") == 1;
+    if (changed) ++counts.adaptiveSelected; else ++counts.officialPreserved;
     void *adaptiveWorkspace = nullptr;
     if (rc == ACL_SUCCESS && adaptiveExecutor == nullptr) rc = 4;
     if (rc == ACL_SUCCESS && !IsDeterministicSplitK(adaptive.key)) rc = 4;
@@ -446,11 +449,14 @@ int main(int argc, char **argv)
                           std::strtoll(argv[index + 4], nullptr, 10), stream, counts);
     }
     std::printf("{\"summary\":true,\"inputs\":%lu,\"non_deterministic\":%lu,"
-                "\"deterministic\":%lu,\"passed\":%lu,\"failed\":%lu,"
+                "\"deterministic\":%lu,\"adaptive_selected\":%lu,\"official_preserved\":%lu,"
+                "\"passed\":%lu,\"failed\":%lu,"
                 "\"official_failed\":%lu}\n",
                 static_cast<unsigned long>(counts.inputs),
                 static_cast<unsigned long>(counts.nonDeterministic),
                 static_cast<unsigned long>(counts.deterministic),
+                static_cast<unsigned long>(counts.adaptiveSelected),
+                static_cast<unsigned long>(counts.officialPreserved),
                 static_cast<unsigned long>(counts.passed),
                 static_cast<unsigned long>(counts.failed),
                 static_cast<unsigned long>(counts.officialFailed));

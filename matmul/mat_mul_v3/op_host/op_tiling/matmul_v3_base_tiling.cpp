@@ -2995,12 +2995,21 @@ bool MatmulV3BaseTiling::DoDeterministicMultiCoreSplitKTiling()
     OptCoreNumsDeterministicMultiCoreSplitK();
     const char *adaptive = std::getenv("MATMUL_DETERMINISTIC_ADAPTIVE");
     if (adaptive != nullptr && adaptive[0] == '1' && adaptive[1] == '\0') {
-        const uint64_t originalSingleCoreM = runInfo_.singleCoreM;
-        const uint64_t originalSingleCoreN = runInfo_.singleCoreN;
-        runInfo_.singleCoreM = std::min(runInfo_.singleCoreM, args_.mValue);
-        runInfo_.singleCoreN = std::min(runInfo_.singleCoreN, args_.nValue);
-        const bool changed = runInfo_.singleCoreM != originalSingleCoreM ||
-            runInfo_.singleCoreN != originalSingleCoreN;
+        const uint64_t candidateSingleCoreM = ops::CeilAlign(args_.mValue, BASIC_ALIGN_16);
+        const bool mkOrder = runInfo_.singleCoreN == args_.nValue;
+        const bool baseOutput = tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE;
+        const uint64_t oldPartialBytes = runInfo_.usedCoreNum * runInfo_.singleCoreM *
+            runInfo_.singleCoreN * DB_SIZE * DATA_SIZE_FP32;
+        const uint64_t newPartialBytes = runInfo_.usedCoreNum * candidateSingleCoreM *
+            runInfo_.singleCoreN * DB_SIZE * DATA_SIZE_FP32;
+        const uint64_t fixedWorkspaceBytes = RPC_WORKSIZE * MB_SIZE;
+        const bool removesHalfWorkspace = oldPartialBytes > newPartialBytes &&
+            oldPartialBytes - newPartialBytes >= (fixedWorkspaceBytes + oldPartialBytes + 1) / NUMBER_TWO;
+        const bool changed = mkOrder && baseOutput && candidateSingleCoreM < runInfo_.singleCoreM &&
+            removesHalfWorkspace;
+        if (changed) {
+            runInfo_.singleCoreM = candidateSingleCoreM;
+        }
         (void)::setenv("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED", changed ? "1" : "0", 1);
     }
     return true;
