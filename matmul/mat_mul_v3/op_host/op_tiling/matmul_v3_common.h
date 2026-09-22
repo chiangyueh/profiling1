@@ -134,6 +134,9 @@ enum class TilingEnableSpecialOpti : int32_t // 互斥flag, 对应不同的优�
     ENABLE_K_SHIFT = 1,  // K轴错峰
     // NEW BEGIN
     VECTOR_DOT = 2,
+    CUBE_VECTOR_EDGE = 3,
+    RECTANGULAR_CUBE = 4,
+    REUSE_DIRECTED = 5,
     // NEW END
     MAX = 10 //模板类别不能超过10个
 };

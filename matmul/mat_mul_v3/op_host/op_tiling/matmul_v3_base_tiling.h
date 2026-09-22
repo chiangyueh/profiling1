@@ -104,6 +104,10 @@ protected:
     void DoSelectTiling();
     // NEW BEGIN
     bool DoVectorDotTiling();
+    bool DoExperimentalBaseTiling();
+    bool DoCubeVectorEdgeTiling();
+    bool DoRectangularCubeTiling();
+    bool DoReuseDirectedTiling();
     bool DoExperimentalSplitKTiling();
     bool DoAdaptiveDeterministicSplitKTiling();
     bool DoAtomicSplitKTiling();

@@ -1372,6 +1372,7 @@ void MatmulV3BaseTiling::DoSelectTiling()
             DO_CACL_TILING_ENABLE(DoL2CacheTiling310P())
             // NEW BEGIN
             DO_CACL_TILING_ENABLE(DoVectorDotTiling())
+            DO_CACL_TILING_ENABLE(DoExperimentalBaseTiling())
             // NEW END
             break;
         case TilingCalcSelect::BASE:
@@ -1421,6 +1422,202 @@ bool MatmulV3BaseTiling::DoVectorDotTiling()
     runInfo_.usedCoreNum = std::min(outputDots, compileInfo_.aivNum);
     runInfo_.needUpdate = true;
     return true;
+}
+
+bool MatmulV3BaseTiling::DoCubeVectorEdgeTiling()
+{
+    if (!compileInfo_.supportL0c2out || compileInfo_.aicNum == 0 || compileInfo_.aivNum == 0 || args_.hasBias ||
+        tilingEnable_.tilingEnableFullLoad != TilingEnableFullLoad::BASE ||
+        tilingEnable_.tilingEnableSplitCore != TilingEnableSplitCore::BASE ||
+        tilingEnable_.tilingEnableFixOpti != TilingEnableFixOpti::BASE ||
+        args_.aType != ge::DT_FLOAT || args_.bType != ge::DT_FLOAT || args_.cType != ge::DT_FLOAT ||
+        args_.isATrans || !args_.isBTrans || args_.aFormat != ge::FORMAT_ND ||
+        args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
+        args_.nd2nzA || args_.nd2nzB || args_.isNzA || args_.isNzB ||
+        args_.kValue < 8192 || args_.kValue % (BLOCK_BYTE_SIZE / DATA_SIZE_FP32) != 0 ||
+        runInfo_.baseM == 0 || runInfo_.baseN == 0) {
+        return false;
+    }
+    const uint64_t interiorM = ops::FloorAlign(args_.mValue, runInfo_.baseM);
+    const uint64_t interiorN = ops::FloorAlign(args_.nValue, runInfo_.baseN);
+    if (interiorM == 0 || interiorN == 0 || (interiorM == args_.mValue && interiorN == args_.nValue)) {
+        return false;
+    }
+    const uint64_t mTiles = MathUtil::CeilDivision(args_.mValue, runInfo_.baseM);
+    const uint64_t nTiles = MathUtil::CeilDivision(args_.nValue, runInfo_.baseN);
+    const uint64_t paddedEdge = mTiles * runInfo_.baseM * nTiles * runInfo_.baseN - interiorM * interiorN;
+    const uint64_t actualEdge = args_.mValue * args_.nValue - interiorM * interiorN;
+    if (actualEdge == 0 || paddedEdge * NUMBER_TWO <= actualEdge * 5UL) {
+        return false;
+    }
+    runInfo_.singleCoreM = runInfo_.baseM;
+    runInfo_.singleCoreN = runInfo_.baseN;
+    runInfo_.singleCoreK = args_.kValue;
+    runInfo_.usedCoreNum = compileInfo_.aicNum;
+    runInfo_.needUpdate = true;
+    tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
+    tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::BASE;
+    tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
+    tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::CUBE_VECTOR_EDGE;
+    return true;
+}
+
+bool MatmulV3BaseTiling::DoRectangularCubeTiling()
+{
+    const bool dtypeSupported = args_.aType == args_.bType && args_.bType == args_.cType &&
+        (args_.aType == ge::DT_FLOAT16 || args_.aType == ge::DT_BF16 || args_.aType == ge::DT_FLOAT);
+    if (!compileInfo_.supportL0c2out || compileInfo_.aicNum == 0 || args_.hasBias ||
+        !dtypeSupported ||
+        tilingEnable_.tilingEnableFullLoad != TilingEnableFullLoad::BASE ||
+        tilingEnable_.tilingEnableSplitCore != TilingEnableSplitCore::BASE ||
+        tilingEnable_.tilingEnableFixOpti != TilingEnableFixOpti::BASE ||
+        args_.aFormat != ge::FORMAT_ND || args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
+        args_.nd2nzA || args_.nd2nzB || args_.isNzA || args_.isNzB ||
+        args_.mValue == 0 || args_.nValue == 0 || runInfo_.baseM == 0 || runInfo_.baseN == 0 ||
+        (args_.mValue < args_.nValue * 4UL && args_.nValue < args_.mValue * 4UL)) {
+        return false;
+    }
+    const uint64_t oldBaseM = runInfo_.baseM;
+    const uint64_t oldBaseN = runInfo_.baseN;
+    const uint64_t capacity = oldBaseM * oldBaseN;
+    const bool mDominant = args_.mValue >= args_.nValue;
+    const uint64_t shortValue = mDominant ? args_.nValue : args_.mValue;
+    const uint64_t shortBase = ops::CeilAlign(std::min(shortValue, BASIC_BLOCK_SIZE_128), BASIC_ALIGN_16);
+    const uint64_t longLimit = mDominant ? BASIC_BLOCK_SIZE_256 : 512UL;
+    const uint64_t longBase = ops::FloorAlign(std::min(longLimit, capacity / shortBase), BASIC_ALIGN_16);
+    if (shortBase == 0 || longBase == 0) {
+        return false;
+    }
+    const uint64_t newBaseM = mDominant ? longBase : shortBase;
+    const uint64_t newBaseN = mDominant ? shortBase : longBase;
+    if (newBaseM == oldBaseM && newBaseN == oldBaseN) {
+        return false;
+    }
+    const uint64_t oldTiles = MathUtil::CeilDivision(args_.mValue, oldBaseM) *
+                              MathUtil::CeilDivision(args_.nValue, oldBaseN);
+    const uint64_t newTiles = MathUtil::CeilDivision(args_.mValue, newBaseM) *
+                              MathUtil::CeilDivision(args_.nValue, newBaseN);
+    const uint64_t oldCritical = MathUtil::CeilDivision(oldTiles, compileInfo_.aicNum) * oldBaseM * oldBaseN;
+    const uint64_t newCritical = MathUtil::CeilDivision(newTiles, compileInfo_.aicNum) * newBaseM * newBaseN;
+    if (newCritical * 100UL > oldCritical * 95UL) {
+        return false;
+    }
+    const uint64_t kAlign = BLOCK_BYTE_SIZE / std::max(aDtypeSize_, bDtypeSize_);
+    const uint64_t baseKa = compileInfo_.l0ASize / DB_SIZE / aDtypeSize_ / newBaseM;
+    const uint64_t baseKb = compileInfo_.l0BSize / DB_SIZE / bDtypeSize_ / newBaseN;
+    const uint64_t newBaseK = ops::FloorAlign(std::min({runInfo_.baseK, baseKa, baseKb}), kAlign);
+    if (newBaseK == 0) {
+        return false;
+    }
+    runInfo_.baseM = newBaseM;
+    runInfo_.baseN = newBaseN;
+    runInfo_.baseK = newBaseK;
+    CalL1Tiling();
+    const uint64_t mCnt = MathUtil::CeilDivision(args_.mValue, runInfo_.baseM);
+    const uint64_t nCnt = MathUtil::CeilDivision(args_.nValue, runInfo_.baseN);
+    const uint64_t mBlock = mDominant ? std::min(mCnt, compileInfo_.aicNum) :
+        std::min(mCnt, std::max(1UL, compileInfo_.aicNum / std::min(nCnt, compileInfo_.aicNum)));
+    const uint64_t nBlock = mDominant ?
+        std::min(nCnt, std::max(1UL, compileInfo_.aicNum / mBlock)) : std::min(nCnt, compileInfo_.aicNum);
+    runInfo_.usedCoreNum = std::min(compileInfo_.aicNum, mCnt * nCnt);
+    runInfo_.singleCoreK = args_.kValue;
+    runInfo_.l2Info.mTileBlock = mBlock;
+    runInfo_.l2Info.nTileBlock = nBlock;
+    runInfo_.l2Info.mTile = MathUtil::CeilDivision(mCnt, mBlock);
+    runInfo_.l2Info.nTile = MathUtil::CeilDivision(nCnt, nBlock);
+    runInfo_.l2Info.calOrder = mDominant ? 2UL : 1UL;
+    runInfo_.needUpdate = true;
+    tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
+    tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::BASE;
+    tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
+    tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::RECTANGULAR_CUBE;
+    return true;
+}
+
+bool MatmulV3BaseTiling::DoReuseDirectedTiling()
+{
+    const bool dtypeSupported = args_.aType == args_.bType && args_.bType == args_.cType &&
+        (args_.aType == ge::DT_FLOAT16 || args_.aType == ge::DT_BF16 || args_.aType == ge::DT_FLOAT);
+    if (!compileInfo_.supportL0c2out || compileInfo_.aicNum == 0 || args_.hasBias ||
+        !dtypeSupported ||
+        tilingEnable_.tilingEnableFullLoad != TilingEnableFullLoad::BASE ||
+        tilingEnable_.tilingEnableSplitCore != TilingEnableSplitCore::BASE ||
+        tilingEnable_.tilingEnableFixOpti != TilingEnableFixOpti::BASE ||
+        args_.aFormat != ge::FORMAT_ND || args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
+        args_.nd2nzA || args_.nd2nzB || args_.isNzA || args_.isNzB ||
+        runInfo_.baseM == 0 || runInfo_.baseN == 0 || compileInfo_.l2Size == 0) {
+        return false;
+    }
+    const uint64_t mCnt = MathUtil::CeilDivision(args_.mValue, runInfo_.baseM);
+    const uint64_t nCnt = MathUtil::CeilDivision(args_.nValue, runInfo_.baseN);
+    if (mCnt < NUMBER_TWO || nCnt < NUMBER_TWO) {
+        return false;
+    }
+    const uint64_t aBytes = args_.mValue * args_.kValue * aDtypeSize_;
+    const uint64_t bBytes = args_.nValue * args_.kValue * bDtypeSize_;
+    const uint64_t cBytes = args_.mValue * args_.nValue * cDtypeSize_;
+    const uint64_t budget = compileInfo_.l2Size * 7UL / 10UL;
+    const uint64_t aSlice = runInfo_.baseM * args_.kValue * aDtypeSize_;
+    const uint64_t bSlice = runInfo_.baseN * args_.kValue * bDtypeSize_;
+    const uint64_t cTile = runInfo_.baseM * runInfo_.baseN * cDtypeSize_;
+    const bool preserveA = aBytes * nCnt >= bBytes * mCnt;
+    uint64_t mBlock = 1;
+    uint64_t nBlock = 1;
+    if (preserveA) {
+        if (budget <= aSlice + bSlice + cTile) return false;
+        nBlock = std::min(nCnt, std::max(1UL, (budget - aSlice) / (bSlice + cTile)));
+        const uint64_t fixed = nBlock * bSlice;
+        if (budget <= fixed) return false;
+        mBlock = std::min(mCnt, std::max(1UL, (budget - fixed) / (aSlice + nBlock * cTile)));
+    } else {
+        if (budget <= aSlice + bSlice + cTile) return false;
+        mBlock = std::min(mCnt, std::max(1UL, (budget - bSlice) / (aSlice + cTile)));
+        const uint64_t fixed = mBlock * aSlice;
+        if (budget <= fixed) return false;
+        nBlock = std::min(nCnt, std::max(1UL, (budget - fixed) / (bSlice + mBlock * cTile)));
+    }
+    const uint64_t targetParallel = std::min(compileInfo_.aicNum, mCnt * nCnt);
+    if (mBlock * nBlock < targetParallel) {
+        return false;
+    }
+    const uint64_t newMTile = MathUtil::CeilDivision(mCnt, mBlock);
+    const uint64_t newNTile = MathUtil::CeilDivision(nCnt, nBlock);
+    const uint64_t oldTraffic = aBytes * runInfo_.l2Info.nTile + bBytes * runInfo_.l2Info.mTile + cBytes;
+    const uint64_t newTraffic = aBytes * newNTile + bBytes * newMTile + cBytes;
+    if (newTraffic * 100UL > oldTraffic * 90UL) {
+        return false;
+    }
+    runInfo_.l2Info.mTileBlock = mBlock;
+    runInfo_.l2Info.nTileBlock = nBlock;
+    runInfo_.l2Info.mTile = newMTile;
+    runInfo_.l2Info.nTile = newNTile;
+    runInfo_.l2Info.calOrder = preserveA ? 1UL : 2UL;
+    runInfo_.usedCoreNum = targetParallel;
+    runInfo_.needUpdate = true;
+    tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
+    tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::BASE;
+    tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
+    tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::REUSE_DIRECTED;
+    return true;
+}
+
+bool MatmulV3BaseTiling::DoExperimentalBaseTiling()
+{
+    (void)::unsetenv("MATMUL_BASE_EXPERIMENT_SELECTED");
+    const char *mode = std::getenv("MATMUL_BASE_MODE");
+    if (mode == nullptr || mode[0] == '\0') {
+        return false;
+    }
+    bool selected = false;
+    if (std::strcmp(mode, "CUBE_VECTOR_EDGE") == 0) {
+        selected = DoCubeVectorEdgeTiling();
+    } else if (std::strcmp(mode, "RECTANGULAR_CUBE") == 0) {
+        selected = DoRectangularCubeTiling();
+    } else if (std::strcmp(mode, "REUSE_DIRECTED") == 0) {
+        selected = DoReuseDirectedTiling();
+    }
+    if (selected) (void)::setenv("MATMUL_BASE_EXPERIMENT_SELECTED", "1", 1);
+    return selected;
 }
 
 bool MatmulV3BaseTiling::DoAtomicSplitKTiling()
@@ -2924,6 +3121,7 @@ void MatmulV3BaseTiling::ExportExperimentalTiling()
 {
     const bool vectorDot = tilingEnable_.tilingEnableSpecialOpti == TilingEnableSpecialOpti::VECTOR_DOT;
     const char *splitMode = std::getenv("MATMUL_SPLITK_MODE");
+    const char *baseMode = std::getenv("MATMUL_BASE_MODE");
     char cores[16] = {};
     char key[32] = {};
     (void)snprintf(cores, sizeof(cores), "%d", tilingData_.matmulTiling.usedCoreNum);
@@ -2931,8 +3129,12 @@ void MatmulV3BaseTiling::ExportExperimentalTiling()
     (void)::setenv("MATMUL_OBSERVED_CORES", cores, 1);
     (void)::setenv("MATMUL_OBSERVED_KEY", key, 1);
     const char *selected = std::getenv("MATMUL_EXPERIMENT_SELECTED");
-    if (!vectorDot && (splitMode == nullptr || splitMode[0] == '\0' ||
-        selected == nullptr || selected[0] != '1' || selected[1] != '\0')) {
+    const char *baseSelected = std::getenv("MATMUL_BASE_EXPERIMENT_SELECTED");
+    const bool splitSelected = splitMode != nullptr && splitMode[0] != '\0' &&
+        selected != nullptr && selected[0] == '1' && selected[1] == '\0';
+    const bool selectedBase = baseMode != nullptr && baseMode[0] != '\0' &&
+        baseSelected != nullptr && baseSelected[0] == '1' && baseSelected[1] == '\0';
+    if (!vectorDot && !splitSelected && !selectedBase) {
         return;
     }
     const auto *bytes = reinterpret_cast<const uint8_t *>(&tilingData_);
@@ -2945,7 +3147,7 @@ void MatmulV3BaseTiling::ExportExperimentalTiling()
     (void)::setenv("MATMUL_EXPERIMENT_TILING", text, 1);
     (void)::setenv("MATMUL_EXPERIMENT_CORES", cores, 1);
     (void)::setenv("MATMUL_EXPERIMENT_KEY", key, 1);
-    (void)::setenv("MATMUL_EXPERIMENT_BRANCH", vectorDot ? "VECTOR_DOT" : splitMode, 1);
+    (void)::setenv("MATMUL_EXPERIMENT_BRANCH", vectorDot ? "VECTOR_DOT" : (selectedBase ? baseMode : splitMode), 1);
     if (vectorDot) {
         (void)::setenv("MATMUL_VECTOR_TILING", text, 1);
         (void)::setenv("MATMUL_VECTOR_CORES", cores, 1);
