@@ -14,6 +14,9 @@
  */
 #include "matmul_v3_tiling.h"
 
+// NEW BEGIN
+#include <cstdlib>
+// NEW END
 #include <type_traits>
 
 #include "op_cache_tiling.h"
@@ -84,7 +87,11 @@ static ge::graphStatus TilingPrepareForMatmulV3(gert::TilingParseContext *contex
   ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_C, compileInfoPtr->l0CSize);
   ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L2, compileInfoPtr->l2Size);
 
-  if(!TilingPrepareForOpCache(context)) {
+  // NEW BEGIN
+  const char *disableRepo = std::getenv("MATMUL_DISABLE_REPO");
+  const bool repoDisabled = disableRepo != nullptr && disableRepo[0] == '1' && disableRepo[1] == '\0';
+  if(!repoDisabled && !TilingPrepareForOpCache(context)) {
+  // NEW END
       OP_LOGE(context->GetNodeName(), "TilingPrepareForOpCache fail");
       return ge::GRAPH_FAILED;
   }

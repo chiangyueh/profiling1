@@ -65,7 +65,6 @@ done
 if [[ ! -f "${host_library}" || -z "${opapi_nn}" || -z "${opapi_math}" || -z "${legacy_common}" ]]; then
     exit 1
 fi
-ln -sfn -- "${legacy_common}" "${build_dir}/libophost_comm_legacy.so"
 
 runtime_library="-lacl_rt"
 if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/lib64/libascendcl.so" ]]; then
@@ -186,5 +185,6 @@ done
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_VECTOR_BINARY="${vector_binary}"
 export MATMUL_DISABLE_REPO=1
+export MATMUL_LEGACY_COMMON_LIBRARY="${legacy_common}"
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 exec "${runner}" "${shapes[@]}"
