@@ -136,8 +136,20 @@ std::vector<uint8_t> DecodeHex(const char *text)
 }
 
 int RunShape(int64_t m, int64_t n, int64_t k, aclrtStream stream,
-             aclrtFuncHandle vectorFunction)
+             aclrtFuncHandle vectorFunction, std::string &failureStage, std::string &failureDetail)
 {
+    failureStage.clear();
+    failureDetail.clear();
+    auto captureFailure = [&](const char *stage, int code) {
+        failureStage = stage;
+        const char *detail = aclGetRecentErrMsg();
+        if (detail != nullptr) {
+            failureDetail = detail;
+            std::replace(failureDetail.begin(), failureDetail.end(), '\n', ' ');
+            std::replace(failureDetail.begin(), failureDetail.end(), '\r', ' ');
+        }
+        return code;
+    };
     std::vector<float> a(static_cast<size_t>(m * k), 1.0f);
     std::vector<float> b(static_cast<size_t>(n * k));
     std::vector<float> c(static_cast<size_t>(m * n), 0.0f);
@@ -149,42 +161,59 @@ int RunShape(int64_t m, int64_t n, int64_t k, aclrtStream stream,
     Tensor aTensor;
     Tensor bTensor;
     Tensor cTensor;
+    const char *activeStage = "create_a";
     int rc = CreateTensor(a, {m, k}, {m, k}, {k, 1}, aTensor);
-    if (rc == ACL_SUCCESS) rc = CreateTensor(b, {k, n}, {n, k}, {1, k}, bTensor);
-    if (rc == ACL_SUCCESS) rc = CreateTensor(c, {m, n}, {m, n}, {n, 1}, cTensor);
+    if (rc == ACL_SUCCESS) {
+        activeStage = "create_b";
+        rc = CreateTensor(b, {k, n}, {n, k}, {1, k}, bTensor);
+    }
+    if (rc == ACL_SUCCESS) {
+        activeStage = "create_c";
+        rc = CreateTensor(c, {m, n}, {m, n}, {n, 1}, cTensor);
+    }
     if (rc != ACL_SUCCESS) {
+        const int failureCode = captureFailure(activeStage, rc);
         ReleaseTensor(cTensor);
         ReleaseTensor(bTensor);
         ReleaseTensor(aTensor);
-        return rc;
+        return failureCode;
     }
 
     (void)::setenv("MATMUL_VECTOR_ENABLE", "0", 1);
     uint64_t originalWorkspaceSize = 0;
     aclOpExecutor *originalExecutor = nullptr;
+    activeStage = "original_get_workspace";
     rc = aclnnMatmulGetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, 1,
                                      &originalWorkspaceSize, &originalExecutor);
     void *originalWorkspace = nullptr;
     if (rc == ACL_SUCCESS && originalWorkspaceSize != 0) {
+        activeStage = "original_allocate_workspace";
         rc = aclrtMalloc(&originalWorkspace, originalWorkspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
     }
     if (rc == ACL_SUCCESS) {
+        activeStage = "original_make_repeatable";
         rc = aclSetAclOpExecutorRepeatable(originalExecutor);
     }
     float originalLatency = 0.0f;
     if (rc == ACL_SUCCESS) {
+        activeStage = "original_measure";
         rc = Measure([&]() {
             return aclnnMatmul(originalWorkspace, originalWorkspaceSize, originalExecutor, stream);
         }, stream, originalLatency);
     }
     const bool originalCorrect = rc == ACL_SUCCESS && Validate(cTensor.device, m, n, k);
+    int originalFailureCode = ACL_SUCCESS;
+    if (!originalCorrect) {
+        if (rc == ACL_SUCCESS) activeStage = "original_validate";
+        originalFailureCode = captureFailure(activeStage, rc == ACL_SUCCESS ? 3 : rc);
+    }
     if (originalExecutor != nullptr) (void)aclDestroyAclOpExecutor(originalExecutor);
     if (originalWorkspace != nullptr) (void)aclrtFree(originalWorkspace);
     if (!originalCorrect) {
         ReleaseTensor(cTensor);
         ReleaseTensor(bTensor);
         ReleaseTensor(aTensor);
-        return rc == ACL_SUCCESS ? 3 : rc;
+        return originalFailureCode;
     }
 
     (void)::unsetenv("MATMUL_VECTOR_TILING");
@@ -192,12 +221,21 @@ int RunShape(int64_t m, int64_t n, int64_t k, aclrtStream stream,
     (void)::setenv("MATMUL_VECTOR_ENABLE", "1", 1);
     uint64_t ignoredWorkspaceSize = 0;
     aclOpExecutor *ignoredExecutor = nullptr;
+    activeStage = "modified_get_workspace";
     rc = aclnnMatmulGetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, 1,
                                      &ignoredWorkspaceSize, &ignoredExecutor);
+    int modifiedWorkspaceFailureCode = ACL_SUCCESS;
+    if (rc != ACL_SUCCESS) modifiedWorkspaceFailureCode = captureFailure(activeStage, rc);
     if (ignoredExecutor != nullptr) (void)aclDestroyAclOpExecutor(ignoredExecutor);
     const char *tilingText = std::getenv("MATMUL_VECTOR_TILING");
     const char *coreText = std::getenv("MATMUL_VECTOR_CORES");
-    if (rc != ACL_SUCCESS || tilingText == nullptr || coreText == nullptr) {
+    if (rc != ACL_SUCCESS) {
+        ReleaseTensor(cTensor);
+        ReleaseTensor(bTensor);
+        ReleaseTensor(aTensor);
+        return modifiedWorkspaceFailureCode;
+    }
+    if (tilingText == nullptr || coreText == nullptr) {
         ReleaseTensor(cTensor);
         ReleaseTensor(bTensor);
         ReleaseTensor(aTensor);
@@ -209,29 +247,49 @@ int RunShape(int64_t m, int64_t n, int64_t k, aclrtStream stream,
     void *tilingDevice = nullptr;
     aclrtArgsHandle arguments = nullptr;
     if (tiling.empty() || cores == 0) {
+        activeStage = "modified_packet";
         rc = 4;
     }
-    if (rc == ACL_SUCCESS) rc = aclrtMalloc(&tilingDevice, tiling.size(), ACL_MEM_MALLOC_HUGE_FIRST);
     if (rc == ACL_SUCCESS) {
+        activeStage = "modified_allocate_tiling";
+        rc = aclrtMalloc(&tilingDevice, tiling.size(), ACL_MEM_MALLOC_HUGE_FIRST);
+    }
+    if (rc == ACL_SUCCESS) {
+        activeStage = "modified_copy_tiling";
         rc = aclrtMemcpy(tilingDevice, tiling.size(), tiling.data(), tiling.size(), ACL_MEMCPY_HOST_TO_DEVICE);
     }
-    if (rc == ACL_SUCCESS) rc = aclrtKernelArgsInit(vectorFunction, &arguments);
+    if (rc == ACL_SUCCESS) {
+        activeStage = "modified_args_init";
+        rc = aclrtKernelArgsInit(vectorFunction, &arguments);
+    }
     void *bias = nullptr;
     void *offset = nullptr;
     void *workspace = nullptr;
     void *values[] = {aTensor.device, bTensor.device, bias, offset, cTensor.device, workspace, tilingDevice};
     for (void *&value : values) {
         aclrtParamHandle parameter = nullptr;
-        if (rc == ACL_SUCCESS) rc = aclrtKernelArgsAppend(arguments, &value, sizeof(value), &parameter);
+        if (rc == ACL_SUCCESS) {
+            activeStage = "modified_args_append";
+            rc = aclrtKernelArgsAppend(arguments, &value, sizeof(value), &parameter);
+        }
     }
-    if (rc == ACL_SUCCESS) rc = aclrtKernelArgsFinalize(arguments);
+    if (rc == ACL_SUCCESS) {
+        activeStage = "modified_args_finalize";
+        rc = aclrtKernelArgsFinalize(arguments);
+    }
     float modifiedLatency = 0.0f;
     if (rc == ACL_SUCCESS) {
+        activeStage = "modified_measure";
         rc = Measure([&]() {
             return aclrtLaunchKernelWithConfig(vectorFunction, cores, stream, nullptr, arguments, nullptr);
         }, stream, modifiedLatency);
     }
     const bool modifiedCorrect = rc == ACL_SUCCESS && Validate(cTensor.device, m, n, k);
+    int modifiedFailureCode = ACL_SUCCESS;
+    if (!modifiedCorrect) {
+        if (rc == ACL_SUCCESS) activeStage = "modified_validate";
+        modifiedFailureCode = captureFailure(activeStage, rc == ACL_SUCCESS ? 3 : rc);
+    }
     if (tilingDevice != nullptr) (void)aclrtFree(tilingDevice);
     if (modifiedCorrect) {
         std::printf(
@@ -245,7 +303,8 @@ int RunShape(int64_t m, int64_t n, int64_t k, aclrtStream stream,
     ReleaseTensor(cTensor);
     ReleaseTensor(bTensor);
     ReleaseTensor(aTensor);
-    return modifiedCorrect ? ACL_SUCCESS : (rc == ACL_SUCCESS ? 3 : rc);
+    if (modifiedCorrect) return ACL_SUCCESS;
+    return modifiedFailureCode;
 }
 
 int main(int argc, char **argv)
@@ -276,10 +335,13 @@ int main(int argc, char **argv)
         const int64_t m = std::strtoll(argv[index], nullptr, 10);
         const int64_t n = std::strtoll(argv[index + 1], nullptr, 10);
         const int64_t k = std::strtoll(argv[index + 2], nullptr, 10);
-        const int shapeRc = RunShape(m, n, k, stream, function);
+        std::string failureStage;
+        std::string failureDetail;
+        const int shapeRc = RunShape(m, n, k, stream, function, failureStage, failureDetail);
         if (shapeRc != ACL_SUCCESS) {
-            std::fprintf(stderr, "skip M%ld_N%ld_K%ld_NT rc=%d\n",
-                         static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), shapeRc);
+            std::fprintf(stderr, "skip M%ld_N%ld_K%ld_NT stage=%s rc=%d detail=%s\n",
+                         static_cast<long>(m), static_cast<long>(n), static_cast<long>(k),
+                         failureStage.c_str(), shapeRc, failureDetail.c_str());
         }
     }
     (void)aclrtBinaryUnLoad(binary);
