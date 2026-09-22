@@ -71,6 +71,9 @@ static ge::graphStatus TilingPrepareForMatmulV3(gert::TilingParseContext *contex
   compileInfoPtr->supportL0c2out = !val.empty();
   compileInfoPtr->supportL12BtBf16 = (dataMoveL12Bt.find("bf16") != std::string::npos);
   compileInfoPtr->aicNum = ascendcPlatform.GetCoreNumAic();
+  // NEW BEGIN
+  compileInfoPtr->aivNum = ascendcPlatform.GetCoreNumAiv();
+  // NEW END
   compileInfoPtr->socVersion = ascendcPlatform.GetSocVersion();
   compileInfoPtr->btSize = compileInfoPtr->supportL0c2out ? 1024UL : 0UL;                       // 1024 is btSize
   compileInfoPtr->btSize = compileInfoPtr->supportL12BtBf16 ? 4096UL : compileInfoPtr->btSize;  // 4096 is btSize
