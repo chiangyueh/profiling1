@@ -484,6 +484,9 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
 int main(int argc, char **argv)
 {
     if (argc < 6 || (argc - 1) % 5 != 0) return 2;
+    if (!IsRectangularCampaign()) return 4;
+    std::printf("{\"campaign_start\":\"RECTANGULAR_CUBE\",\"runner\":\"rectangular_cube_v1\"}\n");
+    std::fflush(stdout);
     const char *hostLibrary = std::getenv("MATMUL_HOST_LIBRARY");
     if (hostLibrary == nullptr) return 4;
     int rc = aclInit(nullptr);

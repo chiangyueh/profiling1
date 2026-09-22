@@ -74,7 +74,7 @@ runtime_library="-lacl_rt"
 if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/lib64/libascendcl.so" ]]; then
     runtime_library="-lascendcl"
 fi
-runner="${build_dir}/test_splitk_routes"
+runner="${build_dir}/test_rectangular_cube_v1"
 if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
     -std=gnu++17 -D_GLIBCXX_USE_CXX11_ABI=0 \
     -I "${PWD}" \
