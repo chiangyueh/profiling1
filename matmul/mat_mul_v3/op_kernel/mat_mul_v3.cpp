@@ -33,6 +33,9 @@
 
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220 || (defined(__NPU_ARCH__) && __NPU_ARCH__ == 3003)
 #include "mat_mul_multi_core_splitk_kernel.h"
+// NEW BEGIN
+#include "mat_mul_tail_stream_k_kernel.h"
+// NEW END
 #endif
 
 using namespace AscendC;
@@ -276,6 +279,14 @@ __global__ __aicore__ void mat_mul_v3(
         MMV3_IMPL(
             MatMulMultiCoreSplitK, format_x1, FIXPIPE_OPT_SELECT::BASE
         );
+    // NEW BEGIN
+    } else if constexpr (
+        LOADMODE == MAT_MUL_V3_BASE_FULLLOAD && SPLITCOREMODE == MAT_MUL_V3_TAIL_STREAM_K &&
+        FIXOPTI == MAT_MUL_V3_BASE_FIXOPTI && MIXND2NZ == MAT_MUL_V3_MIXND2NZ_FALSE) {
+        MMV3_IMPL(
+            MatMulTailStreamK, format_x1, FIXPIPE_OPT_SELECT::BASE
+        );
+    // NEW END
     } else if constexpr (
         LOADMODE == MAT_MUL_V3_BASE_FULLLOAD && SPLITCOREMODE == MAT_MUL_V3_BASE_SPLIT_K &&
         FIXOPTI == MAT_MUL_V3_BASE_FIXOPTI && MIXND2NZ == MAT_MUL_V3_MIXND2NZ_FALSE) {

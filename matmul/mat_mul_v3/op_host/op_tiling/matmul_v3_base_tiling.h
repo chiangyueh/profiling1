@@ -104,7 +104,10 @@ protected:
     void DoSelectTiling();
     // NEW BEGIN
     bool DoVectorDotTiling();
-    void ExportVectorDotTiling();
+    bool DoExperimentalSplitKTiling();
+    bool DoAtomicSplitKTiling();
+    bool DoTailStreamKTiling();
+    void ExportExperimentalTiling();
     // NEW END
     bool IsSupportSingleCoreSplitSmallK(uint64_t xDim, uint64_t yDim) const;
     bool IsSupportSingleCoreSplitK() const;

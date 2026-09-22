@@ -71,8 +71,8 @@ runtime_library="-lacl_rt"
 if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/lib64/libascendcl.so" ]]; then
     runtime_library="-lascendcl"
 fi
-runner="${build_dir}/test_vector_dot"
-if ! g++ matmul/mat_mul_v3/examples/test_vector_dot.cpp \
+runner="${build_dir}/test_splitk_routes"
+if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
     -std=gnu++17 -D_GLIBCXX_USE_CXX11_ABI=0 \
     -I "${PWD}" \
     -I "${ASCEND_HOME_PATH}/include" \
@@ -90,22 +90,12 @@ if ! g++ matmul/mat_mul_v3/examples/test_vector_dot.cpp \
     exit 1
 fi
 
-build_vector_kernel() {
-    local kernel_name="MatMulV3_VectorDot"
-    local kernel_dir="${build_dir}/vector_dot_bin"
-    local object="${kernel_dir}/${kernel_name}.o"
-    local metadata="${kernel_dir}/${kernel_name}.json"
-    if [[ -f "${object}" && -f "${metadata}" ]] &&
-       ! find matmul/mat_mul_v3/op_kernel -type f -newer "${object}" -print -quit | grep -q .; then
-        printf '%s\n' "${object}"
-        return 0
-    fi
-
+prepare_kernel_build() {
     local ascendc_dir="${build_dir}/tbe/ascendc"
     local dynamic_dir="${build_dir}/tbe/dynamic"
-    local param_dir="${build_dir}/vector_dot_params"
-    rm -rf -- "${kernel_dir}" "${param_dir}" "${ascendc_dir}/mat_mul_v3"
-    mkdir -p -- "${kernel_dir}" "${ascendc_dir}/mat_mul_v3" \
+    local param_dir="${build_dir}/splitk_params"
+    rm -rf -- "${param_dir}" "${ascendc_dir}/mat_mul_v3"
+    mkdir -p -- "${ascendc_dir}/mat_mul_v3" \
         "${ascendc_dir}/common/act" "${ascendc_dir}/common/matmul_act" \
         "${dynamic_dir}" "${param_dir}"
     cp -a matmul/mat_mul_v3/op_kernel/. "${ascendc_dir}/mat_mul_v3/"
@@ -119,24 +109,37 @@ build_vector_kernel() {
     python3 scripts/util/ascendc_bin_param_build.py "${ops_info}" "${param_dir}" ascend910b \
         --opc-config-file "${opc_options}" --ops MatMulV3 >>"${build_log}" 2>&1
 
-    local fp32_param
-    fp32_param="$(python3 - "${param_dir}" <<'PY'
+    python3 - "${param_dir}" "${build_dir}/splitk_fp32_param.json" <<'PY'
 import glob
 import json
 import os
+import shutil
 import sys
 for path in sorted(glob.glob(os.path.join(sys.argv[1], "*_param.json"))):
     with open(path, encoding="utf-8") as stream:
         node = json.load(stream)["op_list"][0]
     values = [item for item in node["inputs"] + node["outputs"] if item.get("paramType") == "required"]
     if len(values) == 3 and all(item.get("dtype") == "float32" and item.get("format") == "ND" for item in values):
-        print(path)
-        break
+        shutil.copyfile(path, sys.argv[2])
+        raise SystemExit(0)
+raise SystemExit(1)
 PY
-)"
-    if [[ -z "${fp32_param}" ]]; then
-        return 1
+}
+
+build_kernel() {
+    local kernel_name="$1"
+    local tiling_key="$2"
+    local kernel_dir="${build_dir}/splitk_bin/${kernel_name}"
+    local object="${kernel_dir}/${kernel_name}.o"
+    local metadata="${kernel_dir}/${kernel_name}.json"
+    if [[ -f "${object}" && -f "${metadata}" ]] &&
+       ! find matmul/mat_mul_v3/op_kernel -type f -newer "${object}" -print -quit | grep -q .; then
+        printf '%s\n' "${object}"
+        return 0
     fi
+    mkdir -p -- "${kernel_dir}"
+    local fp32_param="${kernel_dir}/param.json"
+    cp -- "${build_dir}/splitk_fp32_param.json" "${fp32_param}"
     python3 - "${fp32_param}" "${kernel_name}" <<'PY'
 import json
 import sys
@@ -147,44 +150,44 @@ data["op_list"][0]["bin_filename"] = name
 with open(path, "w", encoding="utf-8") as stream:
     json.dump(data, stream, separators=(",", ":"))
 PY
-    asc_opc "${dynamic_dir}/mat_mul_v3.py" --main_func=mat_mul_v3 \
+    asc_opc "${build_dir}/tbe/dynamic/mat_mul_v3.py" --main_func=mat_mul_v3 \
         --input_param="${fp32_param}" --soc_version=Ascend910B1 --output="${kernel_dir}" \
         --impl_mode=high_performance,optional --simplified_key_mode=0 --op_mode=dynamic \
-        --deterministic=false --tiling_key=2162688 >>"${build_log}" 2>&1
+        --deterministic=false --tiling_key="${tiling_key}" >>"${build_log}" 2>&1
     if [[ ! -f "${object}" || ! -f "${metadata}" ]]; then
         return 1
     fi
-    if ! readelf -Ws "${object}" | awk \
-        '$4 == "FUNC" && $5 == "GLOBAL" && $8 == "MatMulV3_VectorDot_2162688" {found=1} END {exit !found}'; then
+    if ! readelf -Ws "${object}" | awk -v symbol="${kernel_name}_${tiling_key}" \
+        '$4 == "FUNC" && $5 == "GLOBAL" && $8 == symbol {found=1} END {exit !found}'; then
         return 1
     fi
     printf '%s\n' "${object}"
 }
 
-vector_binary="$(build_vector_kernel)" || {
+prepare_kernel_build || {
     cat "${build_log}" >&2
     exit 1
 }
+tail_binary="$(build_kernel MatMulV3_TailStream 65648)" || { cat "${build_log}" >&2; exit 1; }
 
-shapes=()
-for k in 8192 10240 12288 14336 16384 20480; do
-    for m in {1..16}; do
-        for n in 17 18 20 22 24 28 31 32 33 36 40 44 48 52 56 60 63 64; do
-            output_dots=$((m * n))
-            padded_dots=$(( ((m + 15) / 16 * 16) * ((n + 15) / 16 * 16) ))
-            if ((output_dots <= 20 || padded_dots * 2 <= output_dots * 5)); then
-                continue
-            fi
-            if ((k < 16384 && output_dots >= 280)); then
-                continue
-            fi
-            shapes+=("${m}" "${n}" "${k}")
-        done
-    done
-done
+shapes=(
+    16 16 8192
+    32 32 12288
+    32 64 16384
+    48 48 24576
+    64 64 32768
+    96 32 49152
+    128 64 65536
+    384 896 8192
+    512 768 12288
+    640 640 8192
+    640 768 12288
+    768 640 16384
+    896 512 16384
+)
 
 export MATMUL_HOST_LIBRARY="${host_library}"
-export MATMUL_VECTOR_BINARY="${vector_binary}"
+export MATMUL_TAIL_BINARY="${tail_binary}"
 export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 exec "${runner}" "${shapes[@]}"

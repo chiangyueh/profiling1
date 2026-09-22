@@ -17,6 +17,7 @@
 // NEW BEGIN
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 // NEW END
 #include "matmul_v3_base_tiling.h"
 #include "../../op_kernel/mat_mul_v3_tiling_key.h"
@@ -1359,6 +1360,9 @@ void MatmulV3BaseTiling::DoSelectTiling()
 {
     switch (tilingSelect_) {
         case TilingCalcSelect::ALL:
+            // NEW BEGIN
+            DO_CACL_TILING_ENABLE(DoExperimentalSplitKTiling())
+            // NEW END
             DO_CACL_TILING_ENABLE(DoBL1FullloadWithFixpipeTiling())
             DO_CACL_TILING_ENABLE(DoAL1FullLoadTiling())
             DO_CACL_TILING_ENABLE(DoBL1FullLoadTiling())
@@ -1416,6 +1420,127 @@ bool MatmulV3BaseTiling::DoVectorDotTiling()
     tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::VECTOR_DOT;
     runInfo_.usedCoreNum = std::min(outputDots, compileInfo_.aivNum);
     runInfo_.needUpdate = true;
+    return true;
+}
+
+bool MatmulV3BaseTiling::DoAtomicSplitKTiling()
+{
+    if (!compileInfo_.supportL0c2out || compileInfo_.aicNum == 0 || args_.hasBias ||
+        args_.aType != ge::DT_FLOAT || args_.bType != ge::DT_FLOAT || args_.cType != ge::DT_FLOAT ||
+        args_.isATrans || !args_.isBTrans || args_.aFormat != ge::FORMAT_ND ||
+        args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
+        args_.mValue == 0 || args_.mValue > BASIC_BLOCK_SIZE_128 ||
+        args_.nValue == 0 || args_.nValue > BASIC_BLOCK_SIZE_128 ||
+        args_.kValue < 8192 || args_.kValue % BASIC_ALIGN_16 != 0) {
+        return false;
+    }
+    const uint64_t split = std::min(compileInfo_.aicNum, args_.kValue / 512UL);
+    if (split < NUMBER_TWO) {
+        return false;
+    }
+    runInfo_.baseM = ops::CeilAlign(args_.mValue, BASIC_ALIGN_16);
+    runInfo_.baseN = ops::CeilAlign(args_.nValue, BASIC_ALIGN_16);
+    runInfo_.baseK = BASIC_BLOCK_K_128_BYTE / DATA_SIZE_FP32;
+    runInfo_.depthA1 = DB_SIZE;
+    runInfo_.depthB1 = DB_SIZE;
+    runInfo_.stepM = 1;
+    runInfo_.stepN = 1;
+    runInfo_.stepKa = 1;
+    runInfo_.stepKb = 1;
+    runInfo_.iterateOrder = ITER_ROW_FIRST;
+    runInfo_.singleCoreM = args_.mValue;
+    runInfo_.singleCoreN = args_.nValue;
+    runInfo_.singleCoreK = ops::CeilAlign(MathUtil::CeilDivision(args_.kValue, split), runInfo_.baseK);
+    runInfo_.usedCoreNum = MathUtil::CeilDivision(args_.kValue, runInfo_.singleCoreK);
+    runInfo_.dbL0c = DB_SIZE;
+    runInfo_.needUpdate = true;
+    args_.nd2nzA = false;
+    args_.nd2nzB = false;
+    args_.isNzA = false;
+    args_.isNzB = false;
+    tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
+    tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::MULTI_CORE_SPLIT_K;
+    tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
+    tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::BASE;
+    return true;
+}
+
+bool MatmulV3BaseTiling::DoTailStreamKTiling()
+{
+    if (!compileInfo_.supportL0c2out || compileInfo_.aicNum == 0 || args_.hasBias ||
+        args_.aType != ge::DT_FLOAT || args_.bType != ge::DT_FLOAT || args_.cType != ge::DT_FLOAT ||
+        args_.isATrans || !args_.isBTrans || args_.aFormat != ge::FORMAT_ND ||
+        args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
+        args_.mValue == 0 || args_.nValue == 0 || args_.kValue < 8192 ||
+        args_.kValue % BASIC_ALIGN_16 != 0) {
+        return false;
+    }
+    const uint64_t mTiles = MathUtil::CeilDivision(args_.mValue, BASIC_BLOCK_SIZE_128);
+    const uint64_t nTiles = MathUtil::CeilDivision(args_.nValue, BASIC_BLOCK_SIZE_128);
+    const uint64_t tileCount = mTiles * nTiles;
+    const uint64_t tailTiles = tileCount % compileInfo_.aicNum;
+    if (tileCount <= compileInfo_.aicNum || tailTiles == 0 || tailTiles > compileInfo_.aicNum / NUMBER_TWO) {
+        return false;
+    }
+    runInfo_.baseM = BASIC_BLOCK_SIZE_128;
+    runInfo_.baseN = BASIC_BLOCK_SIZE_128;
+    runInfo_.baseK = BASIC_BLOCK_K_128_BYTE / DATA_SIZE_FP32;
+    runInfo_.depthA1 = DB_SIZE;
+    runInfo_.depthB1 = DB_SIZE;
+    runInfo_.stepM = 1;
+    runInfo_.stepN = 1;
+    runInfo_.stepKa = 1;
+    runInfo_.stepKb = 1;
+    runInfo_.iterateOrder = ITER_ROW_FIRST;
+    runInfo_.singleCoreM = BASIC_BLOCK_SIZE_128;
+    runInfo_.singleCoreN = BASIC_BLOCK_SIZE_128;
+    runInfo_.singleCoreK = args_.kValue;
+    runInfo_.usedCoreNum = compileInfo_.aicNum;
+    runInfo_.dbL0c = DB_SIZE;
+    runInfo_.needUpdate = true;
+    args_.nd2nzA = false;
+    args_.nd2nzB = false;
+    args_.isNzA = false;
+    args_.isNzB = false;
+    tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
+    tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::TAIL_STREAM_K;
+    tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
+    tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::BASE;
+    return true;
+}
+
+bool MatmulV3BaseTiling::DoExperimentalSplitKTiling()
+{
+    (void)::unsetenv("MATMUL_EXPERIMENT_SELECTED");
+    const char *mode = std::getenv("MATMUL_SPLITK_MODE");
+    if (mode == nullptr || mode[0] == '\0') {
+        return false;
+    }
+    if (std::strcmp(mode, "ATOMIC_SPLIT_K") == 0) {
+        const bool selected = DoAtomicSplitKTiling();
+        if (selected) (void)::setenv("MATMUL_EXPERIMENT_SELECTED", "1", 1);
+        return selected;
+    }
+    if (std::strcmp(mode, "TAIL_STREAM_K") == 0) {
+        const bool selected = DoTailStreamKTiling();
+        if (selected) (void)::setenv("MATMUL_EXPERIMENT_SELECTED", "1", 1);
+        return selected;
+    }
+    if (std::strcmp(mode, "ADAPTIVE_DETERMINISTIC_SPLIT_K") != 0 ||
+        args_.kValue < 8192 || !DoDeterministicMultiCoreSplitKTiling()) {
+        return false;
+    }
+    constexpr uint64_t minKPerCore = 2048;
+    const uint64_t byCompute = std::max(1UL, args_.kValue / minKPerCore);
+    const uint64_t partialBytes = runInfo_.singleCoreM * runInfo_.singleCoreN * DB_SIZE * DATA_SIZE_FP32;
+    const uint64_t byWorkspace = partialBytes == 0 ? 1UL :
+        std::max(1UL, compileInfo_.l2Size * 7UL / 10UL / partialBytes);
+    runInfo_.usedCoreNum = std::min({runInfo_.usedCoreNum, byCompute, byWorkspace});
+    if (runInfo_.usedCoreNum < NUMBER_TWO) {
+        runInfo_.usedCoreNum = NUMBER_TWO;
+    }
+    runInfo_.needUpdate = true;
+    (void)::setenv("MATMUL_EXPERIMENT_SELECTED", "1", 1);
     return true;
 }
 // NEW END
@@ -2752,15 +2877,25 @@ ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
     L2Cache l2Cache(args_, tilingData_);
     l2Cache.SetL2CacheFlag(tilingEnable_, compileInfo_.l2Size, l2CacheFlag_);
     // NEW BEGIN
-    ExportVectorDotTiling();
+    ExportExperimentalTiling();
     // NEW END
     return ge::GRAPH_SUCCESS;
 }
 
 // NEW BEGIN
-void MatmulV3BaseTiling::ExportVectorDotTiling()
+void MatmulV3BaseTiling::ExportExperimentalTiling()
 {
-    if (tilingEnable_.tilingEnableSpecialOpti != TilingEnableSpecialOpti::VECTOR_DOT) {
+    const bool vectorDot = tilingEnable_.tilingEnableSpecialOpti == TilingEnableSpecialOpti::VECTOR_DOT;
+    const char *splitMode = std::getenv("MATMUL_SPLITK_MODE");
+    char cores[16] = {};
+    char key[32] = {};
+    (void)snprintf(cores, sizeof(cores), "%d", tilingData_.matmulTiling.usedCoreNum);
+    (void)snprintf(key, sizeof(key), "%lu", tilingKey_);
+    (void)::setenv("MATMUL_OBSERVED_CORES", cores, 1);
+    (void)::setenv("MATMUL_OBSERVED_KEY", key, 1);
+    const char *selected = std::getenv("MATMUL_EXPERIMENT_SELECTED");
+    if (!vectorDot && (splitMode == nullptr || splitMode[0] == '\0' ||
+        selected == nullptr || selected[0] != '1' || selected[1] != '\0')) {
         return;
     }
     const auto *bytes = reinterpret_cast<const uint8_t *>(&tilingData_);
@@ -2770,10 +2905,14 @@ void MatmulV3BaseTiling::ExportVectorDotTiling()
         text[index * 2] = digits[bytes[index] >> 4];
         text[index * 2 + 1] = digits[bytes[index] & 0x0f];
     }
-    char cores[16] = {};
-    (void)snprintf(cores, sizeof(cores), "%d", tilingData_.matmulTiling.usedCoreNum);
-    (void)::setenv("MATMUL_VECTOR_TILING", text, 1);
-    (void)::setenv("MATMUL_VECTOR_CORES", cores, 1);
+    (void)::setenv("MATMUL_EXPERIMENT_TILING", text, 1);
+    (void)::setenv("MATMUL_EXPERIMENT_CORES", cores, 1);
+    (void)::setenv("MATMUL_EXPERIMENT_KEY", key, 1);
+    (void)::setenv("MATMUL_EXPERIMENT_BRANCH", vectorDot ? "VECTOR_DOT" : splitMode, 1);
+    if (vectorDot) {
+        (void)::setenv("MATMUL_VECTOR_TILING", text, 1);
+        (void)::setenv("MATMUL_VECTOR_CORES", cores, 1);
+    }
 }
 // NEW END
 
