@@ -9,7 +9,10 @@
 #include <vector>
 
 #include "acl/acl.h"
+#include "common/stub/op_api/aclnn_kernels/contiguous.h"
 #include "matmul/mat_mul_v3/op_host/op_api/aclnn_matmul.h"
+#include "matmul/mat_mul_v3/op_host/op_api/matmul.h"
+#include "opdev/make_op_executor.h"
 
 extern "C" uint32_t TbeLoadSoAndSaveToRegistry(const char *soPath);
 
@@ -269,6 +272,49 @@ int CreateEmptyTensor(size_t bytes, const std::vector<int64_t> &shape,
     return rc;
 }
 
+int MatMulV3GetWorkspaceSize(const Tensor &a, const Tensor &b, const Tensor &c,
+                             const DTypeSpec &dtype, const LayoutSpec &layout,
+                             uint64_t *workspaceSize, aclOpExecutor **executor)
+{
+    auto uniqueExecutor = CREATE_EXECUTOR();
+    if (uniqueExecutor.get() == nullptr) return 4;
+    auto prepareInput = [&](const aclTensor *input, bool transpose) -> const aclTensor * {
+        if (!transpose) return l0op::Contiguous(input, uniqueExecutor.get());
+        op::Shape shape = input->GetViewShape();
+        if (shape.GetDimNum() < 2) return nullptr;
+        const size_t last = shape.GetDimNum() - 1;
+        const int64_t value = shape[last];
+        shape.SetDim(last, shape[last - 1]);
+        shape.SetDim(last - 1, value);
+        return uniqueExecutor->CreateView(input, shape, input->GetViewOffset());
+    };
+    const aclTensor *aInput = prepareInput(a.tensor, layout.transA);
+    const aclTensor *bInput = prepareInput(b.tensor, layout.transB);
+    if (aInput == nullptr || bInput == nullptr) return 4;
+    const int64_t opImplMode = dtype.input.aclType == ACL_FLOAT ? 0x40 : 0x1;
+    const bool mixedOutput = dtype.output.aclType == ACL_FLOAT && dtype.input.aclType != ACL_FLOAT;
+    const aclTensor *matmulOutput = mixedOutput ?
+        l0op::MatMulV3NdFp162Fp32(aInput, bInput, nullptr, layout.transA, layout.transB,
+                                  false, opImplMode, uniqueExecutor.get()) :
+        l0op::MatMulV3Nd(aInput, bInput, nullptr, layout.transA, layout.transB,
+                         false, opImplMode, uniqueExecutor.get());
+    if (matmulOutput == nullptr) return 4;
+    if (l0op::ViewCopy(matmulOutput, c.tensor, uniqueExecutor.get()) == nullptr) return 4;
+    *workspaceSize = uniqueExecutor->GetWorkspaceSize();
+    uniqueExecutor.ReleaseTo(executor);
+    return ACL_SUCCESS;
+}
+
+int GetWorkspaceSize(const bool forceV3, const Tensor &a, const Tensor &b, const Tensor &c,
+                     const DTypeSpec &dtype, const LayoutSpec &layout,
+                     uint64_t *workspaceSize, aclOpExecutor **executor)
+{
+    if (forceV3) {
+        return MatMulV3GetWorkspaceSize(a, b, c, dtype, layout, workspaceSize, executor);
+    }
+    return aclnnMatmulGetWorkspaceSize(a.tensor, b.tensor, c.tensor, 1, workspaceSize, executor);
+}
+
 template <typename Launch>
 int Measure(Launch launch, aclrtStream stream, float &latency)
 {
@@ -380,8 +426,8 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     ClearObservedTiling();
     uint64_t officialWorkspaceSize = 0;
     aclOpExecutor *officialExecutor = nullptr;
-    rc = aclnnMatmulGetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, 1,
-                                     &officialWorkspaceSize, &officialExecutor);
+    rc = GetWorkspaceSize(baseCampaign, aTensor, bTensor, cTensor, dtype, layout,
+                          &officialWorkspaceSize, &officialExecutor);
     const TilingSnapshot official = ReadTilingSnapshot();
     if (rc != ACL_SUCCESS || officialExecutor == nullptr) {
         if (official.key == 0) {
@@ -445,8 +491,8 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     ClearObservedTiling();
     uint64_t adaptiveWorkspaceSize = 0;
     aclOpExecutor *adaptiveExecutor = nullptr;
-    rc = aclnnMatmulGetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, 1,
-                                     &adaptiveWorkspaceSize, &adaptiveExecutor);
+    rc = GetWorkspaceSize(baseCampaign, aTensor, bTensor, cTensor, dtype, layout,
+                          &adaptiveWorkspaceSize, &adaptiveExecutor);
     const TilingSnapshot adaptive = ReadTilingSnapshot();
     const char *experimentBranch = std::getenv("MATMUL_EXPERIMENT_BRANCH");
     const bool changed = baseCampaign ?
