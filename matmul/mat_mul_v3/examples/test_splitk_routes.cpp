@@ -254,15 +254,12 @@ void ReleaseTensor(Tensor &value)
     value = {};
 }
 
-int CreateTensor(const std::vector<uint8_t> &host, const std::vector<int64_t> &shape,
-                 const std::vector<int64_t> &storage, const std::vector<int64_t> &strides,
-                 const ScalarType &dtype, Tensor &value)
+int CreateEmptyTensor(size_t bytes, const std::vector<int64_t> &shape,
+                      const std::vector<int64_t> &storage, const std::vector<int64_t> &strides,
+                      const ScalarType &dtype, Tensor &value)
 {
-    value.bytes = host.size();
+    value.bytes = bytes;
     int rc = aclrtMalloc(&value.device, value.bytes, ACL_MEM_MALLOC_HUGE_FIRST);
-    if (rc == ACL_SUCCESS) {
-        rc = aclrtMemcpy(value.device, value.bytes, host.data(), value.bytes, ACL_MEMCPY_HOST_TO_DEVICE);
-    }
     if (rc == ACL_SUCCESS) {
         value.tensor = aclCreateTensor(shape.data(), shape.size(), dtype.aclType, strides.data(), 0,
                                        ACL_FORMAT_ND, storage.data(), storage.size(), value.device);
@@ -347,36 +344,23 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     const bool edgeCampaign = std::strcmp(CampaignName(), "CUBE_VECTOR_EDGE") == 0;
     const bool kParallelCampaign = IsKParallelCampaign();
     ++counts.inputs;
-    std::vector<uint8_t> a(static_cast<size_t>(m * k) * dtype.input.bytes);
-    std::vector<uint8_t> b(static_cast<size_t>(n * k) * dtype.input.bytes);
-    std::vector<uint8_t> c(static_cast<size_t>(m * n) * dtype.output.bytes, 0);
-    for (int64_t row = 0; row < m; ++row) {
-        for (int64_t index = 0; index < k; ++index) {
-            const size_t offset = layout.transA ? static_cast<size_t>(index * m + row) :
-                                                  static_cast<size_t>(row * k + index);
-            const float value = static_cast<float>((row % 3 + 1) * (index % 2 + 1)) / 16.0f;
-            StoreValue(a, offset, dtype.input, value);
-        }
-    }
-    for (int64_t column = 0; column < n; ++column) {
-        for (int64_t index = 0; index < k; ++index) {
-            const size_t offset = layout.transB ? static_cast<size_t>(column * k + index) :
-                                                  static_cast<size_t>(index * n + column);
-            const float value = static_cast<float>((column % 5 + 1) * ((index / 2) % 2 + 1)) / 16.0f;
-            StoreValue(b, offset, dtype.input, value);
-        }
-    }
-
     Tensor aTensor;
     Tensor bTensor;
     Tensor cTensor;
-    int rc = CreateTensor(a, {m, k}, layout.transA ? std::vector<int64_t>{k, m} : std::vector<int64_t>{m, k},
-                          layout.transA ? std::vector<int64_t>{1, m} : std::vector<int64_t>{k, 1}, dtype.input, aTensor);
+    int rc = CreateEmptyTensor(static_cast<size_t>(m * k) * dtype.input.bytes, {m, k},
+                               layout.transA ? std::vector<int64_t>{k, m} : std::vector<int64_t>{m, k},
+                               layout.transA ? std::vector<int64_t>{1, m} : std::vector<int64_t>{k, 1},
+                               dtype.input, aTensor);
     if (rc == ACL_SUCCESS) {
-        rc = CreateTensor(b, {k, n}, layout.transB ? std::vector<int64_t>{n, k} : std::vector<int64_t>{k, n},
-                          layout.transB ? std::vector<int64_t>{1, k} : std::vector<int64_t>{n, 1}, dtype.input, bTensor);
+        rc = CreateEmptyTensor(static_cast<size_t>(n * k) * dtype.input.bytes, {k, n},
+                               layout.transB ? std::vector<int64_t>{n, k} : std::vector<int64_t>{k, n},
+                               layout.transB ? std::vector<int64_t>{1, k} : std::vector<int64_t>{n, 1},
+                               dtype.input, bTensor);
     }
-    if (rc == ACL_SUCCESS) rc = CreateTensor(c, {m, n}, {m, n}, {n, 1}, dtype.output, cTensor);
+    if (rc == ACL_SUCCESS) {
+        rc = CreateEmptyTensor(static_cast<size_t>(m * n) * dtype.output.bytes,
+                               {m, n}, {m, n}, {n, 1}, dtype.output, cTensor);
+    }
     if (rc != ACL_SUCCESS) {
         ++counts.officialFailed;
         ReleaseTensor(cTensor);
@@ -422,31 +406,6 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         return ACL_SUCCESS;
     }
     ++counts.deterministic;
-
-    void *officialWorkspace = nullptr;
-    if (officialWorkspaceSize != 0) rc = aclrtMalloc(&officialWorkspace, officialWorkspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
-    if (rc == ACL_SUCCESS) rc = aclSetAclOpExecutorRepeatable(officialExecutor);
-    float officialLatency = 0.0f;
-    if (rc == ACL_SUCCESS) {
-        rc = Measure([&]() {
-            return aclnnMatmul(officialWorkspace, officialWorkspaceSize, officialExecutor, stream);
-        }, stream, officialLatency);
-    }
-    const std::vector<uint8_t> officialOutput = rc == ACL_SUCCESS ? CopyDeviceOutput(cTensor) : std::vector<uint8_t>{};
-    if (officialWorkspace != nullptr) (void)aclrtFree(officialWorkspace);
-    (void)aclDestroyAclOpExecutor(officialExecutor);
-    if (rc != ACL_SUCCESS || officialOutput.empty()) {
-        ++counts.officialFailed;
-        std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
-                    "\"output_dtype\":\"%s\",\"status\":\"OFFICIAL_MEASUREMENT_FAILED\",\"result_code\":%d}\n",
-                    static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
-                    dtype.inputName, dtype.outputName, rc == ACL_SUCCESS ? 4 : rc);
-        std::fflush(stdout);
-        ReleaseTensor(cTensor);
-        ReleaseTensor(bTensor);
-        ReleaseTensor(aTensor);
-        return rc == ACL_SUCCESS ? 4 : rc;
-    }
 
     if (baseCampaign) {
         (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE");
@@ -501,6 +460,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
             std::fflush(stdout);
         }
         if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
+        (void)aclDestroyAclOpExecutor(officialExecutor);
         (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE");
         (void)::unsetenv("MATMUL_SPLITK_MODE");
         (void)::unsetenv("MATMUL_BASE_MODE");
@@ -512,6 +472,78 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     }
     const bool candidateRouteMatched = baseCampaign ? changed : IsDeterministicSplitK(adaptive.key);
     if (rc == ACL_SUCCESS && !candidateRouteMatched) rc = 4;
+    if (rc != ACL_SUCCESS) {
+        ++counts.failed;
+        std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
+                    "\"output_dtype\":\"%s\",\"candidate_branch\":\"%s\","
+                    "\"status\":\"CANDIDATE_TILING_FAILED\",\"result_code\":%d}\n",
+                    static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
+                    dtype.inputName, dtype.outputName,
+                    baseCampaign ? CampaignName() : "K_PARALLEL_DETERMINISTIC_SPLIT_K", rc);
+        std::fflush(stdout);
+        if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
+        (void)aclDestroyAclOpExecutor(officialExecutor);
+        (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE");
+        (void)::unsetenv("MATMUL_SPLITK_MODE");
+        (void)::unsetenv("MATMUL_BASE_MODE");
+        (void)::unsetenv("MATMUL_VECTOR_ENABLE");
+        ReleaseTensor(cTensor);
+        ReleaseTensor(bTensor);
+        ReleaseTensor(aTensor);
+        return rc;
+    }
+    std::vector<uint8_t> a(static_cast<size_t>(m * k) * dtype.input.bytes);
+    std::vector<uint8_t> b(static_cast<size_t>(n * k) * dtype.input.bytes);
+    for (int64_t row = 0; row < m; ++row) {
+        for (int64_t index = 0; index < k; ++index) {
+            const size_t offset = layout.transA ? static_cast<size_t>(index * m + row) :
+                                                  static_cast<size_t>(row * k + index);
+            const float value = static_cast<float>((row % 3 + 1) * (index % 2 + 1)) / 16.0f;
+            StoreValue(a, offset, dtype.input, value);
+        }
+    }
+    for (int64_t column = 0; column < n; ++column) {
+        for (int64_t index = 0; index < k; ++index) {
+            const size_t offset = layout.transB ? static_cast<size_t>(column * k + index) :
+                                                  static_cast<size_t>(index * n + column);
+            const float value = static_cast<float>((column % 5 + 1) * ((index / 2) % 2 + 1)) / 16.0f;
+            StoreValue(b, offset, dtype.input, value);
+        }
+    }
+    if (rc == ACL_SUCCESS) {
+        rc = aclrtMemcpy(aTensor.device, aTensor.bytes, a.data(), a.size(), ACL_MEMCPY_HOST_TO_DEVICE);
+    }
+    if (rc == ACL_SUCCESS) {
+        rc = aclrtMemcpy(bTensor.device, bTensor.bytes, b.data(), b.size(), ACL_MEMCPY_HOST_TO_DEVICE);
+    }
+    if (rc == ACL_SUCCESS) rc = aclrtMemset(cTensor.device, cTensor.bytes, 0, cTensor.bytes);
+    void *officialWorkspace = nullptr;
+    if (rc == ACL_SUCCESS && officialWorkspaceSize != 0) {
+        rc = aclrtMalloc(&officialWorkspace, officialWorkspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+    }
+    if (rc == ACL_SUCCESS) rc = aclSetAclOpExecutorRepeatable(officialExecutor);
+    float officialLatency = 0.0f;
+    if (rc == ACL_SUCCESS) {
+        rc = Measure([&]() {
+            return aclnnMatmul(officialWorkspace, officialWorkspaceSize, officialExecutor, stream);
+        }, stream, officialLatency);
+    }
+    const std::vector<uint8_t> officialOutput = rc == ACL_SUCCESS ? CopyDeviceOutput(cTensor) : std::vector<uint8_t>{};
+    if (officialWorkspace != nullptr) (void)aclrtFree(officialWorkspace);
+    (void)aclDestroyAclOpExecutor(officialExecutor);
+    if (rc != ACL_SUCCESS || officialOutput.empty()) {
+        ++counts.officialFailed;
+        std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
+                    "\"output_dtype\":\"%s\",\"status\":\"OFFICIAL_MEASUREMENT_FAILED\",\"result_code\":%d}\n",
+                    static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
+                    dtype.inputName, dtype.outputName, rc == ACL_SUCCESS ? 4 : rc);
+        std::fflush(stdout);
+        if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
+        ReleaseTensor(cTensor);
+        ReleaseTensor(bTensor);
+        ReleaseTensor(aTensor);
+        return rc == ACL_SUCCESS ? 4 : rc;
+    }
     if (rc == ACL_SUCCESS && adaptiveWorkspaceSize != 0) {
         rc = aclrtMalloc(&adaptiveWorkspace, adaptiveWorkspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
     }

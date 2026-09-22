@@ -172,9 +172,9 @@ layouts=(NN NT TN TT)
 
 rectangular_workloads=()
 serial=0
-for k in 256 384 512 768 1024 1536 2048 4096; do
-    for long_dim in 2561 3073 3585 4097 5121 6145; do
-        for short_dim in 17 23 31 47 63 79 95 111; do
+for k in 256 384 512 640 768 1024 1280 1536 2048 2560 3072 4096; do
+    for long_dim in 2561 3073 3585 4097 4609 5121 5633 6145 6657 7169 7681 8193; do
+        for short_dim in 17 23 31 39 47 55 63 71 79 87 95 103 111 119 127 143; do
             dtype="${homogeneous_dtypes[$((serial % ${#homogeneous_dtypes[@]}))]}"
             layout="${layouts[$(((serial / ${#homogeneous_dtypes[@]}) % ${#layouts[@]}))]}"
             rectangular_workloads+=("${dtype}" "${layout}" "${short_dim}" "${long_dim}" "${k}")
@@ -189,9 +189,9 @@ done
 
 reuse_workloads=()
 serial=0
-for k in 512 768 1024 1536 2048 3072 4096 6144 8192; do
-    for m in 513 641 769 897 1025 1281 1537 1793 2049; do
-        for n in 513 641 769 897 1025 1281 1537 1793 2049; do
+for k in 512 768 1024 1280 1536 2048 2560 3072 4096 5120 6144 8192; do
+    for m in 257 385 513 641 769 897 1025 1153 1281 1409 1537 1665 1793 1921 2049 2305; do
+        for n in 257 385 513 641 769 897 1025 1153 1281 1409 1537 1665 1793 1921 2049 2305; do
             dtype="${homogeneous_dtypes[$((serial % ${#homogeneous_dtypes[@]}))]}"
             layout="${layouts[$(((serial / ${#homogeneous_dtypes[@]}) % ${#layouts[@]}))]}"
             reuse_workloads+=("${dtype}" "${layout}" "${m}" "${n}" "${k}")
@@ -201,9 +201,9 @@ for k in 512 768 1024 1536 2048 3072 4096 6144 8192; do
 done
 
 edge_workloads=()
-for k in 8192 10240 12288 14336 16384 20480 24576 32768; do
-    for m in 129 130 131 257 259 385 389 513 519; do
-        for n in 513 515 641 643 769 773 897 899 1025; do
+for k in 8192 9216 10240 12288 14336 16384 18432 20480 22528 24576 28672 32768; do
+    for m in 129 130 131 257 258 259 385 386 389 513 514 519 641 643 769 773; do
+        for n in 513 514 515 641 642 643 769 770 773 897 899 1025 1027 1153 1157 1281; do
             edge_workloads+=(fp32_fp32 NT "${m}" "${n}" "${k}")
         done
     done
