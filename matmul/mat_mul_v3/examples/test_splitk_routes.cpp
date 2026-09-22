@@ -70,6 +70,7 @@ struct RunCounts {
     uint64_t passed = 0;
     uint64_t failed = 0;
     uint64_t officialFailed = 0;
+    uint64_t skippedNonV3 = 0;
 };
 
 uint64_t ReadEnvUnsigned(const char *name)
@@ -383,6 +384,14 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
                                      &officialWorkspaceSize, &officialExecutor);
     const TilingSnapshot official = ReadTilingSnapshot();
     if (rc != ACL_SUCCESS || officialExecutor == nullptr) {
+        if (official.key == 0) {
+            ++counts.skippedNonV3;
+            if (officialExecutor != nullptr) (void)aclDestroyAclOpExecutor(officialExecutor);
+            ReleaseTensor(cTensor);
+            ReleaseTensor(bTensor);
+            ReleaseTensor(aTensor);
+            return ACL_SUCCESS;
+        }
         ++counts.officialFailed;
         std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
                     "\"output_dtype\":\"%s\",\"status\":\"OFFICIAL_TILING_FAILED\",\"result_code\":%d}\n",
@@ -396,7 +405,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         return rc == ACL_SUCCESS ? 4 : rc;
     }
     const bool officialRouteMatched = baseCampaign ? IsPlainBase(official.key) :
-        (kParallelCampaign ? (IsPlainBase(official.key) || IsDeterministicSplitK(official.key)) : false);
+        (kParallelCampaign ? IsDeterministicSplitK(official.key) : false);
     if (!officialRouteMatched) {
         ++counts.nonDeterministic;
         (void)aclDestroyAclOpExecutor(officialExecutor);
@@ -415,7 +424,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         (void)::unsetenv("MATMUL_BASE_EXPERIMENT_SELECTED");
         (void)::unsetenv("MATMUL_EXPERIMENT_BRANCH");
     } else if (kParallelCampaign) {
-        (void)::setenv("MATMUL_DETERMINISTIC_ADAPTIVE", "1", 1);
+        (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE");
         (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED");
         (void)::setenv("MATMUL_VECTOR_ENABLE", "0", 1);
         (void)::unsetenv("MATMUL_BASE_MODE");
@@ -423,10 +432,10 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         (void)::unsetenv("MATMUL_EXPERIMENT_SELECTED");
         (void)::unsetenv("MATMUL_EXPERIMENT_BRANCH");
         const char *modelNames[] = {
-            "MATMUL_KPAR_K_TILES", "MATMUL_KPAR_OUTPUT_TILES", "MATMUL_KPAR_BY_K",
-            "MATMUL_KPAR_BY_WORK", "MATMUL_KPAR_BY_L2", "MATMUL_KPAR_SELECTED_CORES",
-            "MATMUL_KPAR_FINAL_PARTIAL_BYTES", "MATMUL_ADAPTIVE_OLD_PARTIAL_BYTES",
-            "MATMUL_ADAPTIVE_NEW_PARTIAL_BYTES"
+            "MATMUL_KPAR_K_ITERATIONS", "MATMUL_KPAR_K_BYTES_PER_ITERATION",
+            "MATMUL_KPAR_TARGET_ITERATIONS_PER_CORE", "MATMUL_KPAR_BY_K",
+            "MATMUL_KPAR_BY_L2", "MATMUL_KPAR_SELECTED_CORES",
+            "MATMUL_KPAR_OLD_PARTIAL_BYTES", "MATMUL_KPAR_FINAL_PARTIAL_BYTES"
         };
         for (const char *name : modelNames) (void)::unsetenv(name);
     } else {
@@ -586,8 +595,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     double maxRel = 0.0;
     const bool correct = rc == ACL_SUCCESS && CompareOutputs(officialOutput, adaptiveOutput, dtype.output, maxAbs, maxRel);
     const double delta = correct ? (adaptiveLatency / officialLatency - 1.0) * 100.0 : 0.0;
-    const uint64_t oldPartialBytes = ReadEnvUnsigned("MATMUL_ADAPTIVE_OLD_PARTIAL_BYTES");
-    const uint64_t trimmedPartialBytes = ReadEnvUnsigned("MATMUL_ADAPTIVE_NEW_PARTIAL_BYTES");
+    const uint64_t oldPartialBytes = ReadEnvUnsigned("MATMUL_KPAR_OLD_PARTIAL_BYTES");
     const uint64_t finalPartialBytes = ReadEnvUnsigned("MATMUL_KPAR_FINAL_PARTIAL_BYTES");
     const double partialSaved = oldPartialBytes > 0 && finalPartialBytes <= oldPartialBytes ?
         static_cast<double>(oldPartialBytes - finalPartialBytes) * 100.0 / oldPartialBytes : 0.0;
@@ -604,19 +612,17 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     PrintTiling("candidate_tiling", adaptive);
     std::printf(",\"official_core\":%u,\"candidate_core\":%u", official.cores, adaptive.cores);
     if (kParallelCampaign) {
-        std::printf(",\"k_tiles\":%lu,\"output_tiles\":%lu,\"limit_by_k\":%lu,"
-                    "\"limit_by_work\":%lu,\"limit_by_l2\":%lu,"
-                    "\"m_trim_applied\":%s,\"pre_adjust_partial_bytes\":%lu,"
-                    "\"m_trim_partial_bytes\":%lu,\"final_partial_bytes\":%lu,"
+        std::printf(",\"k_iterations\":%lu,\"k_bytes_per_iteration\":%lu,"
+                    "\"target_iterations_per_core\":%lu,\"limit_by_k\":%lu,"
+                    "\"limit_by_l2\":%lu,\"pre_adjust_partial_bytes\":%lu,"
+                    "\"final_partial_bytes\":%lu,"
                     "\"partial_saved_pct\":%.6f",
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_K_TILES")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_OUTPUT_TILES")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_K_ITERATIONS")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_K_BYTES_PER_ITERATION")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_TARGET_ITERATIONS_PER_CORE")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_K")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_WORK")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_L2")),
-                    ReadEnvUnsigned("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED") == 1 ? "true" : "false",
                     static_cast<unsigned long>(oldPartialBytes),
-                    static_cast<unsigned long>(trimmedPartialBytes),
                     static_cast<unsigned long>(finalPartialBytes), partialSaved);
     }
     std::printf(",\"official_workspace\":%lu,\"candidate_workspace\":%lu,"
@@ -683,12 +689,14 @@ int main(int argc, char **argv)
                           std::strtoll(argv[index + 4], nullptr, 10), stream, edgeFunction, counts);
         if (targetPasses != 0 && counts.passed >= targetPasses) break;
     }
-    std::printf("{\"summary\":true,\"campaign\":\"%s\",\"inputs\":%lu,\"non_target_route\":%lu,"
+    std::printf("{\"summary\":true,\"campaign\":\"%s\",\"inputs\":%lu,\"skipped_non_v3\":%lu,"
+                "\"non_target_route\":%lu,"
                 "\"official_target\":%lu,\"candidate_selected\":%lu,\"official_preserved\":%lu,"
                 "\"target_passes\":%lu,\"quota_met\":%s,\"passed\":%lu,\"failed\":%lu,"
                 "\"official_failed\":%lu}\n",
                 CampaignName(),
                 static_cast<unsigned long>(counts.inputs),
+                static_cast<unsigned long>(counts.skippedNonV3),
                 static_cast<unsigned long>(counts.nonDeterministic),
                 static_cast<unsigned long>(counts.deterministic),
                 static_cast<unsigned long>(counts.adaptiveSelected),
