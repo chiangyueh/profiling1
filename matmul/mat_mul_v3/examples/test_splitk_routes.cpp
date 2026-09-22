@@ -13,8 +13,8 @@
 
 extern "C" uint32_t TbeLoadSoAndSaveToRegistry(const char *soPath);
 
-constexpr int WARMUP = 3;
-constexpr int REPEATS = 12;
+constexpr int WARMUP = 2;
+constexpr int REPEATS = 8;
 
 struct ScalarType {
     aclDataType aclType;
@@ -118,6 +118,19 @@ bool IsRectangularCampaign()
 {
     const char *campaign = std::getenv("MATMUL_CAMPAIGN");
     return campaign != nullptr && std::strcmp(campaign, "RECTANGULAR_CUBE") == 0;
+}
+
+bool IsKParallelCampaign()
+{
+    const char *campaign = std::getenv("MATMUL_CAMPAIGN");
+    return campaign != nullptr && std::strcmp(campaign, "K_PARALLEL_SPLIT_K") == 0;
+}
+
+const char *CampaignName()
+{
+    if (IsRectangularCampaign()) return "RECTANGULAR_CUBE";
+    if (IsKParallelCampaign()) return "K_PARALLEL_SPLIT_K";
+    return "INVALID";
 }
 
 const DTypeSpec *FindDType(const char *name)
@@ -285,6 +298,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
                 aclrtStream stream, RunCounts &counts)
 {
     const bool rectangularCampaign = IsRectangularCampaign();
+    const bool kParallelCampaign = IsKParallelCampaign();
     ++counts.inputs;
     std::vector<uint8_t> a(static_cast<size_t>(m * k) * dtype.input.bytes);
     std::vector<uint8_t> b(static_cast<size_t>(n * k) * dtype.input.bytes);
@@ -351,7 +365,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         return rc == ACL_SUCCESS ? 4 : rc;
     }
     const bool officialRouteMatched = rectangularCampaign ? IsPlainBase(official.key) :
-        IsDeterministicSplitK(official.key);
+        (kParallelCampaign ? (IsPlainBase(official.key) || IsDeterministicSplitK(official.key)) : false);
     if (!officialRouteMatched) {
         ++counts.nonDeterministic;
         (void)aclDestroyAclOpExecutor(officialExecutor);
@@ -393,6 +407,21 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         (void)::setenv("MATMUL_BASE_MODE", "RECTANGULAR_CUBE", 1);
         (void)::unsetenv("MATMUL_BASE_EXPERIMENT_SELECTED");
         (void)::unsetenv("MATMUL_EXPERIMENT_BRANCH");
+    } else if (kParallelCampaign) {
+        (void)::setenv("MATMUL_DETERMINISTIC_ADAPTIVE", "1", 1);
+        (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED");
+        (void)::setenv("MATMUL_VECTOR_ENABLE", "0", 1);
+        (void)::unsetenv("MATMUL_BASE_MODE");
+        (void)::setenv("MATMUL_SPLITK_MODE", "K_PARALLEL_DETERMINISTIC_SPLIT_K", 1);
+        (void)::unsetenv("MATMUL_EXPERIMENT_SELECTED");
+        (void)::unsetenv("MATMUL_EXPERIMENT_BRANCH");
+        const char *modelNames[] = {
+            "MATMUL_KPAR_K_TILES", "MATMUL_KPAR_OUTPUT_TILES", "MATMUL_KPAR_BY_K",
+            "MATMUL_KPAR_BY_WORK", "MATMUL_KPAR_BY_L2", "MATMUL_KPAR_SELECTED_CORES",
+            "MATMUL_KPAR_FINAL_PARTIAL_BYTES", "MATMUL_ADAPTIVE_OLD_PARTIAL_BYTES",
+            "MATMUL_ADAPTIVE_NEW_PARTIAL_BYTES"
+        };
+        for (const char *name : modelNames) (void)::unsetenv(name);
     } else {
         (void)::setenv("MATMUL_DETERMINISTIC_ADAPTIVE", "1", 1);
         (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED");
@@ -406,21 +435,26 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     const char *experimentBranch = std::getenv("MATMUL_EXPERIMENT_BRANCH");
     const bool changed = rectangularCampaign ?
         experimentBranch != nullptr && std::strcmp(experimentBranch, "RECTANGULAR_CUBE") == 0 :
-        ReadEnvUnsigned("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED") == 1;
+        (kParallelCampaign ? experimentBranch != nullptr &&
+            std::strcmp(experimentBranch, "K_PARALLEL_DETERMINISTIC_SPLIT_K") == 0 :
+            ReadEnvUnsigned("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED") == 1);
     if (changed) ++counts.adaptiveSelected; else if (rc == ACL_SUCCESS) ++counts.officialPreserved;
     void *adaptiveWorkspace = nullptr;
     if (rc == ACL_SUCCESS && adaptiveExecutor == nullptr) rc = 4;
-    if (rectangularCampaign && !changed) {
+    if ((rectangularCampaign || kParallelCampaign) && !changed) {
         if (rc != ACL_SUCCESS) {
             ++counts.failed;
             std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
-                        "\"output_dtype\":\"%s\",\"candidate_branch\":\"RECTANGULAR_CUBE\","
+                        "\"output_dtype\":\"%s\",\"candidate_branch\":\"%s\","
                         "\"status\":\"CANDIDATE_TILING_FAILED\",\"result_code\":%d}\n",
                         static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
-                        dtype.inputName, dtype.outputName, rc);
+                        dtype.inputName, dtype.outputName,
+                        rectangularCampaign ? "RECTANGULAR_CUBE" : "K_PARALLEL_DETERMINISTIC_SPLIT_K", rc);
             std::fflush(stdout);
         }
         if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
+        (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE");
+        (void)::unsetenv("MATMUL_SPLITK_MODE");
         (void)::unsetenv("MATMUL_BASE_MODE");
         (void)::unsetenv("MATMUL_VECTOR_ENABLE");
         ReleaseTensor(cTensor);
@@ -447,21 +481,42 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     double maxRel = 0.0;
     const bool correct = rc == ACL_SUCCESS && CompareOutputs(officialOutput, adaptiveOutput, dtype.output, maxAbs, maxRel);
     const double delta = correct ? (adaptiveLatency / officialLatency - 1.0) * 100.0 : 0.0;
+    const uint64_t oldPartialBytes = ReadEnvUnsigned("MATMUL_ADAPTIVE_OLD_PARTIAL_BYTES");
+    const uint64_t trimmedPartialBytes = ReadEnvUnsigned("MATMUL_ADAPTIVE_NEW_PARTIAL_BYTES");
+    const uint64_t finalPartialBytes = ReadEnvUnsigned("MATMUL_KPAR_FINAL_PARTIAL_BYTES");
+    const double partialSaved = oldPartialBytes > 0 && finalPartialBytes <= oldPartialBytes ?
+        static_cast<double>(oldPartialBytes - finalPartialBytes) * 100.0 / oldPartialBytes : 0.0;
 
     std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
                 "\"output_dtype\":\"%s\","
                 "\"candidate_branch\":\"%s\",\"candidate_selected\":%s,",
                 static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
                 dtype.inputName, dtype.outputName,
-                rectangularCampaign ? "RECTANGULAR_CUBE" : "ADAPTIVE_DETERMINISTIC_SPLIT_K",
+                rectangularCampaign ? "RECTANGULAR_CUBE" : "K_PARALLEL_DETERMINISTIC_SPLIT_K",
                 changed ? "true" : "false");
     PrintTiling("official_tiling", official);
     std::printf(",");
     PrintTiling("candidate_tiling", adaptive);
-    std::printf(",\"official_workspace\":%lu,\"candidate_workspace\":%lu,"
+    std::printf(",\"official_core\":%u,\"candidate_core\":%u,"
+                "\"k_tiles\":%lu,\"output_tiles\":%lu,\"limit_by_k\":%lu,"
+                "\"limit_by_work\":%lu,\"limit_by_l2\":%lu,"
+                "\"m_trim_applied\":%s,\"pre_adjust_partial_bytes\":%lu,"
+                "\"m_trim_partial_bytes\":%lu,\"final_partial_bytes\":%lu,"
+                "\"partial_saved_pct\":%.6f,"
+                "\"official_workspace\":%lu,\"candidate_workspace\":%lu,"
                 "\"official_latency_ms\":%.9f,\"candidate_latency_ms\":%s,"
                 "\"delta_pct\":%s,\"max_abs_diff\":%.9g,\"max_rel_diff\":%.9g,"
                 "\"correctness\":\"%s\",\"result_code\":%d}\n",
+                official.cores, adaptive.cores,
+                static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_K_TILES")),
+                static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_OUTPUT_TILES")),
+                static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_K")),
+                static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_WORK")),
+                static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_L2")),
+                ReadEnvUnsigned("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED") == 1 ? "true" : "false",
+                static_cast<unsigned long>(oldPartialBytes),
+                static_cast<unsigned long>(trimmedPartialBytes),
+                static_cast<unsigned long>(finalPartialBytes), partialSaved,
                 static_cast<unsigned long>(officialWorkspaceSize),
                 static_cast<unsigned long>(adaptiveWorkspaceSize), officialLatency,
                 correct ? std::to_string(adaptiveLatency).c_str() : "null",
@@ -475,6 +530,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE");
     (void)::unsetenv("MATMUL_BASE_MODE");
     (void)::unsetenv("MATMUL_VECTOR_ENABLE");
+    (void)::unsetenv("MATMUL_SPLITK_MODE");
     ReleaseTensor(cTensor);
     ReleaseTensor(bTensor);
     ReleaseTensor(aTensor);
@@ -484,8 +540,8 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
 int main(int argc, char **argv)
 {
     if (argc < 6 || (argc - 1) % 5 != 0) return 2;
-    if (!IsRectangularCampaign()) return 4;
-    std::printf("{\"campaign_start\":\"RECTANGULAR_CUBE\",\"runner\":\"rectangular_cube_v1\"}\n");
+    if (!IsRectangularCampaign() && !IsKParallelCampaign()) return 4;
+    std::printf("{\"campaign_start\":\"%s\",\"runner\":\"matmul_paired_v2\"}\n", CampaignName());
     std::fflush(stdout);
     const char *hostLibrary = std::getenv("MATMUL_HOST_LIBRARY");
     if (hostLibrary == nullptr) return 4;
@@ -506,10 +562,10 @@ int main(int argc, char **argv)
                           std::strtoll(argv[index + 4], nullptr, 10), stream, counts);
     }
     std::printf("{\"summary\":true,\"campaign\":\"%s\",\"inputs\":%lu,\"non_target_route\":%lu,"
-                "\"official_base\":%lu,\"rectangular_selected\":%lu,\"official_preserved\":%lu,"
+                "\"official_target\":%lu,\"candidate_selected\":%lu,\"official_preserved\":%lu,"
                 "\"passed\":%lu,\"failed\":%lu,"
                 "\"official_failed\":%lu}\n",
-                IsRectangularCampaign() ? "RECTANGULAR_CUBE" : "ADAPTIVE_DETERMINISTIC_SPLIT_K",
+                CampaignName(),
                 static_cast<unsigned long>(counts.inputs),
                 static_cast<unsigned long>(counts.nonDeterministic),
                 static_cast<unsigned long>(counts.deterministic),

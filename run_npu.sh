@@ -9,7 +9,7 @@ export ASCEND_SLOG_PRINT_TO_STDOUT=0
 unset ASCEND_CUSTOM_OPP_PATH
 unset MATMUL_BASE_MODE MATMUL_BASE_EXPERIMENT_SELECTED MATMUL_SPLITK_MODE
 unset MATMUL_DETERMINISTIC_ADAPTIVE MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED
-export MATMUL_CAMPAIGN=RECTANGULAR_CUBE
+export MATMUL_CAMPAIGN=K_PARALLEL_SPLIT_K
 
 if [[ "$#" -ne 0 ]]; then
     exit 2
@@ -74,7 +74,7 @@ runtime_library="-lacl_rt"
 if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/lib64/libascendcl.so" ]]; then
     runtime_library="-lascendcl"
 fi
-runner="${build_dir}/test_rectangular_cube_v1"
+runner="${build_dir}/test_k_parallel_splitk_v1"
 if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
     -std=gnu++17 -D_GLIBCXX_USE_CXX11_ABI=0 \
     -I "${PWD}" \
@@ -93,22 +93,19 @@ if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
     exit 1
 fi
 
-dtypes=(fp16_fp16 bf16_bf16 fp32_fp32)
-layouts=(NN NT TN TT)
+dtypes=(fp16_fp16 fp16_fp32 bf16_bf16 bf16_fp32 fp32_fp32)
+layouts=(NT TN)
 mn_pairs=(
-    "17 1024" "31 1536" "48 2048" "64 3072" "80 4096" "96 2048"
-    "1024 17" "1536 31" "2048 48" "3072 64" "4096 80" "2048 96"
+    "8 8" "16 16" "16 64" "24 96" "32 32" "32 64"
+    "48 48" "64 16" "64 32" "64 64" "96 24" "128 64"
 )
-k_values=(256 512 1024 2048 4096 8192)
+k_values=(8192 12288 16384 20480 24576 32768 40960 49152 65536)
 workloads=()
-pair_count="${#mn_pairs[@]}"
 for dtype in "${dtypes[@]}"; do
     for layout in "${layouts[@]}"; do
-        for k_index in "${!k_values[@]}"; do
-            k="${k_values[${k_index}]}"
-            for offset in 0 1 2 3; do
-                pair_index=$(( (k_index * 4 + offset) % pair_count ))
-                read -r m n <<<"${mn_pairs[${pair_index}]}"
+        for pair in "${mn_pairs[@]}"; do
+            read -r m n <<<"${pair}"
+            for k in "${k_values[@]}"; do
                 workloads+=("${dtype}" "${layout}" "${m}" "${n}" "${k}")
             done
         done

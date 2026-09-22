@@ -1360,6 +1360,9 @@ void MatmulV3BaseTiling::DoSelectTiling()
 {
     switch (tilingSelect_) {
         case TilingCalcSelect::ALL:
+            // NEW BEGIN
+            DO_CACL_TILING_ENABLE(DoExperimentalSplitKTiling())
+            // NEW END
             DO_CACL_TILING_ENABLE(DoBL1FullloadWithFixpipeTiling())
             DO_CACL_TILING_ENABLE(DoAL1FullLoadTiling())
             DO_CACL_TILING_ENABLE(DoBL1FullLoadTiling())
@@ -1709,6 +1712,56 @@ bool MatmulV3BaseTiling::DoExperimentalSplitKTiling()
     const char *mode = std::getenv("MATMUL_SPLITK_MODE");
     if (mode == nullptr || mode[0] == '\0') {
         return false;
+    }
+    if (std::strcmp(mode, "K_PARALLEL_DETERMINISTIC_SPLIT_K") == 0) {
+        const uint64_t kQuantum = BLOCK_BYTE_SIZE / aDtypeSize_;
+        const uint64_t kTiles = MathUtil::CeilDivision(args_.kValue, kQuantum);
+        const uint64_t outputTiles = MathUtil::CeilDivision(args_.mValue, BASIC_ALIGN_16) *
+            MathUtil::CeilDivision(args_.nValue, BASIC_ALIGN_16);
+        constexpr uint64_t minKTilesPerCore = 256;
+        constexpr uint64_t minCubeTasksPerCore = 512;
+        if (kTiles < minKTilesPerCore * NUMBER_TWO ||
+            outputTiles * kTiles < minCubeTasksPerCore * NUMBER_TWO) {
+            return false;
+        }
+        const MatmulV3RunInfo savedRunInfo = runInfo_;
+        const TilingEnable savedTilingEnable = tilingEnable_;
+        const MatmulV3Args savedArgs = args_;
+        if (!DoDeterministicMultiCoreSplitKTiling()) {
+            runInfo_ = savedRunInfo;
+            tilingEnable_ = savedTilingEnable;
+            args_ = savedArgs;
+            return false;
+        }
+        const uint64_t byK = kTiles / minKTilesPerCore;
+        const uint64_t byWork = outputTiles * kTiles / minCubeTasksPerCore;
+        const uint64_t partialBytes = runInfo_.singleCoreM * runInfo_.singleCoreN *
+            DB_SIZE * DATA_SIZE_FP32;
+        const uint64_t byL2 = partialBytes == 0 ? 0 :
+            compileInfo_.l2Size * 7UL / 10UL / partialBytes;
+        const uint64_t selectedCores = std::min({runInfo_.usedCoreNum, byK, byWork, byL2});
+        if (selectedCores < NUMBER_TWO) {
+            runInfo_ = savedRunInfo;
+            tilingEnable_ = savedTilingEnable;
+            args_ = savedArgs;
+            return false;
+        }
+        runInfo_.usedCoreNum = selectedCores;
+        runInfo_.needUpdate = true;
+        auto exportValue = [](const char *name, uint64_t value) {
+            char text[32] = {};
+            (void)snprintf(text, sizeof(text), "%lu", value);
+            (void)::setenv(name, text, 1);
+        };
+        exportValue("MATMUL_KPAR_K_TILES", kTiles);
+        exportValue("MATMUL_KPAR_OUTPUT_TILES", outputTiles);
+        exportValue("MATMUL_KPAR_BY_K", byK);
+        exportValue("MATMUL_KPAR_BY_WORK", byWork);
+        exportValue("MATMUL_KPAR_BY_L2", byL2);
+        exportValue("MATMUL_KPAR_SELECTED_CORES", selectedCores);
+        exportValue("MATMUL_KPAR_FINAL_PARTIAL_BYTES", selectedCores * partialBytes);
+        (void)::setenv("MATMUL_EXPERIMENT_SELECTED", "1", 1);
+        return true;
     }
     if (std::strcmp(mode, "ATOMIC_SPLIT_K") == 0) {
         const bool selected = DoAtomicSplitKTiling();
@@ -3003,16 +3056,19 @@ bool MatmulV3BaseTiling::DoDeterministicMultiCoreSplitKTiling()
             args_.bType == args_.aType && args_.cType == args_.aType;
         const uint64_t oldPartialBytes = runInfo_.usedCoreNum * runInfo_.singleCoreM *
             runInfo_.singleCoreN * DB_SIZE * DATA_SIZE_FP32;
-        const uint64_t newPartialBytes = runInfo_.usedCoreNum * candidateSingleCoreM *
-            runInfo_.singleCoreN * DB_SIZE * DATA_SIZE_FP32;
-        const uint64_t fixedWorkspaceBytes = RPC_WORKSIZE * MB_SIZE;
-        const bool removesHalfWorkspace = oldPartialBytes > newPartialBytes &&
-            oldPartialBytes - newPartialBytes >= (fixedWorkspaceBytes + oldPartialBytes + 1) / NUMBER_TWO;
-        const bool changed = tn16Bit && mkOrder && baseOutput && candidateSingleCoreM < runInfo_.singleCoreM &&
-            removesHalfWorkspace;
+        const bool changed = tn16Bit && mkOrder && baseOutput && candidateSingleCoreM < runInfo_.singleCoreM;
+        auto exportValue = [](const char *name, uint64_t value) {
+            char text[32] = {};
+            (void)snprintf(text, sizeof(text), "%lu", value);
+            (void)::setenv(name, text, 1);
+        };
+        exportValue("MATMUL_ADAPTIVE_OLD_PARTIAL_BYTES", oldPartialBytes);
         if (changed) {
             runInfo_.singleCoreM = candidateSingleCoreM;
         }
+        const uint64_t newPartialBytes = runInfo_.usedCoreNum * runInfo_.singleCoreM *
+            runInfo_.singleCoreN * DB_SIZE * DATA_SIZE_FP32;
+        exportValue("MATMUL_ADAPTIVE_NEW_PARTIAL_BYTES", newPartialBytes);
         (void)::setenv("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED", changed ? "1" : "0", 1);
     }
     return true;
