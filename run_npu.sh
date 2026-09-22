@@ -35,6 +35,7 @@ fi
 host_library="${build_dir}/libophost_nn.so"
 opapi_nn=""
 opapi_math=""
+legacy_common=""
 for path in \
     "${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64/libopapi_nn.so" \
     "${ASCEND_HOME_PATH}/lib64/libopapi_nn.so" \
@@ -53,9 +54,18 @@ for path in \
         break
     fi
 done
-if [[ ! -f "${host_library}" || -z "${opapi_nn}" || -z "${opapi_math}" ]]; then
+for path in \
+    "${ASCEND_OPP_PATH}/built-in/op_impl/ai_core/tbe/op_host/lib/linux/$(uname -m)/libophost_comm_legacy.so" \
+    "${ASCEND_HOME_PATH}/opp/built-in/op_impl/ai_core/tbe/op_host/lib/linux/$(uname -m)/libophost_comm_legacy.so"; do
+    if [[ -f "${path}" ]]; then
+        legacy_common="${path}"
+        break
+    fi
+done
+if [[ ! -f "${host_library}" || -z "${opapi_nn}" || -z "${opapi_math}" || -z "${legacy_common}" ]]; then
     exit 1
 fi
+ln -sfn -- "${legacy_common}" "${build_dir}/libophost_comm_legacy.so"
 
 runtime_library="-lacl_rt"
 if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/lib64/libascendcl.so" ]]; then
