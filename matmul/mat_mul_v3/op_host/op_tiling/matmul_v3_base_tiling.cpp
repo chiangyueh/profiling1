@@ -2998,6 +2998,9 @@ bool MatmulV3BaseTiling::DoDeterministicMultiCoreSplitKTiling()
         const uint64_t candidateSingleCoreM = ops::CeilAlign(args_.mValue, BASIC_ALIGN_16);
         const bool mkOrder = runInfo_.singleCoreN == args_.nValue;
         const bool baseOutput = tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE;
+        const bool tn16Bit = args_.isATrans && !args_.isBTrans &&
+            (args_.aType == ge::DT_FLOAT16 || args_.aType == ge::DT_BF16) &&
+            args_.bType == args_.aType && args_.cType == args_.aType;
         const uint64_t oldPartialBytes = runInfo_.usedCoreNum * runInfo_.singleCoreM *
             runInfo_.singleCoreN * DB_SIZE * DATA_SIZE_FP32;
         const uint64_t newPartialBytes = runInfo_.usedCoreNum * candidateSingleCoreM *
@@ -3005,7 +3008,7 @@ bool MatmulV3BaseTiling::DoDeterministicMultiCoreSplitKTiling()
         const uint64_t fixedWorkspaceBytes = RPC_WORKSIZE * MB_SIZE;
         const bool removesHalfWorkspace = oldPartialBytes > newPartialBytes &&
             oldPartialBytes - newPartialBytes >= (fixedWorkspaceBytes + oldPartialBytes + 1) / NUMBER_TWO;
-        const bool changed = mkOrder && baseOutput && candidateSingleCoreM < runInfo_.singleCoreM &&
+        const bool changed = tn16Bit && mkOrder && baseOutput && candidateSingleCoreM < runInfo_.singleCoreM &&
             removesHalfWorkspace;
         if (changed) {
             runInfo_.singleCoreM = candidateSingleCoreM;

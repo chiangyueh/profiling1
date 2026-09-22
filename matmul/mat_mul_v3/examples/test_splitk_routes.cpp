@@ -13,8 +13,8 @@
 
 extern "C" uint32_t TbeLoadSoAndSaveToRegistry(const char *soPath);
 
-constexpr int WARMUP = 1;
-constexpr int REPEATS = 5;
+constexpr int WARMUP = 3;
+constexpr int REPEATS = 12;
 
 struct ScalarType {
     aclDataType aclType;

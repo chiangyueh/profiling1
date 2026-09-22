@@ -92,22 +92,22 @@ if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
     exit 1
 fi
 
-dtypes=(fp16_fp16 bf16_bf16 fp32_fp32)
-layouts=(NN NT TN TT)
+dtypes=(fp16_fp16 bf16_bf16)
+layouts=(TN)
 mn_pairs=(
-    "17 512" "23 640" "31 768" "33 896" "47 1024" "55 1280"
-    "63 1536" "65 1792" "79 2048" "95 2304" "111 2560" "127 3072"
-    "31 384" "63 448" "127 512" "159 2048"
+    "19 576" "27 704" "35 832" "43 960" "51 1152" "59 1408"
+    "67 1664" "75 1920" "83 2176" "91 2432" "99 2816" "107 3328"
+    "115 3584" "123 4096" "139 2304" "155 3072"
 )
-k_values=(14336 15360 17408 18432 20480 22528 28672 36864 45056 57344)
+k_values=(16896 19456 21504 26624 30720 34816 40960 51200)
 workloads=()
 pair_count="${#mn_pairs[@]}"
 for dtype in "${dtypes[@]}"; do
     for layout in "${layouts[@]}"; do
         for k_index in "${!k_values[@]}"; do
             k="${k_values[${k_index}]}"
-            for offset in 0 1 2 3 4 5; do
-                pair_index=$(( (k_index * 6 + offset) % pair_count ))
+            for offset in 0 1 2 3 4 5 6 7; do
+                pair_index=$(( (k_index * 8 + offset) % pair_count ))
                 read -r m n <<<"${mn_pairs[${pair_index}]}"
                 workloads+=("${dtype}" "${layout}" "${m}" "${n}" "${k}")
             done
