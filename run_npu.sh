@@ -19,6 +19,7 @@ build_dir="${PWD}/build"
 build_log="$(mktemp)"
 trap 'rm -f "${build_log}"' EXIT
 
+printf '{"stage":"host_build","status":"begin"}\n'
 if ! cmake -S . -B "${build_dir}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DENABLE_CUSTOM=FALSE \
@@ -34,6 +35,7 @@ if ! cmake --build "${build_dir}" --target ophost_nn -- -j1 >>"${build_log}" 2>&
     cat "${build_log}" >&2
     exit 1
 fi
+printf '{"stage":"host_build","status":"passed"}\n'
 
 host_library="${build_dir}/libophost_nn.so"
 opapi_nn=""
@@ -66,6 +68,11 @@ for path in \
     fi
 done
 if [[ ! -f "${host_library}" || -z "${opapi_nn}" || -z "${opapi_math}" || -z "${legacy_common}" ]]; then
+    printf '{"fatal":"required_library_missing","host":%s,"opapi_nn":%s,"opapi_math":%s,"legacy":%s}\n' \
+        "$([[ -f "${host_library}" ]] && printf true || printf false)" \
+        "$([[ -n "${opapi_nn}" ]] && printf true || printf false)" \
+        "$([[ -n "${opapi_math}" ]] && printf true || printf false)" \
+        "$([[ -n "${legacy_common}" ]] && printf true || printf false)" >&2
     exit 1
 fi
 ln -sfn -- "${legacy_common}" "${build_dir}/libophost_comm_legacy.so"
@@ -75,6 +82,7 @@ if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/li
     runtime_library="-lascendcl"
 fi
 runner="${build_dir}/test_four_route_overnight_v1"
+printf '{"stage":"runner_build","status":"begin"}\n'
 if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
     matmul/mat_mul_v3/op_host/op_api/matmul.cpp \
     -std=gnu++17 -D_GLIBCXX_USE_CXX11_ABI=0 \
@@ -94,6 +102,7 @@ if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
     cat "${build_log}" >&2
     exit 1
 fi
+printf '{"stage":"runner_build","status":"passed"}\n'
 
 build_edge_kernel() {
     local kernel_name="MatMulV3_CubeVectorEdge"
@@ -168,6 +177,7 @@ PY
     printf '%s\n' "${object}"
 }
 
+printf '{"stage":"workload_generation","status":"begin"}\n'
 mapfile -t k_parallel_workloads < <(python3 - <<'PY'
 import itertools
 import random
@@ -227,14 +237,13 @@ for k in 8192 9216 10240 12288 14336 16384 18432 20480 22528 24576 28672 32768; 
         done
     done
 done
+printf '{"stage":"workload_generation","status":"passed","k_parallel":%d,"rectangular":%d,"reuse":%d,"edge":%d}\n' \
+    "$(( ${#k_parallel_workloads[@]} / 5 ))" "$(( ${#rectangular_workloads[@]} / 5 ))" \
+    "$(( ${#reuse_workloads[@]} / 5 ))" "$(( ${#edge_workloads[@]} / 5 ))"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
-edge_binary="$(build_edge_kernel)" || {
-    cat "${build_log}" >&2
-    exit 1
-}
 
 campaign_failures=0
 run_campaign() {
@@ -242,6 +251,7 @@ run_campaign() {
     local target="$2"
     shift 2
     local rc=0
+    printf '{"campaign_begin":"%s","target_passes":%d}\n' "${campaign}" "${target}"
     MATMUL_CAMPAIGN="${campaign}" MATMUL_TARGET_PASSES="${target}" "$@" || rc=$?
     printf '{"campaign_complete":"%s","process_result_code":%d}\n' "${campaign}" "${rc}"
     if [[ "${rc}" -ne 0 ]]; then
@@ -252,6 +262,14 @@ run_campaign() {
 run_campaign K_PARALLEL_SPLIT_K 300 "${runner}" "${k_parallel_workloads[@]}"
 run_campaign RECTANGULAR_CUBE 200 "${runner}" "${rectangular_workloads[@]}"
 run_campaign REUSE_DIRECTED 200 "${runner}" "${reuse_workloads[@]}"
-export MATMUL_EDGE_BINARY="${edge_binary}"
-run_campaign CUBE_VECTOR_EDGE 200 "${runner}" "${edge_workloads[@]}"
+printf '{"stage":"edge_kernel_build","status":"begin"}\n'
+if edge_binary="$(build_edge_kernel)"; then
+    printf '{"stage":"edge_kernel_build","status":"passed"}\n'
+    export MATMUL_EDGE_BINARY="${edge_binary}"
+    run_campaign CUBE_VECTOR_EDGE 200 "${runner}" "${edge_workloads[@]}"
+else
+    cat "${build_log}" >&2
+    printf '{"campaign_complete":"CUBE_VECTOR_EDGE","process_result_code":4,"reason":"kernel_build_failed"}\n'
+    campaign_failures=$((campaign_failures + 1))
+fi
 printf '{"overnight_complete":true,"campaigns":4,"campaign_process_failures":%d}\n' "${campaign_failures}"
