@@ -1360,14 +1360,14 @@ void MatmulV3BaseTiling::DoSelectTiling()
 {
     switch (tilingSelect_) {
         case TilingCalcSelect::ALL:
-            // NEW BEGIN
-            DO_CACL_TILING_ENABLE(DoExperimentalSplitKTiling())
-            // NEW END
             DO_CACL_TILING_ENABLE(DoBL1FullloadWithFixpipeTiling())
             DO_CACL_TILING_ENABLE(DoAL1FullLoadTiling())
             DO_CACL_TILING_ENABLE(DoBL1FullLoadTiling())
             DO_CACL_TILING_ENABLE(DoL2CacheTiling())
             DO_CACL_TILING_ENABLE(DoSingleCoreSplitKTiling())
+            // NEW BEGIN
+            DO_CACL_TILING_ENABLE(DoExperimentalSplitKTiling())
+            // NEW END
             DO_CACL_TILING_ENABLE(DoDeterministicMultiCoreSplitKTiling())
             DO_CACL_TILING_ENABLE(DoL2CacheTiling310P())
             // NEW BEGIN
@@ -1734,12 +1734,17 @@ bool MatmulV3BaseTiling::DoExperimentalSplitKTiling()
         const uint64_t kBytesPerIteration = runInfo_.singleCoreK * aDtypeSize_;
         const uint64_t targetIterationsPerCore =
             MathUtil::CeilDivision(minKBytesPerCore, kBytesPerIteration);
-        const uint64_t byK = MathUtil::CeilDivision(kIterations, targetIterationsPerCore);
+        const uint64_t outputQuanta =
+            MathUtil::CeilDivision(args_.mValue, BASIC_BLOCK_SIZE_64) *
+            MathUtil::CeilDivision(args_.nValue, BASIC_BLOCK_SIZE_64);
+        const uint64_t byWork = MathUtil::CeilDivision(
+            kIterations * outputQuanta, targetIterationsPerCore);
         const uint64_t partialBytes = runInfo_.singleCoreM * runInfo_.singleCoreN *
             DB_SIZE * DATA_SIZE_FP32;
         const uint64_t byL2 = std::max(NUMBER_TWO,
             partialBytes == 0 ? NUMBER_TWO : compileInfo_.l2Size * 7UL / 10UL / partialBytes);
-        const uint64_t selectedCores = std::min({runInfo_.usedCoreNum, std::max(NUMBER_TWO, byK), byL2});
+        const uint64_t selectedCores =
+            std::min({runInfo_.usedCoreNum, std::max(NUMBER_TWO, byWork), byL2});
         if (selectedCores >= runInfo_.usedCoreNum) {
             runInfo_ = savedRunInfo;
             tilingEnable_ = savedTilingEnable;
@@ -1757,7 +1762,8 @@ bool MatmulV3BaseTiling::DoExperimentalSplitKTiling()
         exportValue("MATMUL_KPAR_K_ITERATIONS", kIterations);
         exportValue("MATMUL_KPAR_K_BYTES_PER_ITERATION", kBytesPerIteration);
         exportValue("MATMUL_KPAR_TARGET_ITERATIONS_PER_CORE", targetIterationsPerCore);
-        exportValue("MATMUL_KPAR_BY_K", byK);
+        exportValue("MATMUL_KPAR_OUTPUT_QUANTA", outputQuanta);
+        exportValue("MATMUL_KPAR_BY_WORK", byWork);
         exportValue("MATMUL_KPAR_BY_L2", byL2);
         exportValue("MATMUL_KPAR_SELECTED_CORES", selectedCores);
         exportValue("MATMUL_KPAR_OLD_PARTIAL_BYTES", oldPartialBytes);

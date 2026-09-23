@@ -146,6 +146,17 @@ bool IsPlainBase(uint64_t key)
         ((key >> 20U) & 0x0fU) == 0U;
 }
 
+bool SameTilingExceptCore(const TilingSnapshot &left, const TilingSnapshot &right)
+{
+    return left.key == right.key && left.singleM == right.singleM && left.singleN == right.singleN &&
+        left.singleK == right.singleK && left.baseM == right.baseM && left.baseN == right.baseN &&
+        left.baseK == right.baseK && left.stepKa == right.stepKa && left.stepKb == right.stepKb &&
+        left.depthA1 == right.depthA1 && left.depthB1 == right.depthB1 &&
+        left.l2MTile == right.l2MTile && left.l2NTile == right.l2NTile &&
+        left.l2MBlock == right.l2MBlock && left.l2NBlock == right.l2NBlock &&
+        left.l2Order == right.l2Order;
+}
+
 bool IsRectangularCampaign()
 {
     const char *campaign = std::getenv("MATMUL_CAMPAIGN");
@@ -433,7 +444,8 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         (void)::unsetenv("MATMUL_EXPERIMENT_BRANCH");
         const char *modelNames[] = {
             "MATMUL_KPAR_K_ITERATIONS", "MATMUL_KPAR_K_BYTES_PER_ITERATION",
-            "MATMUL_KPAR_TARGET_ITERATIONS_PER_CORE", "MATMUL_KPAR_BY_K",
+            "MATMUL_KPAR_TARGET_ITERATIONS_PER_CORE", "MATMUL_KPAR_OUTPUT_QUANTA",
+            "MATMUL_KPAR_BY_WORK",
             "MATMUL_KPAR_BY_L2", "MATMUL_KPAR_SELECTED_CORES",
             "MATMUL_KPAR_OLD_PARTIAL_BYTES", "MATMUL_KPAR_FINAL_PARTIAL_BYTES"
         };
@@ -479,16 +491,19 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         ReleaseTensor(aTensor);
         return rc == ACL_SUCCESS ? ACL_SUCCESS : rc;
     }
-    const bool candidateRouteMatched = baseCampaign ? changed : IsDeterministicSplitK(adaptive.key);
+    const bool invariantPassed = !kParallelCampaign || !changed || SameTilingExceptCore(official, adaptive);
+    const bool candidateRouteMatched = baseCampaign ? changed :
+        (IsDeterministicSplitK(adaptive.key) && invariantPassed);
     if (rc == ACL_SUCCESS && !candidateRouteMatched) rc = 4;
     if (rc != ACL_SUCCESS) {
         ++counts.failed;
         std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
                     "\"output_dtype\":\"%s\",\"candidate_branch\":\"%s\","
-                    "\"status\":\"CANDIDATE_TILING_FAILED\",\"result_code\":%d}\n",
+                    "\"status\":\"%s\",\"result_code\":%d}\n",
                     static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
                     dtype.inputName, dtype.outputName,
-                    baseCampaign ? CampaignName() : "K_PARALLEL_DETERMINISTIC_SPLIT_K", rc);
+                    baseCampaign ? CampaignName() : "K_PARALLEL_DETERMINISTIC_SPLIT_K",
+                    invariantPassed ? "CANDIDATE_TILING_FAILED" : "CANDIDATE_INVARIANT_FAILED", rc);
         std::fflush(stdout);
         if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
         (void)aclDestroyAclOpExecutor(officialExecutor);
@@ -613,14 +628,16 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     std::printf(",\"official_core\":%u,\"candidate_core\":%u", official.cores, adaptive.cores);
     if (kParallelCampaign) {
         std::printf(",\"k_iterations\":%lu,\"k_bytes_per_iteration\":%lu,"
-                    "\"target_iterations_per_core\":%lu,\"limit_by_k\":%lu,"
+                    "\"target_iterations_per_core\":%lu,\"output_quanta_64x64\":%lu,"
+                    "\"limit_by_work\":%lu,"
                     "\"limit_by_l2\":%lu,\"pre_adjust_partial_bytes\":%lu,"
                     "\"final_partial_bytes\":%lu,"
                     "\"partial_saved_pct\":%.6f",
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_K_ITERATIONS")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_K_BYTES_PER_ITERATION")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_TARGET_ITERATIONS_PER_CORE")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_K")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_OUTPUT_QUANTA")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_WORK")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_L2")),
                     static_cast<unsigned long>(oldPartialBytes),
                     static_cast<unsigned long>(finalPartialBytes), partialSaved);

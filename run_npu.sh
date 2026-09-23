@@ -178,6 +178,24 @@ PY
 }
 
 printf '{"stage":"workload_generation","status":"begin"}\n'
+mapfile -t k_parallel_workloads < <(python3 - <<'PY'
+import itertools
+import random
+
+dtypes = ("fp16_fp16", "fp16_fp32", "bf16_bf16", "bf16_fp32", "fp32_fp32")
+layouts = ("NT", "TN")
+m_values = (8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192)
+n_values = (8, 16, 24, 32, 40, 48, 64, 80, 96, 112, 128, 160, 192, 256)
+k_values = (8192, 10240, 12288, 14336, 16384, 18432, 20480, 24576,
+            28672, 32768, 36864, 40960, 49152, 57344, 65536)
+rows = list(itertools.product(dtypes, layouts, m_values, n_values, k_values))
+random.Random(8504).shuffle(rows)
+for row in rows:
+    for value in row:
+        print(value)
+PY
+)
+
 rectangular_workloads=()
 for k in 256 512 1024 2048 4096; do
     for n in 673 689 705 721 737 753; do
@@ -209,8 +227,8 @@ for k in 8192 9216 10240 12288 14336 16384 18432 20480 22528 24576 28672 32768; 
         done
     done
 done
-printf '{"stage":"workload_generation","status":"passed","rectangular":%d,"reuse":%d,"edge":%d}\n' \
-    "$(( ${#rectangular_workloads[@]} / 5 ))" \
+printf '{"stage":"workload_generation","status":"passed","k_parallel":%d,"rectangular":%d,"reuse":%d,"edge":%d}\n' \
+    "$(( ${#k_parallel_workloads[@]} / 5 ))" "$(( ${#rectangular_workloads[@]} / 5 ))" \
     "$(( ${#reuse_workloads[@]} / 5 ))" "$(( ${#edge_workloads[@]} / 5 ))"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
@@ -231,6 +249,7 @@ run_campaign() {
     fi
 }
 
+run_campaign K_PARALLEL_SPLIT_K 300 "${runner}" "${k_parallel_workloads[@]}"
 run_campaign RECTANGULAR_CUBE 200 "${runner}" "${rectangular_workloads[@]}"
 run_campaign REUSE_DIRECTED 200 "${runner}" "${reuse_workloads[@]}"
 printf '{"stage":"edge_kernel_build","status":"begin"}\n'
@@ -243,4 +262,4 @@ else
     printf '{"campaign_complete":"CUBE_VECTOR_EDGE","process_result_code":4,"reason":"kernel_build_failed"}\n'
     campaign_failures=$((campaign_failures + 1))
 fi
-printf '{"overnight_complete":true,"campaigns":3,"campaign_process_failures":%d}\n' "${campaign_failures}"
+printf '{"overnight_complete":true,"campaigns":4,"campaign_process_failures":%d}\n' "${campaign_failures}"
