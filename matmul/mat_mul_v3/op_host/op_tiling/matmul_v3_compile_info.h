@@ -31,6 +31,15 @@ struct MatmulV3CompileInfo {
     uint64_t l0BSize{0UL};
     uint64_t btSize{0UL};
     float cubeFreq{0};
+    // NEW BEGIN
+    double ddrReadRate{32.0};
+    double ddrWriteRate{32.0};
+    double l2ReadRate{110.0};
+    double l2WriteRate{86.0};
+    double l1ToL0ARate{512.0};
+    double l1ToL0BRate{256.0};
+    double vectorBytesPerCycle{128.0};
+    // NEW END
     platform_ascendc::SocVersion socVersion;
     std::string socVersionStr = "";
     bool supportL0c2out = false;

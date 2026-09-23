@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 // NEW END
 #include "matmul_v3_base_tiling.h"
 #include "../../op_kernel/mat_mul_v3_tiling_key.h"
@@ -199,6 +200,27 @@ void MatmulV3BaseTiling::InitCompileInfo() // 检查输入属性是否支持
     ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_B, compileInfo.l0BSize);
     ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_C, compileInfo.l0CSize);
     ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L2, compileInfo.l2Size);
+
+    // NEW BEGIN
+    auto readRate = [platformInfo](const char *section, const char *key, double fallback) {
+        std::string text;
+        platformInfo->GetPlatformRes(section, key, text);
+        if (text.empty()) {
+            return fallback;
+        }
+        char *end = nullptr;
+        const double value = std::strtod(text.c_str(), &end);
+        return end != text.c_str() && value > 0.0 ? value : fallback;
+    };
+    compileInfo.cubeFreq = static_cast<float>(readRate("AICoreSpec", "cube_freq", 1800.0));
+    compileInfo.vectorBytesPerCycle = readRate("AICoreSpec", "vec_calc_size", 128.0);
+    compileInfo.ddrReadRate = readRate("AICoreMemoryRates", "ddr_read_rate", 32.0);
+    compileInfo.ddrWriteRate = readRate("AICoreMemoryRates", "ddr_write_rate", 32.0);
+    compileInfo.l2ReadRate = readRate("AICoreMemoryRates", "l2_read_rate", 110.0);
+    compileInfo.l2WriteRate = readRate("AICoreMemoryRates", "l2_write_rate", 86.0);
+    compileInfo.l1ToL0ARate = readRate("AICoreMemoryRates", "l1_to_l0_a_rate", 512.0);
+    compileInfo.l1ToL0BRate = readRate("AICoreMemoryRates", "l1_to_l0_b_rate", 256.0);
+    // NEW END
 
     TilingPrepareForOpCache(context_);
     OP_LOGI(context_->GetNodeName(),
@@ -1729,47 +1751,160 @@ bool MatmulV3BaseTiling::DoExperimentalSplitKTiling()
             args_ = savedArgs;
             return false;
         }
-        constexpr uint64_t minKBytesPerCore = 8192;
+        // NEW BEGIN
         const uint64_t kIterations = MathUtil::CeilDivision(args_.kValue, runInfo_.singleCoreK);
-        const uint64_t kBytesPerIteration = runInfo_.singleCoreK * aDtypeSize_;
-        const uint64_t targetIterationsPerCore =
-            MathUtil::CeilDivision(minKBytesPerCore, kBytesPerIteration);
-        const uint64_t outputQuanta =
-            MathUtil::CeilDivision(args_.mValue, BASIC_BLOCK_SIZE_64) *
-            MathUtil::CeilDivision(args_.nValue, BASIC_BLOCK_SIZE_64);
-        const uint64_t byWork = MathUtil::CeilDivision(
-            kIterations * outputQuanta, targetIterationsPerCore);
-        const uint64_t partialBytes = runInfo_.singleCoreM * runInfo_.singleCoreN *
-            DB_SIZE * DATA_SIZE_FP32;
-        const uint64_t byL2 = std::max(NUMBER_TWO,
-            partialBytes == 0 ? NUMBER_TWO : compileInfo_.l2Size * 7UL / 10UL / partialBytes);
-        const uint64_t selectedCores =
-            std::min({runInfo_.usedCoreNum, std::max(NUMBER_TWO, byWork), byL2});
-        if (selectedCores >= runInfo_.usedCoreNum) {
-            runInfo_ = savedRunInfo;
-            tilingEnable_ = savedTilingEnable;
-            args_ = savedArgs;
-            return false;
+        const uint64_t officialCores = runInfo_.usedCoreNum;
+        const bool orderFlag = runInfo_.iterateOrder == 0;
+        const bool l2Split = orderFlag ? args_.mValue != runInfo_.singleCoreM :
+                                         args_.nValue != runInfo_.singleCoreN;
+        const bool vectorNz = tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::VEC_NZ2ND_UNALIGNOUT;
+        const uint64_t alignedM = ops::CeilAlign(args_.mValue, BASIC_ALIGN_16);
+        const uint64_t alignedN = ops::CeilAlign(args_.nValue, BASIC_ALIGN_16);
+        const uint64_t workspaceSingleSize = vectorNz ?
+            std::max(alignedM, runInfo_.singleCoreM) * std::max(alignedN, runInfo_.singleCoreN) :
+            (l2Split ? runInfo_.singleCoreM * runInfo_.singleCoreN :
+                (orderFlag ? args_.mValue * runInfo_.singleCoreN : runInfo_.singleCoreM * args_.nValue));
+        const uint64_t partialBytes = workspaceSingleSize * DB_SIZE * DATA_SIZE_FP32;
+        const uint64_t mTiles = MathUtil::CeilDivision(args_.mValue, runInfo_.singleCoreM);
+        const uint64_t nTiles = MathUtil::CeilDivision(args_.nValue, runInfo_.singleCoreN);
+        const uint64_t kAlign = args_.aType == ge::DT_FLOAT && !args_.isHf32 ? 8UL : BASIC_ALIGN_16;
+        const double cubeOpsPerCycle = args_.aType == ge::DT_FLOAT && !args_.isHf32 ? 4096.0 : 8192.0;
+
+        struct SplitKCoreCost {
+            double total = std::numeric_limits<double>::max();
+            double cube = 0.0;
+            double reduce = 0.0;
+            double preprocess = 0.0;
+            uint64_t workspace = 0;
+            uint64_t maxK = 0;
+        };
+
+        auto evaluate = [&](uint64_t cores) {
+            SplitKCoreCost cost;
+            cost.workspace = cores * partialBytes;
+            const uint64_t preCoreNumRaw = kIterations % cores;
+            const uint64_t preCoreNum = preCoreNumRaw == 0 ? cores : preCoreNumRaw;
+            const uint64_t rounds = MathUtil::CeilDivision(kIterations, cores);
+            uint64_t maxAlignedK = 0;
+            for (uint64_t core = 0; core < cores; ++core) {
+                uint64_t first = core * rounds;
+                uint64_t coreRounds = rounds;
+                if (core >= preCoreNum) {
+                    first = core * (rounds - 1) + preCoreNum;
+                    coreRounds = rounds - 1;
+                }
+                uint64_t coreK = 0;
+                for (uint64_t offset = 0; offset < coreRounds; ++offset) {
+                    const uint64_t kIndex = first + offset;
+                    const uint64_t actualK = std::min(runInfo_.singleCoreK,
+                        args_.kValue - kIndex * runInfo_.singleCoreK);
+                    coreK += ops::CeilAlign(actualK, kAlign);
+                }
+                maxAlignedK = std::max(maxAlignedK, coreK);
+            }
+            cost.maxK = maxAlignedK;
+            const bool workspaceInL2 = cost.workspace <= compileInfo_.l2Size * 7UL / 10UL;
+            const double workspaceReadRate = workspaceInL2 ? compileInfo_.l2ReadRate : compileInfo_.ddrReadRate;
+            const double workspaceWriteRate = workspaceInL2 ? compileInfo_.l2WriteRate : compileInfo_.ddrWriteRate;
+            double previousReduce = 0.0;
+            bool firstTile = true;
+            for (uint64_t mIndex = 0; mIndex < mTiles; ++mIndex) {
+                const uint64_t tileM = std::min(runInfo_.singleCoreM,
+                    args_.mValue - mIndex * runInfo_.singleCoreM);
+                for (uint64_t nIndex = 0; nIndex < nTiles; ++nIndex) {
+                    const uint64_t tileN = std::min(runInfo_.singleCoreN,
+                        args_.nValue - nIndex * runInfo_.singleCoreN);
+                    const uint64_t cubeM = ops::CeilAlign(tileM, BASIC_ALIGN_16);
+                    const uint64_t cubeN = ops::CeilAlign(tileN, BASIC_ALIGN_16);
+                    const double computeCycles =
+                        2.0 * static_cast<double>(cubeM) * static_cast<double>(cubeN) *
+                        static_cast<double>(maxAlignedK) / cubeOpsPerCycle;
+                    const double aBytes = static_cast<double>(tileM) * maxAlignedK * aDtypeSize_;
+                    const double bBytes = static_cast<double>(tileN) * maxAlignedK * bDtypeSize_;
+                    const double partialWriteBytes =
+                        static_cast<double>(cubeM) * cubeN * DATA_SIZE_FP32;
+                    const double cubeCycles = std::max({
+                        computeCycles,
+                        (aBytes + bBytes) / compileInfo_.ddrReadRate,
+                        aBytes / compileInfo_.l1ToL0ARate,
+                        bBytes / compileInfo_.l1ToL0BRate,
+                        partialWriteBytes / workspaceWriteRate});
+                    const uint64_t vectorElements = vectorNz ? cubeM * cubeN : tileM * tileN;
+                    const uint64_t elementsPerVector = MathUtil::CeilDivision(
+                        vectorElements, cores * NUMBER_TWO);
+                    const double reduceReadCycles = static_cast<double>(elementsPerVector) * cores *
+                        DATA_SIZE_FP32 / workspaceReadRate;
+                    const double reduceAddCycles = static_cast<double>(elementsPerVector) * (cores - 1) *
+                        DATA_SIZE_FP32 / compileInfo_.vectorBytesPerCycle;
+                    const double castCycles = cDtypeSize_ == DATA_SIZE_FP32 ? 0.0 :
+                        static_cast<double>(elementsPerVector) * DATA_SIZE_FP32 /
+                        compileInfo_.vectorBytesPerCycle;
+                    const double outputWriteCycles =
+                        static_cast<double>(elementsPerVector) * cDtypeSize_ / compileInfo_.ddrWriteRate;
+                    const double reduceCycles =
+                        reduceReadCycles + reduceAddCycles + castCycles + outputWriteCycles;
+                    cost.cube += cubeCycles;
+                    cost.reduce += reduceCycles;
+                    if (firstTile) {
+                        cost.total = cubeCycles;
+                        firstTile = false;
+                    } else {
+                        cost.total += std::max(cubeCycles, previousReduce);
+                    }
+                    previousReduce = reduceCycles;
+                }
+            }
+            if (!firstTile) {
+                cost.total += previousReduce;
+            }
+            const double preprocessBytes =
+                (args_.nd2nzA ? static_cast<double>(args_.mValue) * args_.kValue * aDtypeSize_ : 0.0) +
+                (args_.nd2nzB ? static_cast<double>(args_.nValue) * args_.kValue * bDtypeSize_ : 0.0);
+            cost.preprocess = preprocessBytes /
+                (static_cast<double>(cores * NUMBER_TWO) * compileInfo_.vectorBytesPerCycle);
+            cost.total += cost.preprocess;
+            return cost;
+        };
+
+        const SplitKCoreCost officialCost = evaluate(officialCores);
+        SplitKCoreCost selectedCost = officialCost;
+        uint64_t selectedCores = officialCores;
+        for (uint64_t cores = NUMBER_TWO; cores < officialCores; ++cores) {
+            const SplitKCoreCost candidateCost = evaluate(cores);
+            if (candidateCost.total < selectedCost.total) {
+                selectedCost = candidateCost;
+                selectedCores = cores;
+            }
         }
-        const uint64_t oldPartialBytes = runInfo_.usedCoreNum * partialBytes;
-        runInfo_.usedCoreNum = selectedCores;
-        runInfo_.needUpdate = true;
         auto exportValue = [](const char *name, uint64_t value) {
             char text[32] = {};
             (void)snprintf(text, sizeof(text), "%lu", value);
             (void)::setenv(name, text, 1);
         };
         exportValue("MATMUL_KPAR_K_ITERATIONS", kIterations);
-        exportValue("MATMUL_KPAR_K_BYTES_PER_ITERATION", kBytesPerIteration);
-        exportValue("MATMUL_KPAR_TARGET_ITERATIONS_PER_CORE", targetIterationsPerCore);
-        exportValue("MATMUL_KPAR_OUTPUT_QUANTA", outputQuanta);
-        exportValue("MATMUL_KPAR_BY_WORK", byWork);
-        exportValue("MATMUL_KPAR_BY_L2", byL2);
+        exportValue("MATMUL_KPAR_OFFICIAL_CORES", officialCores);
         exportValue("MATMUL_KPAR_SELECTED_CORES", selectedCores);
-        exportValue("MATMUL_KPAR_OLD_PARTIAL_BYTES", oldPartialBytes);
-        exportValue("MATMUL_KPAR_FINAL_PARTIAL_BYTES", selectedCores * partialBytes);
+        exportValue("MATMUL_KPAR_OFFICIAL_SCORE", static_cast<uint64_t>(officialCost.total + 0.5));
+        exportValue("MATMUL_KPAR_SELECTED_SCORE", static_cast<uint64_t>(selectedCost.total + 0.5));
+        exportValue("MATMUL_KPAR_OFFICIAL_CUBE_CYCLES", static_cast<uint64_t>(officialCost.cube + 0.5));
+        exportValue("MATMUL_KPAR_SELECTED_CUBE_CYCLES", static_cast<uint64_t>(selectedCost.cube + 0.5));
+        exportValue("MATMUL_KPAR_OFFICIAL_REDUCE_CYCLES", static_cast<uint64_t>(officialCost.reduce + 0.5));
+        exportValue("MATMUL_KPAR_SELECTED_REDUCE_CYCLES", static_cast<uint64_t>(selectedCost.reduce + 0.5));
+        exportValue("MATMUL_KPAR_OFFICIAL_MAX_K", officialCost.maxK);
+        exportValue("MATMUL_KPAR_SELECTED_MAX_K", selectedCost.maxK);
+        exportValue("MATMUL_KPAR_OLD_PARTIAL_BYTES", officialCost.workspace);
+        exportValue("MATMUL_KPAR_FINAL_PARTIAL_BYTES", selectedCost.workspace);
+        if (selectedCores >= runInfo_.usedCoreNum) {
+            runInfo_ = savedRunInfo;
+            tilingEnable_ = savedTilingEnable;
+            args_ = savedArgs;
+            return false;
+        }
+        runInfo_.usedCoreNum = selectedCores;
+        runInfo_.needUpdate = true;
         (void)::setenv("MATMUL_EXPERIMENT_SELECTED", "1", 1);
         return true;
+        // NEW END
     }
     if (std::strcmp(mode, "ATOMIC_SPLIT_K") == 0) {
         const bool selected = DoAtomicSplitKTiling();

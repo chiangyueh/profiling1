@@ -88,6 +88,27 @@ static ge::graphStatus TilingPrepareForMatmulV3(gert::TilingParseContext *contex
   ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L2, compileInfoPtr->l2Size);
 
   // NEW BEGIN
+  auto readRate = [platformInfo](const char *section, const char *key, double fallback) {
+      std::string text;
+      platformInfo->GetPlatformRes(section, key, text);
+      if (text.empty()) {
+          return fallback;
+      }
+      char *end = nullptr;
+      const double value = std::strtod(text.c_str(), &end);
+      return end != text.c_str() && value > 0.0 ? value : fallback;
+  };
+  compileInfoPtr->cubeFreq = static_cast<float>(readRate("AICoreSpec", "cube_freq", 1800.0));
+  compileInfoPtr->vectorBytesPerCycle = readRate("AICoreSpec", "vec_calc_size", 128.0);
+  compileInfoPtr->ddrReadRate = readRate("AICoreMemoryRates", "ddr_read_rate", 32.0);
+  compileInfoPtr->ddrWriteRate = readRate("AICoreMemoryRates", "ddr_write_rate", 32.0);
+  compileInfoPtr->l2ReadRate = readRate("AICoreMemoryRates", "l2_read_rate", 110.0);
+  compileInfoPtr->l2WriteRate = readRate("AICoreMemoryRates", "l2_write_rate", 86.0);
+  compileInfoPtr->l1ToL0ARate = readRate("AICoreMemoryRates", "l1_to_l0_a_rate", 512.0);
+  compileInfoPtr->l1ToL0BRate = readRate("AICoreMemoryRates", "l1_to_l0_b_rate", 256.0);
+  // NEW END
+
+  // NEW BEGIN
   const char *disableRepo = std::getenv("MATMUL_DISABLE_REPO");
   const bool repoDisabled = disableRepo != nullptr && disableRepo[0] == '1' && disableRepo[1] == '\0';
   if(!repoDisabled && !TilingPrepareForOpCache(context)) {

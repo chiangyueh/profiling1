@@ -453,9 +453,12 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         (void)::unsetenv("MATMUL_EXPERIMENT_SELECTED");
         (void)::unsetenv("MATMUL_EXPERIMENT_BRANCH");
         const char *modelNames[] = {
-            "MATMUL_KPAR_K_ITERATIONS", "MATMUL_KPAR_K_BYTES_PER_ITERATION",
-            "MATMUL_KPAR_TARGET_ITERATIONS_PER_CORE", "MATMUL_KPAR_OUTPUT_QUANTA",
-            "MATMUL_KPAR_BY_WORK", "MATMUL_KPAR_BY_L2", "MATMUL_KPAR_SELECTED_CORES",
+            "MATMUL_KPAR_K_ITERATIONS", "MATMUL_KPAR_OFFICIAL_CORES",
+            "MATMUL_KPAR_SELECTED_CORES", "MATMUL_KPAR_OFFICIAL_SCORE",
+            "MATMUL_KPAR_SELECTED_SCORE", "MATMUL_KPAR_OFFICIAL_CUBE_CYCLES",
+            "MATMUL_KPAR_SELECTED_CUBE_CYCLES", "MATMUL_KPAR_OFFICIAL_REDUCE_CYCLES",
+            "MATMUL_KPAR_SELECTED_REDUCE_CYCLES", "MATMUL_KPAR_OFFICIAL_MAX_K",
+            "MATMUL_KPAR_SELECTED_MAX_K",
             "MATMUL_KPAR_OLD_PARTIAL_BYTES", "MATMUL_KPAR_FINAL_PARTIAL_BYTES"
         };
         for (const char *name : modelNames) (void)::unsetenv(name);
@@ -635,17 +638,25 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     PrintTiling("candidate_tiling", adaptive);
     std::printf(",\"official_core\":%u,\"candidate_core\":%u", official.cores, adaptive.cores);
     if (kParallelCampaign) {
-        std::printf(",\"k_iterations\":%lu,\"k_bytes_per_iteration\":%lu,"
-                    "\"target_iterations_per_core\":%lu,\"output_quanta_64x64\":%lu,"
-                    "\"limit_by_work\":%lu,\"limit_by_l2\":%lu,"
+        std::printf(",\"k_iterations\":%lu,\"model_official_core\":%lu,"
+                    "\"model_selected_core\":%lu,\"official_score_cycles\":%lu,"
+                    "\"selected_score_cycles\":%lu,\"official_cube_cycles\":%lu,"
+                    "\"selected_cube_cycles\":%lu,\"official_reduce_cycles\":%lu,"
+                    "\"selected_reduce_cycles\":%lu,\"official_max_k\":%lu,"
+                    "\"selected_max_k\":%lu,"
                     "\"pre_adjust_partial_bytes\":%lu,\"final_partial_bytes\":%lu,"
                     "\"partial_saved_pct\":%.6f",
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_K_ITERATIONS")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_K_BYTES_PER_ITERATION")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_TARGET_ITERATIONS_PER_CORE")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_OUTPUT_QUANTA")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_WORK")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_L2")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_OFFICIAL_CORES")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_SELECTED_CORES")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_OFFICIAL_SCORE")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_SELECTED_SCORE")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_OFFICIAL_CUBE_CYCLES")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_SELECTED_CUBE_CYCLES")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_OFFICIAL_REDUCE_CYCLES")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_SELECTED_REDUCE_CYCLES")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_OFFICIAL_MAX_K")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_SELECTED_MAX_K")),
                     static_cast<unsigned long>(oldPartialBytes),
                     static_cast<unsigned long>(finalPartialBytes), partialSaved);
     }
