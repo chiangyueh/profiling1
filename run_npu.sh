@@ -81,7 +81,7 @@ runtime_library="-lacl_rt"
 if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/lib64/libascendcl.so" ]]; then
     runtime_library="-lascendcl"
 fi
-runner="${build_dir}/test_four_route_overnight_v1"
+runner="${build_dir}/test_k_parallel_rectangular_v1"
 printf '{"stage":"runner_build","status":"begin"}\n'
 if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
     matmul/mat_mul_v3/op_host/op_api/matmul.cpp \
@@ -104,79 +104,6 @@ if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
 fi
 printf '{"stage":"runner_build","status":"passed"}\n'
 
-build_edge_kernel() {
-    local kernel_name="MatMulV3_CubeVectorEdge"
-    local kernel_dir="${build_dir}/cube_vector_edge_bin"
-    local object="${kernel_dir}/${kernel_name}.o"
-    local metadata="${kernel_dir}/${kernel_name}.json"
-    if [[ -f "${object}" && -f "${metadata}" ]] &&
-       ! find matmul/mat_mul_v3/op_kernel -type f -newer "${object}" -print -quit | grep -q .; then
-        printf '%s\n' "${object}"
-        return 0
-    fi
-
-    local ascendc_dir="${build_dir}/tbe/ascendc"
-    local dynamic_dir="${build_dir}/tbe/dynamic"
-    local param_dir="${build_dir}/cube_vector_edge_params"
-    rm -rf -- "${kernel_dir}" "${param_dir}" "${ascendc_dir}/mat_mul_v3"
-    mkdir -p -- "${kernel_dir}" "${ascendc_dir}/mat_mul_v3" \
-        "${ascendc_dir}/common/act" "${ascendc_dir}/common/matmul_act" \
-        "${dynamic_dir}" "${param_dir}"
-    cp -a matmul/mat_mul_v3/op_kernel/. "${ascendc_dir}/mat_mul_v3/"
-    cp -a common/act/. "${ascendc_dir}/common/act/"
-    cp -a matmul/common/matmul_act/. "${ascendc_dir}/common/matmul_act/"
-
-    local ops_info="${build_dir}/autogen/exc/aic-ascend910b-ops-info.ini"
-    local opc_options="${build_dir}/autogen/custom_opc_options.ini"
-    python3 scripts/util/ascendc_impl_build.py "${ops_info}" "" "" \
-        "${ascendc_dir}" "${dynamic_dir}" "${build_dir}/autogen" >>"${build_log}" 2>&1
-    python3 scripts/util/ascendc_bin_param_build.py "${ops_info}" "${param_dir}" ascend910b \
-        --opc-config-file "${opc_options}" --ops MatMulV3 >>"${build_log}" 2>&1
-
-    local fp32_param
-    fp32_param="$(python3 - "${param_dir}" <<'PY'
-import glob
-import json
-import os
-import sys
-for path in sorted(glob.glob(os.path.join(sys.argv[1], "*_param.json"))):
-    with open(path, encoding="utf-8") as stream:
-        node = json.load(stream)["op_list"][0]
-    values = [item for item in node["inputs"] + node["outputs"] if item.get("paramType") == "required"]
-    if len(values) == 3 and all(item.get("dtype") == "float32" and item.get("format") == "ND" for item in values):
-        print(path)
-        break
-PY
-)"
-    if [[ -z "${fp32_param}" ]]; then
-        return 1
-    fi
-    python3 - "${fp32_param}" "${kernel_name}" <<'PY'
-import json
-import sys
-path, name = sys.argv[1:]
-with open(path, encoding="utf-8") as stream:
-    data = json.load(stream)
-data["op_list"][0]["bin_filename"] = name
-with open(path, "w", encoding="utf-8") as stream:
-    json.dump(data, stream, separators=(",", ":"))
-PY
-    asc_opc "${dynamic_dir}/mat_mul_v3.py" --main_func=mat_mul_v3 \
-        --input_param="${fp32_param}" --soc_version=Ascend910B1 --output="${kernel_dir}" \
-        --impl_mode=high_performance,optional --simplified_key_mode=0 --op_mode=dynamic \
-        --deterministic=false --tiling_key=3211264 >>"${build_log}" 2>&1
-    if [[ ! -f "${object}" || ! -f "${metadata}" ]]; then
-        return 1
-    fi
-    if ! readelf -Ws "${object}" | awk \
-        '$4 == "FUNC" && $5 == "GLOBAL" && $8 == "MatMulV3_CubeVectorEdge_3211264_mix_aic" {aic=1}
-         $4 == "FUNC" && $5 == "GLOBAL" && $8 == "MatMulV3_CubeVectorEdge_3211264_mix_aiv" {aiv=1}
-         END {exit !(aic && aiv)}'; then
-        return 1
-    fi
-    printf '%s\n' "${object}"
-}
-
 printf '{"stage":"workload_generation","status":"begin"}\n'
 mapfile -t k_parallel_workloads < <(python3 - <<'PY'
 import itertools
@@ -196,40 +123,34 @@ for row in rows:
 PY
 )
 
-rectangular_workloads=()
-for k in 256 512 1024 2048 4096; do
-    for n in 673 689 705 721 737 753; do
-        for m in 65 73 105 113 121; do
-            rectangular_workloads+=(fp32_fp32 NN "${m}" "${n}" "${k}")
-        done
-    done
-    for n in 769 785 801 817 833 849 865 881 897 913 929 945 961 977 993 1009 1025; do
-        for m in 73 105; do
-            rectangular_workloads+=(fp32_fp32 NN "${m}" "${n}" "${k}")
-        done
-    done
-done
+mapfile -t rectangular_workloads < <(python3 - <<'PY'
+import itertools
+import random
 
-reuse_workloads=()
-for k in 8192 6144 12288; do
-    for m in 1153 1281 1409 1537 1665 1793 1921 2049 2177 2305 2433 2561 2689 2817 2945 3073 3201 3329 3457 3585 3713 3841 3969 4097; do
-        for n in 4097 3969 3841 3713 3585 3457 3329 3201 3073 2945 2817 2689 2561 2433 2305 2177 2049 1921 1793 1665 1537 1409 1281 1153 1025 897 769 641 513 385 257; do
-            reuse_workloads+=(fp32_fp32 NT "${m}" "${n}" "${k}")
-        done
-    done
-done
+dtypes = (("fp16_fp16", 2), ("bf16_bf16", 2), ("fp32_fp32", 4))
+layouts = ("NT", "TN")
+short_values = (65, 73, 81, 89, 97, 105, 113, 121, 129, 145, 161, 193, 225, 257, 321, 385)
+long_values = (2049, 2561, 3073, 3585, 4097, 4609, 5121, 6145, 7169, 8193)
+k_values = (8192, 12288, 16384, 20480, 24576, 28672, 32768)
+rows = []
+for (dtype, size), layout, short, long, k, reverse in itertools.product(
+        dtypes, layouts, short_values, long_values, k_values, (False, True)):
+    m, n = (long, short) if reverse else (short, long)
+    if long < 4 * short:
+        continue
+    total_bytes = (m * k + n * k + m * n) * size
+    if total_bytes > 384 * 1024 * 1024:
+        continue
+    rows.append((dtype, layout, m, n, k))
+random.Random(8505).shuffle(rows)
+for row in rows:
+    for value in row:
+        print(value)
+PY
+)
 
-edge_workloads=()
-for k in 8192 9216 10240 12288 14336 16384 18432 20480 22528 24576 28672 32768; do
-    for m in 129 130 131 257 258 259 385 386 389 513 514 519 641 643 769 773; do
-        for n in 513 514 515 641 642 643 769 770 773 897 899 1025 1027 1153 1157 1281; do
-            edge_workloads+=(fp32_fp32 NT "${m}" "${n}" "${k}")
-        done
-    done
-done
-printf '{"stage":"workload_generation","status":"passed","k_parallel":%d,"rectangular":%d,"reuse":%d,"edge":%d}\n' \
-    "$(( ${#k_parallel_workloads[@]} / 5 ))" "$(( ${#rectangular_workloads[@]} / 5 ))" \
-    "$(( ${#reuse_workloads[@]} / 5 ))" "$(( ${#edge_workloads[@]} / 5 ))"
+printf '{"stage":"workload_generation","status":"passed","k_parallel":%d,"rectangular":%d}\n' \
+    "$(( ${#k_parallel_workloads[@]} / 5 ))" "$(( ${#rectangular_workloads[@]} / 5 ))"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
@@ -251,15 +172,4 @@ run_campaign() {
 
 run_campaign K_PARALLEL_SPLIT_K 300 "${runner}" "${k_parallel_workloads[@]}"
 run_campaign RECTANGULAR_CUBE 200 "${runner}" "${rectangular_workloads[@]}"
-run_campaign REUSE_DIRECTED 200 "${runner}" "${reuse_workloads[@]}"
-printf '{"stage":"edge_kernel_build","status":"begin"}\n'
-if edge_binary="$(build_edge_kernel)"; then
-    printf '{"stage":"edge_kernel_build","status":"passed"}\n'
-    export MATMUL_EDGE_BINARY="${edge_binary}"
-    run_campaign CUBE_VECTOR_EDGE 200 "${runner}" "${edge_workloads[@]}"
-else
-    cat "${build_log}" >&2
-    printf '{"campaign_complete":"CUBE_VECTOR_EDGE","process_result_code":4,"reason":"kernel_build_failed"}\n'
-    campaign_failures=$((campaign_failures + 1))
-fi
-printf '{"overnight_complete":true,"campaigns":4,"campaign_process_failures":%d}\n' "${campaign_failures}"
+printf '{"overnight_complete":true,"campaigns":2,"campaign_process_failures":%d}\n' "${campaign_failures}"

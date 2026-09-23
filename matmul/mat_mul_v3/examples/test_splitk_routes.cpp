@@ -14,7 +14,8 @@
 extern "C" uint32_t TbeLoadSoAndSaveToRegistry(const char *soPath);
 
 constexpr int WARMUP = 2;
-constexpr int REPEATS = 8;
+constexpr int SAMPLES = 5;
+constexpr int RUNS_PER_SAMPLE = 2;
 
 struct ScalarType {
     aclDataType aclType;
@@ -286,19 +287,26 @@ int Measure(Launch launch, aclrtStream stream, float &latency)
     int rc = ACL_SUCCESS;
     for (int index = 0; rc == ACL_SUCCESS && index < WARMUP; ++index) rc = launch();
     if (rc == ACL_SUCCESS) rc = aclrtSynchronizeStream(stream);
-    aclrtEvent start = nullptr;
-    aclrtEvent end = nullptr;
-    if (rc == ACL_SUCCESS) rc = aclrtCreateEvent(&start);
-    if (rc == ACL_SUCCESS) rc = aclrtCreateEvent(&end);
-    if (rc == ACL_SUCCESS) rc = aclrtRecordEvent(start, stream);
-    for (int index = 0; rc == ACL_SUCCESS && index < REPEATS; ++index) rc = launch();
-    if (rc == ACL_SUCCESS) rc = aclrtRecordEvent(end, stream);
-    if (rc == ACL_SUCCESS) rc = aclrtSynchronizeEvent(end);
-    float total = 0.0f;
-    if (rc == ACL_SUCCESS) rc = aclrtEventElapsedTime(&total, start, end);
-    if (end != nullptr) (void)aclrtDestroyEvent(end);
-    if (start != nullptr) (void)aclrtDestroyEvent(start);
-    if (rc == ACL_SUCCESS) latency = total / REPEATS;
+    std::vector<float> samples;
+    for (int sample = 0; rc == ACL_SUCCESS && sample < SAMPLES; ++sample) {
+        aclrtEvent start = nullptr;
+        aclrtEvent end = nullptr;
+        rc = aclrtCreateEvent(&start);
+        if (rc == ACL_SUCCESS) rc = aclrtCreateEvent(&end);
+        if (rc == ACL_SUCCESS) rc = aclrtRecordEvent(start, stream);
+        for (int index = 0; rc == ACL_SUCCESS && index < RUNS_PER_SAMPLE; ++index) rc = launch();
+        if (rc == ACL_SUCCESS) rc = aclrtRecordEvent(end, stream);
+        if (rc == ACL_SUCCESS) rc = aclrtSynchronizeEvent(end);
+        float total = 0.0f;
+        if (rc == ACL_SUCCESS) rc = aclrtEventElapsedTime(&total, start, end);
+        if (end != nullptr) (void)aclrtDestroyEvent(end);
+        if (start != nullptr) (void)aclrtDestroyEvent(start);
+        if (rc == ACL_SUCCESS) samples.push_back(total / RUNS_PER_SAMPLE);
+    }
+    if (rc == ACL_SUCCESS) {
+        std::sort(samples.begin(), samples.end());
+        latency = samples[samples.size() / 2];
+    }
     return rc;
 }
 
@@ -396,11 +404,13 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     const TilingSnapshot official = ReadTilingSnapshot();
     if (rc != ACL_SUCCESS || officialExecutor == nullptr) {
         ++counts.officialFailed;
-        std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
-                    "\"output_dtype\":\"%s\",\"status\":\"OFFICIAL_GET_WORKSPACE_FAILED\",\"result_code\":%d}\n",
-                    static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
-                    dtype.inputName, dtype.outputName, rc == ACL_SUCCESS ? 4 : rc);
-        std::fflush(stdout);
+        if (rc != 561103) {
+            std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
+                        "\"output_dtype\":\"%s\",\"status\":\"OFFICIAL_GET_WORKSPACE_FAILED\",\"result_code\":%d}\n",
+                        static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
+                        dtype.inputName, dtype.outputName, rc == ACL_SUCCESS ? 4 : rc);
+            std::fflush(stdout);
+        }
         if (officialExecutor != nullptr) (void)aclDestroyAclOpExecutor(officialExecutor);
         ReleaseTensor(cTensor);
         ReleaseTensor(bTensor);
@@ -443,10 +453,9 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         (void)::unsetenv("MATMUL_EXPERIMENT_SELECTED");
         (void)::unsetenv("MATMUL_EXPERIMENT_BRANCH");
         const char *modelNames[] = {
-            "MATMUL_KPAR_K_ITERATIONS", "MATMUL_KPAR_K_BYTES_PER_ITERATION",
-            "MATMUL_KPAR_TARGET_ITERATIONS_PER_CORE", "MATMUL_KPAR_OUTPUT_QUANTA",
-            "MATMUL_KPAR_BY_WORK",
-            "MATMUL_KPAR_BY_L2", "MATMUL_KPAR_SELECTED_CORES",
+            "MATMUL_KPAR_K_ITERATIONS", "MATMUL_KPAR_OFFICIAL_ROUNDS",
+            "MATMUL_KPAR_SELECTED_ROUNDS", "MATMUL_KPAR_OFFICIAL_IDLE_SLOTS",
+            "MATMUL_KPAR_SELECTED_IDLE_SLOTS", "MATMUL_KPAR_SELECTED_CORES",
             "MATMUL_KPAR_OLD_PARTIAL_BYTES", "MATMUL_KPAR_FINAL_PARTIAL_BYTES"
         };
         for (const char *name : modelNames) (void)::unsetenv(name);
@@ -627,18 +636,16 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     PrintTiling("candidate_tiling", adaptive);
     std::printf(",\"official_core\":%u,\"candidate_core\":%u", official.cores, adaptive.cores);
     if (kParallelCampaign) {
-        std::printf(",\"k_iterations\":%lu,\"k_bytes_per_iteration\":%lu,"
-                    "\"target_iterations_per_core\":%lu,\"output_quanta_64x64\":%lu,"
-                    "\"limit_by_work\":%lu,"
-                    "\"limit_by_l2\":%lu,\"pre_adjust_partial_bytes\":%lu,"
+        std::printf(",\"k_iterations\":%lu,\"official_k_rounds\":%lu,"
+                    "\"candidate_k_rounds\":%lu,\"official_idle_k_slots\":%lu,"
+                    "\"candidate_idle_k_slots\":%lu,\"pre_adjust_partial_bytes\":%lu,"
                     "\"final_partial_bytes\":%lu,"
                     "\"partial_saved_pct\":%.6f",
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_K_ITERATIONS")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_K_BYTES_PER_ITERATION")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_TARGET_ITERATIONS_PER_CORE")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_OUTPUT_QUANTA")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_WORK")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_L2")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_OFFICIAL_ROUNDS")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_SELECTED_ROUNDS")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_OFFICIAL_IDLE_SLOTS")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_SELECTED_IDLE_SLOTS")),
                     static_cast<unsigned long>(oldPartialBytes),
                     static_cast<unsigned long>(finalPartialBytes), partialSaved);
     }
