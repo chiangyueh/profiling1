@@ -1735,177 +1735,6 @@ bool MatmulV3BaseTiling::DoExperimentalSplitKTiling()
     if (mode == nullptr || mode[0] == '\0') {
         return false;
     }
-    if (std::strcmp(mode, "K_PARALLEL_DETERMINISTIC_SPLIT_K") == 0) {
-        const MatmulV3RunInfo savedRunInfo = runInfo_;
-        const TilingEnable savedTilingEnable = tilingEnable_;
-        const MatmulV3Args savedArgs = args_;
-        if (!DoDeterministicMultiCoreSplitKTiling()) {
-            runInfo_ = savedRunInfo;
-            tilingEnable_ = savedTilingEnable;
-            args_ = savedArgs;
-            return false;
-        }
-        if (runInfo_.usedCoreNum < NUMBER_TWO || runInfo_.singleCoreK == 0) {
-            runInfo_ = savedRunInfo;
-            tilingEnable_ = savedTilingEnable;
-            args_ = savedArgs;
-            return false;
-        }
-        // NEW BEGIN
-        const uint64_t kIterations = MathUtil::CeilDivision(args_.kValue, runInfo_.singleCoreK);
-        const uint64_t officialCores = runInfo_.usedCoreNum;
-        const bool orderFlag = runInfo_.iterateOrder == 0;
-        const bool l2Split = orderFlag ? args_.mValue != runInfo_.singleCoreM :
-                                         args_.nValue != runInfo_.singleCoreN;
-        const bool vectorNz = tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::VEC_NZ2ND_UNALIGNOUT;
-        const uint64_t alignedM = ops::CeilAlign(args_.mValue, BASIC_ALIGN_16);
-        const uint64_t alignedN = ops::CeilAlign(args_.nValue, BASIC_ALIGN_16);
-        const uint64_t workspaceSingleSize = vectorNz ?
-            std::max(alignedM, runInfo_.singleCoreM) * std::max(alignedN, runInfo_.singleCoreN) :
-            (l2Split ? runInfo_.singleCoreM * runInfo_.singleCoreN :
-                (orderFlag ? args_.mValue * runInfo_.singleCoreN : runInfo_.singleCoreM * args_.nValue));
-        const uint64_t partialBytes = workspaceSingleSize * DB_SIZE * DATA_SIZE_FP32;
-        const uint64_t mTiles = MathUtil::CeilDivision(args_.mValue, runInfo_.singleCoreM);
-        const uint64_t nTiles = MathUtil::CeilDivision(args_.nValue, runInfo_.singleCoreN);
-        const uint64_t kAlign = args_.aType == ge::DT_FLOAT && !args_.isHf32 ? 8UL : BASIC_ALIGN_16;
-        const double cubeOpsPerCycle = args_.aType == ge::DT_FLOAT && !args_.isHf32 ? 4096.0 : 8192.0;
-
-        struct SplitKCoreCost {
-            double total = std::numeric_limits<double>::max();
-            double cube = 0.0;
-            double reduce = 0.0;
-            double preprocess = 0.0;
-            uint64_t workspace = 0;
-            uint64_t maxK = 0;
-        };
-
-        auto evaluate = [&](uint64_t cores) {
-            SplitKCoreCost cost;
-            cost.workspace = cores * partialBytes;
-            const uint64_t preCoreNumRaw = kIterations % cores;
-            const uint64_t preCoreNum = preCoreNumRaw == 0 ? cores : preCoreNumRaw;
-            const uint64_t rounds = MathUtil::CeilDivision(kIterations, cores);
-            uint64_t maxAlignedK = 0;
-            for (uint64_t core = 0; core < cores; ++core) {
-                uint64_t first = core * rounds;
-                uint64_t coreRounds = rounds;
-                if (core >= preCoreNum) {
-                    first = core * (rounds - 1) + preCoreNum;
-                    coreRounds = rounds - 1;
-                }
-                uint64_t coreK = 0;
-                for (uint64_t offset = 0; offset < coreRounds; ++offset) {
-                    const uint64_t kIndex = first + offset;
-                    const uint64_t actualK = std::min(runInfo_.singleCoreK,
-                        args_.kValue - kIndex * runInfo_.singleCoreK);
-                    coreK += ops::CeilAlign(actualK, kAlign);
-                }
-                maxAlignedK = std::max(maxAlignedK, coreK);
-            }
-            cost.maxK = maxAlignedK;
-            const bool workspaceInL2 = cost.workspace <= compileInfo_.l2Size * 7UL / 10UL;
-            const double workspaceReadRate = workspaceInL2 ? compileInfo_.l2ReadRate : compileInfo_.ddrReadRate;
-            const double workspaceWriteRate = workspaceInL2 ? compileInfo_.l2WriteRate : compileInfo_.ddrWriteRate;
-            double previousReduce = 0.0;
-            bool firstTile = true;
-            for (uint64_t mIndex = 0; mIndex < mTiles; ++mIndex) {
-                const uint64_t tileM = std::min(runInfo_.singleCoreM,
-                    args_.mValue - mIndex * runInfo_.singleCoreM);
-                for (uint64_t nIndex = 0; nIndex < nTiles; ++nIndex) {
-                    const uint64_t tileN = std::min(runInfo_.singleCoreN,
-                        args_.nValue - nIndex * runInfo_.singleCoreN);
-                    const uint64_t cubeM = ops::CeilAlign(tileM, BASIC_ALIGN_16);
-                    const uint64_t cubeN = ops::CeilAlign(tileN, BASIC_ALIGN_16);
-                    const double computeCycles =
-                        2.0 * static_cast<double>(cubeM) * static_cast<double>(cubeN) *
-                        static_cast<double>(maxAlignedK) / cubeOpsPerCycle;
-                    const double aBytes = static_cast<double>(tileM) * maxAlignedK * aDtypeSize_;
-                    const double bBytes = static_cast<double>(tileN) * maxAlignedK * bDtypeSize_;
-                    const double partialWriteBytes =
-                        static_cast<double>(cubeM) * cubeN * DATA_SIZE_FP32;
-                    const double cubeCycles = std::max({
-                        computeCycles,
-                        (aBytes + bBytes) / compileInfo_.ddrReadRate,
-                        aBytes / compileInfo_.l1ToL0ARate,
-                        bBytes / compileInfo_.l1ToL0BRate,
-                        partialWriteBytes / workspaceWriteRate});
-                    const uint64_t vectorElements = vectorNz ? cubeM * cubeN : tileM * tileN;
-                    const uint64_t elementsPerVector = MathUtil::CeilDivision(
-                        vectorElements, cores * NUMBER_TWO);
-                    const double reduceReadCycles = static_cast<double>(elementsPerVector) * cores *
-                        DATA_SIZE_FP32 / workspaceReadRate;
-                    const double reduceAddCycles = static_cast<double>(elementsPerVector) * (cores - 1) *
-                        DATA_SIZE_FP32 / compileInfo_.vectorBytesPerCycle;
-                    const double castCycles = cDtypeSize_ == DATA_SIZE_FP32 ? 0.0 :
-                        static_cast<double>(elementsPerVector) * DATA_SIZE_FP32 /
-                        compileInfo_.vectorBytesPerCycle;
-                    const double outputWriteCycles =
-                        static_cast<double>(elementsPerVector) * cDtypeSize_ / compileInfo_.ddrWriteRate;
-                    const double reduceCycles =
-                        reduceReadCycles + reduceAddCycles + castCycles + outputWriteCycles;
-                    cost.cube += cubeCycles;
-                    cost.reduce += reduceCycles;
-                    if (firstTile) {
-                        cost.total = cubeCycles;
-                        firstTile = false;
-                    } else {
-                        cost.total += std::max(cubeCycles, previousReduce);
-                    }
-                    previousReduce = reduceCycles;
-                }
-            }
-            if (!firstTile) {
-                cost.total += previousReduce;
-            }
-            const double preprocessBytes =
-                (args_.nd2nzA ? static_cast<double>(args_.mValue) * args_.kValue * aDtypeSize_ : 0.0) +
-                (args_.nd2nzB ? static_cast<double>(args_.nValue) * args_.kValue * bDtypeSize_ : 0.0);
-            cost.preprocess = preprocessBytes /
-                (static_cast<double>(cores * NUMBER_TWO) * compileInfo_.vectorBytesPerCycle);
-            cost.total += cost.preprocess;
-            return cost;
-        };
-
-        const SplitKCoreCost officialCost = evaluate(officialCores);
-        SplitKCoreCost selectedCost = officialCost;
-        uint64_t selectedCores = officialCores;
-        for (uint64_t cores = NUMBER_TWO; cores < officialCores; ++cores) {
-            const SplitKCoreCost candidateCost = evaluate(cores);
-            if (candidateCost.total < selectedCost.total) {
-                selectedCost = candidateCost;
-                selectedCores = cores;
-            }
-        }
-        auto exportValue = [](const char *name, uint64_t value) {
-            char text[32] = {};
-            (void)snprintf(text, sizeof(text), "%lu", value);
-            (void)::setenv(name, text, 1);
-        };
-        exportValue("MATMUL_KPAR_K_ITERATIONS", kIterations);
-        exportValue("MATMUL_KPAR_OFFICIAL_CORES", officialCores);
-        exportValue("MATMUL_KPAR_SELECTED_CORES", selectedCores);
-        exportValue("MATMUL_KPAR_OFFICIAL_SCORE", static_cast<uint64_t>(officialCost.total + 0.5));
-        exportValue("MATMUL_KPAR_SELECTED_SCORE", static_cast<uint64_t>(selectedCost.total + 0.5));
-        exportValue("MATMUL_KPAR_OFFICIAL_CUBE_CYCLES", static_cast<uint64_t>(officialCost.cube + 0.5));
-        exportValue("MATMUL_KPAR_SELECTED_CUBE_CYCLES", static_cast<uint64_t>(selectedCost.cube + 0.5));
-        exportValue("MATMUL_KPAR_OFFICIAL_REDUCE_CYCLES", static_cast<uint64_t>(officialCost.reduce + 0.5));
-        exportValue("MATMUL_KPAR_SELECTED_REDUCE_CYCLES", static_cast<uint64_t>(selectedCost.reduce + 0.5));
-        exportValue("MATMUL_KPAR_OFFICIAL_MAX_K", officialCost.maxK);
-        exportValue("MATMUL_KPAR_SELECTED_MAX_K", selectedCost.maxK);
-        exportValue("MATMUL_KPAR_OLD_PARTIAL_BYTES", officialCost.workspace);
-        exportValue("MATMUL_KPAR_FINAL_PARTIAL_BYTES", selectedCost.workspace);
-        if (selectedCores >= runInfo_.usedCoreNum) {
-            runInfo_ = savedRunInfo;
-            tilingEnable_ = savedTilingEnable;
-            args_ = savedArgs;
-            return false;
-        }
-        runInfo_.usedCoreNum = selectedCores;
-        runInfo_.needUpdate = true;
-        (void)::setenv("MATMUL_EXPERIMENT_SELECTED", "1", 1);
-        return true;
-        // NEW END
-    }
     if (std::strcmp(mode, "ATOMIC_SPLIT_K") == 0) {
         const bool selected = DoAtomicSplitKTiling();
         if (selected) (void)::setenv("MATMUL_EXPERIMENT_SELECTED", "1", 1);
@@ -3133,6 +2962,13 @@ void MatmulV3BaseTiling::OptCoreNumsDeterministicMultiCoreSplitK(){
 bool MatmulV3BaseTiling::DoDeterministicMultiCoreSplitKTiling()
 {
     (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED");
+    (void)::unsetenv("MATMUL_ADAPTIVE_OLD_PARTIAL_BYTES");
+    (void)::unsetenv("MATMUL_ADAPTIVE_NEW_PARTIAL_BYTES");
+    (void)::unsetenv("MATMUL_ADAPTIVE_K_UNITS");
+    (void)::unsetenv("MATMUL_ADAPTIVE_K_QUOTIENT");
+    (void)::unsetenv("MATMUL_ADAPTIVE_K_REMAINDER");
+    (void)::unsetenv("MATMUL_ADAPTIVE_K_MIN");
+    (void)::unsetenv("MATMUL_ADAPTIVE_K_MAX");
     if (compileInfo_.supportL12BtBf16 || !SupportMultiSplitK()) {
         return false;
     }
@@ -3191,27 +3027,42 @@ bool MatmulV3BaseTiling::DoDeterministicMultiCoreSplitKTiling()
     OptCoreNumsDeterministicMultiCoreSplitK();
     const char *adaptive = std::getenv("MATMUL_DETERMINISTIC_ADAPTIVE");
     if (adaptive != nullptr && adaptive[0] == '1' && adaptive[1] == '\0') {
-        const uint64_t candidateSingleCoreM = ops::CeilAlign(args_.mValue, BASIC_ALIGN_16);
-        const bool mkOrder = runInfo_.singleCoreN == args_.nValue;
-        const bool baseOutput = tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE;
-        const bool tn16Bit = args_.isATrans && !args_.isBTrans &&
-            (args_.aType == ge::DT_FLOAT16 || args_.aType == ge::DT_BF16) &&
-            args_.bType == args_.aType && args_.cType == args_.aType;
-        const uint64_t oldPartialBytes = runInfo_.usedCoreNum * runInfo_.singleCoreM *
-            runInfo_.singleCoreN * DB_SIZE * DATA_SIZE_FP32;
-        const bool changed = tn16Bit && mkOrder && baseOutput && candidateSingleCoreM < runInfo_.singleCoreM;
         auto exportValue = [](const char *name, uint64_t value) {
             char text[32] = {};
             (void)snprintf(text, sizeof(text), "%lu", value);
             (void)::setenv(name, text, 1);
         };
+
+        const auto partialBytes = [&]() {
+            uint64_t singleSize = runInfo_.singleCoreM * runInfo_.singleCoreN;
+            if (tilingEnable_.tilingEnableFixOpti != TilingEnableFixOpti::BASE) {
+                singleSize = std::max(ops::CeilAlign(args_.mValue, BASIC_ALIGN_16), runInfo_.singleCoreM) *
+                    std::max(ops::CeilAlign(args_.nValue, BASIC_ALIGN_16), runInfo_.singleCoreN);
+            }
+            return runInfo_.usedCoreNum * singleSize * DB_SIZE * DATA_SIZE_FP32;
+        };
+
+        const uint64_t oldSingleCoreM = runInfo_.singleCoreM;
+        const uint64_t oldPartialBytes = partialBytes();
+        runInfo_.singleCoreM = std::min(
+            runInfo_.singleCoreM, ops::CeilAlign(args_.mValue, BASIC_ALIGN_16));
+        const uint64_t newPartialBytes = partialBytes();
+        const bool changed = runInfo_.singleCoreM != oldSingleCoreM;
+
+        const uint64_t kUnit = std::max(1UL, runInfo_.baseK);
+        const uint64_t kUnits = MathUtil::CeilDivision(args_.kValue, kUnit);
+        const uint64_t kQuotient = kUnits / runInfo_.usedCoreNum;
+        const uint64_t kRemainder = kUnits % runInfo_.usedCoreNum;
+        const uint64_t kMin = kQuotient * kUnit;
+        const uint64_t kMax = std::min(args_.kValue, (kQuotient + (kRemainder != 0 ? 1UL : 0UL)) * kUnit);
+
         exportValue("MATMUL_ADAPTIVE_OLD_PARTIAL_BYTES", oldPartialBytes);
-        if (changed) {
-            runInfo_.singleCoreM = candidateSingleCoreM;
-        }
-        const uint64_t newPartialBytes = runInfo_.usedCoreNum * runInfo_.singleCoreM *
-            runInfo_.singleCoreN * DB_SIZE * DATA_SIZE_FP32;
         exportValue("MATMUL_ADAPTIVE_NEW_PARTIAL_BYTES", newPartialBytes);
+        exportValue("MATMUL_ADAPTIVE_K_UNITS", kUnits);
+        exportValue("MATMUL_ADAPTIVE_K_QUOTIENT", kQuotient);
+        exportValue("MATMUL_ADAPTIVE_K_REMAINDER", kRemainder);
+        exportValue("MATMUL_ADAPTIVE_K_MIN", kMin);
+        exportValue("MATMUL_ADAPTIVE_K_MAX", kMax);
         (void)::setenv("MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED", changed ? "1" : "0", 1);
     }
     return true;

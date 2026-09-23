@@ -81,7 +81,7 @@ runtime_library="-lacl_rt"
 if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/lib64/libascendcl.so" ]]; then
     runtime_library="-lascendcl"
 fi
-runner="${build_dir}/test_k_parallel_rectangular_v1"
+runner="${build_dir}/test_adaptive_deterministic_v1"
 printf '{"stage":"runner_build","status":"begin"}\n'
 if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
     matmul/mat_mul_v3/op_host/op_api/matmul.cpp \
@@ -105,26 +105,33 @@ fi
 printf '{"stage":"runner_build","status":"passed"}\n'
 
 printf '{"stage":"workload_generation","status":"begin"}\n'
-mapfile -t k_parallel_workloads < <(python3 - <<'PY'
-import itertools
+mapfile -t adaptive_workloads < <(python3 - <<'PY'
 import random
 
-dtypes = ("fp16_fp16", "bf16_bf16", "fp32_fp32")
-layouts = ("NT", "TN")
-m_values = (8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192)
-n_values = (8, 16, 24, 32, 40, 48, 64, 80, 96, 112, 128, 160, 192, 256)
-k_values = (8192, 10240, 12288, 14336, 16384, 18432, 20480, 24576,
-            28672, 32768, 36864, 40960, 49152, 57344, 65536)
-rows = list(itertools.product(dtypes, layouts, m_values, n_values, k_values))
-random.Random(8504).shuffle(rows)
+dtypes = ("fp16_fp16", "fp16_fp32", "bf16_bf16", "bf16_fp32", "fp32_fp32")
+layouts = ("NN", "NT", "TN", "TT")
+m_values = (1, 3, 7, 8, 15, 16, 17, 24, 31, 32, 40, 48, 56, 63, 64,
+            65, 80, 96, 112, 127, 128, 160, 192, 256, 384, 512)
+n_values = (1, 3, 7, 8, 15, 16, 17, 24, 31, 32, 40, 48, 56, 63, 64,
+            65, 80, 96, 112, 127, 128, 160, 192, 256, 384, 512)
+k_values = (6144, 7168, 8192, 9216, 10240, 12288, 14336, 16384, 18432,
+            20480, 24576, 27392, 28672, 32768, 36864, 40960, 49152, 57344, 65536)
+rng = random.Random(8505)
+rows = []
+for dtype in dtypes:
+    for layout in layouts:
+        shapes = [(m, n, k) for m in m_values for n in n_values for k in k_values]
+        rng.shuffle(shapes)
+        rows.extend((dtype, layout, m, n, k) for m, n, k in shapes[:900])
+rng.shuffle(rows)
 for row in rows:
     for value in row:
         print(value)
 PY
 )
 
-printf '{"stage":"workload_generation","status":"passed","k_parallel":%d}\n' \
-    "$(( ${#k_parallel_workloads[@]} / 5 ))"
+printf '{"stage":"workload_generation","status":"passed","adaptive":%d}\n' \
+    "$(( ${#adaptive_workloads[@]} / 5 ))"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
@@ -144,5 +151,5 @@ run_campaign() {
     fi
 }
 
-run_campaign K_PARALLEL_SPLIT_K 300 "${runner}" "${k_parallel_workloads[@]}"
+run_campaign ADAPTIVE_DETERMINISTIC_SPLIT_K 300 "${runner}" "${adaptive_workloads[@]}"
 printf '{"overnight_complete":true,"campaigns":1,"campaign_process_failures":%d}\n' "${campaign_failures}"
