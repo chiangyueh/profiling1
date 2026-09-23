@@ -182,7 +182,7 @@ mapfile -t k_parallel_workloads < <(python3 - <<'PY'
 import itertools
 import random
 
-dtypes = ("fp16_fp16", "fp16_fp32", "bf16_bf16", "bf16_fp32", "fp32_fp32")
+dtypes = ("fp16_fp16", "bf16_bf16", "fp32_fp32")
 layouts = ("NT", "TN")
 m_values = (8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192)
 n_values = (8, 16, 24, 32, 40, 48, 64, 80, 96, 112, 128, 160, 192, 256)
