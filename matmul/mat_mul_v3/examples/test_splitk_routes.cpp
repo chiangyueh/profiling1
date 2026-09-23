@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -383,7 +384,8 @@ void PrintTiling(const char *name, const TilingSnapshot &value)
 }
 
 int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int64_t n, int64_t k,
-                aclrtStream stream, aclrtFuncHandle edgeFunction, RunCounts &counts)
+                aclrtStream stream, aclrtFuncHandle edgeFunction, RunCounts &counts,
+                uint64_t manifestIndex)
 {
     const bool baseCampaign = IsBaseCampaign();
     const bool edgeCampaign = std::strcmp(CampaignName(), "CUBE_VECTOR_EDGE") == 0;
@@ -583,9 +585,11 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     }
     if (rc == ACL_SUCCESS) rc = aclrtMemset(cTensor.device, cTensor.bytes, 0, cTensor.bytes);
     void *officialWorkspace = nullptr;
-    if (rc == ACL_SUCCESS && officialWorkspaceSize != 0) {
-        rc = aclrtMalloc(&officialWorkspace, officialWorkspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+    const uint64_t sharedWorkspaceSize = std::max(officialWorkspaceSize, adaptiveWorkspaceSize);
+    if (rc == ACL_SUCCESS && sharedWorkspaceSize != 0) {
+        rc = aclrtMalloc(&officialWorkspace, sharedWorkspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
     }
+    adaptiveWorkspace = officialWorkspace;
     if (rc == ACL_SUCCESS) rc = aclSetAclOpExecutorRepeatable(officialExecutor);
     float officialLatencyForward = 0.0f;
     if (rc == ACL_SUCCESS) {
@@ -608,9 +612,6 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         ReleaseTensor(bTensor);
         ReleaseTensor(aTensor);
         return rc == ACL_SUCCESS ? 4 : rc;
-    }
-    if (rc == ACL_SUCCESS && adaptiveWorkspaceSize != 0) {
-        rc = aclrtMalloc(&adaptiveWorkspace, adaptiveWorkspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
     }
     if (rc == ACL_SUCCESS) rc = aclrtMemset(cTensor.device, cTensor.bytes, 0, cTensor.bytes);
     if (rc == ACL_SUCCESS && !edgeCampaign) rc = aclSetAclOpExecutorRepeatable(adaptiveExecutor);
@@ -670,9 +671,10 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     const int64_t partialDelta = static_cast<int64_t>(newPartialBytes) - static_cast<int64_t>(oldPartialBytes);
     const double partialSaved = oldPartialBytes > 0 && newPartialBytes <= oldPartialBytes ?
         static_cast<double>(oldPartialBytes - newPartialBytes) * 100.0 / oldPartialBytes : 0.0;
-    std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
+    std::printf("{\"manifest_index\":%lu,\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
                 "\"output_dtype\":\"%s\","
                 "\"candidate_branch\":\"%s\",\"candidate_selected\":%s,\"tiling_changed\":%s,",
+                static_cast<unsigned long>(manifestIndex),
                 static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
                 dtype.inputName, dtype.outputName,
                 CampaignName(),
@@ -715,7 +717,6 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
 
     if (correct) ++counts.passed; else ++counts.failed;
     if (tilingDevice != nullptr) (void)aclrtFree(tilingDevice);
-    if (adaptiveWorkspace != nullptr) (void)aclrtFree(adaptiveWorkspace);
     if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
     if (officialWorkspace != nullptr) (void)aclrtFree(officialWorkspace);
     (void)aclDestroyAclOpExecutor(officialExecutor);
@@ -731,11 +732,12 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
 
 int main(int argc, char **argv)
 {
-    if (argc < 6 || (argc - 1) % 5 != 0) return 2;
+    const bool manifestMode = argc == 3 && std::strcmp(argv[1], "--manifest") == 0;
+    if (!manifestMode && (argc < 6 || (argc - 1) % 5 != 0)) return 2;
     if (!IsBaseCampaign() && !IsAdaptiveCampaign()) return 4;
     const uint64_t targetPasses = ReadEnvUnsigned("MATMUL_TARGET_PASSES");
     std::printf("{\"campaign_start\":\"%s\",\"target_passes\":%lu,"
-                "\"runner\":\"adaptive_deterministic_single_m_boundary_v2\"}\n",
+                "\"runner\":\"adaptive_deterministic_10000_v3\"}\n",
                 CampaignName(), static_cast<unsigned long>(targetPasses));
     std::fflush(stdout);
     const char *hostLibrary = std::getenv("MATMUL_HOST_LIBRARY");
@@ -758,21 +760,55 @@ int main(int argc, char **argv)
     }
 
     RunCounts counts;
-    for (int index = 1; index < argc; index += 5) {
-        const DTypeSpec *dtype = FindDType(argv[index]);
-        const LayoutSpec *layout = FindLayout(argv[index + 1]);
-        if (dtype == nullptr || layout == nullptr) continue;
-        (void)RunWorkload(*dtype, *layout,
-                          std::strtoll(argv[index + 2], nullptr, 10),
-                          std::strtoll(argv[index + 3], nullptr, 10),
-                          std::strtoll(argv[index + 4], nullptr, 10), stream, edgeFunction, counts);
-        if (targetPasses != 0 && counts.passed >= targetPasses) break;
+    const uint64_t startIndex = ReadEnvUnsigned("MATMUL_START_INDEX");
+    uint64_t manifestIndex = 0;
+    auto runOne = [&](const char *dtypeName, const char *layoutName, int64_t m, int64_t n, int64_t k) {
+        const DTypeSpec *dtype = FindDType(dtypeName);
+        const LayoutSpec *layout = FindLayout(layoutName);
+        if (dtype == nullptr || layout == nullptr) return;
+        (void)RunWorkload(*dtype, *layout, m, n, k, stream, edgeFunction, counts, manifestIndex);
+        if (counts.inputs != 0 && counts.inputs % 1000 == 0) {
+            std::printf("{\"progress\":true,\"manifest_index\":%lu,\"inputs\":%lu,"
+                        "\"passed\":%lu,\"official_failed\":%lu,\"non_target_route\":%lu}\n",
+                        static_cast<unsigned long>(manifestIndex),
+                        static_cast<unsigned long>(counts.inputs),
+                        static_cast<unsigned long>(counts.passed),
+                        static_cast<unsigned long>(counts.officialFailed),
+                        static_cast<unsigned long>(counts.nonDeterministic));
+            std::fflush(stdout);
+        }
+    };
+    if (manifestMode) {
+        std::ifstream input(argv[2]);
+        if (!input) return 4;
+        std::string dtypeName;
+        std::string layoutName;
+        int64_t m = 0;
+        int64_t n = 0;
+        int64_t k = 0;
+        while (input >> dtypeName >> layoutName >> m >> n >> k) {
+            ++manifestIndex;
+            if (manifestIndex <= startIndex) continue;
+            runOne(dtypeName.c_str(), layoutName.c_str(), m, n, k);
+            if (targetPasses != 0 && counts.passed >= targetPasses) break;
+        }
+    } else {
+        for (int index = 1; index < argc; index += 5) {
+            ++manifestIndex;
+            if (manifestIndex <= startIndex) continue;
+            runOne(argv[index], argv[index + 1],
+                   std::strtoll(argv[index + 2], nullptr, 10),
+                   std::strtoll(argv[index + 3], nullptr, 10),
+                   std::strtoll(argv[index + 4], nullptr, 10));
+            if (targetPasses != 0 && counts.passed >= targetPasses) break;
+        }
     }
     std::printf("{\"summary\":true,\"campaign\":\"%s\",\"inputs\":%lu,\"skipped_non_v3\":%lu,"
                 "\"non_target_route\":%lu,"
                 "\"official_target\":%lu,\"candidate_selected\":%lu,\"official_preserved\":%lu,"
                 "\"target_passes\":%lu,\"quota_met\":%s,\"passed\":%lu,\"failed\":%lu,"
-                "\"official_failed\":%lu}\n",
+                "\"official_failed\":%lu,\"manifest_start_index\":%lu,"
+                "\"manifest_end_index\":%lu}\n",
                 CampaignName(),
                 static_cast<unsigned long>(counts.inputs),
                 static_cast<unsigned long>(counts.skippedNonV3),
@@ -784,7 +820,9 @@ int main(int argc, char **argv)
                 (targetPasses == 0 || counts.passed >= targetPasses) ? "true" : "false",
                 static_cast<unsigned long>(counts.passed),
                 static_cast<unsigned long>(counts.failed),
-                static_cast<unsigned long>(counts.officialFailed));
+                static_cast<unsigned long>(counts.officialFailed),
+                static_cast<unsigned long>(startIndex),
+                static_cast<unsigned long>(manifestIndex));
     if (edgeBinary != nullptr) (void)aclrtBinaryUnLoad(edgeBinary);
     (void)aclrtDestroyStream(stream);
     (void)aclrtResetDevice(0);
