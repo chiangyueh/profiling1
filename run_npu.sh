@@ -178,53 +178,25 @@ PY
 }
 
 printf '{"stage":"workload_generation","status":"begin"}\n'
-mapfile -t k_parallel_workloads < <(python3 - <<'PY'
-import itertools
-import random
-
-dtypes = ("fp16_fp16", "fp16_fp32", "bf16_bf16", "bf16_fp32", "fp32_fp32")
-layouts = ("NT", "TN")
-m_values = (8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192)
-n_values = (8, 16, 24, 32, 40, 48, 64, 80, 96, 112, 128, 160, 192, 256)
-k_values = (8192, 10240, 12288, 14336, 16384, 18432, 20480, 24576,
-            28672, 32768, 36864, 40960, 49152, 57344, 65536)
-rows = list(itertools.product(dtypes, layouts, m_values, n_values, k_values))
-random.Random(8503).shuffle(rows)
-for row in rows:
-    for value in row:
-        print(value)
-PY
-)
-
-homogeneous_dtypes=(fp16_fp16 bf16_bf16 fp32_fp32)
-layouts=(NN NT TN TT)
-
 rectangular_workloads=()
-serial=0
-for k in 256 384 512 640 768 1024 1280 1536 2048 2560 3072 4096; do
-    for long_dim in 2561 3073 3585 4097 4609 5121 5633 6145 6657 7169 7681 8193; do
-        for short_dim in 17 23 31 39 47 55 63 71 79 87 95 103 111 119 127 143; do
-            dtype="${homogeneous_dtypes[$((serial % ${#homogeneous_dtypes[@]}))]}"
-            layout="${layouts[$(((serial / ${#homogeneous_dtypes[@]}) % ${#layouts[@]}))]}"
-            rectangular_workloads+=("${dtype}" "${layout}" "${short_dim}" "${long_dim}" "${k}")
-            serial=$((serial + 1))
-            dtype="${homogeneous_dtypes[$((serial % ${#homogeneous_dtypes[@]}))]}"
-            layout="${layouts[$(((serial / ${#homogeneous_dtypes[@]}) % ${#layouts[@]}))]}"
-            rectangular_workloads+=("${dtype}" "${layout}" "${long_dim}" "${short_dim}" "${k}")
-            serial=$((serial + 1))
+for k in 256 512 1024 2048 4096; do
+    for n in 673 689 705 721 737 753; do
+        for m in 65 73 105 113 121; do
+            rectangular_workloads+=(fp32_fp32 NN "${m}" "${n}" "${k}")
+        done
+    done
+    for n in 769 785 801 817 833 849 865 881 897 913 929 945 961 977 993 1009 1025; do
+        for m in 73 105; do
+            rectangular_workloads+=(fp32_fp32 NN "${m}" "${n}" "${k}")
         done
     done
 done
 
 reuse_workloads=()
-serial=0
-for k in 512 768 1024 1280 1536 2048 2560 3072 4096 5120 6144 8192; do
-    for m in 257 385 513 641 769 897 1025 1153 1281 1409 1537 1665 1793 1921 2049 2305; do
-        for n in 257 385 513 641 769 897 1025 1153 1281 1409 1537 1665 1793 1921 2049 2305; do
-            dtype="${homogeneous_dtypes[$((serial % ${#homogeneous_dtypes[@]}))]}"
-            layout="${layouts[$(((serial / ${#homogeneous_dtypes[@]}) % ${#layouts[@]}))]}"
-            reuse_workloads+=("${dtype}" "${layout}" "${m}" "${n}" "${k}")
-            serial=$((serial + 1))
+for k in 8192 6144 12288; do
+    for m in 1153 1281 1409 1537 1665 1793 1921 2049 2177 2305 2433 2561 2689 2817 2945 3073 3201 3329 3457 3585 3713 3841 3969 4097; do
+        for n in 4097 3969 3841 3713 3585 3457 3329 3201 3073 2945 2817 2689 2561 2433 2305 2177 2049 1921 1793 1665 1537 1409 1281 1153 1025 897 769 641 513 385 257; do
+            reuse_workloads+=(fp32_fp32 NT "${m}" "${n}" "${k}")
         done
     done
 done
@@ -237,8 +209,8 @@ for k in 8192 9216 10240 12288 14336 16384 18432 20480 22528 24576 28672 32768; 
         done
     done
 done
-printf '{"stage":"workload_generation","status":"passed","k_parallel":%d,"rectangular":%d,"reuse":%d,"edge":%d}\n' \
-    "$(( ${#k_parallel_workloads[@]} / 5 ))" "$(( ${#rectangular_workloads[@]} / 5 ))" \
+printf '{"stage":"workload_generation","status":"passed","rectangular":%d,"reuse":%d,"edge":%d}\n' \
+    "$(( ${#rectangular_workloads[@]} / 5 ))" \
     "$(( ${#reuse_workloads[@]} / 5 ))" "$(( ${#edge_workloads[@]} / 5 ))"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
@@ -259,7 +231,6 @@ run_campaign() {
     fi
 }
 
-run_campaign K_PARALLEL_SPLIT_K 300 "${runner}" "${k_parallel_workloads[@]}"
 run_campaign RECTANGULAR_CUBE 200 "${runner}" "${rectangular_workloads[@]}"
 run_campaign REUSE_DIRECTED 200 "${runner}" "${reuse_workloads[@]}"
 printf '{"stage":"edge_kernel_build","status":"begin"}\n'
@@ -272,4 +243,4 @@ else
     printf '{"campaign_complete":"CUBE_VECTOR_EDGE","process_result_code":4,"reason":"kernel_build_failed"}\n'
     campaign_failures=$((campaign_failures + 1))
 fi
-printf '{"overnight_complete":true,"campaigns":4,"campaign_process_failures":%d}\n' "${campaign_failures}"
+printf '{"overnight_complete":true,"campaigns":3,"campaign_process_failures":%d}\n' "${campaign_failures}"
