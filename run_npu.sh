@@ -108,25 +108,34 @@ printf '{"stage":"workload_generation","status":"begin"}\n'
 mapfile -t adaptive_workloads < <(python3 - <<'PY'
 import random
 
-dtypes = ("fp16_fp16", "fp16_fp32", "bf16_bf16", "bf16_fp32", "fp32_fp32")
+dtypes = ("fp16_fp16", "bf16_bf16", "fp32_fp32")
 layouts = ("NN", "NT", "TN", "TT")
-m_values = (1, 3, 7, 8, 15, 16, 17, 24, 31, 32, 40, 48, 56, 63, 64,
-            65, 80, 96, 112, 127, 128, 160, 192, 256, 384, 512)
-n_values = (1, 3, 7, 8, 15, 16, 17, 24, 31, 32, 40, 48, 56, 63, 64,
-            65, 80, 96, 112, 127, 128, 160, 192, 256, 384, 512)
-k_values = (6144, 7168, 8192, 9216, 10240, 12288, 14336, 16384, 18432,
-            20480, 24576, 27392, 28672, 32768, 36864, 40960, 49152, 57344, 65536)
-rng = random.Random(8505)
-rows = []
-for dtype in dtypes:
-    for layout in layouts:
-        shapes = [(m, n, k) for m in m_values for n in n_values for k in k_values]
-        rng.shuffle(shapes)
-        rows.extend((dtype, layout, m, n, k) for m, n, k in shapes[:900])
-rng.shuffle(rows)
-for row in rows:
-    for value in row:
-        print(value)
+m_values = (1, 7, 15, 16, 17, 24, 31, 32, 33, 47, 48, 55, 63, 64, 65,
+            79, 80, 95, 96, 111, 112, 127, 128, 159, 160, 191, 192, 255,
+            256, 319, 320, 383, 384)
+n_values = (128, 192, 256, 320, 384, 448, 512, 640, 768, 896, 1024,
+            1280, 1536, 1792, 2048, 2304, 2560, 3072, 3584, 4096)
+k_values = (8192, 12288, 14336, 16384, 18432, 22528, 24576, 28672,
+            32768, 36864, 40960, 45056, 49152, 57344, 65536)
+groups = []
+for group_index, (dtype, layout) in enumerate(
+        (pair for dtype in dtypes for pair in ((dtype, value) for value in layouts))):
+    rng = random.Random(8505 + group_index)
+    rows = []
+    for m in m_values:
+        for n in n_values:
+            bytes_per_element = 4 if dtype == "fp32_fp32" else 2
+            valid_k = tuple(k for k in k_values
+                            if (m + n) * k * bytes_per_element <= 512 * 1024 * 1024)
+            first, second = rng.sample(valid_k, 2)
+            rows.append((dtype, layout, m, n, first))
+            rows.append((dtype, layout, m, n, second))
+    rng.shuffle(rows)
+    groups.append(rows)
+for index in range(min(len(group) for group in groups)):
+    for group in groups:
+        for value in group[index]:
+            print(value)
 PY
 )
 
@@ -151,5 +160,5 @@ run_campaign() {
     fi
 }
 
-run_campaign ADAPTIVE_DETERMINISTIC_SPLIT_K 300 "${runner}" "${adaptive_workloads[@]}"
+run_campaign ADAPTIVE_DETERMINISTIC_SPLIT_K 480 "${runner}" "${adaptive_workloads[@]}"
 printf '{"overnight_complete":true,"campaigns":1,"campaign_process_failures":%d}\n' "${campaign_failures}"

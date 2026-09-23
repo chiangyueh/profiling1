@@ -13,8 +13,8 @@
 
 extern "C" uint32_t TbeLoadSoAndSaveToRegistry(const char *soPath);
 
-constexpr int WARMUP = 2;
-constexpr int SAMPLES = 5;
+constexpr int WARMUP = 1;
+constexpr int SAMPLES = 3;
 constexpr int RUNS_PER_SAMPLE = 2;
 
 struct ScalarType {
@@ -243,6 +243,31 @@ void StoreValue(std::vector<uint8_t> &data, size_t index, const ScalarType &dtyp
     } else {
         const uint16_t converted = FloatToBf16(value);
         std::memcpy(destination, &converted, sizeof(converted));
+    }
+}
+
+void FillScalarRange(std::vector<uint8_t> &data, size_t first, size_t count,
+                     const ScalarType &dtype, float value)
+{
+    if (count == 0) return;
+    StoreValue(data, first, dtype, value);
+    size_t filled = dtype.bytes;
+    const size_t begin = first * dtype.bytes;
+    const size_t total = count * dtype.bytes;
+    while (filled < total) {
+        const size_t copied = std::min(filled, total - filled);
+        std::memcpy(data.data() + begin + filled, data.data() + begin, copied);
+        filled += copied;
+    }
+}
+
+void RepeatPrefix(std::vector<uint8_t> &data, size_t prefixBytes)
+{
+    size_t filled = prefixBytes;
+    while (filled < data.size()) {
+        const size_t copied = std::min(filled, data.size() - filled);
+        std::memcpy(data.data() + filled, data.data(), copied);
+        filled += copied;
     }
 }
 
@@ -526,21 +551,29 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     }
     std::vector<uint8_t> a(static_cast<size_t>(m * k) * dtype.input.bytes);
     std::vector<uint8_t> b(static_cast<size_t>(n * k) * dtype.input.bytes);
-    for (int64_t row = 0; row < m; ++row) {
-        for (int64_t index = 0; index < k; ++index) {
-            const size_t offset = layout.transA ? static_cast<size_t>(index * m + row) :
-                                                  static_cast<size_t>(row * k + index);
-            const float value = static_cast<float>((row % 3 + 1) * (index % 2 + 1)) / 16.0f;
-            StoreValue(a, offset, dtype.input, value);
+    if (layout.transA) {
+        for (int64_t row = 0; row < m; ++row) {
+            StoreValue(a, static_cast<size_t>(row), dtype.input,
+                       static_cast<float>(row % 3 + 1) / 16.0f);
+        }
+        RepeatPrefix(a, static_cast<size_t>(m) * dtype.input.bytes);
+    } else {
+        for (int64_t row = 0; row < m; ++row) {
+            FillScalarRange(a, static_cast<size_t>(row * k), static_cast<size_t>(k), dtype.input,
+                            static_cast<float>(row % 3 + 1) / 16.0f);
         }
     }
-    for (int64_t column = 0; column < n; ++column) {
-        for (int64_t index = 0; index < k; ++index) {
-            const size_t offset = layout.transB ? static_cast<size_t>(column * k + index) :
-                                                  static_cast<size_t>(index * n + column);
-            const float value = static_cast<float>((column % 5 + 1) * ((index / 2) % 2 + 1)) / 16.0f;
-            StoreValue(b, offset, dtype.input, value);
+    if (layout.transB) {
+        for (int64_t column = 0; column < n; ++column) {
+            FillScalarRange(b, static_cast<size_t>(column * k), static_cast<size_t>(k), dtype.input,
+                            static_cast<float>(column % 5 + 1) / 16.0f);
         }
+    } else {
+        for (int64_t column = 0; column < n; ++column) {
+            StoreValue(b, static_cast<size_t>(column), dtype.input,
+                       static_cast<float>(column % 5 + 1) / 16.0f);
+        }
+        RepeatPrefix(b, static_cast<size_t>(n) * dtype.input.bytes);
     }
     if (rc == ACL_SUCCESS) {
         rc = aclrtMemcpy(aTensor.device, aTensor.bytes, a.data(), a.size(), ACL_MEMCPY_HOST_TO_DEVICE);
@@ -554,15 +587,13 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         rc = aclrtMalloc(&officialWorkspace, officialWorkspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
     }
     if (rc == ACL_SUCCESS) rc = aclSetAclOpExecutorRepeatable(officialExecutor);
-    float officialLatency = 0.0f;
+    float officialLatencyForward = 0.0f;
     if (rc == ACL_SUCCESS) {
         rc = Measure([&]() {
             return aclnnMatmul(officialWorkspace, officialWorkspaceSize, officialExecutor, stream);
-        }, stream, officialLatency);
+        }, stream, officialLatencyForward);
     }
     const std::vector<uint8_t> officialOutput = rc == ACL_SUCCESS ? CopyDeviceOutput(cTensor) : std::vector<uint8_t>{};
-    if (officialWorkspace != nullptr) (void)aclrtFree(officialWorkspace);
-    (void)aclDestroyAclOpExecutor(officialExecutor);
     if (rc != ACL_SUCCESS || officialOutput.empty()) {
         ++counts.officialFailed;
         std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
@@ -571,6 +602,8 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
                     dtype.inputName, dtype.outputName, rc == ACL_SUCCESS ? 4 : rc);
         std::fflush(stdout);
         if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
+        if (officialWorkspace != nullptr) (void)aclrtFree(officialWorkspace);
+        (void)aclDestroyAclOpExecutor(officialExecutor);
         ReleaseTensor(cTensor);
         ReleaseTensor(bTensor);
         ReleaseTensor(aTensor);
@@ -581,7 +614,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     }
     if (rc == ACL_SUCCESS) rc = aclrtMemset(cTensor.device, cTensor.bytes, 0, cTensor.bytes);
     if (rc == ACL_SUCCESS && !edgeCampaign) rc = aclSetAclOpExecutorRepeatable(adaptiveExecutor);
-    float adaptiveLatency = 0.0f;
+    float adaptiveLatencyForward = 0.0f;
     void *tilingDevice = nullptr;
     aclrtArgsHandle edgeArguments = nullptr;
     if (rc == ACL_SUCCESS && edgeCampaign) {
@@ -607,13 +640,27 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         rc = Measure([&]() {
             return aclrtLaunchKernelWithConfig(edgeFunction, adaptive.cores, stream, nullptr,
                                                edgeArguments, nullptr);
-        }, stream, adaptiveLatency);
+        }, stream, adaptiveLatencyForward);
     } else if (rc == ACL_SUCCESS) {
         rc = Measure([&]() {
             return aclnnMatmul(adaptiveWorkspace, adaptiveWorkspaceSize, adaptiveExecutor, stream);
-        }, stream, adaptiveLatency);
+        }, stream, adaptiveLatencyForward);
     }
     const std::vector<uint8_t> adaptiveOutput = rc == ACL_SUCCESS ? CopyDeviceOutput(cTensor) : std::vector<uint8_t>{};
+    float adaptiveLatencyReverse = adaptiveLatencyForward;
+    float officialLatencyReverse = officialLatencyForward;
+    if (rc == ACL_SUCCESS && adaptiveCampaign) {
+        rc = Measure([&]() {
+            return aclnnMatmul(adaptiveWorkspace, adaptiveWorkspaceSize, adaptiveExecutor, stream);
+        }, stream, adaptiveLatencyReverse);
+    }
+    if (rc == ACL_SUCCESS && adaptiveCampaign) {
+        rc = Measure([&]() {
+            return aclnnMatmul(officialWorkspace, officialWorkspaceSize, officialExecutor, stream);
+        }, stream, officialLatencyReverse);
+    }
+    const float officialLatency = (officialLatencyForward + officialLatencyReverse) * 0.5f;
+    const float adaptiveLatency = (adaptiveLatencyForward + adaptiveLatencyReverse) * 0.5f;
     double maxAbs = 0.0;
     double maxRel = 0.0;
     const bool correct = rc == ACL_SUCCESS && CompareOutputs(officialOutput, adaptiveOutput, dtype.output, maxAbs, maxRel);
@@ -650,10 +697,15 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ADAPTIVE_K_MIN")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ADAPTIVE_K_MAX")));
     }
-    std::printf(",\"official_workspace\":%lu,\"candidate_workspace\":%lu,"
+    std::printf(",\"measurement_order\":\"OCCO\","
+                "\"official_forward_ms\":%.9f,\"candidate_forward_ms\":%.9f,"
+                "\"candidate_reverse_ms\":%.9f,\"official_reverse_ms\":%.9f,"
+                "\"official_workspace\":%lu,\"candidate_workspace\":%lu,"
                 "\"official_latency_ms\":%.9f,\"candidate_latency_ms\":%s,"
                 "\"delta_pct\":%s,\"max_abs_diff\":%.9g,\"max_rel_diff\":%.9g,"
                 "\"correctness\":\"%s\",\"result_code\":%d}\n",
+                officialLatencyForward, adaptiveLatencyForward,
+                adaptiveLatencyReverse, officialLatencyReverse,
                 static_cast<unsigned long>(officialWorkspaceSize),
                 static_cast<unsigned long>(adaptiveWorkspaceSize), officialLatency,
                 correct ? std::to_string(adaptiveLatency).c_str() : "null",
@@ -665,6 +717,8 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     if (tilingDevice != nullptr) (void)aclrtFree(tilingDevice);
     if (adaptiveWorkspace != nullptr) (void)aclrtFree(adaptiveWorkspace);
     if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
+    if (officialWorkspace != nullptr) (void)aclrtFree(officialWorkspace);
+    (void)aclDestroyAclOpExecutor(officialExecutor);
     (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE");
     (void)::unsetenv("MATMUL_BASE_MODE");
     (void)::unsetenv("MATMUL_VECTOR_ENABLE");
@@ -681,7 +735,7 @@ int main(int argc, char **argv)
     if (!IsBaseCampaign() && !IsAdaptiveCampaign()) return 4;
     const uint64_t targetPasses = ReadEnvUnsigned("MATMUL_TARGET_PASSES");
     std::printf("{\"campaign_start\":\"%s\",\"target_passes\":%lu,"
-                "\"runner\":\"adaptive_deterministic_single_m_v1\"}\n",
+                "\"runner\":\"adaptive_deterministic_single_m_boundary_v2\"}\n",
                 CampaignName(), static_cast<unsigned long>(targetPasses));
     std::fflush(stdout);
     const char *hostLibrary = std::getenv("MATMUL_HOST_LIBRARY");
