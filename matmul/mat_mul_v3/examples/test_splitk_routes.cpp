@@ -147,11 +147,10 @@ bool IsPlainBase(uint64_t key)
         ((key >> 20U) & 0x0fU) == 0U;
 }
 
-bool SameTilingExceptKPartition(const TilingSnapshot &left, const TilingSnapshot &right)
+bool SameTilingExceptCore(const TilingSnapshot &left, const TilingSnapshot &right)
 {
-    return left.key == right.key && left.cores == right.cores &&
-        left.singleM == right.singleM && left.singleN == right.singleN &&
-        left.baseM == right.baseM && left.baseN == right.baseN &&
+    return left.key == right.key && left.singleM == right.singleM && left.singleN == right.singleN &&
+        left.singleK == right.singleK && left.baseM == right.baseM && left.baseN == right.baseN &&
         left.baseK == right.baseK && left.stepKa == right.stepKa && left.stepKb == right.stepKb &&
         left.depthA1 == right.depthA1 && left.depthB1 == right.depthB1 &&
         left.l2MTile == right.l2MTile && left.l2NTile == right.l2NTile &&
@@ -454,10 +453,10 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         (void)::unsetenv("MATMUL_EXPERIMENT_SELECTED");
         (void)::unsetenv("MATMUL_EXPERIMENT_BRANCH");
         const char *modelNames[] = {
-            "MATMUL_KPAR_OFFICIAL_SINGLE_K", "MATMUL_KPAR_SELECTED_SINGLE_K",
-            "MATMUL_KPAR_BALANCED_SINGLE_K", "MATMUL_KPAR_L2_LIMIT_SINGLE_K",
-            "MATMUL_KPAR_OFFICIAL_ITERATIONS", "MATMUL_KPAR_SELECTED_ITERATIONS",
-            "MATMUL_KPAR_OFFICIAL_ROUNDS", "MATMUL_KPAR_SELECTED_ROUNDS"
+            "MATMUL_KPAR_K_ITERATIONS", "MATMUL_KPAR_K_BYTES_PER_ITERATION",
+            "MATMUL_KPAR_TARGET_ITERATIONS_PER_CORE", "MATMUL_KPAR_OUTPUT_QUANTA",
+            "MATMUL_KPAR_BY_WORK", "MATMUL_KPAR_BY_L2", "MATMUL_KPAR_SELECTED_CORES",
+            "MATMUL_KPAR_OLD_PARTIAL_BYTES", "MATMUL_KPAR_FINAL_PARTIAL_BYTES"
         };
         for (const char *name : modelNames) (void)::unsetenv(name);
     } else {
@@ -501,7 +500,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         ReleaseTensor(aTensor);
         return rc == ACL_SUCCESS ? ACL_SUCCESS : rc;
     }
-    const bool invariantPassed = !kParallelCampaign || !changed || SameTilingExceptKPartition(official, adaptive);
+    const bool invariantPassed = !kParallelCampaign || !changed || SameTilingExceptCore(official, adaptive);
     const bool candidateRouteMatched = baseCampaign ? changed :
         (IsDeterministicSplitK(adaptive.key) && invariantPassed);
     if (rc == ACL_SUCCESS && !candidateRouteMatched) rc = 4;
@@ -620,6 +619,10 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     double maxRel = 0.0;
     const bool correct = rc == ACL_SUCCESS && CompareOutputs(officialOutput, adaptiveOutput, dtype.output, maxAbs, maxRel);
     const double delta = correct ? (adaptiveLatency / officialLatency - 1.0) * 100.0 : 0.0;
+    const uint64_t oldPartialBytes = ReadEnvUnsigned("MATMUL_KPAR_OLD_PARTIAL_BYTES");
+    const uint64_t finalPartialBytes = ReadEnvUnsigned("MATMUL_KPAR_FINAL_PARTIAL_BYTES");
+    const double partialSaved = oldPartialBytes > 0 && finalPartialBytes <= oldPartialBytes ?
+        static_cast<double>(oldPartialBytes - finalPartialBytes) * 100.0 / oldPartialBytes : 0.0;
     std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
                 "\"output_dtype\":\"%s\","
                 "\"candidate_branch\":\"%s\",\"candidate_selected\":%s,",
@@ -632,18 +635,19 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     PrintTiling("candidate_tiling", adaptive);
     std::printf(",\"official_core\":%u,\"candidate_core\":%u", official.cores, adaptive.cores);
     if (kParallelCampaign) {
-        std::printf(",\"official_single_k\":%lu,\"candidate_single_k\":%lu,"
-                    "\"balanced_single_k\":%lu,\"l2_limit_single_k\":%lu,"
-                    "\"official_k_iterations\":%lu,\"candidate_k_iterations\":%lu,"
-                    "\"official_k_rounds\":%lu,\"candidate_k_rounds\":%lu",
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_OFFICIAL_SINGLE_K")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_SELECTED_SINGLE_K")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BALANCED_SINGLE_K")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_L2_LIMIT_SINGLE_K")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_OFFICIAL_ITERATIONS")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_SELECTED_ITERATIONS")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_OFFICIAL_ROUNDS")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_SELECTED_ROUNDS")));
+        std::printf(",\"k_iterations\":%lu,\"k_bytes_per_iteration\":%lu,"
+                    "\"target_iterations_per_core\":%lu,\"output_quanta_64x64\":%lu,"
+                    "\"limit_by_work\":%lu,\"limit_by_l2\":%lu,"
+                    "\"pre_adjust_partial_bytes\":%lu,\"final_partial_bytes\":%lu,"
+                    "\"partial_saved_pct\":%.6f",
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_K_ITERATIONS")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_K_BYTES_PER_ITERATION")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_TARGET_ITERATIONS_PER_CORE")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_OUTPUT_QUANTA")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_WORK")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_KPAR_BY_L2")),
+                    static_cast<unsigned long>(oldPartialBytes),
+                    static_cast<unsigned long>(finalPartialBytes), partialSaved);
     }
     std::printf(",\"official_workspace\":%lu,\"candidate_workspace\":%lu,"
                 "\"official_latency_ms\":%.9f,\"candidate_latency_ms\":%s,"

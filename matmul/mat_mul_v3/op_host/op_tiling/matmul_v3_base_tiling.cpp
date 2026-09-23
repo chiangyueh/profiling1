@@ -1729,54 +1729,45 @@ bool MatmulV3BaseTiling::DoExperimentalSplitKTiling()
             args_ = savedArgs;
             return false;
         }
-        const uint64_t officialSingleK = runInfo_.singleCoreK;
-        const uint64_t officialIterations = MathUtil::CeilDivision(args_.kValue, officialSingleK);
-        const uint64_t officialCores = runInfo_.usedCoreNum;
-        const uint64_t officialRounds = MathUtil::CeilDivision(officialIterations, officialCores);
-        const uint64_t perCoreL2 = compileInfo_.l2Size * 7UL / 10UL / officialCores;
-        const uint64_t outputBytes = runInfo_.singleCoreM * runInfo_.singleCoreN * DATA_SIZE_FP32;
-        const uint64_t operandBytesPerK = runInfo_.singleCoreM * aDtypeSize_ +
-            runInfo_.singleCoreN * bDtypeSize_;
-        if (perCoreL2 <= outputBytes || operandBytesPerK == 0) {
+        constexpr uint64_t minKBytesPerCore = 8192;
+        const uint64_t kIterations = MathUtil::CeilDivision(args_.kValue, runInfo_.singleCoreK);
+        const uint64_t kBytesPerIteration = runInfo_.singleCoreK * aDtypeSize_;
+        const uint64_t targetIterationsPerCore =
+            MathUtil::CeilDivision(minKBytesPerCore, kBytesPerIteration);
+        const uint64_t outputQuanta =
+            MathUtil::CeilDivision(args_.mValue, BASIC_BLOCK_SIZE_64) *
+            MathUtil::CeilDivision(args_.nValue, BASIC_BLOCK_SIZE_64);
+        const uint64_t byWork = MathUtil::CeilDivision(
+            kIterations * outputQuanta, targetIterationsPerCore);
+        const uint64_t partialBytes = runInfo_.singleCoreM * runInfo_.singleCoreN *
+            DB_SIZE * DATA_SIZE_FP32;
+        const uint64_t byL2 = std::max(NUMBER_TWO,
+            partialBytes == 0 ? NUMBER_TWO : compileInfo_.l2Size * 7UL / 10UL / partialBytes);
+        const uint64_t selectedCores =
+            std::min({runInfo_.usedCoreNum, std::max(NUMBER_TWO, byWork), byL2});
+        if (selectedCores >= runInfo_.usedCoreNum) {
             runInfo_ = savedRunInfo;
             tilingEnable_ = savedTilingEnable;
             args_ = savedArgs;
             return false;
         }
-        const uint64_t l2LimitSingleK = ops::FloorAlign(
-            (perCoreL2 - outputBytes) / operandBytesPerK, BASIC_ALIGN_16);
-        const uint64_t balancedSingleK = ops::CeilAlign(
-            MathUtil::CeilDivision(args_.kValue, officialCores), BASIC_ALIGN_16);
-        const uint64_t selectedSingleK = std::min(balancedSingleK, l2LimitSingleK);
-        if (selectedSingleK <= officialSingleK) {
-            runInfo_ = savedRunInfo;
-            tilingEnable_ = savedTilingEnable;
-            args_ = savedArgs;
-            return false;
-        }
-        const uint64_t selectedIterations = MathUtil::CeilDivision(args_.kValue, selectedSingleK);
-        const uint64_t selectedRounds = MathUtil::CeilDivision(selectedIterations, officialCores);
-        if (selectedIterations < officialCores || selectedRounds >= officialRounds) {
-            runInfo_ = savedRunInfo;
-            tilingEnable_ = savedTilingEnable;
-            args_ = savedArgs;
-            return false;
-        }
-        runInfo_.singleCoreK = selectedSingleK;
+        const uint64_t oldPartialBytes = runInfo_.usedCoreNum * partialBytes;
+        runInfo_.usedCoreNum = selectedCores;
         runInfo_.needUpdate = true;
         auto exportValue = [](const char *name, uint64_t value) {
             char text[32] = {};
             (void)snprintf(text, sizeof(text), "%lu", value);
             (void)::setenv(name, text, 1);
         };
-        exportValue("MATMUL_KPAR_OFFICIAL_SINGLE_K", officialSingleK);
-        exportValue("MATMUL_KPAR_SELECTED_SINGLE_K", selectedSingleK);
-        exportValue("MATMUL_KPAR_BALANCED_SINGLE_K", balancedSingleK);
-        exportValue("MATMUL_KPAR_L2_LIMIT_SINGLE_K", l2LimitSingleK);
-        exportValue("MATMUL_KPAR_OFFICIAL_ITERATIONS", officialIterations);
-        exportValue("MATMUL_KPAR_SELECTED_ITERATIONS", selectedIterations);
-        exportValue("MATMUL_KPAR_OFFICIAL_ROUNDS", officialRounds);
-        exportValue("MATMUL_KPAR_SELECTED_ROUNDS", selectedRounds);
+        exportValue("MATMUL_KPAR_K_ITERATIONS", kIterations);
+        exportValue("MATMUL_KPAR_K_BYTES_PER_ITERATION", kBytesPerIteration);
+        exportValue("MATMUL_KPAR_TARGET_ITERATIONS_PER_CORE", targetIterationsPerCore);
+        exportValue("MATMUL_KPAR_OUTPUT_QUANTA", outputQuanta);
+        exportValue("MATMUL_KPAR_BY_WORK", byWork);
+        exportValue("MATMUL_KPAR_BY_L2", byL2);
+        exportValue("MATMUL_KPAR_SELECTED_CORES", selectedCores);
+        exportValue("MATMUL_KPAR_OLD_PARTIAL_BYTES", oldPartialBytes);
+        exportValue("MATMUL_KPAR_FINAL_PARTIAL_BYTES", selectedCores * partialBytes);
         (void)::setenv("MATMUL_EXPERIMENT_SELECTED", "1", 1);
         return true;
     }
