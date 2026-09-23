@@ -158,6 +158,7 @@ export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
 campaign_failures=0
+success_target="${MATMUL_SUCCESS_TARGET:-10000}"
 run_campaign() {
     local campaign="$1"
     local target="$2"
@@ -171,5 +172,5 @@ run_campaign() {
     fi
 }
 
-run_campaign ADAPTIVE_DETERMINISTIC_SPLIT_K 10000 "${runner}" --manifest "${workload_manifest}"
+run_campaign ADAPTIVE_DETERMINISTIC_SPLIT_K "${success_target}" "${runner}" --manifest "${workload_manifest}"
 printf '{"overnight_complete":true,"campaigns":1,"campaign_process_failures":%d}\n' "${campaign_failures}"
