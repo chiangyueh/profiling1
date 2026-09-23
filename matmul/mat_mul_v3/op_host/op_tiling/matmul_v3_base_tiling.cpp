@@ -1729,35 +1729,54 @@ bool MatmulV3BaseTiling::DoExperimentalSplitKTiling()
             args_ = savedArgs;
             return false;
         }
-        const uint64_t kIterations = MathUtil::CeilDivision(args_.kValue, runInfo_.singleCoreK);
+        const uint64_t officialSingleK = runInfo_.singleCoreK;
+        const uint64_t officialIterations = MathUtil::CeilDivision(args_.kValue, officialSingleK);
         const uint64_t officialCores = runInfo_.usedCoreNum;
-        const uint64_t officialRounds = MathUtil::CeilDivision(kIterations, officialCores);
-        const uint64_t selectedCores = MathUtil::CeilDivision(kIterations, officialRounds);
-        const uint64_t selectedRounds = MathUtil::CeilDivision(kIterations, selectedCores);
-        const uint64_t partialBytes = runInfo_.singleCoreM * runInfo_.singleCoreN *
-            DB_SIZE * DATA_SIZE_FP32;
-        if (selectedCores >= officialCores || selectedRounds != officialRounds) {
+        const uint64_t officialRounds = MathUtil::CeilDivision(officialIterations, officialCores);
+        const uint64_t perCoreL2 = compileInfo_.l2Size * 7UL / 10UL / officialCores;
+        const uint64_t outputBytes = runInfo_.singleCoreM * runInfo_.singleCoreN * DATA_SIZE_FP32;
+        const uint64_t operandBytesPerK = runInfo_.singleCoreM * aDtypeSize_ +
+            runInfo_.singleCoreN * bDtypeSize_;
+        if (perCoreL2 <= outputBytes || operandBytesPerK == 0) {
             runInfo_ = savedRunInfo;
             tilingEnable_ = savedTilingEnable;
             args_ = savedArgs;
             return false;
         }
-        const uint64_t oldPartialBytes = officialCores * partialBytes;
-        runInfo_.usedCoreNum = selectedCores;
+        const uint64_t l2LimitSingleK = ops::FloorAlign(
+            (perCoreL2 - outputBytes) / operandBytesPerK, BASIC_ALIGN_16);
+        const uint64_t balancedSingleK = ops::CeilAlign(
+            MathUtil::CeilDivision(args_.kValue, officialCores), BASIC_ALIGN_16);
+        const uint64_t selectedSingleK = std::min(balancedSingleK, l2LimitSingleK);
+        if (selectedSingleK <= officialSingleK) {
+            runInfo_ = savedRunInfo;
+            tilingEnable_ = savedTilingEnable;
+            args_ = savedArgs;
+            return false;
+        }
+        const uint64_t selectedIterations = MathUtil::CeilDivision(args_.kValue, selectedSingleK);
+        const uint64_t selectedRounds = MathUtil::CeilDivision(selectedIterations, officialCores);
+        if (selectedIterations < officialCores || selectedRounds >= officialRounds) {
+            runInfo_ = savedRunInfo;
+            tilingEnable_ = savedTilingEnable;
+            args_ = savedArgs;
+            return false;
+        }
+        runInfo_.singleCoreK = selectedSingleK;
         runInfo_.needUpdate = true;
         auto exportValue = [](const char *name, uint64_t value) {
             char text[32] = {};
             (void)snprintf(text, sizeof(text), "%lu", value);
             (void)::setenv(name, text, 1);
         };
-        exportValue("MATMUL_KPAR_K_ITERATIONS", kIterations);
+        exportValue("MATMUL_KPAR_OFFICIAL_SINGLE_K", officialSingleK);
+        exportValue("MATMUL_KPAR_SELECTED_SINGLE_K", selectedSingleK);
+        exportValue("MATMUL_KPAR_BALANCED_SINGLE_K", balancedSingleK);
+        exportValue("MATMUL_KPAR_L2_LIMIT_SINGLE_K", l2LimitSingleK);
+        exportValue("MATMUL_KPAR_OFFICIAL_ITERATIONS", officialIterations);
+        exportValue("MATMUL_KPAR_SELECTED_ITERATIONS", selectedIterations);
         exportValue("MATMUL_KPAR_OFFICIAL_ROUNDS", officialRounds);
         exportValue("MATMUL_KPAR_SELECTED_ROUNDS", selectedRounds);
-        exportValue("MATMUL_KPAR_OFFICIAL_IDLE_SLOTS", officialCores * officialRounds - kIterations);
-        exportValue("MATMUL_KPAR_SELECTED_IDLE_SLOTS", selectedCores * selectedRounds - kIterations);
-        exportValue("MATMUL_KPAR_SELECTED_CORES", selectedCores);
-        exportValue("MATMUL_KPAR_OLD_PARTIAL_BYTES", oldPartialBytes);
-        exportValue("MATMUL_KPAR_FINAL_PARTIAL_BYTES", selectedCores * partialBytes);
         (void)::setenv("MATMUL_EXPERIMENT_SELECTED", "1", 1);
         return true;
     }

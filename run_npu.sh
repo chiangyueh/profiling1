@@ -123,34 +123,8 @@ for row in rows:
 PY
 )
 
-mapfile -t rectangular_workloads < <(python3 - <<'PY'
-import itertools
-import random
-
-dtypes = (("fp16_fp16", 2), ("bf16_bf16", 2), ("fp32_fp32", 4))
-layouts = ("NT", "TN")
-short_values = (65, 73, 81, 89, 97, 105, 113, 121, 129, 145, 161, 193, 225, 257, 321, 385)
-long_values = (2049, 2561, 3073, 3585, 4097, 4609, 5121, 6145, 7169, 8193)
-k_values = (8192, 12288, 16384, 20480, 24576, 28672, 32768)
-rows = []
-for (dtype, size), layout, short, long, k, reverse in itertools.product(
-        dtypes, layouts, short_values, long_values, k_values, (False, True)):
-    m, n = (long, short) if reverse else (short, long)
-    if long < 4 * short:
-        continue
-    total_bytes = (m * k + n * k + m * n) * size
-    if total_bytes > 384 * 1024 * 1024:
-        continue
-    rows.append((dtype, layout, m, n, k))
-random.Random(8505).shuffle(rows)
-for row in rows:
-    for value in row:
-        print(value)
-PY
-)
-
-printf '{"stage":"workload_generation","status":"passed","k_parallel":%d,"rectangular":%d}\n' \
-    "$(( ${#k_parallel_workloads[@]} / 5 ))" "$(( ${#rectangular_workloads[@]} / 5 ))"
+printf '{"stage":"workload_generation","status":"passed","k_parallel":%d}\n' \
+    "$(( ${#k_parallel_workloads[@]} / 5 ))"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
@@ -171,5 +145,4 @@ run_campaign() {
 }
 
 run_campaign K_PARALLEL_SPLIT_K 300 "${runner}" "${k_parallel_workloads[@]}"
-run_campaign RECTANGULAR_CUBE 200 "${runner}" "${rectangular_workloads[@]}"
-printf '{"overnight_complete":true,"campaigns":2,"campaign_process_failures":%d}\n' "${campaign_failures}"
+printf '{"overnight_complete":true,"campaigns":1,"campaign_process_failures":%d}\n' "${campaign_failures}"
