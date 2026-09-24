@@ -1649,53 +1649,33 @@ bool MatmulV3BaseTiling::DoShapeAdaptiveBalancedBaseTiling()
         return false;
     }
 
-    const uint64_t maxMGrid = std::min(compileInfo_.aicNum,
-        MathUtil::CeilDivision(args_.mValue, BASIC_ALIGN_16));
-    const uint64_t maxNGrid = std::min(compileInfo_.aicNum,
-        MathUtil::CeilDivision(args_.nValue, BASIC_ALIGN_16));
-    const long double gridRatio = static_cast<long double>(compileInfo_.aicNum) *
-        static_cast<long double>(args_.mValue) * static_cast<long double>(aDtypeSize_) /
-        (static_cast<long double>(args_.nValue) * static_cast<long double>(bDtypeSize_));
-    uint64_t mGrid = static_cast<uint64_t>(std::llround(std::sqrt(gridRatio)));
-    mGrid = std::max(1UL, std::min(mGrid, maxMGrid));
-    uint64_t nGrid = std::max(1UL, std::min(maxNGrid, compileInfo_.aicNum / mGrid));
-    mGrid = std::max(1UL, std::min(maxMGrid, compileInfo_.aicNum / nGrid));
-
-    const uint64_t singleCoreM = ops::CeilAlign(MathUtil::CeilDivision(args_.mValue, mGrid), BASIC_ALIGN_16);
-    const uint64_t actualMGrid = MathUtil::CeilDivision(args_.mValue, singleCoreM);
-    nGrid = std::max(1UL, std::min(maxNGrid, compileInfo_.aicNum / actualMGrid));
-    const uint64_t singleCoreN = ops::CeilAlign(MathUtil::CeilDivision(args_.nValue, nGrid), BASIC_ALIGN_16);
-    const uint64_t actualNGrid = MathUtil::CeilDivision(args_.nValue, singleCoreN);
-    const uint64_t usedCoreNum = actualMGrid * actualNGrid;
-    if (usedCoreNum == 0 || usedCoreNum > compileInfo_.aicNum) {
-        return false;
-    }
-
     const uint64_t l0cElements = compileInfo_.l0CSize / LOC_DATA_SIZE;
-    const long double baseRatio = static_cast<long double>(l0cElements) *
-        static_cast<long double>(bDtypeSize_) / static_cast<long double>(aDtypeSize_);
-    uint64_t balancedBaseM = static_cast<uint64_t>(std::llround(std::sqrt(baseRatio) / BASIC_ALIGN_16)) *
-        BASIC_ALIGN_16;
-    balancedBaseM = std::max(BASIC_ALIGN_16, std::min(balancedBaseM, BASIC_BLOCK_SIZE_256));
-    uint64_t balancedBaseN = ops::FloorAlign(l0cElements / balancedBaseM, BASIC_ALIGN_16);
-    balancedBaseN = std::max(BASIC_ALIGN_16, std::min(balancedBaseN, 512UL));
-
-    uint64_t baseM = 0;
-    uint64_t baseN = 0;
-    if (singleCoreM <= balancedBaseM) {
-        baseM = singleCoreM;
-        baseN = ops::FloorAlign(l0cElements / baseM, BASIC_ALIGN_16);
-        baseN = std::min({singleCoreN, baseN, 512UL});
-    } else if (singleCoreN <= balancedBaseN) {
-        baseN = singleCoreN;
-        baseM = ops::FloorAlign(l0cElements / baseN, BASIC_ALIGN_16);
-        baseM = std::min({singleCoreM, baseM, BASIC_BLOCK_SIZE_256});
-    } else {
-        baseM = std::min(singleCoreM, balancedBaseM);
-        baseN = std::min(singleCoreN, balancedBaseN);
+    uint64_t mLineAlign = args_.isATrans ?
+        std::lcm(BASIC_ALIGN_16, CACHELINE / aDtypeSize_) : BASIC_ALIGN_16;
+    uint64_t nLineAlign = !args_.isBTrans ?
+        std::lcm(BASIC_ALIGN_16, CACHELINE / bDtypeSize_) : BASIC_ALIGN_16;
+    const long double aTransferCost = static_cast<long double>(aDtypeSize_) /
+        std::max(compileInfo_.l1ToL0ARate, 1.0);
+    const long double bTransferCost = static_cast<long double>(bDtypeSize_) /
+        std::max(compileInfo_.l1ToL0BRate, 1.0);
+    if (mLineAlign * nLineAlign > l0cElements) {
+        if (aTransferCost >= bTransferCost) {
+            nLineAlign = BASIC_ALIGN_16;
+        } else {
+            mLineAlign = BASIC_ALIGN_16;
+        }
     }
-    baseM = ops::FloorAlign(baseM, BASIC_ALIGN_16);
-    baseN = ops::FloorAlign(baseN, BASIC_ALIGN_16);
+    const long double continuousBaseM = std::sqrt(
+        static_cast<long double>(l0cElements) * bTransferCost / aTransferCost);
+    uint64_t baseM = static_cast<uint64_t>(std::llround(continuousBaseM / mLineAlign)) * mLineAlign;
+    baseM = std::max(mLineAlign, std::min(baseM, BASIC_BLOCK_SIZE_256));
+    uint64_t baseN = ops::FloorAlign(l0cElements / baseM, nLineAlign);
+    if (baseN == 0) {
+        baseN = nLineAlign;
+        baseM = ops::FloorAlign(l0cElements / baseN, mLineAlign);
+    }
+    baseN = std::min(baseN, 512UL);
+    baseM = ops::FloorAlign(std::min(baseM, l0cElements / baseN), mLineAlign);
     if (baseM == 0 || baseN == 0 || baseM * baseN > l0cElements) {
         return false;
     }
@@ -1708,13 +1688,36 @@ bool MatmulV3BaseTiling::DoShapeAdaptiveBalancedBaseTiling()
         return false;
     }
 
-    const uint64_t halfL1Size = compileInfo_.l1Size / NUM_HALF;
-    uint64_t stepKa = halfL1Size / baseM / baseK / aDtypeSize_ / DB_SIZE;
-    uint64_t stepKb = halfL1Size / baseN / baseK / bDtypeSize_ / DB_SIZE;
+    const uint64_t mTiles = MathUtil::CeilDivision(args_.mValue, baseM);
+    const uint64_t nTiles = MathUtil::CeilDivision(args_.nValue, baseN);
+    const uint64_t aSliceBytes = baseM * baseK * aDtypeSize_;
+    const uint64_t bSliceBytes = baseN * baseK * bDtypeSize_;
+    const uint64_t minimumA1 = DB_SIZE * aSliceBytes;
+    const uint64_t minimumB1 = DB_SIZE * bSliceBytes;
+    if (minimumA1 + minimumB1 > compileInfo_.l1Size) {
+        return false;
+    }
+    const uint64_t distributableL1 = compileInfo_.l1Size - minimumA1 - minimumB1;
+    const long double aDemand = std::sqrt(
+        static_cast<long double>(nTiles) * aSliceBytes / std::max(compileInfo_.l1ToL0ARate, 1.0));
+    const long double bDemand = std::sqrt(
+        static_cast<long double>(mTiles) * bSliceBytes / std::max(compileInfo_.l1ToL0BRate, 1.0));
+    const long double totalDemand = aDemand + bDemand;
+    const uint64_t aBudget = minimumA1 + (totalDemand > 0.0L ? static_cast<uint64_t>(
+        static_cast<long double>(distributableL1) * aDemand / totalDemand) : distributableL1 / NUM_HALF);
+    const uint64_t bBudget = compileInfo_.l1Size - aBudget;
+    uint64_t stepKa = aBudget / aSliceBytes / DB_SIZE;
+    uint64_t stepKb = bBudget / bSliceBytes / DB_SIZE;
     if (stepKa == 0 || stepKb == 0) {
         return false;
     }
-    const auto alignStepK = [baseK](uint64_t stepK, uint64_t dtypeSize) {
+    const uint64_t kSteps = MathUtil::CeilDivision(args_.kValue, baseK);
+    stepKa = std::min(stepKa, kSteps);
+    stepKb = std::min(stepKb, kSteps);
+    const auto alignStepK = [baseK, kSteps](uint64_t stepK, uint64_t dtypeSize) {
+        if (stepK >= kSteps) {
+            return stepK;
+        }
         const uint64_t sliceBytes = baseK * dtypeSize;
         const uint64_t totalBytes = stepK * sliceBytes;
         const uint64_t alignment = totalBytes > BASIC_ALIGN_512 ? BASIC_ALIGN_512 :
@@ -1733,13 +1736,66 @@ bool MatmulV3BaseTiling::DoShapeAdaptiveBalancedBaseTiling()
         stepKb = stepKb / stepKa * stepKa;
     }
 
-    const long double repeatedA = static_cast<long double>(args_.mValue) * args_.kValue * aDtypeSize_ * actualNGrid;
-    const long double repeatedB = static_cast<long double>(args_.nValue) * args_.kValue * bDtypeSize_ * actualMGrid;
+    const uint64_t aPanelBytes = args_.isATrans ?
+        args_.kValue * ops::CeilAlign(baseM * aDtypeSize_, CACHELINE) :
+        baseM * ops::CeilAlign(args_.kValue * aDtypeSize_, CACHELINE);
+    const uint64_t bPanelBytes = args_.isBTrans ?
+        baseN * ops::CeilAlign(args_.kValue * bDtypeSize_, CACHELINE) :
+        args_.kValue * ops::CeilAlign(baseN * bDtypeSize_, CACHELINE);
+    const uint64_t cTileBytes = baseM * baseN * cDtypeSize_;
+    uint64_t mWindowBlock = 1;
+    uint64_t nWindowBlock = 1;
+    const long double minimumWindowBytes = static_cast<long double>(aPanelBytes) + bPanelBytes + cTileBytes;
+    if (minimumWindowBytes <= compileInfo_.l2Size) {
+        const long double pA = static_cast<long double>(aPanelBytes);
+        const long double pB = static_cast<long double>(bPanelBytes);
+        const long double pC = static_cast<long double>(cTileBytes);
+        const long double l2 = static_cast<long double>(compileInfo_.l2Size);
+        const long double root = pC > 0.0L ?
+            (std::sqrt(pB * pB + pC * l2 * pB / pA) - pB) / pC : l2 / (NUM_HALF * pA);
+        const uint64_t maxMWithOneN = static_cast<uint64_t>((l2 - pB) / (pA + pC));
+        mWindowBlock = std::max(1UL, std::min({mTiles, maxMWithOneN,
+            static_cast<uint64_t>(std::max(1.0L, std::floor(root)))}));
+        const uint64_t remainingL2 = compileInfo_.l2Size - mWindowBlock * aPanelBytes;
+        nWindowBlock = std::max(1UL, std::min(nTiles,
+            remainingL2 / (bPanelBytes + mWindowBlock * cTileBytes)));
+    }
+    const uint64_t targetParallel = std::min(compileInfo_.aicNum, mTiles * nTiles);
+    const long double coreGridM = std::sqrt(static_cast<long double>(targetParallel) * bPanelBytes / aPanelBytes);
+    uint64_t parallelM = std::max(1UL, std::min(mTiles,
+        static_cast<uint64_t>(std::max(1LL, std::llround(coreGridM)))));
+    uint64_t parallelN = std::max(1UL, std::min(nTiles, MathUtil::CeilDivision(targetParallel, parallelM)));
+    parallelM = std::max(1UL, std::min(mTiles, MathUtil::CeilDivision(targetParallel, parallelN)));
+    if (mWindowBlock * nWindowBlock < targetParallel) {
+        mWindowBlock = parallelM;
+        nWindowBlock = parallelN;
+    }
+    const uint64_t mWindowCount = MathUtil::CeilDivision(mTiles, mWindowBlock);
+    const uint64_t nWindowCount = MathUtil::CeilDivision(nTiles, nWindowBlock);
+    const uint64_t usedCoreNum = std::min(compileInfo_.aicNum, mWindowBlock * nWindowBlock);
+    if (usedCoreNum == 0) {
+        return false;
+    }
+
+    const uint64_t rowReuseDistance = bPanelBytes + cTileBytes;
+    const uint64_t colReuseDistance = aPanelBytes + cTileBytes;
+    const uint64_t rowAddressJump = (args_.isBTrans ? baseN * args_.kValue : baseN) * bDtypeSize_ +
+        baseN * cDtypeSize_;
+    const uint64_t colAddressJump = (args_.isATrans ? baseM : baseM * args_.kValue) * aDtypeSize_ +
+        baseM * args_.nValue * cDtypeSize_;
+    const long double rowBenefit = static_cast<long double>(nWindowBlock - 1) * aPanelBytes;
+    const long double colBenefit = static_cast<long double>(mWindowBlock - 1) * bPanelBytes;
+    const long double rowCost = MathUtil::CeilDivision(rowReuseDistance, CACHELINE) +
+        MathUtil::CeilDivision(rowAddressJump, CACHELINE);
+    const long double colCost = MathUtil::CeilDivision(colReuseDistance, CACHELINE) +
+        MathUtil::CeilDivision(colAddressJump, CACHELINE);
+    const bool rowFirst = rowBenefit * colCost >= colBenefit * rowCost;
+
     runInfo_.baseM = baseM;
     runInfo_.baseN = baseN;
     runInfo_.baseK = baseK;
-    runInfo_.singleCoreM = singleCoreM;
-    runInfo_.singleCoreN = singleCoreN;
+    runInfo_.singleCoreM = baseM;
+    runInfo_.singleCoreN = baseN;
     runInfo_.singleCoreK = args_.kValue;
     runInfo_.usedCoreNum = usedCoreNum;
     runInfo_.stepM = 1;
@@ -1748,12 +1804,12 @@ bool MatmulV3BaseTiling::DoShapeAdaptiveBalancedBaseTiling()
     runInfo_.stepKb = stepKb;
     runInfo_.depthA1 = stepKa * DB_SIZE;
     runInfo_.depthB1 = stepKb * DB_SIZE;
-    runInfo_.iterateOrder = repeatedA >= repeatedB ? ITER_ROW_FIRST : ITER_COL_FIRST;
+    runInfo_.iterateOrder = rowFirst ? ITER_ROW_FIRST : ITER_COL_FIRST;
     runInfo_.dbL0c = DB_OFF_SIZE;
-    runInfo_.l2Info.mTile = 1;
-    runInfo_.l2Info.nTile = 1;
-    runInfo_.l2Info.mTileBlock = actualMGrid;
-    runInfo_.l2Info.nTileBlock = actualNGrid;
+    runInfo_.l2Info.mTile = mWindowCount;
+    runInfo_.l2Info.nTile = nWindowCount;
+    runInfo_.l2Info.mTileBlock = mWindowBlock;
+    runInfo_.l2Info.nTileBlock = nWindowBlock;
     runInfo_.l2Info.calOrder = runInfo_.iterateOrder;
     runInfo_.needUpdate = true;
     tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
