@@ -1635,7 +1635,7 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
     const char *mode = std::getenv("MATMUL_BASE_MODE");
     const bool dtypeSupported = args_.aType == args_.bType && args_.bType == args_.cType &&
         (args_.aType == ge::DT_FLOAT16 || args_.aType == ge::DT_BF16);
-    if (mode == nullptr || std::strcmp(mode, "WIDE_N_PANEL_REUSE_BASE") != 0 ||
+    if (mode == nullptr || std::strcmp(mode, "WIDE_N_SHALLOW_K_BASE") != 0 ||
         !compileInfo_.supportL0c2out || compileInfo_.aicNum == 0 || args_.hasBias || !dtypeSupported ||
         tilingEnable_.tilingEnableFullLoad != TilingEnableFullLoad::BASE ||
         tilingEnable_.tilingEnableSplitCore != TilingEnableSplitCore::BASE ||
@@ -1644,129 +1644,35 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
         args_.isATrans || args_.isBTrans ||
         args_.aFormat != ge::FORMAT_ND || args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
         args_.nd2nzA || args_.nd2nzB || args_.isNzA || args_.isNzB ||
-        args_.mValue == 0 || args_.nValue == 0 || args_.kValue == 0 ||
+        args_.mValue == 0 || args_.mValue > BASIC_BLOCK_SIZE_128 ||
+        args_.nValue % BASIC_BLOCK_SIZE_256 != 0 ||
+        args_.kValue < 16384UL || args_.kValue % BASIC_BLOCK_SIZE_64 != 0 ||
+        runInfo_.baseN != BASIC_BLOCK_SIZE_128 || runInfo_.baseK != BASIC_BLOCK_SIZE_128 ||
         aDtypeSize_ != DATA_SIZE_FP16 || bDtypeSize_ != DATA_SIZE_FP16) {
         return false;
     }
 
-    const uint64_t l0cElements = compileInfo_.l0CSize / LOC_DATA_SIZE;
-    const uint64_t nLineAlign = std::lcm(BASIC_ALIGN_16, CACHELINE / bDtypeSize_);
-    const uint64_t maximumBaseN = std::min(nLineAlign,
-        ops::FloorAlign(l0cElements / BASIC_ALIGN_16, nLineAlign));
-    if (maximumBaseN == 0) {
-        return false;
-    }
-    const uint64_t narrowBaseN = std::max(BASIC_ALIGN_16,
-        ops::FloorAlign(maximumBaseN / NUM_HALF, BASIC_ALIGN_16));
-    const bool tinyM = args_.mValue < 10UL;
-    const uint64_t nominalBaseM = tinyM ? BASIC_ALIGN_16 : BASIC_BLOCK_SIZE_128;
-    const uint64_t wideGridTasks = MathUtil::CeilDivision(args_.mValue, nominalBaseM) *
-        MathUtil::CeilDivision(args_.nValue, maximumBaseN);
-    const uint64_t baseN = tinyM || wideGridTasks < compileInfo_.aicNum ? narrowBaseN : maximumBaseN;
-    const uint64_t maximumBaseM = ops::FloorAlign(l0cElements / baseN, BASIC_ALIGN_16);
-    const uint64_t baseM = std::min(nominalBaseM, maximumBaseM);
-    if (baseM == 0) {
-        return false;
-    }
-    const uint64_t kAlign = BLOCK_BYTE_SIZE / std::max(aDtypeSize_, bDtypeSize_);
-    const uint64_t maxBaseKa = compileInfo_.l0ASize / DB_SIZE / aDtypeSize_ / baseM;
-    const uint64_t maxBaseKb = compileInfo_.l0BSize / DB_SIZE / bDtypeSize_ / baseN;
-    const uint64_t baseK = ops::FloorAlign(
-        std::min({ops::CeilAlign(args_.kValue, kAlign), maxBaseKa, maxBaseKb}), kAlign);
-    if (baseK == 0) {
-        return false;
-    }
+    constexpr uint64_t baseM = BASIC_BLOCK_SIZE_128;
+    constexpr uint64_t baseN = BASIC_BLOCK_SIZE_256;
+    constexpr uint64_t baseK = BASIC_BLOCK_SIZE_64;
+    constexpr uint64_t stepKa = 8UL;
+    constexpr uint64_t stepKb = 2UL;
+    constexpr uint64_t depthA1 = stepKa * DB_SIZE;
+    constexpr uint64_t depthB1 = stepKb * DB_SIZE;
 
     const uint64_t mTiles = MathUtil::CeilDivision(args_.mValue, baseM);
     const uint64_t nTiles = MathUtil::CeilDivision(args_.nValue, baseN);
-    if (mTiles == 0 || nTiles == 0) {
+    if (mTiles != 1 || nTiles < compileInfo_.aicNum) {
         return false;
     }
-    const uint64_t gridParallel = std::min(compileInfo_.aicNum, mTiles * nTiles);
 
     const uint64_t l0ABytes = DB_SIZE * baseM * baseK * aDtypeSize_;
     const uint64_t l0BBytes = DB_SIZE * baseN * baseK * bDtypeSize_;
     const uint64_t l0CBytes = baseM * baseN * LOC_DATA_SIZE;
-    if (l0ABytes > compileInfo_.l0ASize || l0BBytes > compileInfo_.l0BSize ||
-        l0CBytes > compileInfo_.l0CSize) {
-        return false;
-    }
-
-    if (tinyM) {
-        const uint64_t alignedM = ops::CeilAlign(args_.mValue, BASIC_ALIGN_16);
-        const uint64_t alignedK = ops::CeilAlign(args_.kValue, kAlign);
-        const uint64_t aFullLoadBytes = alignedM * alignedK * aDtypeSize_;
-        const uint64_t bDoubleBufferBytes = DB_SIZE * baseN * baseK * bDtypeSize_;
-        if (aFullLoadBytes > compileInfo_.l1Size ||
-            bDoubleBufferBytes > compileInfo_.l1Size - aFullLoadBytes) {
-            return false;
-        }
-
-        runInfo_.baseM = baseM;
-        runInfo_.baseN = baseN;
-        runInfo_.baseK = baseK;
-        runInfo_.singleCoreM = args_.mValue;
-        runInfo_.singleCoreN = baseN;
-        runInfo_.singleCoreK = args_.kValue;
-        runInfo_.usedCoreNum = gridParallel;
-        runInfo_.stepM = 1;
-        runInfo_.stepN = 1;
-        runInfo_.stepKa = MathUtil::CeilDivision(args_.kValue, baseK);
-        runInfo_.stepKb = 1;
-        runInfo_.depthA1 = runInfo_.stepKa;
-        runInfo_.depthB1 = DB_SIZE;
-        runInfo_.iterateOrder = ITER_ROW_FIRST;
-        runInfo_.dbL0c = l0CBytes * DB_SIZE <= compileInfo_.l0CSize ? DB_SIZE : DB_OFF_SIZE;
-        runInfo_.l2Info.mTile = 1;
-        runInfo_.l2Info.nTile = 1;
-        runInfo_.l2Info.mTileBlock = 1;
-        runInfo_.l2Info.nTileBlock = nTiles;
-        runInfo_.l2Info.calOrder = ITER_ROW_FIRST;
-        runInfo_.needUpdate = true;
-        tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::AL1_FULL_LOAD;
-        tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::BASE;
-        tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
-        tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::BASE;
-        (void)::setenv("MATMUL_BASE_EXPERIMENT_VARIANT", "TINY_M_A_RESIDENT_CUBE", 1);
-        (void)::setenv("MATMUL_BASE_EXPERIMENT_SELECTED", "1", 1);
-        return true;
-    }
-
-    const uint64_t kSteps = MathUtil::CeilDivision(args_.kValue, baseK);
-    const uint64_t aKStepBytes = DB_SIZE * baseM * baseK * aDtypeSize_;
-    const uint64_t bKStepBytes = DB_SIZE * baseN * baseK * bDtypeSize_;
-    uint64_t stepKa = std::min(kSteps, compileInfo_.l1Size / NUM_HALF / aKStepBytes);
-    uint64_t stepKb = std::min(kSteps, compileInfo_.l1Size / (NUM_HALF * NUM_HALF) / bKStepBytes);
-    if (stepKa == 0 || stepKb == 0) {
-        return false;
-    }
-    const auto alignStepK = [baseK, kSteps](uint64_t stepK, uint64_t dtypeSize) {
-        if (stepK >= kSteps) {
-            return stepK;
-        }
-        const uint64_t sliceBytes = baseK * dtypeSize;
-        const uint64_t totalBytes = stepK * sliceBytes;
-        const uint64_t alignment = totalBytes > BASIC_ALIGN_512 ? BASIC_ALIGN_512 :
-            (totalBytes > BASIC_ALIGN_256 ? BASIC_ALIGN_256 : 1UL);
-        if (alignment == 1) {
-            return stepK;
-        }
-        const uint64_t stepAlignment = alignment / std::gcd(alignment, sliceBytes);
-        return stepK >= stepAlignment ? stepK / stepAlignment * stepAlignment : stepK;
-    };
-    stepKa = alignStepK(stepKa, aDtypeSize_);
-    stepKb = alignStepK(stepKb, bDtypeSize_);
-    if (stepKa >= stepKb) {
-        stepKa = stepKa / stepKb * stepKb;
-    } else {
-        stepKb = stepKb / stepKa * stepKa;
-    }
-    const uint64_t depthA1 = stepKa * DB_SIZE;
-    const uint64_t depthB1 = stepKb * DB_SIZE;
-
     const uint64_t l1ABytes = depthA1 * baseM * baseK * aDtypeSize_;
     const uint64_t l1BBytes = depthB1 * baseN * baseK * bDtypeSize_;
-    if (l1ABytes + l1BBytes > compileInfo_.l1Size) {
+    if (l0ABytes > compileInfo_.l0ASize || l0BBytes > compileInfo_.l0BSize ||
+        l0CBytes > compileInfo_.l0CSize || l1ABytes + l1BBytes > compileInfo_.l1Size) {
         return false;
     }
 
@@ -1779,31 +1685,23 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
         return false;
     }
 
-    const long double aReuseBytes = static_cast<long double>(mTiles) * (nTiles - 1UL) * aPanelBytes;
-    const long double bReuseBytes = static_cast<long double>(nTiles) * (mTiles - 1UL) * bPanelBytes;
-    const bool preserveA = aReuseBytes >= bReuseBytes;
-    uint64_t mWindowBlock = 1;
-    uint64_t nWindowBlock = 1;
-    if (preserveA) {
-        nWindowBlock = std::min(nTiles, std::max(1UL,
-            (compileInfo_.l2Size - aPanelBytes) / (bPanelBytes + cTileBytes)));
-        const uint64_t fixedBBytes = nWindowBlock * bPanelBytes;
-        if (fixedBBytes >= compileInfo_.l2Size) {
-            return false;
-        }
-        mWindowBlock = std::min(mTiles, std::max(1UL,
-            (compileInfo_.l2Size - fixedBBytes) / (aPanelBytes + nWindowBlock * cTileBytes)));
-    } else {
-        mWindowBlock = std::min(mTiles, std::max(1UL,
-            (compileInfo_.l2Size - bPanelBytes) / (aPanelBytes + cTileBytes)));
-        const uint64_t fixedABytes = mWindowBlock * aPanelBytes;
-        if (fixedABytes >= compileInfo_.l2Size) {
-            return false;
-        }
-        nWindowBlock = std::min(nTiles, std::max(1UL,
-            (compileInfo_.l2Size - fixedABytes) / (bPanelBytes + mWindowBlock * cTileBytes)));
+    const long double pA = static_cast<long double>(aPanelBytes);
+    const long double pB = static_cast<long double>(bPanelBytes);
+    const long double pC = static_cast<long double>(cTileBytes);
+    const long double l2 = static_cast<long double>(compileInfo_.l2Size);
+    const long double root =
+        (std::sqrt(pB * pB + pC * l2 * pB / pA) - pB) / pC;
+    const uint64_t maxMWithOneN = static_cast<uint64_t>((l2 - pB) / (pA + pC));
+    uint64_t mWindowBlock = std::max(1UL, std::min({mTiles, maxMWithOneN,
+        static_cast<uint64_t>(std::max(1.0L, std::floor(root)))}));
+    const uint64_t remainingL2 = compileInfo_.l2Size - mWindowBlock * aPanelBytes;
+    uint64_t nWindowBlock = std::max(1UL, std::min(nTiles,
+        remainingL2 / (bPanelBytes + mWindowBlock * cTileBytes)));
+    const uint64_t targetParallel = std::min(compileInfo_.aicNum, mTiles * nTiles);
+    if (mWindowBlock * nWindowBlock < targetParallel) {
+        mWindowBlock = 1;
+        nWindowBlock = targetParallel;
     }
-    const uint64_t windowParallel = std::min(gridParallel, mWindowBlock * nWindowBlock);
 
     runInfo_.baseM = baseM;
     runInfo_.baseN = baseN;
@@ -1811,22 +1709,22 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
     runInfo_.singleCoreM = baseM;
     runInfo_.singleCoreN = baseN;
     runInfo_.singleCoreK = args_.kValue;
-    runInfo_.usedCoreNum = windowParallel;
+    runInfo_.usedCoreNum = compileInfo_.aicNum;
     runInfo_.stepM = 1;
     runInfo_.stepN = 1;
     runInfo_.stepKa = stepKa;
     runInfo_.stepKb = stepKb;
     runInfo_.depthA1 = depthA1;
     runInfo_.depthB1 = depthB1;
-    runInfo_.iterateOrder = preserveA ? ITER_ROW_FIRST : ITER_COL_FIRST;
+    runInfo_.iterateOrder = ITER_ROW_FIRST;
     runInfo_.dbL0c = DB_OFF_SIZE;
     runInfo_.l2Info.mTile = MathUtil::CeilDivision(mTiles, mWindowBlock);
     runInfo_.l2Info.nTile = MathUtil::CeilDivision(nTiles, nWindowBlock);
     runInfo_.l2Info.mTileBlock = mWindowBlock;
     runInfo_.l2Info.nTileBlock = nWindowBlock;
-    runInfo_.l2Info.calOrder = preserveA ? 1UL : 2UL;
+    runInfo_.l2Info.calOrder = ITER_ROW_FIRST;
     runInfo_.needUpdate = true;
-    (void)::setenv("MATMUL_BASE_EXPERIMENT_VARIANT", "JOINT_MN_GRID_REUSE", 1);
+    (void)::setenv("MATMUL_BASE_EXPERIMENT_VARIANT", "WIDE_N_SHALLOW_K_BASE", 1);
     (void)::setenv("MATMUL_BASE_EXPERIMENT_SELECTED", "1", 1);
     return true;
 }

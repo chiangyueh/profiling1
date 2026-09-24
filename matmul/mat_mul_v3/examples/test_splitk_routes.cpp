@@ -75,8 +75,7 @@ struct RunCounts {
     uint64_t failed = 0;
     uint64_t officialFailed = 0;
     uint64_t skippedNonV3 = 0;
-    uint64_t tinyMResidentPassed = 0;
-    uint64_t jointMnGridReusePassed = 0;
+    uint64_t wideNShallowKPassed = 0;
     uint64_t mCoverage[5] = {};
     uint64_t nCoverage[5] = {};
     uint64_t kCoverage[5] = {};
@@ -90,9 +89,9 @@ uint64_t ReadEnvUnsigned(const char *name)
 
 void CountPassCoverage(RunCounts &counts, int64_t m, int64_t n, int64_t k)
 {
-    const size_t mBucket = m <= 9 ? 0 : (m <= 128 ? 1 : (m <= 512 ? 2 : (m <= 2048 ? 3 : 4)));
-    const size_t nBucket = n <= 2432 ? 0 : (n <= 8192 ? 1 : (n <= 16384 ? 2 : (n <= 32768 ? 3 : 4)));
-    const size_t kBucket = k <= 4096 ? 0 : (k <= 16384 ? 1 : (k <= 32768 ? 2 : (k <= 65536 ? 3 : 4)));
+    const size_t mBucket = m <= 9 ? 0 : (m <= 31 ? 1 : (m <= 63 ? 2 : (m <= 95 ? 3 : 4)));
+    const size_t nBucket = n <= 5632 ? 0 : (n <= 8192 ? 1 : (n <= 10752 ? 2 : (n <= 13568 ? 3 : 4)));
+    const size_t kBucket = k <= 16384 ? 0 : (k <= 20480 ? 1 : (k <= 24576 ? 2 : (k <= 28672 ? 3 : 4)));
     ++counts.mCoverage[mBucket];
     ++counts.nCoverage[nBucket];
     ++counts.kCoverage[kBucket];
@@ -198,7 +197,7 @@ bool IsBaseCampaign()
         (std::strcmp(campaign, "RECTANGULAR_CUBE") == 0 ||
          std::strcmp(campaign, "REUSE_DIRECTED") == 0 ||
          std::strcmp(campaign, "CUBE_VECTOR_EDGE") == 0 ||
-         std::strcmp(campaign, "WIDE_N_PANEL_REUSE_BASE") == 0);
+         std::strcmp(campaign, "WIDE_N_SHALLOW_K_BASE") == 0);
 }
 
 const char *CampaignName()
@@ -207,8 +206,8 @@ const char *CampaignName()
     const char *campaign = std::getenv("MATMUL_CAMPAIGN");
     if (campaign != nullptr && std::strcmp(campaign, "REUSE_DIRECTED") == 0) return "REUSE_DIRECTED";
     if (campaign != nullptr && std::strcmp(campaign, "CUBE_VECTOR_EDGE") == 0) return "CUBE_VECTOR_EDGE";
-    if (campaign != nullptr && std::strcmp(campaign, "WIDE_N_PANEL_REUSE_BASE") == 0) {
-        return "WIDE_N_PANEL_REUSE_BASE";
+    if (campaign != nullptr && std::strcmp(campaign, "WIDE_N_SHALLOW_K_BASE") == 0) {
+        return "WIDE_N_SHALLOW_K_BASE";
     }
     if (IsAdaptiveCampaign()) return "ADAPTIVE_DETERMINISTIC_SPLIT_K";
     return "INVALID";
@@ -748,8 +747,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     if (correct) {
         ++counts.passed;
         CountPassCoverage(counts, m, n, k);
-        if (candidateVariant == "TINY_M_A_RESIDENT_CUBE") ++counts.tinyMResidentPassed;
-        if (candidateVariant == "JOINT_MN_GRID_REUSE") ++counts.jointMnGridReusePassed;
+        if (candidateVariant == "WIDE_N_SHALLOW_K_BASE") ++counts.wideNShallowKPassed;
     } else {
         ++counts.failed;
     }
@@ -844,7 +842,7 @@ int main(int argc, char **argv)
                 "\"non_target_route\":%lu,"
                 "\"official_target\":%lu,\"candidate_selected\":%lu,\"official_preserved\":%lu,"
                 "\"target_passes\":%lu,\"quota_met\":%s,\"passed\":%lu,\"failed\":%lu,"
-                "\"tiny_m_a_resident_passed\":%lu,\"joint_mn_grid_reuse_passed\":%lu,"
+                "\"wide_n_shallow_k_passed\":%lu,"
                 "\"official_failed\":%lu,\"manifest_start_index\":%lu,"
                 "\"manifest_end_index\":%lu}\n",
                 CampaignName(),
@@ -858,15 +856,14 @@ int main(int argc, char **argv)
                 (targetPasses == 0 || counts.passed >= targetPasses) ? "true" : "false",
                 static_cast<unsigned long>(counts.passed),
                 static_cast<unsigned long>(counts.failed),
-                static_cast<unsigned long>(counts.tinyMResidentPassed),
-                static_cast<unsigned long>(counts.jointMnGridReusePassed),
+                static_cast<unsigned long>(counts.wideNShallowKPassed),
                 static_cast<unsigned long>(counts.officialFailed),
                 static_cast<unsigned long>(startIndex),
                 static_cast<unsigned long>(manifestIndex));
     std::printf("{\"measured_coverage\":true,"
-                "\"m\":{\"1_9\":%lu,\"10_128\":%lu,\"129_512\":%lu,\"513_2048\":%lu,\"2049_4096\":%lu},"
-                "\"n\":{\"512_2432\":%lu,\"2433_8192\":%lu,\"8193_16384\":%lu,\"16385_32768\":%lu,\"32769_65536\":%lu},"
-                "\"k\":{\"1024_4096\":%lu,\"4097_16384\":%lu,\"16385_32768\":%lu,\"32769_65536\":%lu,\"65537_131072\":%lu}}\n",
+                "\"m\":{\"1_9\":%lu,\"10_31\":%lu,\"32_63\":%lu,\"64_95\":%lu,\"96_128\":%lu},"
+                "\"n\":{\"5120_5632\":%lu,\"5888_8192\":%lu,\"8448_10752\":%lu,\"11008_13568\":%lu,\"13824_16384\":%lu},"
+                "\"k\":{\"16384\":%lu,\"16896_20480\":%lu,\"20992_24576\":%lu,\"25088_28672\":%lu,\"29184_32768\":%lu}}\n",
                 static_cast<unsigned long>(counts.mCoverage[0]),
                 static_cast<unsigned long>(counts.mCoverage[1]),
                 static_cast<unsigned long>(counts.mCoverage[2]),
