@@ -143,7 +143,7 @@ for dtype in ("fp16_fp16", "bf16_bf16"):
     for m_lo, m_hi in m_ranges:
         for n_lo, n_hi in n_ranges:
             for k_lo, k_hi in k_ranges:
-                for _ in range(100):
+                for _ in range(200):
                     m = rng.randint(m_lo, m_hi)
                     n = quantized(n_lo, n_hi, 256, n_offsets[sample_index % len(n_offsets)])
                     k = quantized(k_lo, k_hi, 64, k_offsets[sample_index % len(k_offsets)])
@@ -166,7 +166,8 @@ export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
 campaign_failures=0
-success_target="${MATMUL_SUCCESS_TARGET:-300}"
+cell_quota="${MATMUL_CELL_QUOTA:-4}"
+theoretical_maximum_pairs=$((250 * cell_quota))
 run_campaign() {
     local campaign="$1"
     local target="$2"
@@ -181,9 +182,10 @@ run_campaign() {
 }
 
 panel_rc=0
-printf '{"campaign_begin":"WIDE_N_PANEL_ONLY","target_passes":%d}\n' "${success_target}"
+printf '{"campaign_begin":"WIDE_N_PANEL_ONLY","quota_per_joint_cell":%d,"theoretical_maximum_pairs":%d}\n' \
+    "${cell_quota}" "${theoretical_maximum_pairs}"
 set +e
-MATMUL_CAMPAIGN=WIDE_N_PANEL_ONLY MATMUL_TARGET_PASSES="${success_target}" \
+MATMUL_CAMPAIGN=WIDE_N_PANEL_ONLY MATMUL_TARGET_PASSES=0 MATMUL_CELL_QUOTA="${cell_quota}" \
     "${runner}" --manifest "${workload_manifest}" | tee "${panel_log}"
 panel_status=("${PIPESTATUS[@]}")
 set -e

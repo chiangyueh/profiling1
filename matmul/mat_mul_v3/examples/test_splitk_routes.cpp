@@ -79,6 +79,10 @@ struct RunCounts {
     uint64_t mCoverage[5] = {};
     uint64_t nCoverage[5] = {};
     uint64_t kCoverage[5] = {};
+    uint64_t jointInputs[250] = {};
+    uint64_t jointOfficial[250] = {};
+    uint64_t jointPassed[250] = {};
+    uint64_t jointQuotaSkipped = 0;
 };
 
 uint64_t ReadEnvUnsigned(const char *name)
@@ -90,11 +94,20 @@ uint64_t ReadEnvUnsigned(const char *name)
 void CountPassCoverage(RunCounts &counts, int64_t m, int64_t n, int64_t k)
 {
     const size_t mBucket = m <= 9 ? 0 : (m <= 31 ? 1 : (m <= 63 ? 2 : (m <= 95 ? 3 : 4)));
-    const size_t nBucket = n <= 5632 ? 0 : (n <= 8192 ? 1 : (n <= 10752 ? 2 : (n <= 13568 ? 3 : 4)));
-    const size_t kBucket = k <= 4096 ? 0 : (k <= 8192 ? 1 : (k <= 16384 ? 2 : (k <= 24576 ? 3 : 4)));
+    const size_t nBucket = n <= 7168 ? 0 : (n <= 12288 ? 1 : (n <= 18432 ? 2 : (n <= 24576 ? 3 : 4)));
+    const size_t kBucket = k <= 8192 ? 0 : (k <= 15871 ? 1 : (k <= 23552 ? 2 : (k <= 32768 ? 3 : 4)));
     ++counts.mCoverage[mBucket];
     ++counts.nCoverage[nBucket];
     ++counts.kCoverage[kBucket];
+}
+
+size_t JointCoverageBucket(const DTypeSpec &dtype, int64_t m, int64_t n, int64_t k)
+{
+    const size_t dtypeBucket = std::strcmp(dtype.inputName, "bf16") == 0 ? 1 : 0;
+    const size_t mBucket = m <= 9 ? 0 : (m <= 31 ? 1 : (m <= 63 ? 2 : (m <= 95 ? 3 : 4)));
+    const size_t nBucket = n <= 7168 ? 0 : (n <= 12288 ? 1 : (n <= 18432 ? 2 : (n <= 24576 ? 3 : 4)));
+    const size_t kBucket = k <= 8192 ? 0 : (k <= 15871 ? 1 : (k <= 23552 ? 2 : (k <= 32768 ? 3 : 4)));
+    return (((dtypeBucket * 5 + mBucket) * 5 + nBucket) * 5 + kBucket);
 }
 
 TilingSnapshot ReadTilingSnapshot()
@@ -782,9 +795,10 @@ int main(int argc, char **argv)
     if (!manifestMode && (argc < 6 || (argc - 1) % 5 != 0)) return 2;
     if (!IsBaseCampaign() && !IsAdaptiveCampaign()) return 4;
     const uint64_t targetPasses = ReadEnvUnsigned("MATMUL_TARGET_PASSES");
+    const uint64_t cellQuota = ReadEnvUnsigned("MATMUL_CELL_QUOTA");
     std::printf("{\"campaign_start\":\"%s\",\"target_passes\":%lu,"
-                "\"runner\":\"wide_n_mechanism_ablation_v2\"}\n",
-                CampaignName(), static_cast<unsigned long>(targetPasses));
+                "\"joint_cell_quota\":%lu,\"runner\":\"wide_n_mechanism_ablation_v2\"}\n",
+                CampaignName(), static_cast<unsigned long>(targetPasses), static_cast<unsigned long>(cellQuota));
     std::fflush(stdout);
     const char *hostLibrary = std::getenv("MATMUL_HOST_LIBRARY");
     if (hostLibrary == nullptr) return 4;
@@ -812,7 +826,17 @@ int main(int argc, char **argv)
         const DTypeSpec *dtype = FindDType(dtypeName);
         const LayoutSpec *layout = FindLayout(layoutName);
         if (dtype == nullptr || layout == nullptr) return;
+        const size_t jointBucket = JointCoverageBucket(*dtype, m, n, k);
+        ++counts.jointInputs[jointBucket];
+        if (cellQuota != 0 && counts.jointPassed[jointBucket] >= cellQuota) {
+            ++counts.jointQuotaSkipped;
+            return;
+        }
+        const uint64_t officialBefore = counts.deterministic;
+        const uint64_t passedBefore = counts.passed;
         (void)RunWorkload(*dtype, *layout, m, n, k, stream, edgeFunction, counts, manifestIndex);
+        if (counts.deterministic > officialBefore) ++counts.jointOfficial[jointBucket];
+        if (counts.passed > passedBefore) ++counts.jointPassed[jointBucket];
         if (counts.inputs != 0 && counts.inputs % 1000 == 0) {
             std::printf("{\"progress\":true,\"manifest_index\":%lu,\"inputs\":%lu,"
                         "\"passed\":%lu,\"official_failed\":%lu,\"non_target_route\":%lu}\n",
@@ -873,8 +897,8 @@ int main(int argc, char **argv)
                 static_cast<unsigned long>(manifestIndex));
     std::printf("{\"measured_coverage\":true,"
                 "\"m\":{\"1_9\":%lu,\"10_31\":%lu,\"32_63\":%lu,\"64_95\":%lu,\"96_128\":%lu},"
-                "\"n\":{\"5120_5632\":%lu,\"5888_8192\":%lu,\"8448_10752\":%lu,\"11008_13568\":%lu,\"13824_16384\":%lu},"
-                "\"k\":{\"512_4096\":%lu,\"4608_8192\":%lu,\"8704_16384\":%lu,\"16896_24576\":%lu,\"25088_32768\":%lu}}\n",
+                "\"n\":{\"4865_7168\":%lu,\"7169_12288\":%lu,\"12289_18432\":%lu,\"18433_24576\":%lu,\"24577_32768\":%lu},"
+                "\"k\":{\"512_8192\":%lu,\"8193_15871\":%lu,\"15872_23552\":%lu,\"23553_32768\":%lu,\"32769_65536\":%lu}}\n",
                 static_cast<unsigned long>(counts.mCoverage[0]),
                 static_cast<unsigned long>(counts.mCoverage[1]),
                 static_cast<unsigned long>(counts.mCoverage[2]),
@@ -890,6 +914,61 @@ int main(int argc, char **argv)
                 static_cast<unsigned long>(counts.kCoverage[2]),
                 static_cast<unsigned long>(counts.kCoverage[3]),
                 static_cast<unsigned long>(counts.kCoverage[4]));
+    if (cellQuota != 0) {
+        uint64_t inputCells = 0;
+        uint64_t officialCells = 0;
+        uint64_t metCells = 0;
+        uint64_t partialCells = 0;
+        uint64_t unreachedCells = 0;
+        uint64_t pairedPasses = 0;
+        for (size_t index = 0; index < 250; ++index) {
+            pairedPasses += counts.jointPassed[index];
+            if (counts.jointInputs[index] != 0) ++inputCells;
+            if (counts.jointOfficial[index] != 0) {
+                ++officialCells;
+                if (counts.jointPassed[index] >= cellQuota) {
+                    ++metCells;
+                } else {
+                    ++partialCells;
+                }
+            } else if (counts.jointInputs[index] != 0) {
+                ++unreachedCells;
+            }
+        }
+        std::printf("{\"joint_coverage\":true,\"quota_per_cell\":%lu,\"input_cells\":%lu,"
+                    "\"official_base_cells\":%lu,\"quota_met_cells\":%lu,\"partial_cells\":%lu,"
+                    "\"unreached_cells\":%lu,\"unrepresented_cells\":%lu,\"paired_passes\":%lu,"
+                    "\"represented_capacity\":%lu,\"quota_skipped_inputs\":%lu}\n",
+                    static_cast<unsigned long>(cellQuota), static_cast<unsigned long>(inputCells),
+                    static_cast<unsigned long>(officialCells), static_cast<unsigned long>(metCells),
+                    static_cast<unsigned long>(partialCells), static_cast<unsigned long>(unreachedCells),
+                    static_cast<unsigned long>(250 - inputCells), static_cast<unsigned long>(pairedPasses),
+                    static_cast<unsigned long>(inputCells * cellQuota),
+                    static_cast<unsigned long>(counts.jointQuotaSkipped));
+        const char *dtypeNames[] = {"fp16", "bf16"};
+        const char *mNames[] = {"1_9", "10_31", "32_63", "64_95", "96_128"};
+        const char *nNames[] = {"4865_7168", "7169_12288", "12289_18432", "18433_24576", "24577_32768"};
+        const char *kNames[] = {"512_8192", "8193_15871", "15872_23552", "23553_32768", "32769_65536"};
+        bool first = true;
+        std::printf("{\"joint_unmet_cells\":[");
+        for (size_t index = 0; index < 250; ++index) {
+            if (counts.jointPassed[index] >= cellQuota) continue;
+            size_t value = index;
+            const size_t kBucket = value % 5;
+            value /= 5;
+            const size_t nBucket = value % 5;
+            value /= 5;
+            const size_t mBucket = value % 5;
+            value /= 5;
+            std::printf("%s\"%s:M%s:N%s:K%s:input=%lu:official=%lu:passed=%lu\"", first ? "" : ",",
+                        dtypeNames[value], mNames[mBucket], nNames[nBucket], kNames[kBucket],
+                        static_cast<unsigned long>(counts.jointInputs[index]),
+                        static_cast<unsigned long>(counts.jointOfficial[index]),
+                        static_cast<unsigned long>(counts.jointPassed[index]));
+            first = false;
+        }
+        std::printf("]}\n");
+    }
     if (edgeBinary != nullptr) (void)aclrtBinaryUnLoad(edgeBinary);
     (void)aclrtDestroyStream(stream);
     (void)aclrtResetDevice(0);
