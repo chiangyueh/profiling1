@@ -165,36 +165,39 @@ rng.shuffle(tiny_rows)
 tiny_rows = tiny_rows[:320]
 
 normal_m = (10, 12, 14, 15, 16, 17, 19, 20, 23, 27, 31, 32, 33, 40, 47,
-            54, 58, 64, 73, 80, 87, 95, 103, 111, 120, 127, 128)
+            54, 58, 64, 73, 80, 87, 95, 103, 111, 120, 127, 128, 160, 192,
+            256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096)
 normal_n = (512, 640, 768, 896, 1024, 1152, 1280, 1536, 2048, 2304, 2432,
             2560, 3072, 3584, 4096, 4608, 4864, 4992, 5120, 5632, 6144,
-            7168, 8192, 10240, 12288)
+            7168, 8192, 10240, 12288, 16384, 24576, 32768, 49152, 65536)
+normal_k = (1024, 2048, 3072, 4096, 6144, 8192, 10240, 12288, 14336,
+            16384, 18432, 20480, 22528, 32768, 49152, 65536, 98304, 131072)
 normal_rows = []
 for dtype in ("fp16_fp16", "bf16_bf16"):
     for m in normal_m:
         for n in normal_n:
-            if n < 1280:
-                k_values = (2048, 3072, 4096)
-            elif n <= 2432:
-                k_values = (4096, 6144, 8192, 10240)
-            elif n <= 4864:
-                k_values = (6144, 8192, 10240, 12288, 16384, 20480)
-            else:
-                k_values = (8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528)
-            for k in k_values:
-                if (m + n) * k * 2 + m * n * 2 <= 256 * 1024 * 1024:
+            for k in normal_k:
+                if (m + n) * k * 2 + m * n * 2 <= 192 * 1024 * 1024:
                     normal_rows.append((dtype, "NN", m, n, k))
 rng.shuffle(normal_rows)
-normal_rows = normal_rows[:900]
+normal_rows = normal_rows[:1800]
+
+coverage_shapes = (
+    (160, 16384, 4096), (256, 65536, 1024), (384, 32768, 2048),
+    (512, 24576, 3072), (768, 16384, 4096), (1024, 8192, 6144),
+    (1536, 6144, 8192), (2048, 4096, 12288), (3072, 2048, 16384),
+    (4096, 1024, 20480), (256, 512, 131072), (512, 512, 65536),
+)
+coverage_rows = [
+    (dtype, "NN", m, n, k)
+    for dtype in ("fp16_fp16", "bf16_bf16")
+    for m, n, k in coverage_shapes
+]
 
 for round_index in range(3):
-    tiny_round = tiny_rows[:]
-    diagnostic_round = diagnostic_shapes[:]
-    normal_round = normal_rows[:]
-    random.Random(8505 + round_index * 17).shuffle(tiny_round)
-    random.Random(8511 + round_index * 17).shuffle(diagnostic_round)
-    random.Random(8517 + round_index * 17).shuffle(normal_round)
-    for row in tiny_round + diagnostic_round + normal_round:
+    rows = tiny_rows + normal_rows + coverage_rows + diagnostic_shapes * 3
+    random.Random(8505 + round_index * 17).shuffle(rows)
+    for row in rows:
         print("\t".join(str(value) for value in row))
 PY
 

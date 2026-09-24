@@ -76,7 +76,7 @@ struct RunCounts {
     uint64_t officialFailed = 0;
     uint64_t skippedNonV3 = 0;
     uint64_t tinyMResidentPassed = 0;
-    uint64_t jointBaseNCorePassed = 0;
+    uint64_t jointMnGridReusePassed = 0;
 };
 
 uint64_t ReadEnvUnsigned(const char *name)
@@ -735,7 +735,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     if (correct) {
         ++counts.passed;
         if (candidateVariant == "TINY_M_A_RESIDENT_CUBE") ++counts.tinyMResidentPassed;
-        if (candidateVariant == "JOINT_BASE_N_CORE") ++counts.jointBaseNCorePassed;
+        if (candidateVariant == "JOINT_MN_GRID_REUSE") ++counts.jointMnGridReusePassed;
     } else {
         ++counts.failed;
     }
@@ -830,7 +830,7 @@ int main(int argc, char **argv)
                 "\"non_target_route\":%lu,"
                 "\"official_target\":%lu,\"candidate_selected\":%lu,\"official_preserved\":%lu,"
                 "\"target_passes\":%lu,\"quota_met\":%s,\"passed\":%lu,\"failed\":%lu,"
-                "\"tiny_m_a_resident_passed\":%lu,\"joint_base_n_core_passed\":%lu,"
+                "\"tiny_m_a_resident_passed\":%lu,\"joint_mn_grid_reuse_passed\":%lu,"
                 "\"official_failed\":%lu,\"manifest_start_index\":%lu,"
                 "\"manifest_end_index\":%lu}\n",
                 CampaignName(),
@@ -845,7 +845,7 @@ int main(int argc, char **argv)
                 static_cast<unsigned long>(counts.passed),
                 static_cast<unsigned long>(counts.failed),
                 static_cast<unsigned long>(counts.tinyMResidentPassed),
-                static_cast<unsigned long>(counts.jointBaseNCorePassed),
+                static_cast<unsigned long>(counts.jointMnGridReusePassed),
                 static_cast<unsigned long>(counts.officialFailed),
                 static_cast<unsigned long>(startIndex),
                 static_cast<unsigned long>(manifestIndex));
