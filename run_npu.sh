@@ -139,11 +139,19 @@ def quantized(lo, hi, quantum, offset):
 
 rows = set()
 sample_index = 0
+candidates_per_cell = 256
+maximum_attempts_per_cell = 100000
 for dtype in ("fp16_fp16", "bf16_bf16"):
     for m_lo, m_hi in m_ranges:
         for n_lo, n_hi in n_ranges:
             for k_lo, k_hi in k_ranges:
-                for _ in range(200):
+                minimum_bytes = 2 * (m_lo * k_lo + k_lo * n_lo + m_lo * n_lo)
+                if minimum_bytes > byte_limit:
+                    continue
+                cell_rows = set()
+                attempts = 0
+                while len(cell_rows) < candidates_per_cell and attempts < maximum_attempts_per_cell:
+                    attempts += 1
                     m = rng.randint(m_lo, m_hi)
                     n = quantized(n_lo, n_hi, 256, n_offsets[sample_index % len(n_offsets)])
                     k = quantized(k_lo, k_hi, 64, k_offsets[sample_index % len(k_offsets)])
@@ -151,7 +159,8 @@ for dtype in ("fp16_fp16", "bf16_bf16"):
                     record = (dtype, "NN", m, n, k)
                     total_bytes = 2 * (m * k + k * n + m * n)
                     if total_bytes <= byte_limit and record not in historical:
-                        rows.add(record)
+                        cell_rows.add(record)
+                rows.update(cell_rows)
 rows = list(rows)
 rng.shuffle(rows)
 for record in rows:
@@ -166,7 +175,8 @@ export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
 campaign_failures=0
-cell_quota="${MATMUL_CELL_QUOTA:-4}"
+success_target="${MATMUL_SUCCESS_TARGET:-5000}"
+cell_quota="${MATMUL_CELL_QUOTA:-64}"
 theoretical_maximum_pairs=$((250 * cell_quota))
 run_campaign() {
     local campaign="$1"
@@ -182,10 +192,10 @@ run_campaign() {
 }
 
 panel_rc=0
-printf '{"campaign_begin":"WIDE_N_PANEL_ONLY","quota_per_joint_cell":%d,"theoretical_maximum_pairs":%d}\n' \
-    "${cell_quota}" "${theoretical_maximum_pairs}"
+printf '{"campaign_begin":"WIDE_N_PANEL_ONLY","target_passes":%d,"maximum_per_joint_cell":%d,"theoretical_maximum_pairs":%d}\n' \
+    "${success_target}" "${cell_quota}" "${theoretical_maximum_pairs}"
 set +e
-MATMUL_CAMPAIGN=WIDE_N_PANEL_ONLY MATMUL_TARGET_PASSES=0 MATMUL_CELL_QUOTA="${cell_quota}" \
+MATMUL_CAMPAIGN=WIDE_N_PANEL_ONLY MATMUL_TARGET_PASSES="${success_target}" MATMUL_CELL_QUOTA="${cell_quota}" \
     "${runner}" --manifest "${workload_manifest}" | tee "${panel_log}"
 panel_status=("${PIPESTATUS[@]}")
 set -e
