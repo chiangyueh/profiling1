@@ -106,50 +106,35 @@ fi
 printf '{"stage":"runner_build","status":"passed"}\n'
 
 printf '{"stage":"workload_generation","status":"begin"}\n'
-python3 - >"${workload_manifest}" <<'PY'
-import random
+python3 - "${PWD}/data/wide_n_result48_shapes.csv" >"${workload_manifest}" <<'PY'
+import csv
+import sys
 
-rng = random.Random(8505)
-anchors = (
-    ("bf16_bf16", "NN", 111, 7168, 16384),
-    ("bf16_bf16", "NN", 80, 7168, 22528),
-    ("fp16_fp16", "NN", 33, 12288, 18432),
-    ("fp16_fp16", "NN", 10, 6144, 22528),
-    ("bf16_bf16", "NN", 27, 6144, 16384),
-    ("fp16_fp16", "NN", 40, 6144, 24576),
-    ("fp16_fp16", "NN", 80, 7168, 18432),
-    ("bf16_bf16", "NN", 10, 7168, 22528),
-    ("bf16_bf16", "NN", 20, 12288, 20480),
-)
-for row in anchors:
-    print("\t".join(str(value) for value in row))
-
-rows = []
-k_offsets = (0, 1, 17, 31, 63)
-k_values = tuple(
-    min(32768, base + k_offsets[index % len(k_offsets)])
-    for index, base in enumerate(range(512, 32769, 512))
-)
-for dtype in ("fp16_fp16", "bf16_bf16"):
-    for m in range(1, 129):
-        for n in range(5120, 16385, 256):
-            for k in k_values:
-                rows.append((dtype, "NN", m, n, k))
-rng.shuffle(rows)
+with open(sys.argv[1], newline="") as source:
+    rows = list(csv.DictReader(source))
+if len(rows) != 300:
+    raise SystemExit(f"expected 300 result48 shapes, found {len(rows)}")
+seen = set()
 for row in rows:
-    if row not in anchors:
-        print("\t".join(str(value) for value in row))
+    record = (
+        f"{row['input_dtype']}_{row['output_dtype']}", row["layout"],
+        int(row["m"]), int(row["n"]), int(row["k"])
+    )
+    if record in seen:
+        raise SystemExit(f"duplicate result48 shape: {record}")
+    seen.add(record)
+    print("\t".join(str(value) for value in record))
 PY
 
 adaptive_count="$(wc -l <"${workload_manifest}")"
-printf '{"stage":"workload_generation","status":"passed","coverage":"result45_region_without_byte_filter","candidates":%d}\n' "${adaptive_count}"
+printf '{"stage":"workload_generation","status":"passed","coverage":"exact_result48_candidate_shapes","candidates":%d}\n' "${adaptive_count}"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
 campaign_failures=0
-success_target="${MATMUL_SUCCESS_TARGET:-300}"
+success_target="${MATMUL_SUCCESS_TARGET:-${adaptive_count}}"
 run_campaign() {
     local campaign="$1"
     local target="$2"
@@ -163,5 +148,7 @@ run_campaign() {
     fi
 }
 
+run_campaign WIDE_N_PANEL_ONLY "${success_target}" "${runner}" --manifest "${workload_manifest}"
+run_campaign WIDE_N_WINDOW_ONLY "${success_target}" "${runner}" --manifest "${workload_manifest}"
 run_campaign WIDE_N_SHALLOW_K_BASE "${success_target}" "${runner}" --manifest "${workload_manifest}"
-printf '{"overnight_complete":true,"campaigns":1,"campaign_process_failures":%d}\n' "${campaign_failures}"
+printf '{"overnight_complete":true,"campaigns":3,"campaign_process_failures":%d}\n' "${campaign_failures}"

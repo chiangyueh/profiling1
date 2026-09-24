@@ -197,6 +197,8 @@ bool IsBaseCampaign()
         (std::strcmp(campaign, "RECTANGULAR_CUBE") == 0 ||
          std::strcmp(campaign, "REUSE_DIRECTED") == 0 ||
          std::strcmp(campaign, "CUBE_VECTOR_EDGE") == 0 ||
+         std::strcmp(campaign, "WIDE_N_PANEL_ONLY") == 0 ||
+         std::strcmp(campaign, "WIDE_N_WINDOW_ONLY") == 0 ||
          std::strcmp(campaign, "WIDE_N_SHALLOW_K_BASE") == 0);
 }
 
@@ -206,6 +208,12 @@ const char *CampaignName()
     const char *campaign = std::getenv("MATMUL_CAMPAIGN");
     if (campaign != nullptr && std::strcmp(campaign, "REUSE_DIRECTED") == 0) return "REUSE_DIRECTED";
     if (campaign != nullptr && std::strcmp(campaign, "CUBE_VECTOR_EDGE") == 0) return "CUBE_VECTOR_EDGE";
+    if (campaign != nullptr && std::strcmp(campaign, "WIDE_N_PANEL_ONLY") == 0) {
+        return "WIDE_N_PANEL_ONLY";
+    }
+    if (campaign != nullptr && std::strcmp(campaign, "WIDE_N_WINDOW_ONLY") == 0) {
+        return "WIDE_N_WINDOW_ONLY";
+    }
     if (campaign != nullptr && std::strcmp(campaign, "WIDE_N_SHALLOW_K_BASE") == 0) {
         return "WIDE_N_SHALLOW_K_BASE";
     }
@@ -747,7 +755,10 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     if (correct) {
         ++counts.passed;
         CountPassCoverage(counts, m, n, k);
-        if (candidateVariant == "WIDE_N_SHALLOW_K_BASE") ++counts.wideNShallowKPassed;
+        if (candidateVariant == "WIDE_N_PANEL_ONLY" || candidateVariant == "WIDE_N_WINDOW_ONLY" ||
+            candidateVariant == "WIDE_N_SHALLOW_K_BASE") {
+            ++counts.wideNShallowKPassed;
+        }
     } else {
         ++counts.failed;
     }
@@ -772,7 +783,7 @@ int main(int argc, char **argv)
     if (!IsBaseCampaign() && !IsAdaptiveCampaign()) return 4;
     const uint64_t targetPasses = ReadEnvUnsigned("MATMUL_TARGET_PASSES");
     std::printf("{\"campaign_start\":\"%s\",\"target_passes\":%lu,"
-                "\"runner\":\"wide_n_shallow_k_base_v1\"}\n",
+                "\"runner\":\"wide_n_mechanism_ablation_v2\"}\n",
                 CampaignName(), static_cast<unsigned long>(targetPasses));
     std::fflush(stdout);
     const char *hostLibrary = std::getenv("MATMUL_HOST_LIBRARY");

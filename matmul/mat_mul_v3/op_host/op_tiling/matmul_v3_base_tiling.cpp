@@ -1633,9 +1633,12 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
 {
     (void)::unsetenv("MATMUL_BASE_EXPERIMENT_VARIANT");
     const char *mode = std::getenv("MATMUL_BASE_MODE");
+    const bool panelOnly = mode != nullptr && std::strcmp(mode, "WIDE_N_PANEL_ONLY") == 0;
+    const bool windowOnly = mode != nullptr && std::strcmp(mode, "WIDE_N_WINDOW_ONLY") == 0;
+    const bool panelAndWindow = mode != nullptr && std::strcmp(mode, "WIDE_N_SHALLOW_K_BASE") == 0;
     const bool dtypeSupported = args_.aType == args_.bType && args_.bType == args_.cType &&
         (args_.aType == ge::DT_FLOAT16 || args_.aType == ge::DT_BF16);
-    if (mode == nullptr || std::strcmp(mode, "WIDE_N_SHALLOW_K_BASE") != 0 ||
+    if ((!panelOnly && !windowOnly && !panelAndWindow) ||
         !compileInfo_.supportL0c2out || compileInfo_.aicNum == 0 || args_.hasBias || !dtypeSupported ||
         tilingEnable_.tilingEnableFullLoad != TilingEnableFullLoad::BASE ||
         tilingEnable_.tilingEnableSplitCore != TilingEnableSplitCore::BASE ||
@@ -1666,6 +1669,22 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
         return false;
     }
 
+    if (windowOnly) {
+        const uint64_t officialMTiles = MathUtil::CeilDivision(args_.mValue, runInfo_.singleCoreM);
+        const uint64_t officialNTiles = MathUtil::CeilDivision(args_.nValue, runInfo_.singleCoreN);
+        if (officialMTiles != 1 || officialNTiles < compileInfo_.aicNum) {
+            return false;
+        }
+        runInfo_.l2Info.mTile = 1;
+        runInfo_.l2Info.nTile = MathUtil::CeilDivision(officialNTiles, compileInfo_.aicNum);
+        runInfo_.l2Info.mTileBlock = 1;
+        runInfo_.l2Info.nTileBlock = compileInfo_.aicNum;
+        runInfo_.needUpdate = true;
+        (void)::setenv("MATMUL_BASE_EXPERIMENT_VARIANT", mode, 1);
+        (void)::setenv("MATMUL_BASE_EXPERIMENT_SELECTED", "1", 1);
+        return true;
+    }
+
     const uint64_t l0ABytes = DB_SIZE * baseM * baseK * aDtypeSize_;
     const uint64_t l0BBytes = DB_SIZE * baseN * baseK * bDtypeSize_;
     const uint64_t l0CBytes = baseM * baseN * LOC_DATA_SIZE;
@@ -1685,22 +1704,26 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
         return false;
     }
 
-    const long double pA = static_cast<long double>(aPanelBytes);
-    const long double pB = static_cast<long double>(bPanelBytes);
-    const long double pC = static_cast<long double>(cTileBytes);
-    const long double l2 = static_cast<long double>(compileInfo_.l2Size);
-    const long double root =
-        (std::sqrt(pB * pB + pC * l2 * pB / pA) - pB) / pC;
-    const uint64_t maxMWithOneN = static_cast<uint64_t>((l2 - pB) / (pA + pC));
-    uint64_t mWindowBlock = std::max(1UL, std::min({mTiles, maxMWithOneN,
-        static_cast<uint64_t>(std::max(1.0L, std::floor(root)))}));
-    const uint64_t remainingL2 = compileInfo_.l2Size - mWindowBlock * aPanelBytes;
-    uint64_t nWindowBlock = std::max(1UL, std::min(nTiles,
-        remainingL2 / (bPanelBytes + mWindowBlock * cTileBytes)));
-    const uint64_t targetParallel = std::min(compileInfo_.aicNum, mTiles * nTiles);
-    if (mWindowBlock * nWindowBlock < targetParallel) {
-        mWindowBlock = 1;
-        nWindowBlock = targetParallel;
+    uint64_t mWindowBlock = 1;
+    uint64_t nWindowBlock = std::min(5UL, nTiles);
+    if (panelAndWindow) {
+        const long double pA = static_cast<long double>(aPanelBytes);
+        const long double pB = static_cast<long double>(bPanelBytes);
+        const long double pC = static_cast<long double>(cTileBytes);
+        const long double l2 = static_cast<long double>(compileInfo_.l2Size);
+        const long double root =
+            (std::sqrt(pB * pB + pC * l2 * pB / pA) - pB) / pC;
+        const uint64_t maxMWithOneN = static_cast<uint64_t>((l2 - pB) / (pA + pC));
+        mWindowBlock = std::max(1UL, std::min({mTiles, maxMWithOneN,
+            static_cast<uint64_t>(std::max(1.0L, std::floor(root)))}));
+        const uint64_t remainingL2 = compileInfo_.l2Size - mWindowBlock * aPanelBytes;
+        nWindowBlock = std::max(1UL, std::min(nTiles,
+            remainingL2 / (bPanelBytes + mWindowBlock * cTileBytes)));
+        const uint64_t targetParallel = std::min(compileInfo_.aicNum, mTiles * nTiles);
+        if (mWindowBlock * nWindowBlock < targetParallel) {
+            mWindowBlock = 1;
+            nWindowBlock = targetParallel;
+        }
     }
 
     runInfo_.baseM = baseM;
@@ -1724,7 +1747,7 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
     runInfo_.l2Info.nTileBlock = nWindowBlock;
     runInfo_.l2Info.calOrder = ITER_ROW_FIRST;
     runInfo_.needUpdate = true;
-    (void)::setenv("MATMUL_BASE_EXPERIMENT_VARIANT", "WIDE_N_SHALLOW_K_BASE", 1);
+    (void)::setenv("MATMUL_BASE_EXPERIMENT_VARIANT", mode, 1);
     (void)::setenv("MATMUL_BASE_EXPERIMENT_SELECTED", "1", 1);
     return true;
 }
