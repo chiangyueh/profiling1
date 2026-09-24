@@ -15,10 +15,12 @@
 
 #include <cinttypes>
 // NEW BEGIN
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <numeric>
 // NEW END
 #include "matmul_v3_base_tiling.h"
 #include "../../op_kernel/mat_mul_v3_tiling_key.h"
@@ -674,8 +676,12 @@ void MatmulV3BaseTiling::DoBasicTiling()
 
     CalL1Tiling();
     DoIncreTiling();
-    OptimizeLoadBalanceBasicKernel();
+    const char *baseMode = std::getenv("MATMUL_BASE_MODE");
+    if (baseMode == nullptr || std::strcmp(baseMode, "SHAPE_ADAPTIVE_BALANCED_BASE") != 0) {
+        OptimizeLoadBalanceBasicKernel();
+    }
     DoSelectTiling();
+    DoShapeAdaptiveBalancedBaseTiling();
     // add nd2nz tiling here
     DoNd2NzVectorTiling();
     if (args_.hasBias) {
@@ -729,7 +735,10 @@ ge::graphStatus MatmulV3BaseTiling::DoOpTiling()
     OP_TILING_CHECK(SelectNZTiling() != ge::GRAPH_SUCCESS, CUBE_INNER_ERR_REPORT(args_.opName, "invalid tiling select"),
         return ge::GRAPH_FAILED);
     DoBasicTiling();
-    OptimizeBasicKernelStepK();
+    const char *baseSelected = std::getenv("MATMUL_BASE_EXPERIMENT_SELECTED");
+    if (baseSelected == nullptr || baseSelected[0] != '1' || baseSelected[1] != '\0') {
+        OptimizeBasicKernelStepK();
+    }
     SetNd2NzInfo();
     return ge::GRAPH_SUCCESS;
 }
@@ -1620,6 +1629,138 @@ bool MatmulV3BaseTiling::DoReuseDirectedTiling()
     tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::BASE;
     tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
     tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::BASE;
+    return true;
+}
+
+bool MatmulV3BaseTiling::DoShapeAdaptiveBalancedBaseTiling()
+{
+    const char *mode = std::getenv("MATMUL_BASE_MODE");
+    if (mode == nullptr || std::strcmp(mode, "SHAPE_ADAPTIVE_BALANCED_BASE") != 0 ||
+        !compileInfo_.supportL0c2out || compileInfo_.aicNum == 0 || args_.hasBias ||
+        tilingEnable_.tilingEnableFullLoad != TilingEnableFullLoad::BASE ||
+        tilingEnable_.tilingEnableSplitCore != TilingEnableSplitCore::BASE ||
+        tilingEnable_.tilingEnableFixOpti != TilingEnableFixOpti::BASE ||
+        tilingEnable_.tilingEnableSpecialOpti != TilingEnableSpecialOpti::BASE ||
+        args_.aFormat != ge::FORMAT_ND || args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
+        args_.nd2nzA || args_.nd2nzB || args_.isNzA || args_.isNzB ||
+        args_.mValue == 0 || args_.nValue == 0 || args_.kValue == 0 ||
+        aDtypeSize_ == 0 || bDtypeSize_ == 0 ||
+        compileInfo_.l0CSize < LOC_DATA_SIZE * BASIC_ALIGN_16 * BASIC_ALIGN_16) {
+        return false;
+    }
+
+    const uint64_t maxMGrid = std::min(compileInfo_.aicNum,
+        MathUtil::CeilDivision(args_.mValue, BASIC_ALIGN_16));
+    const uint64_t maxNGrid = std::min(compileInfo_.aicNum,
+        MathUtil::CeilDivision(args_.nValue, BASIC_ALIGN_16));
+    const long double gridRatio = static_cast<long double>(compileInfo_.aicNum) *
+        static_cast<long double>(args_.mValue) * static_cast<long double>(aDtypeSize_) /
+        (static_cast<long double>(args_.nValue) * static_cast<long double>(bDtypeSize_));
+    uint64_t mGrid = static_cast<uint64_t>(std::llround(std::sqrt(gridRatio)));
+    mGrid = std::max(1UL, std::min(mGrid, maxMGrid));
+    uint64_t nGrid = std::max(1UL, std::min(maxNGrid, compileInfo_.aicNum / mGrid));
+    mGrid = std::max(1UL, std::min(maxMGrid, compileInfo_.aicNum / nGrid));
+
+    const uint64_t singleCoreM = ops::CeilAlign(MathUtil::CeilDivision(args_.mValue, mGrid), BASIC_ALIGN_16);
+    const uint64_t actualMGrid = MathUtil::CeilDivision(args_.mValue, singleCoreM);
+    nGrid = std::max(1UL, std::min(maxNGrid, compileInfo_.aicNum / actualMGrid));
+    const uint64_t singleCoreN = ops::CeilAlign(MathUtil::CeilDivision(args_.nValue, nGrid), BASIC_ALIGN_16);
+    const uint64_t actualNGrid = MathUtil::CeilDivision(args_.nValue, singleCoreN);
+    const uint64_t usedCoreNum = actualMGrid * actualNGrid;
+    if (usedCoreNum == 0 || usedCoreNum > compileInfo_.aicNum) {
+        return false;
+    }
+
+    const uint64_t l0cElements = compileInfo_.l0CSize / LOC_DATA_SIZE;
+    const long double baseRatio = static_cast<long double>(l0cElements) *
+        static_cast<long double>(bDtypeSize_) / static_cast<long double>(aDtypeSize_);
+    uint64_t balancedBaseM = static_cast<uint64_t>(std::llround(std::sqrt(baseRatio) / BASIC_ALIGN_16)) *
+        BASIC_ALIGN_16;
+    balancedBaseM = std::max(BASIC_ALIGN_16, std::min(balancedBaseM, BASIC_BLOCK_SIZE_256));
+    uint64_t balancedBaseN = ops::FloorAlign(l0cElements / balancedBaseM, BASIC_ALIGN_16);
+    balancedBaseN = std::max(BASIC_ALIGN_16, std::min(balancedBaseN, 512UL));
+
+    uint64_t baseM = 0;
+    uint64_t baseN = 0;
+    if (singleCoreM <= balancedBaseM) {
+        baseM = singleCoreM;
+        baseN = ops::FloorAlign(l0cElements / baseM, BASIC_ALIGN_16);
+        baseN = std::min({singleCoreN, baseN, 512UL});
+    } else if (singleCoreN <= balancedBaseN) {
+        baseN = singleCoreN;
+        baseM = ops::FloorAlign(l0cElements / baseN, BASIC_ALIGN_16);
+        baseM = std::min({singleCoreM, baseM, BASIC_BLOCK_SIZE_256});
+    } else {
+        baseM = std::min(singleCoreM, balancedBaseM);
+        baseN = std::min(singleCoreN, balancedBaseN);
+    }
+    baseM = ops::FloorAlign(baseM, BASIC_ALIGN_16);
+    baseN = ops::FloorAlign(baseN, BASIC_ALIGN_16);
+    if (baseM == 0 || baseN == 0 || baseM * baseN > l0cElements) {
+        return false;
+    }
+
+    const uint64_t maxBaseKa = compileInfo_.l0ASize / DB_SIZE / aDtypeSize_ / baseM;
+    const uint64_t maxBaseKb = compileInfo_.l0BSize / DB_SIZE / bDtypeSize_ / baseN;
+    const uint64_t baseK = ops::FloorAlign(
+        std::min({ops::CeilAlign(args_.kValue, BASIC_ALIGN_16), maxBaseKa, maxBaseKb}), BASIC_ALIGN_16);
+    if (baseK == 0) {
+        return false;
+    }
+
+    const uint64_t halfL1Size = compileInfo_.l1Size / NUM_HALF;
+    uint64_t stepKa = halfL1Size / baseM / baseK / aDtypeSize_ / DB_SIZE;
+    uint64_t stepKb = halfL1Size / baseN / baseK / bDtypeSize_ / DB_SIZE;
+    if (stepKa == 0 || stepKb == 0) {
+        return false;
+    }
+    const auto alignStepK = [baseK](uint64_t stepK, uint64_t dtypeSize) {
+        const uint64_t sliceBytes = baseK * dtypeSize;
+        const uint64_t totalBytes = stepK * sliceBytes;
+        const uint64_t alignment = totalBytes > BASIC_ALIGN_512 ? BASIC_ALIGN_512 :
+            (totalBytes > BASIC_ALIGN_256 ? BASIC_ALIGN_256 : 1UL);
+        if (alignment == 1) {
+            return stepK;
+        }
+        const uint64_t stepAlignment = alignment / std::gcd(alignment, sliceBytes);
+        return stepK >= stepAlignment ? stepK / stepAlignment * stepAlignment : stepK;
+    };
+    stepKa = alignStepK(stepKa, aDtypeSize_);
+    stepKb = alignStepK(stepKb, bDtypeSize_);
+    if (stepKa >= stepKb) {
+        stepKa = stepKa / stepKb * stepKb;
+    } else {
+        stepKb = stepKb / stepKa * stepKa;
+    }
+
+    const long double repeatedA = static_cast<long double>(args_.mValue) * args_.kValue * aDtypeSize_ * actualNGrid;
+    const long double repeatedB = static_cast<long double>(args_.nValue) * args_.kValue * bDtypeSize_ * actualMGrid;
+    runInfo_.baseM = baseM;
+    runInfo_.baseN = baseN;
+    runInfo_.baseK = baseK;
+    runInfo_.singleCoreM = singleCoreM;
+    runInfo_.singleCoreN = singleCoreN;
+    runInfo_.singleCoreK = args_.kValue;
+    runInfo_.usedCoreNum = usedCoreNum;
+    runInfo_.stepM = 1;
+    runInfo_.stepN = 1;
+    runInfo_.stepKa = stepKa;
+    runInfo_.stepKb = stepKb;
+    runInfo_.depthA1 = stepKa * DB_SIZE;
+    runInfo_.depthB1 = stepKb * DB_SIZE;
+    runInfo_.iterateOrder = repeatedA >= repeatedB ? ITER_ROW_FIRST : ITER_COL_FIRST;
+    runInfo_.dbL0c = DB_OFF_SIZE;
+    runInfo_.l2Info.mTile = 1;
+    runInfo_.l2Info.nTile = 1;
+    runInfo_.l2Info.mTileBlock = actualMGrid;
+    runInfo_.l2Info.nTileBlock = actualNGrid;
+    runInfo_.l2Info.calOrder = runInfo_.iterateOrder;
+    runInfo_.needUpdate = true;
+    tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
+    tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::BASE;
+    tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
+    tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::BASE;
+    (void)::setenv("MATMUL_BASE_EXPERIMENT_SELECTED", "1", 1);
     return true;
 }
 

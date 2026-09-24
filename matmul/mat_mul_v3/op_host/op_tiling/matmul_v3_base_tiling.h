@@ -108,6 +108,7 @@ protected:
     bool DoCubeVectorEdgeTiling();
     bool DoRectangularCubeTiling();
     bool DoReuseDirectedTiling();
+    bool DoShapeAdaptiveBalancedBaseTiling();
     bool DoExperimentalSplitKTiling();
     bool DoAtomicSplitKTiling();
     bool DoTailStreamKTiling();

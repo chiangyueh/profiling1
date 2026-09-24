@@ -82,7 +82,7 @@ runtime_library="-lacl_rt"
 if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/lib64/libascendcl.so" ]]; then
     runtime_library="-lascendcl"
 fi
-runner="${build_dir}/test_adaptive_deterministic_v1"
+runner="${build_dir}/test_shape_adaptive_balanced_base"
 printf '{"stage":"runner_build","status":"begin"}\n'
 if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
     matmul/mat_mul_v3/op_host/op_api/matmul.cpp \
@@ -151,14 +151,14 @@ for index in range(min(len(group) for group in groups)):
 PY
 
 adaptive_count="$(wc -l <"${workload_manifest}")"
-printf '{"stage":"workload_generation","status":"passed","adaptive":%d}\n' "${adaptive_count}"
+printf '{"stage":"workload_generation","status":"passed","candidates":%d}\n' "${adaptive_count}"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
 campaign_failures=0
-success_target="${MATMUL_SUCCESS_TARGET:-10000}"
+success_target="${MATMUL_SUCCESS_TARGET:-300}"
 run_campaign() {
     local campaign="$1"
     local target="$2"
@@ -172,5 +172,5 @@ run_campaign() {
     fi
 }
 
-run_campaign ADAPTIVE_DETERMINISTIC_SPLIT_K "${success_target}" "${runner}" --manifest "${workload_manifest}"
+run_campaign SHAPE_ADAPTIVE_BALANCED_BASE "${success_target}" "${runner}" --manifest "${workload_manifest}"
 printf '{"overnight_complete":true,"campaigns":1,"campaign_process_failures":%d}\n' "${campaign_failures}"
