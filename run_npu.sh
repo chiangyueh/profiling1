@@ -82,7 +82,7 @@ runtime_library="-lacl_rt"
 if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/lib64/libascendcl.so" ]]; then
     runtime_library="-lascendcl"
 fi
-runner="${build_dir}/test_wide_n_shallow_k_base"
+runner="${build_dir}/test_wide_n_panel_reuse_base"
 printf '{"stage":"runner_build","status":"begin"}\n'
 if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
     matmul/mat_mul_v3/op_host/op_api/matmul.cpp \
@@ -119,6 +119,12 @@ anchors = (
     ("fp16_fp16", "NN", 80, 7168, 18432),
     ("bf16_bf16", "NN", 10, 7168, 22528),
     ("bf16_bf16", "NN", 20, 12288, 20480),
+    ("fp16_fp16", "NN", 17, 4865, 16384),
+    ("bf16_bf16", "NN", 31, 5001, 18432),
+    ("fp16_fp16", "NN", 63, 5119, 20480),
+    ("bf16_bf16", "NN", 79, 5121, 22528),
+    ("fp16_fp16", "NN", 95, 6145, 24576),
+    ("bf16_bf16", "NN", 127, 12289, 28672),
 )
 for row in anchors:
     print("\t".join(str(value) for value in row))
@@ -127,10 +133,11 @@ rng = random.Random(8505)
 rows = []
 for dtype in ("fp16_fp16", "bf16_bf16"):
     for m in range(1, 129):
-        for n in range(5120, 16385, 256):
-            for k in range(16384, 32769, 512):
-                if (m + n) * k * 2 <= 512 * 1024 * 1024:
-                    rows.append((dtype, "NN", m, n, k))
+        for _ in range(96):
+            n = rng.randrange(4865, 32769)
+            k = rng.randrange(1024, 131073)
+            if (m + n) * k * 2 <= 512 * 1024 * 1024:
+                rows.append((dtype, "NN", m, n, k))
 rng.shuffle(rows)
 for row in rows:
     if row not in anchors:
@@ -159,5 +166,5 @@ run_campaign() {
     fi
 }
 
-run_campaign WIDE_N_SHALLOW_K_BASE "${success_target}" "${runner}" --manifest "${workload_manifest}"
+run_campaign WIDE_N_PANEL_REUSE_BASE "${success_target}" "${runner}" --manifest "${workload_manifest}"
 printf '{"overnight_complete":true,"campaigns":1,"campaign_process_failures":%d}\n' "${campaign_failures}"

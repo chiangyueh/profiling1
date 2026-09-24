@@ -183,7 +183,7 @@ bool IsBaseCampaign()
         (std::strcmp(campaign, "RECTANGULAR_CUBE") == 0 ||
          std::strcmp(campaign, "REUSE_DIRECTED") == 0 ||
          std::strcmp(campaign, "CUBE_VECTOR_EDGE") == 0 ||
-         std::strcmp(campaign, "WIDE_N_SHALLOW_K_BASE") == 0);
+         std::strcmp(campaign, "WIDE_N_PANEL_REUSE_BASE") == 0);
 }
 
 const char *CampaignName()
@@ -192,8 +192,8 @@ const char *CampaignName()
     const char *campaign = std::getenv("MATMUL_CAMPAIGN");
     if (campaign != nullptr && std::strcmp(campaign, "REUSE_DIRECTED") == 0) return "REUSE_DIRECTED";
     if (campaign != nullptr && std::strcmp(campaign, "CUBE_VECTOR_EDGE") == 0) return "CUBE_VECTOR_EDGE";
-    if (campaign != nullptr && std::strcmp(campaign, "WIDE_N_SHALLOW_K_BASE") == 0) {
-        return "WIDE_N_SHALLOW_K_BASE";
+    if (campaign != nullptr && std::strcmp(campaign, "WIDE_N_PANEL_REUSE_BASE") == 0) {
+        return "WIDE_N_PANEL_REUSE_BASE";
     }
     if (IsAdaptiveCampaign()) return "ADAPTIVE_DETERMINISTIC_SPLIT_K";
     return "INVALID";
@@ -661,12 +661,13 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     const std::vector<uint8_t> adaptiveOutput = rc == ACL_SUCCESS ? CopyDeviceOutput(cTensor) : std::vector<uint8_t>{};
     float adaptiveLatencyReverse = adaptiveLatencyForward;
     float officialLatencyReverse = officialLatencyForward;
-    if (rc == ACL_SUCCESS && adaptiveCampaign) {
+    const bool repeatInReverseOrder = adaptiveCampaign || (baseCampaign && !edgeCampaign);
+    if (rc == ACL_SUCCESS && repeatInReverseOrder) {
         rc = Measure([&]() {
             return aclnnMatmul(adaptiveWorkspace, adaptiveWorkspaceSize, adaptiveExecutor, stream);
         }, stream, adaptiveLatencyReverse);
     }
-    if (rc == ACL_SUCCESS && adaptiveCampaign) {
+    if (rc == ACL_SUCCESS && repeatInReverseOrder) {
         rc = Measure([&]() {
             return aclnnMatmul(officialWorkspace, officialWorkspaceSize, officialExecutor, stream);
         }, stream, officialLatencyReverse);

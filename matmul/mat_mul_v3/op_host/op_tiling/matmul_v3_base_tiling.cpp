@@ -678,7 +678,7 @@ void MatmulV3BaseTiling::DoBasicTiling()
     DoIncreTiling();
     OptimizeLoadBalanceBasicKernel();
     DoSelectTiling();
-    DoWideNShallowKBaseTiling();
+    DoWideNPanelReuseBaseTiling();
     // add nd2nz tiling here
     DoNd2NzVectorTiling();
     if (args_.hasBias) {
@@ -1629,12 +1629,12 @@ bool MatmulV3BaseTiling::DoReuseDirectedTiling()
     return true;
 }
 
-bool MatmulV3BaseTiling::DoWideNShallowKBaseTiling()
+bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
 {
     const char *mode = std::getenv("MATMUL_BASE_MODE");
     const bool dtypeSupported = args_.aType == args_.bType && args_.bType == args_.cType &&
         (args_.aType == ge::DT_FLOAT16 || args_.aType == ge::DT_BF16);
-    if (mode == nullptr || std::strcmp(mode, "WIDE_N_SHALLOW_K_BASE") != 0 ||
+    if (mode == nullptr || std::strcmp(mode, "WIDE_N_PANEL_REUSE_BASE") != 0 ||
         !compileInfo_.supportL0c2out || compileInfo_.aicNum == 0 || args_.hasBias || !dtypeSupported ||
         tilingEnable_.tilingEnableFullLoad != TilingEnableFullLoad::BASE ||
         tilingEnable_.tilingEnableSplitCore != TilingEnableSplitCore::BASE ||
@@ -1643,26 +1643,68 @@ bool MatmulV3BaseTiling::DoWideNShallowKBaseTiling()
         args_.isATrans || args_.isBTrans ||
         args_.aFormat != ge::FORMAT_ND || args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
         args_.nd2nzA || args_.nd2nzB || args_.isNzA || args_.isNzB ||
-        args_.mValue == 0 || args_.mValue > BASIC_BLOCK_SIZE_128 ||
-        args_.nValue % BASIC_BLOCK_SIZE_256 != 0 ||
-        args_.kValue < 16384UL || args_.kValue % BASIC_BLOCK_SIZE_64 != 0 ||
-        runInfo_.baseN != BASIC_BLOCK_SIZE_128 || runInfo_.baseK != BASIC_BLOCK_SIZE_128 ||
+        args_.mValue == 0 || args_.nValue == 0 || args_.kValue == 0 ||
         aDtypeSize_ != DATA_SIZE_FP16 || bDtypeSize_ != DATA_SIZE_FP16) {
         return false;
     }
 
-    constexpr uint64_t baseM = BASIC_BLOCK_SIZE_128;
-    constexpr uint64_t baseN = BASIC_BLOCK_SIZE_256;
-    constexpr uint64_t baseK = BASIC_BLOCK_SIZE_64;
-    constexpr uint64_t stepKa = 8UL;
-    constexpr uint64_t stepKb = 2UL;
-    constexpr uint64_t depthA1 = stepKa * DB_SIZE;
-    constexpr uint64_t depthB1 = stepKb * DB_SIZE;
+    const uint64_t l0cElements = compileInfo_.l0CSize / LOC_DATA_SIZE;
+    const uint64_t nLineAlign = std::lcm(BASIC_ALIGN_16, CACHELINE / bDtypeSize_);
+    const uint64_t baseN = std::min(nLineAlign,
+        ops::FloorAlign(l0cElements / BASIC_ALIGN_16, nLineAlign));
+    if (baseN == 0) {
+        return false;
+    }
+    const uint64_t baseM = ops::FloorAlign(l0cElements / baseN, BASIC_ALIGN_16);
+    if (baseM == 0) {
+        return false;
+    }
+    const uint64_t kAlign = BLOCK_BYTE_SIZE / std::max(aDtypeSize_, bDtypeSize_);
+    const uint64_t maxBaseKa = compileInfo_.l0ASize / DB_SIZE / aDtypeSize_ / baseM;
+    const uint64_t maxBaseKb = compileInfo_.l0BSize / DB_SIZE / bDtypeSize_ / baseN;
+    const uint64_t baseK = ops::FloorAlign(
+        std::min({ops::CeilAlign(args_.kValue, kAlign), maxBaseKa, maxBaseKb}), kAlign);
+    if (baseK == 0) {
+        return false;
+    }
+
     const uint64_t mTiles = MathUtil::CeilDivision(args_.mValue, baseM);
     const uint64_t nTiles = MathUtil::CeilDivision(args_.nValue, baseN);
     if (mTiles != 1 || nTiles < compileInfo_.aicNum) {
         return false;
     }
+
+    const uint64_t kSteps = MathUtil::CeilDivision(args_.kValue, baseK);
+    const uint64_t aKStepBytes = DB_SIZE * baseM * baseK * aDtypeSize_;
+    const uint64_t bKStepBytes = DB_SIZE * baseN * baseK * bDtypeSize_;
+    uint64_t stepKa = std::min(kSteps, compileInfo_.l1Size / NUM_HALF / aKStepBytes);
+    uint64_t stepKb = std::min(kSteps, compileInfo_.l1Size / (NUM_HALF * NUM_HALF) / bKStepBytes);
+    if (stepKa == 0 || stepKb == 0) {
+        return false;
+    }
+    const auto alignStepK = [baseK, kSteps](uint64_t stepK, uint64_t dtypeSize) {
+        if (stepK >= kSteps) {
+            return stepK;
+        }
+        const uint64_t sliceBytes = baseK * dtypeSize;
+        const uint64_t totalBytes = stepK * sliceBytes;
+        const uint64_t alignment = totalBytes > BASIC_ALIGN_512 ? BASIC_ALIGN_512 :
+            (totalBytes > BASIC_ALIGN_256 ? BASIC_ALIGN_256 : 1UL);
+        if (alignment == 1) {
+            return stepK;
+        }
+        const uint64_t stepAlignment = alignment / std::gcd(alignment, sliceBytes);
+        return stepK >= stepAlignment ? stepK / stepAlignment * stepAlignment : stepK;
+    };
+    stepKa = alignStepK(stepKa, aDtypeSize_);
+    stepKb = alignStepK(stepKb, bDtypeSize_);
+    if (stepKa >= stepKb) {
+        stepKa = stepKa / stepKb * stepKb;
+    } else {
+        stepKb = stepKb / stepKa * stepKa;
+    }
+    const uint64_t depthA1 = stepKa * DB_SIZE;
+    const uint64_t depthB1 = stepKb * DB_SIZE;
 
     const uint64_t l0ABytes = DB_SIZE * baseM * baseK * aDtypeSize_;
     const uint64_t l0BBytes = DB_SIZE * baseN * baseK * bDtypeSize_;
