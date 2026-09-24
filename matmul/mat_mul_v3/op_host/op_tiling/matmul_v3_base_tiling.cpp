@@ -1659,6 +1659,11 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
     if (baseM == 0) {
         return false;
     }
+    const uint64_t alignedM = ops::CeilAlign(args_.mValue, BASIC_ALIGN_16);
+    const uint64_t minimumUsefulM = MathUtil::CeilDivision(alignedM * 5UL, 8UL);
+    if (args_.mValue < minimumUsefulM) {
+        return false;
+    }
     const uint64_t kAlign = BLOCK_BYTE_SIZE / std::max(aDtypeSize_, bDtypeSize_);
     const uint64_t maxBaseKa = compileInfo_.l0ASize / DB_SIZE / aDtypeSize_ / baseM;
     const uint64_t maxBaseKb = compileInfo_.l0BSize / DB_SIZE / bDtypeSize_ / baseN;
