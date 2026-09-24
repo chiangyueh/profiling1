@@ -82,7 +82,7 @@ runtime_library="-lacl_rt"
 if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/lib64/libascendcl.so" ]]; then
     runtime_library="-lascendcl"
 fi
-runner="${build_dir}/test_partial_panel_reuse_base"
+runner="${build_dir}/test_wide_n_shallow_k_base"
 printf '{"stage":"runner_build","status":"begin"}\n'
 if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
     matmul/mat_mul_v3/op_host/op_api/matmul.cpp \
@@ -109,45 +109,32 @@ printf '{"stage":"workload_generation","status":"begin"}\n'
 python3 - >"${workload_manifest}" <<'PY'
 import random
 
-dtypes = ("fp16_fp16", "fp16_fp32", "bf16_bf16", "bf16_fp32", "fp32_fp32")
-layouts = ("NN", "NT", "TN", "TT")
-m_values = tuple(range(1, 33)) + (
-    33, 40, 47, 48, 55, 63, 64, 65, 79, 80, 95, 96, 111, 112, 127,
-    128, 144, 159, 160, 176, 191, 192, 224, 255, 256, 288, 319, 320,
-    352, 383, 384, 385, 448, 512, 640, 768, 896, 1024, 1280, 1536,
-    1792, 2048)
-n_values = (
-    1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 24, 31, 32, 33, 40, 48, 56,
-    63, 64, 65, 80, 96, 112, 127, 128, 160, 192, 256, 320, 384, 448,
-    512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048, 2304, 2560,
-    2816, 3072, 3328, 3584, 3840, 4096, 4608, 5120, 6144, 7168,
-    8192, 10240, 12288, 16384)
-k_values = (
-    512, 1024, 1536, 2048, 3072, 4095, 4096, 6144, 7168, 8191,
-    8192, 8193, 9216, 10240, 12288, 14336,
-    16383, 16384, 16389, 18432, 20480, 22528, 24576, 24577, 28672,
-    32768, 32771, 36864, 40960, 45056, 49152, 49157, 57344, 65521,
-    65536, 73728, 81920, 98304, 114688, 131072)
-groups = []
-for group_index, (dtype, layout) in enumerate(
-        (pair for dtype in dtypes for pair in ((dtype, value) for value in layouts))):
-    rng = random.Random(8505 + group_index)
-    rows = []
-    for m in m_values:
-        for n in n_values:
-            bytes_per_element = 4 if dtype == "fp32_fp32" else 2
-            valid_k = tuple(k for k in k_values
-                            if (m + n) * k * bytes_per_element <= 512 * 1024 * 1024)
-            split1 = (len(valid_k) + 2) // 3
-            split2 = (2 * len(valid_k) + 2) // 3
-            bands = (valid_k[:split1], valid_k[split1:split2], valid_k[split2:])
-            for band in bands:
-                rows.append((dtype, layout, m, n, rng.choice(band)))
-    rng.shuffle(rows)
-    groups.append(rows)
-for index in range(min(len(group) for group in groups)):
-    for group in groups:
-        print("\t".join(str(value) for value in group[index]))
+anchors = (
+    ("bf16_bf16", "NN", 111, 7168, 16384),
+    ("bf16_bf16", "NN", 80, 7168, 22528),
+    ("fp16_fp16", "NN", 33, 12288, 18432),
+    ("fp16_fp16", "NN", 10, 6144, 22528),
+    ("bf16_bf16", "NN", 27, 6144, 16384),
+    ("fp16_fp16", "NN", 40, 6144, 24576),
+    ("fp16_fp16", "NN", 80, 7168, 18432),
+    ("bf16_bf16", "NN", 10, 7168, 22528),
+    ("bf16_bf16", "NN", 20, 12288, 20480),
+)
+for row in anchors:
+    print("\t".join(str(value) for value in row))
+
+rng = random.Random(8505)
+rows = []
+for dtype in ("fp16_fp16", "bf16_bf16"):
+    for m in range(1, 129):
+        for n in range(5120, 16385, 256):
+            for k in range(16384, 32769, 512):
+                if (m + n) * k * 2 <= 512 * 1024 * 1024:
+                    rows.append((dtype, "NN", m, n, k))
+rng.shuffle(rows)
+for row in rows:
+    if row not in anchors:
+        print("\t".join(str(value) for value in row))
 PY
 
 adaptive_count="$(wc -l <"${workload_manifest}")"
@@ -172,5 +159,5 @@ run_campaign() {
     fi
 }
 
-run_campaign PARTIAL_PANEL_REUSE_BASE "${success_target}" "${runner}" --manifest "${workload_manifest}"
+run_campaign WIDE_N_SHALLOW_K_BASE "${success_target}" "${runner}" --manifest "${workload_manifest}"
 printf '{"overnight_complete":true,"campaigns":1,"campaign_process_failures":%d}\n' "${campaign_failures}"

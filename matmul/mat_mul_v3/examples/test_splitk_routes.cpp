@@ -183,7 +183,7 @@ bool IsBaseCampaign()
         (std::strcmp(campaign, "RECTANGULAR_CUBE") == 0 ||
          std::strcmp(campaign, "REUSE_DIRECTED") == 0 ||
          std::strcmp(campaign, "CUBE_VECTOR_EDGE") == 0 ||
-         std::strcmp(campaign, "PARTIAL_PANEL_REUSE_BASE") == 0);
+         std::strcmp(campaign, "WIDE_N_SHALLOW_K_BASE") == 0);
 }
 
 const char *CampaignName()
@@ -192,8 +192,8 @@ const char *CampaignName()
     const char *campaign = std::getenv("MATMUL_CAMPAIGN");
     if (campaign != nullptr && std::strcmp(campaign, "REUSE_DIRECTED") == 0) return "REUSE_DIRECTED";
     if (campaign != nullptr && std::strcmp(campaign, "CUBE_VECTOR_EDGE") == 0) return "CUBE_VECTOR_EDGE";
-    if (campaign != nullptr && std::strcmp(campaign, "PARTIAL_PANEL_REUSE_BASE") == 0) {
-        return "PARTIAL_PANEL_REUSE_BASE";
+    if (campaign != nullptr && std::strcmp(campaign, "WIDE_N_SHALLOW_K_BASE") == 0) {
+        return "WIDE_N_SHALLOW_K_BASE";
     }
     if (IsAdaptiveCampaign()) return "ADAPTIVE_DETERMINISTIC_SPLIT_K";
     return "INVALID";
@@ -748,7 +748,7 @@ int main(int argc, char **argv)
     if (!IsBaseCampaign() && !IsAdaptiveCampaign()) return 4;
     const uint64_t targetPasses = ReadEnvUnsigned("MATMUL_TARGET_PASSES");
     std::printf("{\"campaign_start\":\"%s\",\"target_passes\":%lu,"
-                "\"runner\":\"partial_panel_reuse_base_v1\"}\n",
+                "\"runner\":\"wide_n_shallow_k_base_v1\"}\n",
                 CampaignName(), static_cast<unsigned long>(targetPasses));
     std::fflush(stdout);
     const char *hostLibrary = std::getenv("MATMUL_HOST_LIBRARY");

@@ -108,7 +108,7 @@ protected:
     bool DoCubeVectorEdgeTiling();
     bool DoRectangularCubeTiling();
     bool DoReuseDirectedTiling();
-    bool DoPartialPanelReuseBaseTiling();
+    bool DoWideNShallowKBaseTiling();
     bool DoExperimentalSplitKTiling();
     bool DoAtomicSplitKTiling();
     bool DoTailStreamKTiling();
