@@ -75,6 +75,8 @@ struct RunCounts {
     uint64_t failed = 0;
     uint64_t officialFailed = 0;
     uint64_t skippedNonV3 = 0;
+    uint64_t tinyMResidentPassed = 0;
+    uint64_t jointBaseNCorePassed = 0;
 };
 
 uint64_t ReadEnvUnsigned(const char *name)
@@ -506,6 +508,8 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     rc = aclnnMatmulGetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, 1,
                                      &adaptiveWorkspaceSize, &adaptiveExecutor);
     const TilingSnapshot adaptive = ReadTilingSnapshot();
+    const char *variantText = std::getenv("MATMUL_BASE_EXPERIMENT_VARIANT");
+    const std::string candidateVariant = variantText == nullptr ? "" : variantText;
     const char *experimentBranch = std::getenv("MATMUL_EXPERIMENT_BRANCH");
     const bool changed = baseCampaign ?
         experimentBranch != nullptr && std::strcmp(experimentBranch, CampaignName()) == 0 :
@@ -685,11 +689,12 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         static_cast<double>(oldPartialBytes - newPartialBytes) * 100.0 / oldPartialBytes : 0.0;
     std::printf("{\"manifest_index\":%lu,\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
                 "\"output_dtype\":\"%s\","
-                "\"candidate_branch\":\"%s\",\"candidate_selected\":%s,\"tiling_changed\":%s,",
+                "\"candidate_branch\":\"%s\",\"candidate_variant\":\"%s\","
+                "\"candidate_selected\":%s,\"tiling_changed\":%s,",
                 static_cast<unsigned long>(manifestIndex),
                 static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
                 dtype.inputName, dtype.outputName,
-                CampaignName(),
+                CampaignName(), candidateVariant.c_str(),
                 candidateSelected ? "true" : "false", changed ? "true" : "false");
     PrintTiling("official_tiling", official);
     std::printf(",");
@@ -727,7 +732,13 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
                 correct ? "PASS" : "FAIL", rc);
     std::fflush(stdout);
 
-    if (correct) ++counts.passed; else ++counts.failed;
+    if (correct) {
+        ++counts.passed;
+        if (candidateVariant == "TINY_M_A_RESIDENT_CUBE") ++counts.tinyMResidentPassed;
+        if (candidateVariant == "JOINT_BASE_N_CORE") ++counts.jointBaseNCorePassed;
+    } else {
+        ++counts.failed;
+    }
     if (tilingDevice != nullptr) (void)aclrtFree(tilingDevice);
     if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
     if (officialWorkspace != nullptr) (void)aclrtFree(officialWorkspace);
@@ -819,6 +830,7 @@ int main(int argc, char **argv)
                 "\"non_target_route\":%lu,"
                 "\"official_target\":%lu,\"candidate_selected\":%lu,\"official_preserved\":%lu,"
                 "\"target_passes\":%lu,\"quota_met\":%s,\"passed\":%lu,\"failed\":%lu,"
+                "\"tiny_m_a_resident_passed\":%lu,\"joint_base_n_core_passed\":%lu,"
                 "\"official_failed\":%lu,\"manifest_start_index\":%lu,"
                 "\"manifest_end_index\":%lu}\n",
                 CampaignName(),
@@ -832,6 +844,8 @@ int main(int argc, char **argv)
                 (targetPasses == 0 || counts.passed >= targetPasses) ? "true" : "false",
                 static_cast<unsigned long>(counts.passed),
                 static_cast<unsigned long>(counts.failed),
+                static_cast<unsigned long>(counts.tinyMResidentPassed),
+                static_cast<unsigned long>(counts.jointBaseNCorePassed),
                 static_cast<unsigned long>(counts.officialFailed),
                 static_cast<unsigned long>(startIndex),
                 static_cast<unsigned long>(manifestIndex));

@@ -1631,6 +1631,7 @@ bool MatmulV3BaseTiling::DoReuseDirectedTiling()
 
 bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
 {
+    (void)::unsetenv("MATMUL_BASE_EXPERIMENT_VARIANT");
     const char *mode = std::getenv("MATMUL_BASE_MODE");
     const bool dtypeSupported = args_.aType == args_.bType && args_.bType == args_.cType &&
         (args_.aType == ge::DT_FLOAT16 || args_.aType == ge::DT_BF16);
@@ -1650,18 +1651,20 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
 
     const uint64_t l0cElements = compileInfo_.l0CSize / LOC_DATA_SIZE;
     const uint64_t nLineAlign = std::lcm(BASIC_ALIGN_16, CACHELINE / bDtypeSize_);
-    const uint64_t baseN = std::min(nLineAlign,
+    const uint64_t maximumBaseN = std::min(nLineAlign,
         ops::FloorAlign(l0cElements / BASIC_ALIGN_16, nLineAlign));
-    if (baseN == 0) {
+    if (maximumBaseN == 0) {
         return false;
     }
-    const uint64_t baseM = ops::FloorAlign(l0cElements / baseN, BASIC_ALIGN_16);
+    const uint64_t narrowBaseN = std::max(BASIC_ALIGN_16,
+        ops::FloorAlign(maximumBaseN / NUM_HALF, BASIC_ALIGN_16));
+    const bool wideBaseNFillsMachine =
+        MathUtil::CeilDivision(args_.nValue, maximumBaseN) >= compileInfo_.aicNum;
+    const bool tinyM = args_.mValue < 10UL;
+    const uint64_t baseN = tinyM || !wideBaseNFillsMachine ? narrowBaseN : maximumBaseN;
+    const uint64_t maximumBaseM = ops::FloorAlign(l0cElements / baseN, BASIC_ALIGN_16);
+    const uint64_t baseM = tinyM ? BASIC_ALIGN_16 : std::min(BASIC_BLOCK_SIZE_128, maximumBaseM);
     if (baseM == 0) {
-        return false;
-    }
-    const uint64_t alignedM = ops::CeilAlign(args_.mValue, BASIC_ALIGN_16);
-    const uint64_t minimumUsefulM = MathUtil::CeilDivision(alignedM * 5UL, 8UL);
-    if (args_.mValue < minimumUsefulM) {
         return false;
     }
     const uint64_t kAlign = BLOCK_BYTE_SIZE / std::max(aDtypeSize_, bDtypeSize_);
@@ -1675,8 +1678,57 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
 
     const uint64_t mTiles = MathUtil::CeilDivision(args_.mValue, baseM);
     const uint64_t nTiles = MathUtil::CeilDivision(args_.nValue, baseN);
-    if (mTiles != 1 || nTiles < compileInfo_.aicNum) {
+    if (mTiles != 1 || nTiles == 0) {
         return false;
+    }
+    const uint64_t targetParallel = std::min(compileInfo_.aicNum, mTiles * nTiles);
+
+    const uint64_t l0ABytes = DB_SIZE * baseM * baseK * aDtypeSize_;
+    const uint64_t l0BBytes = DB_SIZE * baseN * baseK * bDtypeSize_;
+    const uint64_t l0CBytes = baseM * baseN * LOC_DATA_SIZE;
+    if (l0ABytes > compileInfo_.l0ASize || l0BBytes > compileInfo_.l0BSize ||
+        l0CBytes > compileInfo_.l0CSize) {
+        return false;
+    }
+
+    if (tinyM) {
+        const uint64_t alignedM = ops::CeilAlign(args_.mValue, BASIC_ALIGN_16);
+        const uint64_t alignedK = ops::CeilAlign(args_.kValue, kAlign);
+        const uint64_t aFullLoadBytes = alignedM * alignedK * aDtypeSize_;
+        const uint64_t bDoubleBufferBytes = DB_SIZE * baseN * baseK * bDtypeSize_;
+        if (aFullLoadBytes > compileInfo_.l1Size ||
+            bDoubleBufferBytes > compileInfo_.l1Size - aFullLoadBytes) {
+            return false;
+        }
+
+        runInfo_.baseM = baseM;
+        runInfo_.baseN = baseN;
+        runInfo_.baseK = baseK;
+        runInfo_.singleCoreM = args_.mValue;
+        runInfo_.singleCoreN = baseN;
+        runInfo_.singleCoreK = args_.kValue;
+        runInfo_.usedCoreNum = targetParallel;
+        runInfo_.stepM = 1;
+        runInfo_.stepN = 1;
+        runInfo_.stepKa = MathUtil::CeilDivision(args_.kValue, baseK);
+        runInfo_.stepKb = 1;
+        runInfo_.depthA1 = runInfo_.stepKa;
+        runInfo_.depthB1 = DB_SIZE;
+        runInfo_.iterateOrder = ITER_ROW_FIRST;
+        runInfo_.dbL0c = l0CBytes * DB_SIZE <= compileInfo_.l0CSize ? DB_SIZE : DB_OFF_SIZE;
+        runInfo_.l2Info.mTile = 1;
+        runInfo_.l2Info.nTile = 1;
+        runInfo_.l2Info.mTileBlock = 1;
+        runInfo_.l2Info.nTileBlock = nTiles;
+        runInfo_.l2Info.calOrder = ITER_ROW_FIRST;
+        runInfo_.needUpdate = true;
+        tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::AL1_FULL_LOAD;
+        tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::BASE;
+        tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
+        tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::BASE;
+        (void)::setenv("MATMUL_BASE_EXPERIMENT_VARIANT", "TINY_M_A_RESIDENT_CUBE", 1);
+        (void)::setenv("MATMUL_BASE_EXPERIMENT_SELECTED", "1", 1);
+        return true;
     }
 
     const uint64_t kSteps = MathUtil::CeilDivision(args_.kValue, baseK);
@@ -1711,13 +1763,9 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
     const uint64_t depthA1 = stepKa * DB_SIZE;
     const uint64_t depthB1 = stepKb * DB_SIZE;
 
-    const uint64_t l0ABytes = DB_SIZE * baseM * baseK * aDtypeSize_;
-    const uint64_t l0BBytes = DB_SIZE * baseN * baseK * bDtypeSize_;
-    const uint64_t l0CBytes = baseM * baseN * LOC_DATA_SIZE;
     const uint64_t l1ABytes = depthA1 * baseM * baseK * aDtypeSize_;
     const uint64_t l1BBytes = depthB1 * baseN * baseK * bDtypeSize_;
-    if (l0ABytes > compileInfo_.l0ASize || l0BBytes > compileInfo_.l0BSize ||
-        l0CBytes > compileInfo_.l0CSize || l1ABytes + l1BBytes > compileInfo_.l1Size) {
+    if (l1ABytes + l1BBytes > compileInfo_.l1Size) {
         return false;
     }
 
@@ -1742,7 +1790,6 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
     const uint64_t remainingL2 = compileInfo_.l2Size - mWindowBlock * aPanelBytes;
     uint64_t nWindowBlock = std::max(1UL, std::min(nTiles,
         remainingL2 / (bPanelBytes + mWindowBlock * cTileBytes)));
-    const uint64_t targetParallel = std::min(compileInfo_.aicNum, mTiles * nTiles);
     if (mWindowBlock * nWindowBlock < targetParallel) {
         mWindowBlock = 1;
         nWindowBlock = targetParallel;
@@ -1754,7 +1801,7 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
     runInfo_.singleCoreM = baseM;
     runInfo_.singleCoreN = baseN;
     runInfo_.singleCoreK = args_.kValue;
-    runInfo_.usedCoreNum = compileInfo_.aicNum;
+    runInfo_.usedCoreNum = targetParallel;
     runInfo_.stepM = 1;
     runInfo_.stepN = 1;
     runInfo_.stepKa = stepKa;
@@ -1769,6 +1816,7 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
     runInfo_.l2Info.nTileBlock = nWindowBlock;
     runInfo_.l2Info.calOrder = ITER_ROW_FIRST;
     runInfo_.needUpdate = true;
+    (void)::setenv("MATMUL_BASE_EXPERIMENT_VARIANT", "JOINT_BASE_N_CORE", 1);
     (void)::setenv("MATMUL_BASE_EXPERIMENT_SELECTED", "1", 1);
     return true;
 }

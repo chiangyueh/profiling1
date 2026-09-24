@@ -109,28 +109,8 @@ printf '{"stage":"workload_generation","status":"begin"}\n'
 python3 - >"${workload_manifest}" <<'PY'
 import random
 
-anchors = (
-    ("bf16_bf16", "NN", 111, 7168, 16384),
-    ("bf16_bf16", "NN", 80, 7168, 22528),
-    ("fp16_fp16", "NN", 33, 12288, 18432),
-    ("fp16_fp16", "NN", 10, 6144, 22528),
-    ("bf16_bf16", "NN", 27, 6144, 16384),
-    ("fp16_fp16", "NN", 40, 6144, 24576),
-    ("fp16_fp16", "NN", 80, 7168, 18432),
-    ("bf16_bf16", "NN", 10, 7168, 22528),
-    ("bf16_bf16", "NN", 20, 12288, 20480),
-    ("fp16_fp16", "NN", 17, 4865, 16384),
-    ("bf16_bf16", "NN", 31, 5001, 18432),
-    ("fp16_fp16", "NN", 63, 5119, 20480),
-    ("bf16_bf16", "NN", 79, 5121, 22528),
-    ("fp16_fp16", "NN", 95, 6145, 24576),
-    ("bf16_bf16", "NN", 127, 12289, 28672),
-)
-for row in anchors:
-    print("\t".join(str(value) for value in row))
-
 rng = random.Random(8505)
-diagnostic_failures = [
+diagnostic_shapes = [
     ("fp16_fp16", "NN", 10, 6144, 22528),
     ("fp16_fp16", "NN", 84, 7424, 24576),
     ("bf16_bf16", "NN", 107, 6400, 26624),
@@ -169,22 +149,52 @@ diagnostic_failures = [
     ("bf16_bf16", "NN", 23, 7680, 17408),
     ("bf16_bf16", "NN", 66, 6912, 23040),
 ]
-for _ in range(3):
-    rng.shuffle(diagnostic_failures)
-    for row in diagnostic_failures:
-        print("\t".join(str(value) for value in row))
 
-rows = []
+tiny_rows = []
 for dtype in ("fp16_fp16", "bf16_bf16"):
-    for m in range(1, 129):
-        for _ in range(96):
-            n = rng.randrange(4865, 32769)
-            k = rng.randrange(1024, 131073)
-            if (m + n) * k * 2 <= 512 * 1024 * 1024:
-                rows.append((dtype, "NN", m, n, k))
-rng.shuffle(rows)
-for row in rows:
-    if row not in anchors:
+    for m in range(1, 10):
+        for n in (512, 640, 768, 896, 1024, 1152):
+            for k in (2048, 3072, 4096):
+                tiny_rows.append((dtype, "NN", m, n, k))
+        for n in (1280, 1536, 2048, 2432, 2560, 3072, 3584, 4096, 4608, 4864,
+                  4992, 5120, 5632, 6144, 7168, 8192):
+            for k in (4096, 6144, 8192, 10240, 12288, 14336):
+                if (m + n) * k * 2 + m * n * 2 <= 256 * 1024 * 1024:
+                    tiny_rows.append((dtype, "NN", m, n, k))
+rng.shuffle(tiny_rows)
+tiny_rows = tiny_rows[:320]
+
+normal_m = (10, 12, 14, 15, 16, 17, 19, 20, 23, 27, 31, 32, 33, 40, 47,
+            54, 58, 64, 73, 80, 87, 95, 103, 111, 120, 127, 128)
+normal_n = (512, 640, 768, 896, 1024, 1152, 1280, 1536, 2048, 2304, 2432,
+            2560, 3072, 3584, 4096, 4608, 4864, 4992, 5120, 5632, 6144,
+            7168, 8192, 10240, 12288)
+normal_rows = []
+for dtype in ("fp16_fp16", "bf16_bf16"):
+    for m in normal_m:
+        for n in normal_n:
+            if n < 1280:
+                k_values = (2048, 3072, 4096)
+            elif n <= 2432:
+                k_values = (4096, 6144, 8192, 10240)
+            elif n <= 4864:
+                k_values = (6144, 8192, 10240, 12288, 16384, 20480)
+            else:
+                k_values = (8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528)
+            for k in k_values:
+                if (m + n) * k * 2 + m * n * 2 <= 256 * 1024 * 1024:
+                    normal_rows.append((dtype, "NN", m, n, k))
+rng.shuffle(normal_rows)
+normal_rows = normal_rows[:900]
+
+for round_index in range(3):
+    tiny_round = tiny_rows[:]
+    diagnostic_round = diagnostic_shapes[:]
+    normal_round = normal_rows[:]
+    random.Random(8505 + round_index * 17).shuffle(tiny_round)
+    random.Random(8511 + round_index * 17).shuffle(diagnostic_round)
+    random.Random(8517 + round_index * 17).shuffle(normal_round)
+    for row in tiny_round + diagnostic_round + normal_round:
         print("\t".join(str(value) for value in row))
 PY
 
@@ -196,7 +206,7 @@ export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
 campaign_failures=0
-success_target="${MATMUL_SUCCESS_TARGET:-100}"
+success_target="${MATMUL_SUCCESS_TARGET:-500}"
 run_campaign() {
     local campaign="$1"
     local target="$2"
