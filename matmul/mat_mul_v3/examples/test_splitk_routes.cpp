@@ -52,6 +52,8 @@ struct TilingSnapshot {
     uint32_t baseM = 0;
     uint32_t baseN = 0;
     uint32_t baseK = 0;
+    uint32_t stepM = 0;
+    uint32_t stepN = 0;
     uint32_t stepKa = 0;
     uint32_t stepKb = 0;
     uint32_t depthA1 = 0;
@@ -92,6 +94,8 @@ TilingSnapshot ReadTilingSnapshot()
     value.baseM = static_cast<uint32_t>(ReadEnvUnsigned("MATMUL_OBSERVED_BASE_M"));
     value.baseN = static_cast<uint32_t>(ReadEnvUnsigned("MATMUL_OBSERVED_BASE_N"));
     value.baseK = static_cast<uint32_t>(ReadEnvUnsigned("MATMUL_OBSERVED_BASE_K"));
+    value.stepM = static_cast<uint32_t>(ReadEnvUnsigned("MATMUL_OBSERVED_STEP_M"));
+    value.stepN = static_cast<uint32_t>(ReadEnvUnsigned("MATMUL_OBSERVED_STEP_N"));
     value.stepKa = static_cast<uint32_t>(ReadEnvUnsigned("MATMUL_OBSERVED_STEP_KA"));
     value.stepKb = static_cast<uint32_t>(ReadEnvUnsigned("MATMUL_OBSERVED_STEP_KB"));
     value.depthA1 = static_cast<uint32_t>(ReadEnvUnsigned("MATMUL_OBSERVED_DEPTH_A1"));
@@ -109,7 +113,8 @@ void ClearObservedTiling()
     const char *names[] = {
         "MATMUL_OBSERVED_KEY", "MATMUL_OBSERVED_CORES", "MATMUL_OBSERVED_SINGLE_M",
         "MATMUL_OBSERVED_SINGLE_N", "MATMUL_OBSERVED_SINGLE_K", "MATMUL_OBSERVED_BASE_M",
-        "MATMUL_OBSERVED_BASE_N", "MATMUL_OBSERVED_BASE_K", "MATMUL_OBSERVED_STEP_KA",
+        "MATMUL_OBSERVED_BASE_N", "MATMUL_OBSERVED_BASE_K", "MATMUL_OBSERVED_STEP_M",
+        "MATMUL_OBSERVED_STEP_N", "MATMUL_OBSERVED_STEP_KA",
         "MATMUL_OBSERVED_STEP_KB", "MATMUL_OBSERVED_DEPTH_A1", "MATMUL_OBSERVED_DEPTH_B1",
         "MATMUL_OBSERVED_L2_M_TILE", "MATMUL_OBSERVED_L2_N_TILE", "MATMUL_OBSERVED_L2_M_BLOCK",
         "MATMUL_OBSERVED_L2_N_BLOCK", "MATMUL_OBSERVED_L2_ORDER"
@@ -178,7 +183,7 @@ bool IsBaseCampaign()
         (std::strcmp(campaign, "RECTANGULAR_CUBE") == 0 ||
          std::strcmp(campaign, "REUSE_DIRECTED") == 0 ||
          std::strcmp(campaign, "CUBE_VECTOR_EDGE") == 0 ||
-         std::strcmp(campaign, "SHAPE_ADAPTIVE_BALANCED_BASE") == 0);
+         std::strcmp(campaign, "PARTIAL_PANEL_REUSE_BASE") == 0);
 }
 
 const char *CampaignName()
@@ -187,8 +192,8 @@ const char *CampaignName()
     const char *campaign = std::getenv("MATMUL_CAMPAIGN");
     if (campaign != nullptr && std::strcmp(campaign, "REUSE_DIRECTED") == 0) return "REUSE_DIRECTED";
     if (campaign != nullptr && std::strcmp(campaign, "CUBE_VECTOR_EDGE") == 0) return "CUBE_VECTOR_EDGE";
-    if (campaign != nullptr && std::strcmp(campaign, "SHAPE_ADAPTIVE_BALANCED_BASE") == 0) {
-        return "SHAPE_ADAPTIVE_BALANCED_BASE";
+    if (campaign != nullptr && std::strcmp(campaign, "PARTIAL_PANEL_REUSE_BASE") == 0) {
+        return "PARTIAL_PANEL_REUSE_BASE";
     }
     if (IsAdaptiveCampaign()) return "ADAPTIVE_DETERMINISTIC_SPLIT_K";
     return "INVALID";
@@ -378,11 +383,13 @@ void PrintTiling(const char *name, const TilingSnapshot &value)
 {
     std::printf("\"%s\":{\"key\":%lu,\"core\":%u,\"single_m\":%u,\"single_n\":%u,"
                 "\"single_k\":%u,\"base_m\":%u,\"base_n\":%u,\"base_k\":%u,"
-                "\"step_ka\":%u,\"step_kb\":%u,\"depth_a1\":%u,\"depth_b1\":%u,"
+                "\"step_m\":%u,\"step_n\":%u,\"step_ka\":%u,\"step_kb\":%u,"
+                "\"depth_a1\":%u,\"depth_b1\":%u,"
                 "\"l2_m_tile\":%u,\"l2_n_tile\":%u,\"l2_m_block\":%u,\"l2_n_block\":%u,"
                 "\"l2_order\":%u}",
                 name, static_cast<unsigned long>(value.key), value.cores, value.singleM, value.singleN,
-                value.singleK, value.baseM, value.baseN, value.baseK, value.stepKa, value.stepKb,
+                value.singleK, value.baseM, value.baseN, value.baseK, value.stepM, value.stepN,
+                value.stepKa, value.stepKb,
                 value.depthA1, value.depthB1, value.l2MTile, value.l2NTile, value.l2MBlock,
                 value.l2NBlock, value.l2Order);
 }
@@ -741,7 +748,7 @@ int main(int argc, char **argv)
     if (!IsBaseCampaign() && !IsAdaptiveCampaign()) return 4;
     const uint64_t targetPasses = ReadEnvUnsigned("MATMUL_TARGET_PASSES");
     std::printf("{\"campaign_start\":\"%s\",\"target_passes\":%lu,"
-                "\"runner\":\"shape_adaptive_balanced_base_v3\"}\n",
+                "\"runner\":\"partial_panel_reuse_base_v1\"}\n",
                 CampaignName(), static_cast<unsigned long>(targetPasses));
     std::fflush(stdout);
     const char *hostLibrary = std::getenv("MATMUL_HOST_LIBRARY");

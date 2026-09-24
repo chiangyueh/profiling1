@@ -82,7 +82,7 @@ runtime_library="-lacl_rt"
 if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/lib64/libascendcl.so" ]]; then
     runtime_library="-lascendcl"
 fi
-runner="${build_dir}/test_shape_adaptive_balanced_base"
+runner="${build_dir}/test_partial_panel_reuse_base"
 printf '{"stage":"runner_build","status":"begin"}\n'
 if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
     matmul/mat_mul_v3/op_host/op_api/matmul.cpp \
@@ -172,5 +172,5 @@ run_campaign() {
     fi
 }
 
-run_campaign SHAPE_ADAPTIVE_BALANCED_BASE "${success_target}" "${runner}" --manifest "${workload_manifest}"
+run_campaign PARTIAL_PANEL_REUSE_BASE "${success_target}" "${runner}" --manifest "${workload_manifest}"
 printf '{"overnight_complete":true,"campaigns":1,"campaign_process_failures":%d}\n' "${campaign_failures}"

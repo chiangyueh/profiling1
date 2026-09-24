@@ -676,12 +676,9 @@ void MatmulV3BaseTiling::DoBasicTiling()
 
     CalL1Tiling();
     DoIncreTiling();
-    const char *baseMode = std::getenv("MATMUL_BASE_MODE");
-    if (baseMode == nullptr || std::strcmp(baseMode, "SHAPE_ADAPTIVE_BALANCED_BASE") != 0) {
-        OptimizeLoadBalanceBasicKernel();
-    }
+    OptimizeLoadBalanceBasicKernel();
     DoSelectTiling();
-    DoShapeAdaptiveBalancedBaseTiling();
+    DoPartialPanelReuseBaseTiling();
     // add nd2nz tiling here
     DoNd2NzVectorTiling();
     if (args_.hasBias) {
@@ -1632,11 +1629,11 @@ bool MatmulV3BaseTiling::DoReuseDirectedTiling()
     return true;
 }
 
-bool MatmulV3BaseTiling::DoShapeAdaptiveBalancedBaseTiling()
+bool MatmulV3BaseTiling::DoPartialPanelReuseBaseTiling()
 {
     const char *mode = std::getenv("MATMUL_BASE_MODE");
-    if (mode == nullptr || std::strcmp(mode, "SHAPE_ADAPTIVE_BALANCED_BASE") != 0 ||
-        !compileInfo_.supportL0c2out || compileInfo_.aicNum == 0 || args_.hasBias ||
+    if (mode == nullptr || std::strcmp(mode, "PARTIAL_PANEL_REUSE_BASE") != 0 ||
+        !compileInfo_.supportL0c2out || compileInfo_.aicNum < NUMBER_TWO || args_.hasBias ||
         tilingEnable_.tilingEnableFullLoad != TilingEnableFullLoad::BASE ||
         tilingEnable_.tilingEnableSplitCore != TilingEnableSplitCore::BASE ||
         tilingEnable_.tilingEnableFixOpti != TilingEnableFixOpti::BASE ||
@@ -1644,210 +1641,79 @@ bool MatmulV3BaseTiling::DoShapeAdaptiveBalancedBaseTiling()
         args_.aFormat != ge::FORMAT_ND || args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
         args_.nd2nzA || args_.nd2nzB || args_.isNzA || args_.isNzB ||
         args_.mValue == 0 || args_.nValue == 0 || args_.kValue == 0 ||
-        aDtypeSize_ == 0 || bDtypeSize_ == 0 ||
-        compileInfo_.l0CSize < LOC_DATA_SIZE * BASIC_ALIGN_16 * BASIC_ALIGN_16) {
+        runInfo_.baseM == 0 || runInfo_.baseN == 0 || runInfo_.baseK == 0 ||
+        aDtypeSize_ == 0 || bDtypeSize_ == 0) {
         return false;
     }
 
-    const uint64_t l0cElements = compileInfo_.l0CSize / LOC_DATA_SIZE;
-    const long double aTransferCost = static_cast<long double>(aDtypeSize_) /
-        std::max(compileInfo_.l1ToL0ARate, 1.0);
-    const long double bTransferCost = static_cast<long double>(bDtypeSize_) /
-        std::max(compileInfo_.l1ToL0BRate, 1.0);
-
-    const uint64_t atomicMTiles = MathUtil::CeilDivision(args_.mValue, BASIC_ALIGN_16);
-    const uint64_t atomicNTiles = MathUtil::CeilDivision(args_.nValue, BASIC_ALIGN_16);
-    const uint64_t targetParallel = std::min(compileInfo_.aicNum, atomicMTiles * atomicNTiles);
-    const long double aReplicationCost = static_cast<long double>(args_.mValue) * args_.kValue *
-        aTransferCost;
-    const long double bReplicationCost = static_cast<long double>(args_.nValue) * args_.kValue *
-        bTransferCost;
-    const long double continuousMGrid = std::sqrt(
-        static_cast<long double>(targetParallel) * aReplicationCost / bReplicationCost);
-    const uint64_t minimumMGrid = MathUtil::CeilDivision(targetParallel, atomicNTiles);
-    const uint64_t maximumMGrid = std::min(targetParallel, atomicMTiles);
-    uint64_t mGrid = std::max(minimumMGrid, std::min(maximumMGrid,
-        static_cast<uint64_t>(std::max(1LL, std::llround(continuousMGrid)))));
-    uint64_t nGrid = std::min(atomicNTiles, MathUtil::CeilDivision(targetParallel, mGrid));
-    mGrid = std::min(atomicMTiles, MathUtil::CeilDivision(targetParallel, nGrid));
-
-    const uint64_t mTaskBound = ops::CeilAlign(
-        MathUtil::CeilDivision(args_.mValue, mGrid), BASIC_ALIGN_16);
-    const uint64_t nTaskBound = ops::CeilAlign(
-        MathUtil::CeilDivision(args_.nValue, nGrid), BASIC_ALIGN_16);
-    const uint64_t efficientBaseK = std::max(BASIC_ALIGN_16,
-        BASIC_BLOCK_K_128_BYTE / std::min(aDtypeSize_, bDtypeSize_));
-    const uint64_t mL0Bound = compileInfo_.l0ASize / DB_SIZE / aDtypeSize_ / efficientBaseK;
-    const uint64_t nL0Bound = compileInfo_.l0BSize / DB_SIZE / bDtypeSize_ / efficientBaseK;
-    const uint64_t mBound = ops::FloorAlign(
-        std::min({mTaskBound, mL0Bound, BASIC_BLOCK_SIZE_256}), BASIC_ALIGN_16);
-    const uint64_t nBound = ops::FloorAlign(std::min(nTaskBound, nL0Bound), BASIC_ALIGN_16);
-    if (mBound == 0 || nBound == 0) {
+    const uint64_t mBaseTiles = MathUtil::CeilDivision(args_.mValue, runInfo_.baseM);
+    const uint64_t nBaseTiles = MathUtil::CeilDivision(args_.nValue, runInfo_.baseN);
+    const bool streamN = mBaseTiles == 1 && nBaseTiles >= compileInfo_.aicNum * NUMBER_TWO;
+    const bool streamM = nBaseTiles == 1 && mBaseTiles >= compileInfo_.aicNum * NUMBER_TWO;
+    if (streamN == streamM) {
         return false;
     }
 
-    const long double continuousBaseM = std::sqrt(
-        static_cast<long double>(l0cElements) * bTransferCost / aTransferCost);
-    uint64_t baseM = 0;
-    uint64_t baseN = 0;
-    if (mBound * nBound <= l0cElements) {
-        baseM = mBound;
-        baseN = nBound;
-    } else {
-        const uint64_t minimumBaseM = ops::CeilAlign(
-            MathUtil::CeilDivision(l0cElements, nBound), BASIC_ALIGN_16);
-        const uint64_t maximumBaseM = ops::FloorAlign(
-            std::min(mBound, l0cElements / BASIC_ALIGN_16), BASIC_ALIGN_16);
-        if (minimumBaseM > maximumBaseM) {
-            return false;
-        }
-        const uint64_t analyticBaseM = ops::CeilAlign(
-            static_cast<uint64_t>(std::max(1.0L, continuousBaseM)), BASIC_ALIGN_16);
-        baseM = std::max(minimumBaseM, std::min(maximumBaseM, analyticBaseM));
-        baseN = ops::FloorAlign(std::min(nBound, l0cElements / baseM), BASIC_ALIGN_16);
+    const uint64_t streamTiles = streamN ? nBaseTiles : mBaseTiles;
+    const uint64_t group = (streamTiles - 1) / (compileInfo_.aicNum - 1);
+    if (group < NUMBER_TWO) {
+        return false;
     }
-    if (baseM == 0 || baseN == 0 || baseM * baseN > l0cElements) {
+    const uint64_t mGroup = streamM ? group : 1;
+    const uint64_t nGroup = streamN ? group : 1;
+    const uint64_t singleCoreM = mGroup * runInfo_.baseM;
+    const uint64_t singleCoreN = nGroup * runInfo_.baseN;
+    const uint64_t mTasks = MathUtil::CeilDivision(args_.mValue, singleCoreM);
+    const uint64_t nTasks = MathUtil::CeilDivision(args_.nValue, singleCoreN);
+    if (mTasks * nTasks < compileInfo_.aicNum) {
         return false;
     }
 
-    const uint64_t maxBaseKa = compileInfo_.l0ASize / DB_SIZE / aDtypeSize_ / baseM;
-    const uint64_t maxBaseKb = compileInfo_.l0BSize / DB_SIZE / bDtypeSize_ / baseN;
-    const uint64_t baseK = ops::FloorAlign(
-        std::min({ops::CeilAlign(args_.kValue, BASIC_ALIGN_16), maxBaseKa, maxBaseKb,
-            BASIC_BLOCK_SIZE_128}), BASIC_ALIGN_16);
-    if (baseK == 0) {
+    const long double aSliceBytes =
+        static_cast<long double>(runInfo_.baseM) * runInfo_.baseK * aDtypeSize_;
+    const long double bSliceBytes =
+        static_cast<long double>(runInfo_.baseN) * runInfo_.baseK * bDtypeSize_;
+    const long double l1BytesPerKStep = DB_SIZE * (mGroup * aSliceBytes + nGroup * bSliceBytes);
+    if (l1BytesPerKStep <= 0.0L || l1BytesPerKStep > compileInfo_.l1Size) {
+        return false;
+    }
+    const uint64_t kSteps = MathUtil::CeilDivision(args_.kValue, runInfo_.baseK);
+    uint64_t stepK = std::min(kSteps,
+        static_cast<uint64_t>(static_cast<long double>(compileInfo_.l1Size) / l1BytesPerKStep));
+    UpdateL1TilingStepK(stepK);
+    if (stepK == 0 || stepK >= kSteps) {
         return false;
     }
 
-    const uint64_t mTiles = MathUtil::CeilDivision(args_.mValue, baseM);
-    const uint64_t nTiles = MathUtil::CeilDivision(args_.nValue, baseN);
-    const uint64_t aSliceBytes = baseM * baseK * aDtypeSize_;
-    const uint64_t bSliceBytes = baseN * baseK * bDtypeSize_;
-    const uint64_t minimumA1 = DB_SIZE * aSliceBytes;
-    const uint64_t minimumB1 = DB_SIZE * bSliceBytes;
-    if (minimumA1 + minimumB1 > compileInfo_.l1Size) {
-        return false;
-    }
-    const uint64_t distributableL1 = compileInfo_.l1Size - minimumA1 - minimumB1;
-    const long double aDemand = std::sqrt(
-        static_cast<long double>(nTiles) * aSliceBytes / std::max(compileInfo_.l1ToL0ARate, 1.0));
-    const long double bDemand = std::sqrt(
-        static_cast<long double>(mTiles) * bSliceBytes / std::max(compileInfo_.l1ToL0BRate, 1.0));
-    const long double totalDemand = aDemand + bDemand;
-    const uint64_t aBudget = minimumA1 + (totalDemand > 0.0L ? static_cast<uint64_t>(
-        static_cast<long double>(distributableL1) * aDemand / totalDemand) : distributableL1 / NUM_HALF);
-    const uint64_t bBudget = compileInfo_.l1Size - aBudget;
-    uint64_t stepKa = aBudget / aSliceBytes / DB_SIZE;
-    uint64_t stepKb = bBudget / bSliceBytes / DB_SIZE;
-    if (stepKa == 0 || stepKb == 0) {
-        return false;
-    }
-    const uint64_t kSteps = MathUtil::CeilDivision(args_.kValue, baseK);
-    stepKa = std::min(stepKa, kSteps);
-    stepKb = std::min(stepKb, kSteps);
-    const auto alignStepK = [baseK, kSteps](uint64_t stepK, uint64_t dtypeSize) {
-        if (stepK >= kSteps) {
-            return stepK;
-        }
-        const uint64_t sliceBytes = baseK * dtypeSize;
-        const uint64_t totalBytes = stepK * sliceBytes;
-        const uint64_t alignment = totalBytes > BASIC_ALIGN_512 ? BASIC_ALIGN_512 :
-            (totalBytes > BASIC_ALIGN_256 ? BASIC_ALIGN_256 : 1UL);
-        if (alignment == 1) {
-            return stepK;
-        }
-        const uint64_t stepAlignment = alignment / std::gcd(alignment, sliceBytes);
-        return stepK >= stepAlignment ? stepK / stepAlignment * stepAlignment : stepK;
-    };
-    stepKa = alignStepK(stepKa, aDtypeSize_);
-    stepKb = alignStepK(stepKb, bDtypeSize_);
-    if (stepKa >= stepKb) {
-        stepKa = stepKa / stepKb * stepKb;
-    } else {
-        stepKb = stepKb / stepKa * stepKa;
-    }
-
-    const uint64_t aPanelBytes = args_.isATrans ?
-        args_.kValue * ops::CeilAlign(baseM * aDtypeSize_, CACHELINE) :
-        baseM * ops::CeilAlign(args_.kValue * aDtypeSize_, CACHELINE);
-    const uint64_t bPanelBytes = args_.isBTrans ?
-        baseN * ops::CeilAlign(args_.kValue * bDtypeSize_, CACHELINE) :
-        args_.kValue * ops::CeilAlign(baseN * bDtypeSize_, CACHELINE);
-    const uint64_t cTileBytes = baseM * baseN * cDtypeSize_;
-    uint64_t mWindowBlock = 1;
-    uint64_t nWindowBlock = 1;
-    const long double minimumWindowBytes = static_cast<long double>(aPanelBytes) + bPanelBytes + cTileBytes;
-    if (minimumWindowBytes <= compileInfo_.l2Size) {
-        const long double pA = static_cast<long double>(aPanelBytes);
-        const long double pB = static_cast<long double>(bPanelBytes);
-        const long double pC = static_cast<long double>(cTileBytes);
-        const long double l2 = static_cast<long double>(compileInfo_.l2Size);
-        const long double root = pC > 0.0L ?
-            (std::sqrt(pB * pB + pC * l2 * pB / pA) - pB) / pC : l2 / (NUM_HALF * pA);
-        const uint64_t maxMWithOneN = static_cast<uint64_t>((l2 - pB) / (pA + pC));
-        mWindowBlock = std::max(1UL, std::min({mTiles, maxMWithOneN,
-            static_cast<uint64_t>(std::max(1.0L, std::floor(root)))}));
-        const uint64_t remainingL2 = compileInfo_.l2Size - mWindowBlock * aPanelBytes;
-        nWindowBlock = std::max(1UL, std::min(nTiles,
-            remainingL2 / (bPanelBytes + mWindowBlock * cTileBytes)));
-    }
-    const uint64_t scheduledParallel = std::min(compileInfo_.aicNum, mTiles * nTiles);
-    const long double coreGridM = std::sqrt(static_cast<long double>(scheduledParallel) *
-        bPanelBytes / aPanelBytes);
-    uint64_t parallelM = std::max(1UL, std::min(mTiles,
-        static_cast<uint64_t>(std::max(1LL, std::llround(coreGridM)))));
-    uint64_t parallelN = std::max(1UL, std::min(nTiles, MathUtil::CeilDivision(scheduledParallel, parallelM)));
-    parallelM = std::max(1UL, std::min(mTiles, MathUtil::CeilDivision(scheduledParallel, parallelN)));
-    if (mWindowBlock * nWindowBlock < scheduledParallel) {
-        mWindowBlock = parallelM;
-        nWindowBlock = parallelN;
-    }
-    const uint64_t mWindowCount = MathUtil::CeilDivision(mTiles, mWindowBlock);
-    const uint64_t nWindowCount = MathUtil::CeilDivision(nTiles, nWindowBlock);
-    const uint64_t usedCoreNum = std::min(compileInfo_.aicNum, mWindowBlock * nWindowBlock);
-    if (usedCoreNum == 0) {
+    const long double reusedPanelBytes = streamN ?
+        static_cast<long double>(runInfo_.baseM) * args_.kValue * aDtypeSize_ :
+        static_cast<long double>(runInfo_.baseN) * args_.kValue * bDtypeSize_;
+    const long double savedPanelBytes =
+        reusedPanelBytes * (streamTiles - (streamN ? nTasks : mTasks));
+    const long double extraStagingBytes =
+        DB_SIZE * (group - 1) * (streamN ? bSliceBytes : aSliceBytes);
+    if (savedPanelBytes <= extraStagingBytes) {
         return false;
     }
 
-    const uint64_t rowReuseDistance = bPanelBytes + cTileBytes;
-    const uint64_t colReuseDistance = aPanelBytes + cTileBytes;
-    const uint64_t rowAddressJump = (args_.isBTrans ? baseN * args_.kValue : baseN) * bDtypeSize_ +
-        baseN * cDtypeSize_;
-    const uint64_t colAddressJump = (args_.isATrans ? baseM : baseM * args_.kValue) * aDtypeSize_ +
-        baseM * args_.nValue * cDtypeSize_;
-    const long double rowBenefit = static_cast<long double>(nWindowBlock - 1) * aPanelBytes;
-    const long double colBenefit = static_cast<long double>(mWindowBlock - 1) * bPanelBytes;
-    const long double rowCost = MathUtil::CeilDivision(rowReuseDistance, CACHELINE) +
-        MathUtil::CeilDivision(rowAddressJump, CACHELINE);
-    const long double colCost = MathUtil::CeilDivision(colReuseDistance, CACHELINE) +
-        MathUtil::CeilDivision(colAddressJump, CACHELINE);
-    const bool rowFirst = rowBenefit * colCost >= colBenefit * rowCost;
-
-    runInfo_.baseM = baseM;
-    runInfo_.baseN = baseN;
-    runInfo_.baseK = baseK;
-    runInfo_.singleCoreM = baseM;
-    runInfo_.singleCoreN = baseN;
+    runInfo_.singleCoreM = singleCoreM;
+    runInfo_.singleCoreN = singleCoreN;
     runInfo_.singleCoreK = args_.kValue;
-    runInfo_.usedCoreNum = usedCoreNum;
-    runInfo_.stepM = 1;
-    runInfo_.stepN = 1;
-    runInfo_.stepKa = stepKa;
-    runInfo_.stepKb = stepKb;
-    runInfo_.depthA1 = stepKa * DB_SIZE;
-    runInfo_.depthB1 = stepKb * DB_SIZE;
-    runInfo_.iterateOrder = rowFirst ? ITER_ROW_FIRST : ITER_COL_FIRST;
+    runInfo_.usedCoreNum = compileInfo_.aicNum;
+    runInfo_.stepM = mGroup;
+    runInfo_.stepN = nGroup;
+    runInfo_.stepKa = stepK;
+    runInfo_.stepKb = stepK;
+    runInfo_.depthA1 = mGroup * stepK * DB_SIZE;
+    runInfo_.depthB1 = nGroup * stepK * DB_SIZE;
+    runInfo_.iterateOrder = streamN ? ITER_ROW_FIRST : ITER_COL_FIRST;
     runInfo_.dbL0c = DB_OFF_SIZE;
-    runInfo_.l2Info.mTile = mWindowCount;
-    runInfo_.l2Info.nTile = nWindowCount;
-    runInfo_.l2Info.mTileBlock = mWindowBlock;
-    runInfo_.l2Info.nTileBlock = nWindowBlock;
+    runInfo_.l2Info.mTile = 1;
+    runInfo_.l2Info.nTile = 1;
+    runInfo_.l2Info.mTileBlock = mTasks;
+    runInfo_.l2Info.nTileBlock = nTasks;
     runInfo_.l2Info.calOrder = runInfo_.iterateOrder;
     runInfo_.needUpdate = true;
-    tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
-    tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::BASE;
-    tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
-    tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::BASE;
     (void)::setenv("MATMUL_BASE_EXPERIMENT_SELECTED", "1", 1);
     return true;
 }
@@ -3390,6 +3256,8 @@ void MatmulV3BaseTiling::ExportExperimentalTiling()
     exportField("MATMUL_OBSERVED_BASE_M", tilingData_.matmulTiling.baseM);
     exportField("MATMUL_OBSERVED_BASE_N", tilingData_.matmulTiling.baseN);
     exportField("MATMUL_OBSERVED_BASE_K", tilingData_.matmulTiling.baseK);
+    exportField("MATMUL_OBSERVED_STEP_M", tilingData_.matmulTiling.stepM);
+    exportField("MATMUL_OBSERVED_STEP_N", tilingData_.matmulTiling.stepN);
     exportField("MATMUL_OBSERVED_STEP_KA", tilingData_.matmulTiling.stepKa);
     exportField("MATMUL_OBSERVED_STEP_KB", tilingData_.matmulTiling.stepKb);
     exportField("MATMUL_OBSERVED_DEPTH_A1", tilingData_.matmulTiling.depthA1);
