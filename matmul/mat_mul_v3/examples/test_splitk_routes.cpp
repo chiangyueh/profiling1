@@ -77,12 +77,25 @@ struct RunCounts {
     uint64_t skippedNonV3 = 0;
     uint64_t tinyMResidentPassed = 0;
     uint64_t jointMnGridReusePassed = 0;
+    uint64_t mCoverage[5] = {};
+    uint64_t nCoverage[5] = {};
+    uint64_t kCoverage[5] = {};
 };
 
 uint64_t ReadEnvUnsigned(const char *name)
 {
     const char *text = std::getenv(name);
     return text == nullptr ? 0 : std::strtoull(text, nullptr, 10);
+}
+
+void CountPassCoverage(RunCounts &counts, int64_t m, int64_t n, int64_t k)
+{
+    const size_t mBucket = m <= 9 ? 0 : (m <= 128 ? 1 : (m <= 512 ? 2 : (m <= 2048 ? 3 : 4)));
+    const size_t nBucket = n <= 2432 ? 0 : (n <= 8192 ? 1 : (n <= 16384 ? 2 : (n <= 32768 ? 3 : 4)));
+    const size_t kBucket = k <= 4096 ? 0 : (k <= 16384 ? 1 : (k <= 32768 ? 2 : (k <= 65536 ? 3 : 4)));
+    ++counts.mCoverage[mBucket];
+    ++counts.nCoverage[nBucket];
+    ++counts.kCoverage[kBucket];
 }
 
 TilingSnapshot ReadTilingSnapshot()
@@ -734,6 +747,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
 
     if (correct) {
         ++counts.passed;
+        CountPassCoverage(counts, m, n, k);
         if (candidateVariant == "TINY_M_A_RESIDENT_CUBE") ++counts.tinyMResidentPassed;
         if (candidateVariant == "JOINT_MN_GRID_REUSE") ++counts.jointMnGridReusePassed;
     } else {
@@ -849,6 +863,25 @@ int main(int argc, char **argv)
                 static_cast<unsigned long>(counts.officialFailed),
                 static_cast<unsigned long>(startIndex),
                 static_cast<unsigned long>(manifestIndex));
+    std::printf("{\"measured_coverage\":true,"
+                "\"m\":{\"1_9\":%lu,\"10_128\":%lu,\"129_512\":%lu,\"513_2048\":%lu,\"2049_4096\":%lu},"
+                "\"n\":{\"512_2432\":%lu,\"2433_8192\":%lu,\"8193_16384\":%lu,\"16385_32768\":%lu,\"32769_65536\":%lu},"
+                "\"k\":{\"1024_4096\":%lu,\"4097_16384\":%lu,\"16385_32768\":%lu,\"32769_65536\":%lu,\"65537_131072\":%lu}}\n",
+                static_cast<unsigned long>(counts.mCoverage[0]),
+                static_cast<unsigned long>(counts.mCoverage[1]),
+                static_cast<unsigned long>(counts.mCoverage[2]),
+                static_cast<unsigned long>(counts.mCoverage[3]),
+                static_cast<unsigned long>(counts.mCoverage[4]),
+                static_cast<unsigned long>(counts.nCoverage[0]),
+                static_cast<unsigned long>(counts.nCoverage[1]),
+                static_cast<unsigned long>(counts.nCoverage[2]),
+                static_cast<unsigned long>(counts.nCoverage[3]),
+                static_cast<unsigned long>(counts.nCoverage[4]),
+                static_cast<unsigned long>(counts.kCoverage[0]),
+                static_cast<unsigned long>(counts.kCoverage[1]),
+                static_cast<unsigned long>(counts.kCoverage[2]),
+                static_cast<unsigned long>(counts.kCoverage[3]),
+                static_cast<unsigned long>(counts.kCoverage[4]));
     if (edgeBinary != nullptr) (void)aclrtBinaryUnLoad(edgeBinary);
     (void)aclrtDestroyStream(stream);
     (void)aclrtResetDevice(0);

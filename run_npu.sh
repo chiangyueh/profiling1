@@ -161,9 +161,6 @@ for dtype in ("fp16_fp16", "bf16_bf16"):
             for k in (4096, 6144, 8192, 10240, 12288, 14336):
                 if (m + n) * k * 2 + m * n * 2 <= 256 * 1024 * 1024:
                     tiny_rows.append((dtype, "NN", m, n, k))
-rng.shuffle(tiny_rows)
-tiny_rows = tiny_rows[:320]
-
 normal_m = (10, 12, 14, 15, 16, 17, 19, 20, 23, 27, 31, 32, 33, 40, 47,
             54, 58, 64, 73, 80, 87, 95, 103, 111, 120, 127, 128, 160, 192,
             256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096)
@@ -179,9 +176,6 @@ for dtype in ("fp16_fp16", "bf16_bf16"):
             for k in normal_k:
                 if (m + n) * k * 2 + m * n * 2 <= 192 * 1024 * 1024:
                     normal_rows.append((dtype, "NN", m, n, k))
-rng.shuffle(normal_rows)
-normal_rows = normal_rows[:1800]
-
 coverage_shapes = (
     (160, 16384, 4096), (256, 65536, 1024), (384, 32768, 2048),
     (512, 24576, 3072), (768, 16384, 4096), (1024, 8192, 6144),
@@ -194,22 +188,21 @@ coverage_rows = [
     for m, n, k in coverage_shapes
 ]
 
-for round_index in range(3):
-    rows = tiny_rows + normal_rows + coverage_rows + diagnostic_shapes * 3
-    random.Random(8505 + round_index * 17).shuffle(rows)
-    for row in rows:
-        print("\t".join(str(value) for value in row))
+rows = sorted(set(tiny_rows + normal_rows + coverage_rows + diagnostic_shapes))
+rng.shuffle(rows)
+for row in rows:
+    print("\t".join(str(value) for value in row))
 PY
 
 adaptive_count="$(wc -l <"${workload_manifest}")"
-printf '{"stage":"workload_generation","status":"passed","candidates":%d}\n' "${adaptive_count}"
+printf '{"stage":"workload_generation","status":"passed","coverage":"all_unique_legal_grid_points","candidates":%d}\n' "${adaptive_count}"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
 campaign_failures=0
-success_target="${MATMUL_SUCCESS_TARGET:-500}"
+success_target=0
 run_campaign() {
     local campaign="$1"
     local target="$2"
