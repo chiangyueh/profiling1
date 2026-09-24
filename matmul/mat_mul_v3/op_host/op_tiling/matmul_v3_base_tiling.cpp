@@ -3044,8 +3044,12 @@ bool MatmulV3BaseTiling::DoDeterministicMultiCoreSplitKTiling()
 
         const uint64_t oldSingleCoreM = runInfo_.singleCoreM;
         const uint64_t oldPartialBytes = partialBytes();
-        runInfo_.singleCoreM = std::min(
-            runInfo_.singleCoreM, ops::CeilAlign(args_.mValue, BASIC_ALIGN_16));
+        const bool adaptiveShape = args_.mValue >= 7 && args_.mValue <= BASIC_BLOCK_SIZE_64 &&
+            args_.nValue >= 3072;
+        if (adaptiveShape) {
+            runInfo_.singleCoreM = std::min(
+                runInfo_.singleCoreM, ops::CeilAlign(args_.mValue, BASIC_ALIGN_16));
+        }
         const uint64_t newPartialBytes = partialBytes();
         const bool changed = runInfo_.singleCoreM != oldSingleCoreM;
 
