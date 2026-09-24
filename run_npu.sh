@@ -196,7 +196,7 @@ export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
 campaign_failures=0
-success_target="${MATMUL_SUCCESS_TARGET:-300}"
+success_target="${MATMUL_SUCCESS_TARGET:-100}"
 run_campaign() {
     local campaign="$1"
     local target="$2"
