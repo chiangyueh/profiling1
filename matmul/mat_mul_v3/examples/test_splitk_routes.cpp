@@ -741,7 +741,7 @@ int main(int argc, char **argv)
     if (!IsBaseCampaign() && !IsAdaptiveCampaign()) return 4;
     const uint64_t targetPasses = ReadEnvUnsigned("MATMUL_TARGET_PASSES");
     std::printf("{\"campaign_start\":\"%s\",\"target_passes\":%lu,"
-                "\"runner\":\"shape_adaptive_balanced_base_v2\"}\n",
+                "\"runner\":\"shape_adaptive_balanced_base_v3\"}\n",
                 CampaignName(), static_cast<unsigned long>(targetPasses));
     std::fflush(stdout);
     const char *hostLibrary = std::getenv("MATMUL_HOST_LIBRARY");

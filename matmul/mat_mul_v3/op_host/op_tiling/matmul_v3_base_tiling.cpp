@@ -1650,32 +1650,62 @@ bool MatmulV3BaseTiling::DoShapeAdaptiveBalancedBaseTiling()
     }
 
     const uint64_t l0cElements = compileInfo_.l0CSize / LOC_DATA_SIZE;
-    uint64_t mLineAlign = args_.isATrans ?
-        std::lcm(BASIC_ALIGN_16, CACHELINE / aDtypeSize_) : BASIC_ALIGN_16;
-    uint64_t nLineAlign = !args_.isBTrans ?
-        std::lcm(BASIC_ALIGN_16, CACHELINE / bDtypeSize_) : BASIC_ALIGN_16;
     const long double aTransferCost = static_cast<long double>(aDtypeSize_) /
         std::max(compileInfo_.l1ToL0ARate, 1.0);
     const long double bTransferCost = static_cast<long double>(bDtypeSize_) /
         std::max(compileInfo_.l1ToL0BRate, 1.0);
-    if (mLineAlign * nLineAlign > l0cElements) {
-        if (aTransferCost >= bTransferCost) {
-            nLineAlign = BASIC_ALIGN_16;
-        } else {
-            mLineAlign = BASIC_ALIGN_16;
-        }
+
+    const uint64_t atomicMTiles = MathUtil::CeilDivision(args_.mValue, BASIC_ALIGN_16);
+    const uint64_t atomicNTiles = MathUtil::CeilDivision(args_.nValue, BASIC_ALIGN_16);
+    const uint64_t targetParallel = std::min(compileInfo_.aicNum, atomicMTiles * atomicNTiles);
+    const long double aReplicationCost = static_cast<long double>(args_.mValue) * args_.kValue *
+        aTransferCost;
+    const long double bReplicationCost = static_cast<long double>(args_.nValue) * args_.kValue *
+        bTransferCost;
+    const long double continuousMGrid = std::sqrt(
+        static_cast<long double>(targetParallel) * aReplicationCost / bReplicationCost);
+    const uint64_t minimumMGrid = MathUtil::CeilDivision(targetParallel, atomicNTiles);
+    const uint64_t maximumMGrid = std::min(targetParallel, atomicMTiles);
+    uint64_t mGrid = std::max(minimumMGrid, std::min(maximumMGrid,
+        static_cast<uint64_t>(std::max(1LL, std::llround(continuousMGrid)))));
+    uint64_t nGrid = std::min(atomicNTiles, MathUtil::CeilDivision(targetParallel, mGrid));
+    mGrid = std::min(atomicMTiles, MathUtil::CeilDivision(targetParallel, nGrid));
+
+    const uint64_t mTaskBound = ops::CeilAlign(
+        MathUtil::CeilDivision(args_.mValue, mGrid), BASIC_ALIGN_16);
+    const uint64_t nTaskBound = ops::CeilAlign(
+        MathUtil::CeilDivision(args_.nValue, nGrid), BASIC_ALIGN_16);
+    const uint64_t efficientBaseK = std::max(BASIC_ALIGN_16,
+        BASIC_BLOCK_K_128_BYTE / std::min(aDtypeSize_, bDtypeSize_));
+    const uint64_t mL0Bound = compileInfo_.l0ASize / DB_SIZE / aDtypeSize_ / efficientBaseK;
+    const uint64_t nL0Bound = compileInfo_.l0BSize / DB_SIZE / bDtypeSize_ / efficientBaseK;
+    const uint64_t mBound = ops::FloorAlign(
+        std::min({mTaskBound, mL0Bound, BASIC_BLOCK_SIZE_256}), BASIC_ALIGN_16);
+    const uint64_t nBound = ops::FloorAlign(std::min(nTaskBound, nL0Bound), BASIC_ALIGN_16);
+    if (mBound == 0 || nBound == 0) {
+        return false;
     }
+
     const long double continuousBaseM = std::sqrt(
         static_cast<long double>(l0cElements) * bTransferCost / aTransferCost);
-    uint64_t baseM = static_cast<uint64_t>(std::llround(continuousBaseM / mLineAlign)) * mLineAlign;
-    baseM = std::max(mLineAlign, std::min(baseM, BASIC_BLOCK_SIZE_256));
-    uint64_t baseN = ops::FloorAlign(l0cElements / baseM, nLineAlign);
-    if (baseN == 0) {
-        baseN = nLineAlign;
-        baseM = ops::FloorAlign(l0cElements / baseN, mLineAlign);
+    uint64_t baseM = 0;
+    uint64_t baseN = 0;
+    if (mBound * nBound <= l0cElements) {
+        baseM = mBound;
+        baseN = nBound;
+    } else {
+        const uint64_t minimumBaseM = ops::CeilAlign(
+            MathUtil::CeilDivision(l0cElements, nBound), BASIC_ALIGN_16);
+        const uint64_t maximumBaseM = ops::FloorAlign(
+            std::min(mBound, l0cElements / BASIC_ALIGN_16), BASIC_ALIGN_16);
+        if (minimumBaseM > maximumBaseM) {
+            return false;
+        }
+        const uint64_t analyticBaseM = ops::CeilAlign(
+            static_cast<uint64_t>(std::max(1.0L, continuousBaseM)), BASIC_ALIGN_16);
+        baseM = std::max(minimumBaseM, std::min(maximumBaseM, analyticBaseM));
+        baseN = ops::FloorAlign(std::min(nBound, l0cElements / baseM), BASIC_ALIGN_16);
     }
-    baseN = std::min(baseN, 512UL);
-    baseM = ops::FloorAlign(std::min(baseM, l0cElements / baseN), mLineAlign);
     if (baseM == 0 || baseN == 0 || baseM * baseN > l0cElements) {
         return false;
     }
@@ -1683,7 +1713,8 @@ bool MatmulV3BaseTiling::DoShapeAdaptiveBalancedBaseTiling()
     const uint64_t maxBaseKa = compileInfo_.l0ASize / DB_SIZE / aDtypeSize_ / baseM;
     const uint64_t maxBaseKb = compileInfo_.l0BSize / DB_SIZE / bDtypeSize_ / baseN;
     const uint64_t baseK = ops::FloorAlign(
-        std::min({ops::CeilAlign(args_.kValue, BASIC_ALIGN_16), maxBaseKa, maxBaseKb}), BASIC_ALIGN_16);
+        std::min({ops::CeilAlign(args_.kValue, BASIC_ALIGN_16), maxBaseKa, maxBaseKb,
+            BASIC_BLOCK_SIZE_128}), BASIC_ALIGN_16);
     if (baseK == 0) {
         return false;
     }
@@ -1760,13 +1791,14 @@ bool MatmulV3BaseTiling::DoShapeAdaptiveBalancedBaseTiling()
         nWindowBlock = std::max(1UL, std::min(nTiles,
             remainingL2 / (bPanelBytes + mWindowBlock * cTileBytes)));
     }
-    const uint64_t targetParallel = std::min(compileInfo_.aicNum, mTiles * nTiles);
-    const long double coreGridM = std::sqrt(static_cast<long double>(targetParallel) * bPanelBytes / aPanelBytes);
+    const uint64_t scheduledParallel = std::min(compileInfo_.aicNum, mTiles * nTiles);
+    const long double coreGridM = std::sqrt(static_cast<long double>(scheduledParallel) *
+        bPanelBytes / aPanelBytes);
     uint64_t parallelM = std::max(1UL, std::min(mTiles,
         static_cast<uint64_t>(std::max(1LL, std::llround(coreGridM)))));
-    uint64_t parallelN = std::max(1UL, std::min(nTiles, MathUtil::CeilDivision(targetParallel, parallelM)));
-    parallelM = std::max(1UL, std::min(mTiles, MathUtil::CeilDivision(targetParallel, parallelN)));
-    if (mWindowBlock * nWindowBlock < targetParallel) {
+    uint64_t parallelN = std::max(1UL, std::min(nTiles, MathUtil::CeilDivision(scheduledParallel, parallelM)));
+    parallelM = std::max(1UL, std::min(mTiles, MathUtil::CeilDivision(scheduledParallel, parallelN)));
+    if (mWindowBlock * nWindowBlock < scheduledParallel) {
         mWindowBlock = parallelM;
         nWindowBlock = parallelN;
     }
