@@ -139,7 +139,7 @@ def quantized(lo, hi, quantum, offset):
 
 rows = set()
 sample_index = 0
-candidates_per_cell = 256
+candidates_per_cell = 1024
 maximum_attempts_per_cell = 100000
 for dtype in ("fp16_fp16", "bf16_bf16"):
     for m_lo, m_hi in m_ranges:
@@ -176,8 +176,14 @@ export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"
 
 campaign_failures=0
 success_target="${MATMUL_SUCCESS_TARGET:-5000}"
-cell_quota="${MATMUL_CELL_QUOTA:-64}"
-theoretical_maximum_pairs=$((250 * cell_quota))
+cell_quota="${MATMUL_CELL_QUOTA:-0}"
+if [[ "${cell_quota}" -eq 0 ]]; then
+    cell_quota_json=null
+    theoretical_maximum_pairs_json=null
+else
+    cell_quota_json="${cell_quota}"
+    theoretical_maximum_pairs_json="$((250 * cell_quota))"
+fi
 run_campaign() {
     local campaign="$1"
     local target="$2"
@@ -192,8 +198,8 @@ run_campaign() {
 }
 
 panel_rc=0
-printf '{"campaign_begin":"WIDE_N_PANEL_ONLY","target_passes":%d,"maximum_per_joint_cell":%d,"theoretical_maximum_pairs":%d}\n' \
-    "${success_target}" "${cell_quota}" "${theoretical_maximum_pairs}"
+printf '{"campaign_begin":"WIDE_N_PANEL_ONLY","target_passes":%d,"maximum_per_joint_cell":%s,"theoretical_maximum_pairs":%s}\n' \
+    "${success_target}" "${cell_quota_json}" "${theoretical_maximum_pairs_json}"
 set +e
 MATMUL_CAMPAIGN=WIDE_N_PANEL_ONLY MATMUL_TARGET_PASSES="${success_target}" MATMUL_CELL_QUOTA="${cell_quota}" \
     "${runner}" --manifest "${workload_manifest}" | tee "${panel_log}"
@@ -227,8 +233,9 @@ for line in open(sys.argv[1]):
 PY
 
 comparison_count="$(wc -l <"${comparison_manifest}")"
-if [[ "${comparison_count}" -eq 0 ]]; then
-    printf '{"fatal":"panel_only_produced_no_comparable_shape"}\n' >&2
+if [[ "${comparison_count}" -lt "${success_target}" ]]; then
+    printf '{"fatal":"panel_only_target_not_reached","target":%d,"collected":%d}\n' \
+        "${success_target}" "${comparison_count}" >&2
     exit 1
 fi
 printf '{"ablation_comparison_shapes":%d,"source":"WIDE_N_PANEL_ONLY_PASS"}\n' "${comparison_count}"
