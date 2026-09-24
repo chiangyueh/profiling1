@@ -1648,7 +1648,6 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
         args_.aFormat != ge::FORMAT_ND || args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
         args_.nd2nzA || args_.nd2nzB || args_.isNzA || args_.isNzB ||
         args_.mValue == 0 || args_.mValue > BASIC_BLOCK_SIZE_128 ||
-        args_.nValue % BASIC_BLOCK_SIZE_256 != 0 ||
         args_.kValue < 512UL ||
         runInfo_.baseN != BASIC_BLOCK_SIZE_128 || runInfo_.baseK != BASIC_BLOCK_SIZE_128 ||
         aDtypeSize_ != DATA_SIZE_FP16 || bDtypeSize_ != DATA_SIZE_FP16) {

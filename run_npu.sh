@@ -18,7 +18,9 @@ fi
 build_dir="${PWD}/build"
 build_log="$(mktemp)"
 workload_manifest="$(mktemp)"
-trap 'rm -f "${build_log}" "${workload_manifest}"' EXIT
+comparison_manifest="$(mktemp)"
+panel_log="$(mktemp)"
+trap 'rm -f "${build_log}" "${workload_manifest}" "${comparison_manifest}" "${panel_log}"' EXIT
 
 printf '{"stage":"host_build","status":"begin"}\n'
 if ! cmake -S . -B "${build_dir}" \
@@ -108,33 +110,63 @@ printf '{"stage":"runner_build","status":"passed"}\n'
 printf '{"stage":"workload_generation","status":"begin"}\n'
 python3 - "${PWD}/data/wide_n_result48_shapes.csv" >"${workload_manifest}" <<'PY'
 import csv
+import random
 import sys
 
 with open(sys.argv[1], newline="") as source:
-    rows = list(csv.DictReader(source))
-if len(rows) != 300:
-    raise SystemExit(f"expected 300 result48 shapes, found {len(rows)}")
-seen = set()
-for row in rows:
-    record = (
-        f"{row['input_dtype']}_{row['output_dtype']}", row["layout"],
-        int(row["m"]), int(row["n"]), int(row["k"])
-    )
-    if record in seen:
-        raise SystemExit(f"duplicate result48 shape: {record}")
-    seen.add(record)
+    historical = {
+        (f"{row['input_dtype']}_{row['output_dtype']}", row["layout"],
+         int(row["m"]), int(row["n"]), int(row["k"]))
+        for row in csv.DictReader(source)
+    }
+if len(historical) != 300:
+    raise SystemExit(f"expected 300 result48 shapes, found {len(historical)}")
+
+rng = random.Random(8506)
+m_ranges = ((1, 9), (10, 31), (32, 63), (64, 95), (96, 128))
+n_ranges = ((4865, 7168), (7169, 12288), (12289, 18432), (18433, 24576), (24577, 32768))
+k_ranges = ((512, 8192), (8193, 15871), (15872, 23552), (23553, 32768), (32769, 65536))
+n_offsets = (0, 1, 17, 63, 127, 191)
+k_offsets = (0, 1, 17, 31, 63)
+byte_limit = 1024 * 1024 * 1024
+
+def quantized(lo, hi, quantum, offset):
+    first = (lo - offset + quantum - 1) // quantum
+    last = (hi - offset) // quantum
+    if first > last:
+        return rng.randint(lo, hi)
+    return rng.randint(first, last) * quantum + offset
+
+rows = set()
+sample_index = 0
+for dtype in ("fp16_fp16", "bf16_bf16"):
+    for m_lo, m_hi in m_ranges:
+        for n_lo, n_hi in n_ranges:
+            for k_lo, k_hi in k_ranges:
+                for _ in range(100):
+                    m = rng.randint(m_lo, m_hi)
+                    n = quantized(n_lo, n_hi, 256, n_offsets[sample_index % len(n_offsets)])
+                    k = quantized(k_lo, k_hi, 64, k_offsets[sample_index % len(k_offsets)])
+                    sample_index += 1
+                    record = (dtype, "NN", m, n, k)
+                    total_bytes = 2 * (m * k + k * n + m * n)
+                    if total_bytes <= byte_limit and record not in historical:
+                        rows.add(record)
+rows = list(rows)
+rng.shuffle(rows)
+for record in rows:
     print("\t".join(str(value) for value in record))
 PY
 
 adaptive_count="$(wc -l <"${workload_manifest}")"
-printf '{"stage":"workload_generation","status":"passed","coverage":"exact_result48_candidate_shapes","candidates":%d}\n' "${adaptive_count}"
+printf '{"stage":"workload_generation","status":"passed","coverage":"new_stratified_shapes_excluding_result48","candidates":%d}\n' "${adaptive_count}"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
 campaign_failures=0
-success_target="${MATMUL_SUCCESS_TARGET:-${adaptive_count}}"
+success_target="${MATMUL_SUCCESS_TARGET:-300}"
 run_campaign() {
     local campaign="$1"
     local target="$2"
@@ -148,7 +180,45 @@ run_campaign() {
     fi
 }
 
-run_campaign WIDE_N_PANEL_ONLY "${success_target}" "${runner}" --manifest "${workload_manifest}"
-run_campaign WIDE_N_WINDOW_ONLY "${success_target}" "${runner}" --manifest "${workload_manifest}"
-run_campaign WIDE_N_SHALLOW_K_BASE "${success_target}" "${runner}" --manifest "${workload_manifest}"
-printf '{"overnight_complete":true,"campaigns":3,"campaign_process_failures":%d}\n' "${campaign_failures}"
+panel_rc=0
+printf '{"campaign_begin":"WIDE_N_PANEL_ONLY","target_passes":%d}\n' "${success_target}"
+set +e
+MATMUL_CAMPAIGN=WIDE_N_PANEL_ONLY MATMUL_TARGET_PASSES="${success_target}" \
+    "${runner}" --manifest "${workload_manifest}" | tee "${panel_log}"
+panel_status=("${PIPESTATUS[@]}")
+set -e
+panel_rc="${panel_status[0]}"
+printf '{"campaign_complete":"WIDE_N_PANEL_ONLY","process_result_code":%d}\n' "${panel_rc}"
+if [[ "${panel_rc}" -ne 0 ]]; then
+    campaign_failures=$((campaign_failures + 1))
+fi
+
+python3 - "${panel_log}" >"${comparison_manifest}" <<'PY'
+import json
+import sys
+
+seen = set()
+for line in open(sys.argv[1]):
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if (row.get("candidate_branch") != "WIDE_N_PANEL_ONLY" or
+            row.get("correctness") != "PASS" or row.get("result_code") != 0):
+        continue
+    shape = row["shape"].split("_")
+    record = (f"{row['input_dtype']}_{row['output_dtype']}", shape[3],
+              int(shape[0][1:]), int(shape[1][1:]), int(shape[2][1:]))
+    if record not in seen:
+        seen.add(record)
+        print("\t".join(str(value) for value in record))
+PY
+
+comparison_count="$(wc -l <"${comparison_manifest}")"
+if [[ "${comparison_count}" -eq 0 ]]; then
+    printf '{"fatal":"panel_only_produced_no_comparable_shape"}\n' >&2
+    exit 1
+fi
+printf '{"ablation_comparison_shapes":%d,"source":"WIDE_N_PANEL_ONLY_PASS"}\n' "${comparison_count}"
+run_campaign WIDE_N_WINDOW_ONLY "${comparison_count}" "${runner}" --manifest "${comparison_manifest}"
+printf '{"overnight_complete":true,"campaigns":2,"campaign_process_failures":%d}\n' "${campaign_failures}"
