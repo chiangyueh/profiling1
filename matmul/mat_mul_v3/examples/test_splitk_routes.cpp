@@ -91,7 +91,7 @@ void CountPassCoverage(RunCounts &counts, int64_t m, int64_t n, int64_t k)
 {
     const size_t mBucket = m <= 9 ? 0 : (m <= 31 ? 1 : (m <= 63 ? 2 : (m <= 95 ? 3 : 4)));
     const size_t nBucket = n <= 5632 ? 0 : (n <= 8192 ? 1 : (n <= 10752 ? 2 : (n <= 13568 ? 3 : 4)));
-    const size_t kBucket = k <= 16384 ? 0 : (k <= 20480 ? 1 : (k <= 24576 ? 2 : (k <= 28672 ? 3 : 4)));
+    const size_t kBucket = k <= 4096 ? 0 : (k <= 8192 ? 1 : (k <= 16384 ? 2 : (k <= 24576 ? 3 : 4)));
     ++counts.mCoverage[mBucket];
     ++counts.nCoverage[nBucket];
     ++counts.kCoverage[kBucket];
@@ -863,7 +863,7 @@ int main(int argc, char **argv)
     std::printf("{\"measured_coverage\":true,"
                 "\"m\":{\"1_9\":%lu,\"10_31\":%lu,\"32_63\":%lu,\"64_95\":%lu,\"96_128\":%lu},"
                 "\"n\":{\"5120_5632\":%lu,\"5888_8192\":%lu,\"8448_10752\":%lu,\"11008_13568\":%lu,\"13824_16384\":%lu},"
-                "\"k\":{\"16384\":%lu,\"16896_20480\":%lu,\"20992_24576\":%lu,\"25088_28672\":%lu,\"29184_32768\":%lu}}\n",
+                "\"k\":{\"512_4096\":%lu,\"4608_8192\":%lu,\"8704_16384\":%lu,\"16896_24576\":%lu,\"25088_32768\":%lu}}\n",
                 static_cast<unsigned long>(counts.mCoverage[0]),
                 static_cast<unsigned long>(counts.mCoverage[1]),
                 static_cast<unsigned long>(counts.mCoverage[2]),

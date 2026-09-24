@@ -125,10 +125,15 @@ for row in anchors:
     print("\t".join(str(value) for value in row))
 
 rows = []
+k_offsets = (0, 1, 17, 31, 63)
+k_values = tuple(
+    min(32768, base + k_offsets[index % len(k_offsets)])
+    for index, base in enumerate(range(512, 32769, 512))
+)
 for dtype in ("fp16_fp16", "bf16_bf16"):
     for m in range(1, 129):
         for n in range(5120, 16385, 256):
-            for k in range(16384, 32769, 512):
+            for k in k_values:
                 rows.append((dtype, "NN", m, n, k))
 rng.shuffle(rows)
 for row in rows:
