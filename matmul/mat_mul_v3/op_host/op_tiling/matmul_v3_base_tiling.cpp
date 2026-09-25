@@ -1642,6 +1642,15 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
     (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_K_ITERATIONS");
     (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_N_TAIL_WASTE");
     (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_ACTIVE_CORES");
+    (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_M_TASKS");
+    (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_N_TASKS");
+    (void)::unsetenv("MATMUL_ANALYTIC_L2_DIMENSIONS");
+    (void)::unsetenv("MATMUL_ANALYTIC_L2_M_BLOCK");
+    (void)::unsetenv("MATMUL_ANALYTIC_L2_N_BLOCK");
+    (void)::unsetenv("MATMUL_ANALYTIC_L2_M_WINDOWS");
+    (void)::unsetenv("MATMUL_ANALYTIC_L2_N_WINDOWS");
+    (void)::unsetenv("MATMUL_ANALYTIC_L2_WINDOW_BYTES");
+    (void)::unsetenv("MATMUL_ANALYTIC_L2_ESTIMATED_TRAFFIC");
     const char *mode = std::getenv("MATMUL_BASE_MODE");
     const bool analyticSelector = mode != nullptr && std::strcmp(mode, "WIDE_N_ANALYTIC_SELECTOR") == 0;
     const bool panelOnly = mode != nullptr && std::strcmp(mode, "WIDE_N_PANEL_ONLY") == 0;
@@ -1750,20 +1759,77 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
         const uint64_t bPanelBytes = args_.kValue *
             ops::CeilAlign(runInfo_.baseN * bDtypeSize_, CACHELINE);
         const uint64_t cTileBytes = runInfo_.baseM * runInfo_.baseN * cDtypeSize_;
+        uint64_t mWindowBlock = 1;
         uint64_t nWindowBlock = 1;
-        if (aPanelBytes < compileInfo_.l2Size &&
-            bPanelBytes + cTileBytes <= compileInfo_.l2Size - aPanelBytes) {
-            const uint64_t maxNWindow = (compileInfo_.l2Size - aPanelBytes) /
-                (bPanelBytes + cTileBytes);
-            nWindowBlock = std::max(1UL, std::min({5UL, selected.nTasks, maxNWindow}));
+        uint64_t l2Dimensions = 1;
+        auto windowBytes = [&](uint64_t mBlock, uint64_t nBlock) -> __uint128_t {
+            return static_cast<__uint128_t>(mBlock) * aPanelBytes +
+                static_cast<__uint128_t>(nBlock) * bPanelBytes +
+                static_cast<__uint128_t>(mBlock) * nBlock * cTileBytes;
+        };
+        if (selected.mTasks == 1) {
+            if (aPanelBytes < compileInfo_.l2Size &&
+                bPanelBytes + cTileBytes <= compileInfo_.l2Size - aPanelBytes) {
+                const uint64_t maxNWindow = (compileInfo_.l2Size - aPanelBytes) /
+                    (bPanelBytes + cTileBytes);
+                nWindowBlock = std::max(1UL, std::min({5UL, selected.nTasks, maxNWindow}));
+            }
+        } else {
+            l2Dimensions = 2;
+            const uint64_t l2Budget = compileInfo_.l2Size * 7UL / 10UL;
+            const long double panelRatio = static_cast<long double>(bPanelBytes) /
+                static_cast<long double>(aPanelBytes);
+            const long double quadratic = panelRatio * cTileBytes;
+            const long double linear = panelRatio * aPanelBytes + bPanelBytes;
+            long double nRoot = 1.0L;
+            if (quadratic > 0.0L) {
+                const long double discriminant = linear * linear +
+                    4.0L * quadratic * static_cast<long double>(l2Budget);
+                nRoot = (-linear + std::sqrt(discriminant)) / (2.0L * quadratic);
+            } else if (linear > 0.0L) {
+                nRoot = static_cast<long double>(l2Budget) / linear;
+            }
+            nWindowBlock = std::max(1UL, std::min(selected.nTasks, static_cast<uint64_t>(nRoot)));
+            mWindowBlock = std::max(1UL, std::min(selected.mTasks,
+                static_cast<uint64_t>(nWindowBlock * panelRatio)));
+            if (windowBytes(mWindowBlock, nWindowBlock) > l2Budget) {
+                mWindowBlock = 1;
+                nWindowBlock = 1;
+            }
+
+            if (mWindowBlock == selected.mTasks) {
+                const __uint128_t fixedM = static_cast<__uint128_t>(mWindowBlock) * aPanelBytes;
+                if (fixedM < l2Budget) {
+                    const uint64_t maxNBlock = static_cast<uint64_t>(
+                        (l2Budget - fixedM) /
+                        (bPanelBytes + static_cast<__uint128_t>(mWindowBlock) * cTileBytes));
+                    nWindowBlock = std::max(nWindowBlock,
+                        std::max(1UL, std::min(selected.nTasks, maxNBlock)));
+                }
+            }
+            if (nWindowBlock == selected.nTasks) {
+                const __uint128_t fixedN = static_cast<__uint128_t>(nWindowBlock) * bPanelBytes;
+                if (fixedN < l2Budget) {
+                    const uint64_t maxMBlock = static_cast<uint64_t>(
+                        (l2Budget - fixedN) /
+                        (aPanelBytes + static_cast<__uint128_t>(nWindowBlock) * cTileBytes));
+                    mWindowBlock = std::max(mWindowBlock,
+                        std::max(1UL, std::min(selected.mTasks, maxMBlock)));
+                }
+            }
+
+            const uint64_t mWindows = MathUtil::CeilDivision(selected.mTasks, mWindowBlock);
+            const uint64_t nWindows = MathUtil::CeilDivision(selected.nTasks, nWindowBlock);
+            mWindowBlock = MathUtil::CeilDivision(selected.mTasks, mWindows);
+            nWindowBlock = MathUtil::CeilDivision(selected.nTasks, nWindows);
         }
 
         runInfo_.usedCoreNum = std::min(compileInfo_.aicNum, selected.mTasks * selected.nTasks);
         runInfo_.iterateOrder = ITER_COL_FIRST;
         runInfo_.dbL0c = DB_OFF_SIZE;
-        runInfo_.l2Info.mTile = selected.mTasks;
+        runInfo_.l2Info.mTile = MathUtil::CeilDivision(selected.mTasks, mWindowBlock);
         runInfo_.l2Info.nTile = MathUtil::CeilDivision(selected.nTasks, nWindowBlock);
-        runInfo_.l2Info.mTileBlock = 1;
+        runInfo_.l2Info.mTileBlock = mWindowBlock;
         runInfo_.l2Info.nTileBlock = nWindowBlock;
         runInfo_.l2Info.calOrder = ITER_COL_FIRST;
         tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
@@ -1789,6 +1855,23 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
         exportUnsigned("MATMUL_ANALYTIC_SELECTED_K_ITERATIONS", selected.kIterations);
         exportUnsigned("MATMUL_ANALYTIC_SELECTED_N_TAIL_WASTE", selected.tailWasteN);
         exportUnsigned("MATMUL_ANALYTIC_SELECTED_ACTIVE_CORES", runInfo_.usedCoreNum);
+        exportUnsigned("MATMUL_ANALYTIC_SELECTED_M_TASKS", selected.mTasks);
+        exportUnsigned("MATMUL_ANALYTIC_SELECTED_N_TASKS", selected.nTasks);
+        exportUnsigned("MATMUL_ANALYTIC_L2_DIMENSIONS", l2Dimensions);
+        exportUnsigned("MATMUL_ANALYTIC_L2_M_BLOCK", mWindowBlock);
+        exportUnsigned("MATMUL_ANALYTIC_L2_N_BLOCK", nWindowBlock);
+        exportUnsigned("MATMUL_ANALYTIC_L2_M_WINDOWS", runInfo_.l2Info.mTile);
+        exportUnsigned("MATMUL_ANALYTIC_L2_N_WINDOWS", runInfo_.l2Info.nTile);
+        const __uint128_t selectedWindowBytes = windowBytes(mWindowBlock, nWindowBlock);
+        const __uint128_t estimatedTraffic =
+            static_cast<__uint128_t>(selected.mTasks) * runInfo_.l2Info.nTile * aPanelBytes +
+            static_cast<__uint128_t>(selected.nTasks) * runInfo_.l2Info.mTile * bPanelBytes +
+            static_cast<__uint128_t>(selected.mTasks) * selected.nTasks * cTileBytes;
+        const uint64_t uint64Max = std::numeric_limits<uint64_t>::max();
+        exportUnsigned("MATMUL_ANALYTIC_L2_WINDOW_BYTES",
+            selectedWindowBytes > uint64Max ? uint64Max : static_cast<uint64_t>(selectedWindowBytes));
+        exportUnsigned("MATMUL_ANALYTIC_L2_ESTIMATED_TRAFFIC",
+            estimatedTraffic > uint64Max ? uint64Max : static_cast<uint64_t>(estimatedTraffic));
         (void)::setenv("MATMUL_BASE_EXPERIMENT_VARIANT", selected.name, 1);
         (void)::setenv("MATMUL_BASE_EXPERIMENT_SELECTED", "1", 1);
         return true;

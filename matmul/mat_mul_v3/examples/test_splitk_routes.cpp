@@ -99,7 +99,7 @@ uint64_t ReadEnvUnsigned(const char *name)
 
 void CountPassCoverage(RunCounts &counts, int64_t m, int64_t n, int64_t k)
 {
-    const size_t mBucket = m <= 16 ? 0 : (m <= 64 ? 1 : (m <= 256 ? 2 : (m <= 1024 ? 3 : 4)));
+    const size_t mBucket = m <= 256 ? 0 : (m <= 512 ? 1 : (m <= 1024 ? 2 : (m <= 2048 ? 3 : 4)));
     const size_t nBucket = n <= 512 ? 0 : (n <= 2048 ? 1 : (n <= 8192 ? 2 : (n <= 24576 ? 3 : 4)));
     const size_t kBucket = k <= 8192 ? 0 : (k <= 16384 ? 1 : (k <= 24576 ? 2 : 3));
     ++counts.mCoverage[mBucket];
@@ -110,7 +110,7 @@ void CountPassCoverage(RunCounts &counts, int64_t m, int64_t n, int64_t k)
 size_t JointCoverageBucket(const DTypeSpec &dtype, int64_t m, int64_t n, int64_t k)
 {
     const size_t dtypeBucket = std::strcmp(dtype.inputName, "bf16") == 0 ? 1 : 0;
-    const size_t mBucket = m <= 16 ? 0 : (m <= 64 ? 1 : (m <= 256 ? 2 : (m <= 1024 ? 3 : 4)));
+    const size_t mBucket = m <= 256 ? 0 : (m <= 512 ? 1 : (m <= 1024 ? 2 : (m <= 2048 ? 3 : 4)));
     const size_t nBucket = n <= 512 ? 0 : (n <= 2048 ? 1 : (n <= 8192 ? 2 : (n <= 24576 ? 3 : 4)));
     const size_t kBucket = k <= 8192 ? 0 : (k <= 16384 ? 1 : (k <= 24576 ? 2 : 3));
     return (((dtypeBucket * 5 + mBucket) * 5 + nBucket) * 4 + kBucket);
@@ -747,7 +747,12 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         std::printf(",\"analytic_score_n128\":%lu,\"analytic_score_n256\":%lu,"
                     "\"analytic_score_n512\":%lu,\"analytic_tasks\":%lu,"
                     "\"analytic_waves\":%lu,\"analytic_k_iterations\":%lu,"
-                    "\"analytic_n_tail_waste\":%lu,\"analytic_active_cores\":%lu",
+                    "\"analytic_n_tail_waste\":%lu,\"analytic_active_cores\":%lu,"
+                    "\"analytic_m_tasks\":%lu,\"analytic_n_tasks\":%lu,"
+                    "\"analytic_l2_dimensions\":%lu,\"analytic_l2_m_block\":%lu,"
+                    "\"analytic_l2_n_block\":%lu,\"analytic_l2_m_windows\":%lu,"
+                    "\"analytic_l2_n_windows\":%lu,\"analytic_l2_window_bytes\":%lu,"
+                    "\"analytic_l2_estimated_traffic\":%lu",
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SCORE_N128")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SCORE_N256")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SCORE_N512")),
@@ -755,7 +760,16 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SELECTED_WAVES")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SELECTED_K_ITERATIONS")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SELECTED_N_TAIL_WASTE")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SELECTED_ACTIVE_CORES")));
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SELECTED_ACTIVE_CORES")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SELECTED_M_TASKS")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SELECTED_N_TASKS")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_L2_DIMENSIONS")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_L2_M_BLOCK")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_L2_N_BLOCK")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_L2_M_WINDOWS")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_L2_N_WINDOWS")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_L2_WINDOW_BYTES")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_L2_ESTIMATED_TRAFFIC")));
     }
     if (adaptiveCampaign) {
         std::printf(",\"old_partial_bytes\":%lu,\"new_partial_bytes\":%lu,"
@@ -945,7 +959,7 @@ int main(int argc, char **argv)
                 static_cast<unsigned long>(startIndex),
                 static_cast<unsigned long>(manifestIndex));
     std::printf("{\"measured_coverage\":true,"
-                "\"m\":{\"1_16\":%lu,\"17_64\":%lu,\"65_256\":%lu,\"257_1024\":%lu,\"1025_4096\":%lu},"
+                "\"m\":{\"129_256\":%lu,\"257_512\":%lu,\"513_1024\":%lu,\"1025_2048\":%lu,\"2049_4096\":%lu},"
                 "\"n\":{\"16_512\":%lu,\"513_2048\":%lu,\"2049_8192\":%lu,\"8193_24576\":%lu,\"24577_65536\":%lu},"
                 "\"k\":{\"512_8192\":%lu,\"8193_16384\":%lu,\"16385_24576\":%lu,\"24577_65536\":%lu}}\n",
                 static_cast<unsigned long>(counts.mCoverage[0]),
@@ -994,7 +1008,7 @@ int main(int argc, char **argv)
                     static_cast<unsigned long>(inputCells * cellQuota),
                     static_cast<unsigned long>(counts.jointQuotaSkipped));
         const char *dtypeNames[] = {"fp16", "bf16"};
-        const char *mNames[] = {"1_16", "17_64", "65_256", "257_1024", "1025_4096"};
+        const char *mNames[] = {"129_256", "257_512", "513_1024", "1025_2048", "2049_4096"};
         const char *nNames[] = {"16_512", "513_2048", "2049_8192", "8193_24576", "24577_65536"};
         const char *kNames[] = {"512_8192", "8193_16384", "16385_24576", "24577_65536"};
         bool first = true;

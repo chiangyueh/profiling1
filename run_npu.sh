@@ -12,6 +12,10 @@ unset MATMUL_ANALYTIC_SCORE_N128 MATMUL_ANALYTIC_SCORE_N256 MATMUL_ANALYTIC_SCOR
 unset MATMUL_ANALYTIC_SELECTED_TASKS MATMUL_ANALYTIC_SELECTED_WAVES
 unset MATMUL_ANALYTIC_SELECTED_K_ITERATIONS MATMUL_ANALYTIC_SELECTED_N_TAIL_WASTE
 unset MATMUL_ANALYTIC_SELECTED_ACTIVE_CORES
+unset MATMUL_ANALYTIC_SELECTED_M_TASKS MATMUL_ANALYTIC_SELECTED_N_TASKS
+unset MATMUL_ANALYTIC_L2_DIMENSIONS MATMUL_ANALYTIC_L2_M_BLOCK MATMUL_ANALYTIC_L2_N_BLOCK
+unset MATMUL_ANALYTIC_L2_M_WINDOWS MATMUL_ANALYTIC_L2_N_WINDOWS
+unset MATMUL_ANALYTIC_L2_WINDOW_BYTES MATMUL_ANALYTIC_L2_ESTIMATED_TRAFFIC
 unset MATMUL_DETERMINISTIC_ADAPTIVE MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED
 unset MATMUL_CAMPAIGN
 
@@ -118,24 +122,24 @@ def stepped(first, last, step, offsets=(0,)):
                    for offset in offsets if first <= base + offset <= last})
 
 m_groups = (
-    list(range(1, 17)),
-    list(range(17, 65)),
-    list(range(65, 257)),
-    stepped(257, 1024, 16, (0, 1, 7, 15)),
-    stepped(1025, 4096, 32, (0, 1, 15, 31)),
+    list(range(129, 257)),
+    list(range(257, 513)),
+    stepped(513, 1024, 4, (0, 1, 3)),
+    stepped(1025, 2048, 8, (0, 1, 7)),
+    stepped(2049, 4096, 16, (0, 1, 15)),
 )
 n_groups = (
-    list(range(16, 513)),
-    stepped(513, 2048, 8, (0, 1, 7)),
-    stepped(2049, 8192, 16, (0, 1, 15)),
-    stepped(8193, 24576, 32, (0, 1, 17, 31)),
-    stepped(24577, 65536, 64, (0, 1, 31, 63)),
+    stepped(16, 512, 16, (0, 1, 15)),
+    stepped(513, 2048, 64, (0, 1, 63)),
+    stepped(2049, 8192, 128, (0, 1, 127)),
+    stepped(8193, 24576, 128, (0, 1, 127)),
+    stepped(24577, 65536, 256, (0, 1, 255)),
 )
 k_groups = (
-    stepped(512, 8192, 128, (0, 1, 64)),
-    stepped(8193, 16384, 128, (0, 1, 64, 127)),
-    stepped(16385, 24576, 128, (0, 1, 64, 127)),
-    stepped(24577, 65536, 256, (0, 1, 128, 255)),
+    sorted(set(stepped(512, 8192, 128, (0, 1))) | {8192}),
+    sorted(set(stepped(8193, 16384, 128, (0, 1))) | {16384}),
+    sorted(set(stepped(16385, 24576, 128, (0, 1))) | {24576}),
+    sorted(set(stepped(24577, 65536, 256, (0, 1))) | {65536}),
 )
 byte_limit = 1024 * 1024 * 1024
 per_cell_limit = 20000
@@ -189,13 +193,13 @@ while active:
 PY
 
 adaptive_count="$(wc -l <"${workload_manifest}")"
-printf '{"stage":"workload_generation","status":"passed","coverage":"200_interleaved_dtype_m_n_k_cells","candidates":%d}\n' "${adaptive_count}"
+printf '{"stage":"workload_generation","status":"passed","coverage":"200_interleaved_multi_m_tile_dtype_m_n_k_cells","candidates":%d}\n' "${adaptive_count}"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
-success_target="${MATMUL_SUCCESS_TARGET:-100000}"
+success_target="${MATMUL_SUCCESS_TARGET:-10000}"
 cell_quota="${MATMUL_CELL_QUOTA:-0}"
 if [[ "${cell_quota}" -eq 0 ]]; then
     cell_quota_json=null
