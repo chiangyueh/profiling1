@@ -1632,12 +1632,13 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
 {
     (void)::unsetenv("MATMUL_BASE_EXPERIMENT_VARIANT");
     const char *mode = std::getenv("MATMUL_BASE_MODE");
+    const bool analyticSelector = mode != nullptr && std::strcmp(mode, "WIDE_N_ANALYTIC_SELECTOR") == 0;
     const bool panelOnly = mode != nullptr && std::strcmp(mode, "WIDE_N_PANEL_ONLY") == 0;
     const bool windowOnly = mode != nullptr && std::strcmp(mode, "WIDE_N_WINDOW_ONLY") == 0;
     const bool panelAndWindow = mode != nullptr && std::strcmp(mode, "WIDE_N_SHALLOW_K_BASE") == 0;
     const bool dtypeSupported = args_.aType == args_.bType && args_.bType == args_.cType &&
         (args_.aType == ge::DT_FLOAT16 || args_.aType == ge::DT_BF16);
-    if ((!panelOnly && !windowOnly && !panelAndWindow) ||
+    if ((!analyticSelector && !panelOnly && !windowOnly && !panelAndWindow) ||
         !compileInfo_.supportL0c2out || compileInfo_.aicNum == 0 || args_.hasBias || !dtypeSupported ||
         args_.isATrans || args_.isBTrans ||
         args_.aFormat != ge::FORMAT_ND || args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
@@ -1646,6 +1647,115 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
         args_.kValue < 512UL ||
         aDtypeSize_ != DATA_SIZE_FP16 || bDtypeSize_ != DATA_SIZE_FP16) {
         return false;
+    }
+
+    if (analyticSelector) {
+        struct AnalyticCandidate {
+            uint64_t maxBaseM;
+            uint64_t baseN;
+            uint64_t baseKBytes;
+            uint64_t baseM;
+            uint64_t baseK;
+            uint64_t mTasks;
+            uint64_t nTasks;
+            uint64_t waves;
+            uint64_t paddedK;
+            long double criticalCubeAndB;
+            long double replayedAPanel;
+            long double score;
+            const char *name;
+        };
+        AnalyticCandidate candidates[] = {
+            {BASIC_BLOCK_SIZE_128, BASIC_BLOCK_SIZE_128, 256UL, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+             "ANALYTIC_N128_K128"},
+            {BASIC_BLOCK_SIZE_128, BASIC_BLOCK_SIZE_256, 128UL, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+             "ANALYTIC_N256_K64"},
+            {BASIC_BLOCK_SIZE_64, 512UL, 64UL, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+             "ANALYTIC_N512_K32"},
+        };
+        constexpr uint64_t aReplayStageWeight = DB_SIZE * NUMBER_TWO;
+        size_t selectedIndex = 0;
+        for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); ++index) {
+            AnalyticCandidate &candidate = candidates[index];
+            candidate.baseK = candidate.baseKBytes / aDtypeSize_;
+            candidate.nTasks = MathUtil::CeilDivision(args_.nValue, candidate.baseN);
+            candidate.baseM = CalBaseSize(candidate.nTasks, compileInfo_.aicNum,
+                                          args_.mValue, candidate.maxBaseM);
+            candidate.mTasks = MathUtil::CeilDivision(args_.mValue, candidate.baseM);
+            candidate.waves = MathUtil::CeilDivision(candidate.mTasks * candidate.nTasks,
+                                                      compileInfo_.aicNum);
+            candidate.paddedK = MathUtil::CeilDivision(args_.kValue, candidate.baseK) * candidate.baseK;
+            candidate.criticalCubeAndB = static_cast<long double>(candidate.waves) *
+                candidate.baseN * candidate.paddedK;
+            candidate.replayedAPanel = static_cast<long double>(candidate.waves) *
+                candidate.baseM * args_.kValue;
+            candidate.score = candidate.criticalCubeAndB +
+                aReplayStageWeight * candidate.replayedAPanel;
+            if (candidate.score < candidates[selectedIndex].score) {
+                selectedIndex = index;
+            }
+        }
+
+        const AnalyticCandidate &selected = candidates[selectedIndex];
+        const uint64_t l0ABytes = DB_SIZE * selected.baseM * selected.baseK * aDtypeSize_;
+        const uint64_t l0BBytes = DB_SIZE * selected.baseN * selected.baseK * bDtypeSize_;
+        const uint64_t l0CBytes = selected.baseM * selected.baseN * LOC_DATA_SIZE;
+        if (l0ABytes > compileInfo_.l0ASize || l0BBytes > compileInfo_.l0BSize ||
+            l0CBytes > compileInfo_.l0CSize) {
+            return false;
+        }
+
+        runInfo_.baseM = selected.baseM;
+        runInfo_.baseN = selected.baseN;
+        runInfo_.baseK = selected.baseK;
+        runInfo_.singleCoreK = args_.kValue;
+        runInfo_.stepM = 1;
+        runInfo_.stepN = 1;
+        CalL1Tiling();
+
+        const uint64_t l1ABytes = runInfo_.depthA1 * runInfo_.baseM * runInfo_.baseK * aDtypeSize_;
+        const uint64_t l1BBytes = runInfo_.depthB1 * runInfo_.baseN * runInfo_.baseK * bDtypeSize_;
+        if (l1ABytes + l1BBytes > compileInfo_.l1Size + 256UL) {
+            return false;
+        }
+
+        const uint64_t aPanelBytes = runInfo_.baseM *
+            ops::CeilAlign(args_.kValue * aDtypeSize_, CACHELINE);
+        const uint64_t bPanelBytes = args_.kValue *
+            ops::CeilAlign(runInfo_.baseN * bDtypeSize_, CACHELINE);
+        const uint64_t cTileBytes = runInfo_.baseM * runInfo_.baseN * cDtypeSize_;
+        if (aPanelBytes >= compileInfo_.l2Size ||
+            bPanelBytes + cTileBytes > compileInfo_.l2Size - aPanelBytes) {
+            return false;
+        }
+        const uint64_t maxNWindow = (compileInfo_.l2Size - aPanelBytes) /
+            (bPanelBytes + cTileBytes);
+        const uint64_t nWindowBlock = std::max(1UL, std::min({5UL, selected.nTasks, maxNWindow}));
+
+        runInfo_.usedCoreNum = std::min(compileInfo_.aicNum, selected.mTasks * selected.nTasks);
+        runInfo_.iterateOrder = ITER_COL_FIRST;
+        runInfo_.dbL0c = DB_OFF_SIZE;
+        runInfo_.l2Info.mTile = selected.mTasks;
+        runInfo_.l2Info.nTile = MathUtil::CeilDivision(selected.nTasks, nWindowBlock);
+        runInfo_.l2Info.mTileBlock = 1;
+        runInfo_.l2Info.nTileBlock = nWindowBlock;
+        runInfo_.l2Info.calOrder = ITER_COL_FIRST;
+        tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
+        tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::BASE;
+        tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
+        tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::BASE;
+        runInfo_.needUpdate = true;
+        auto exportScore = [](const char *name, long double value) {
+            char text[48] = {};
+            (void)snprintf(text, sizeof(text), "%.0Lf", value);
+            (void)::setenv(name, text, 1);
+        };
+        exportScore("MATMUL_ANALYTIC_SCORE_N128", candidates[0].score);
+        exportScore("MATMUL_ANALYTIC_SCORE_N256", candidates[1].score);
+        exportScore("MATMUL_ANALYTIC_SCORE_N512", candidates[2].score);
+        (void)::setenv("MATMUL_BASE_EXPERIMENT_VARIANT", selected.name, 1);
+        (void)::setenv("MATMUL_BASE_EXPERIMENT_SELECTED", "1", 1);
+        return true;
     }
 
     constexpr uint64_t baseM = BASIC_BLOCK_SIZE_128;
@@ -1779,7 +1889,8 @@ bool MatmulV3BaseTiling::DoExperimentalBaseTiling()
         selected = DoRectangularCubeTiling();
     } else if (std::strcmp(mode, "REUSE_DIRECTED") == 0) {
         selected = DoReuseDirectedTiling();
-    } else if (std::strcmp(mode, "WIDE_N_PANEL_ONLY") == 0 ||
+    } else if (std::strcmp(mode, "WIDE_N_ANALYTIC_SELECTOR") == 0 ||
+               std::strcmp(mode, "WIDE_N_PANEL_ONLY") == 0 ||
                std::strcmp(mode, "WIDE_N_WINDOW_ONLY") == 0 ||
                std::strcmp(mode, "WIDE_N_SHALLOW_K_BASE") == 0) {
         selected = DoWideNPanelReuseBaseTiling();

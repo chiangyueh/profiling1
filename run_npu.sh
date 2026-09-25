@@ -8,6 +8,7 @@ export ASCEND_GLOBAL_LOG_LEVEL=3
 export ASCEND_SLOG_PRINT_TO_STDOUT=0
 unset ASCEND_CUSTOM_OPP_PATH
 unset MATMUL_BASE_MODE MATMUL_BASE_EXPERIMENT_SELECTED MATMUL_SPLITK_MODE
+unset MATMUL_ANALYTIC_SCORE_N128 MATMUL_ANALYTIC_SCORE_N256 MATMUL_ANALYTIC_SCORE_N512
 unset MATMUL_DETERMINISTIC_ADAPTIVE MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED
 unset MATMUL_CAMPAIGN
 
@@ -106,34 +107,27 @@ fi
 printf '{"stage":"runner_build","status":"passed"}\n'
 
 printf '{"stage":"workload_generation","status":"begin"}\n'
-python3 - "${PWD}/data/wide_n_result48_shapes.csv" >"${workload_manifest}" <<'PY'
-import csv
+python3 - >"${workload_manifest}" <<'PY'
 import random
-import sys
 
-with open(sys.argv[1], newline="") as source:
-    historical = {
-        (f"{row['input_dtype']}_{row['output_dtype']}", row["layout"],
-         int(row["m"]), int(row["n"]), int(row["k"]))
-        for row in csv.DictReader(source)
-    }
-if len(historical) != 300:
-    raise SystemExit(f"expected 300 result48 shapes, found {len(historical)}")
-
-rng = random.Random(8506)
-n_tiles = tuple(range(101, 109)) + tuple(range(121, 129))
+rng = random.Random(8507)
+m_values = (1, 3, 7, 8, 12, 16, 24, 32, 48, 64, 80, 96, 112, 128)
+n_tiles = tuple(range(41, 131))
+k_values = (512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288,
+            15104, 16384, 18432, 20480, 24576, 32768, 49152, 65536)
 byte_limit = 1024 * 1024 * 1024
 
 rows = set()
 for dtype in ("fp16_fp16", "bf16_bf16"):
-    for m in range(13, 16):
+    for m in m_values:
         for n_tile in n_tiles:
-            n = n_tile * 256
-            for k in range(15104, 20609, 128):
-                record = (dtype, "NN", m, n, k)
-                total_bytes = 2 * (m * k + k * n + m * n)
-                if total_bytes <= byte_limit and record not in historical:
-                    rows.add(record)
+            for n_tail in (0, 17, 127):
+                n = n_tile * 256 + n_tail
+                for k in k_values:
+                    record = (dtype, "NN", m, n, k)
+                    total_bytes = 2 * (m * k + k * n + m * n)
+                    if total_bytes <= byte_limit:
+                        rows.add(record)
 rows = list(rows)
 rng.shuffle(rows)
 for record in rows:
@@ -141,13 +135,13 @@ for record in rows:
 PY
 
 adaptive_count="$(wc -l <"${workload_manifest}")"
-printf '{"stage":"workload_generation","status":"passed","coverage":"new_stratified_shapes_excluding_result48","candidates":%d}\n' "${adaptive_count}"
+printf '{"stage":"workload_generation","status":"passed","coverage":"analytic_m_n_k_dtype_strata","candidates":%d}\n' "${adaptive_count}"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
-success_target="${MATMUL_SUCCESS_TARGET:-2000}"
+success_target="${MATMUL_SUCCESS_TARGET:-3000}"
 cell_quota="${MATMUL_CELL_QUOTA:-0}"
 if [[ "${cell_quota}" -eq 0 ]]; then
     cell_quota_json=null
@@ -157,15 +151,15 @@ else
     theoretical_maximum_pairs_json="$((200 * cell_quota))"
 fi
 panel_rc=0
-printf '{"campaign_begin":"WIDE_N_PANEL_ONLY","target_passes":%d,"maximum_per_joint_cell":%s,"theoretical_maximum_pairs":%s}\n' \
+printf '{"campaign_begin":"WIDE_N_ANALYTIC_SELECTOR","target_passes":%d,"maximum_per_joint_cell":%s,"theoretical_maximum_pairs":%s}\n' \
     "${success_target}" "${cell_quota_json}" "${theoretical_maximum_pairs_json}"
 set +e
-MATMUL_CAMPAIGN=WIDE_N_PANEL_ONLY MATMUL_TARGET_PASSES="${success_target}" MATMUL_CELL_QUOTA="${cell_quota}" \
+MATMUL_CAMPAIGN=WIDE_N_ANALYTIC_SELECTOR MATMUL_TARGET_PASSES="${success_target}" MATMUL_CELL_QUOTA="${cell_quota}" \
     "${runner}" --manifest "${workload_manifest}"
 panel_rc=$?
 set -e
-printf '{"campaign_complete":"WIDE_N_PANEL_ONLY","process_result_code":%d}\n' "${panel_rc}"
+printf '{"campaign_complete":"WIDE_N_ANALYTIC_SELECTOR","process_result_code":%d}\n' "${panel_rc}"
 if [[ "${panel_rc}" -ne 0 ]]; then
     exit "${panel_rc}"
 fi
-printf '{"validation_complete":true,"campaigns":1,"candidate_branch":"WIDE_N_PANEL_ONLY"}\n'
+printf '{"validation_complete":true,"campaigns":1,"candidate_branch":"WIDE_N_ANALYTIC_SELECTOR"}\n'

@@ -216,6 +216,7 @@ bool IsBaseCampaign()
         (std::strcmp(campaign, "RECTANGULAR_CUBE") == 0 ||
          std::strcmp(campaign, "REUSE_DIRECTED") == 0 ||
          std::strcmp(campaign, "CUBE_VECTOR_EDGE") == 0 ||
+         std::strcmp(campaign, "WIDE_N_ANALYTIC_SELECTOR") == 0 ||
          std::strcmp(campaign, "WIDE_N_PANEL_ONLY") == 0 ||
          std::strcmp(campaign, "WIDE_N_WINDOW_ONLY") == 0 ||
          std::strcmp(campaign, "WIDE_N_SHALLOW_K_BASE") == 0);
@@ -227,6 +228,9 @@ const char *CampaignName()
     const char *campaign = std::getenv("MATMUL_CAMPAIGN");
     if (campaign != nullptr && std::strcmp(campaign, "REUSE_DIRECTED") == 0) return "REUSE_DIRECTED";
     if (campaign != nullptr && std::strcmp(campaign, "CUBE_VECTOR_EDGE") == 0) return "CUBE_VECTOR_EDGE";
+    if (campaign != nullptr && std::strcmp(campaign, "WIDE_N_ANALYTIC_SELECTOR") == 0) {
+        return "WIDE_N_ANALYTIC_SELECTOR";
+    }
     if (campaign != nullptr && std::strcmp(campaign, "WIDE_N_PANEL_ONLY") == 0) {
         return "WIDE_N_PANEL_ONLY";
     }
@@ -739,6 +743,13 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     std::printf(",");
     PrintTiling("candidate_tiling", adaptive);
     std::printf(",\"official_core\":%u,\"candidate_core\":%u", official.cores, adaptive.cores);
+    if (std::strcmp(CampaignName(), "WIDE_N_ANALYTIC_SELECTOR") == 0) {
+        std::printf(",\"analytic_score_n128\":%lu,\"analytic_score_n256\":%lu,"
+                    "\"analytic_score_n512\":%lu",
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SCORE_N128")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SCORE_N256")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SCORE_N512")));
+    }
     if (adaptiveCampaign) {
         std::printf(",\"old_partial_bytes\":%lu,\"new_partial_bytes\":%lu,"
                     "\"partial_delta_bytes\":%ld,\"partial_saved_bytes\":%lu,"
@@ -789,7 +800,9 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
             ++counts.mixedOrder;
         }
         CountPassCoverage(counts, m, n, k);
-        if (candidateVariant == "WIDE_N_PANEL_ONLY" || candidateVariant == "WIDE_N_WINDOW_ONLY" ||
+        if (candidateVariant == "ANALYTIC_N128_K128" || candidateVariant == "ANALYTIC_N256_K64" ||
+            candidateVariant == "ANALYTIC_N512_K32" || candidateVariant == "WIDE_N_PANEL_ONLY" ||
+            candidateVariant == "WIDE_N_WINDOW_ONLY" ||
             candidateVariant == "WIDE_N_SHALLOW_K_BASE") {
             ++counts.wideNShallowKPassed;
         }
