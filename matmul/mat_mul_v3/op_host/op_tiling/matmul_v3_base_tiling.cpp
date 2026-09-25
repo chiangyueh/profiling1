@@ -1663,7 +1663,7 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
     const uint64_t fullNWaves = nTiles / compileInfo_.aicNum;
     const uint64_t tailNTiles = nTiles % compileInfo_.aicNum;
     const uint64_t kBlocks = MathUtil::CeilDivision(args_.kValue, baseK);
-    if (alignedM != BASIC_ALIGN_16 || args_.mValue * NUMBER_TWO < alignedM ||
+    if (alignedM != BASIC_ALIGN_16 || args_.mValue * 4UL <= alignedM * 3UL || args_.mValue >= alignedM ||
         args_.nValue % baseN != 0 || args_.kValue % BASIC_BLOCK_SIZE_128 != 0 ||
         args_.kValue < minValidatedK || args_.kValue > maxValidatedK ||
         fullNWaves < 5UL || nTiles > BASIC_BLOCK_SIZE_128 || tailNTiles == 0 ||

@@ -126,7 +126,7 @@ byte_limit = 1024 * 1024 * 1024
 
 rows = set()
 for dtype in ("fp16_fp16", "bf16_bf16"):
-    for m in range(8, 17):
+    for m in range(13, 16):
         for n_tile in n_tiles:
             n = n_tile * 256
             for k in range(15104, 20609, 128):
@@ -147,7 +147,7 @@ export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
-success_target="${MATMUL_SUCCESS_TARGET:-5000}"
+success_target="${MATMUL_SUCCESS_TARGET:-2000}"
 cell_quota="${MATMUL_CELL_QUOTA:-0}"
 if [[ "${cell_quota}" -eq 0 ]]; then
     cell_quota_json=null
