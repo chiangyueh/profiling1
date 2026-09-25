@@ -76,6 +76,12 @@ struct RunCounts {
     uint64_t officialFailed = 0;
     uint64_t skippedNonV3 = 0;
     uint64_t wideNShallowKPassed = 0;
+    uint64_t clearCandidateWins = 0;
+    uint64_t clearOfficialWins = 0;
+    uint64_t overlap = 0;
+    uint64_t stableCandidateWins = 0;
+    uint64_t stableOfficialWins = 0;
+    uint64_t mixedOrder = 0;
     uint64_t mCoverage[5] = {};
     uint64_t nCoverage[5] = {};
     uint64_t kCoverage[5] = {};
@@ -94,8 +100,8 @@ uint64_t ReadEnvUnsigned(const char *name)
 void CountPassCoverage(RunCounts &counts, int64_t m, int64_t n, int64_t k)
 {
     const size_t mBucket = m <= 9 ? 0 : (m <= 31 ? 1 : (m <= 63 ? 2 : (m <= 95 ? 3 : 4)));
-    const size_t nBucket = n <= 7168 ? 0 : (n <= 12288 ? 1 : (n <= 18432 ? 2 : (n <= 24576 ? 3 : 4)));
-    const size_t kBucket = k <= 15872 ? 0 : (k <= 19456 ? 1 : (k <= 23552 ? 2 : 3));
+    const size_t nBucket = n <= 24576 ? 0 : (n <= 26624 ? 1 : (n <= 28160 ? 2 : (n <= 30464 ? 3 : 4)));
+    const size_t kBucket = k <= 8192 ? 0 : (k <= 15872 ? 1 : (k <= 27264 ? 2 : 3));
     ++counts.mCoverage[mBucket];
     ++counts.nCoverage[nBucket];
     ++counts.kCoverage[kBucket];
@@ -105,8 +111,8 @@ size_t JointCoverageBucket(const DTypeSpec &dtype, int64_t m, int64_t n, int64_t
 {
     const size_t dtypeBucket = std::strcmp(dtype.inputName, "bf16") == 0 ? 1 : 0;
     const size_t mBucket = m <= 9 ? 0 : (m <= 31 ? 1 : (m <= 63 ? 2 : (m <= 95 ? 3 : 4)));
-    const size_t nBucket = n <= 7168 ? 0 : (n <= 12288 ? 1 : (n <= 18432 ? 2 : (n <= 24576 ? 3 : 4)));
-    const size_t kBucket = k <= 15872 ? 0 : (k <= 19456 ? 1 : (k <= 23552 ? 2 : 3));
+    const size_t nBucket = n <= 24576 ? 0 : (n <= 26624 ? 1 : (n <= 28160 ? 2 : (n <= 30464 ? 3 : 4)));
+    const size_t kBucket = k <= 8192 ? 0 : (k <= 15872 ? 1 : (k <= 27264 ? 2 : 3));
     return (((dtypeBucket * 5 + mBucket) * 5 + nBucket) * 4 + kBucket);
 }
 
@@ -767,6 +773,21 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
 
     if (correct) {
         ++counts.passed;
+        if (delta < -2.0) {
+            ++counts.clearCandidateWins;
+        } else if (delta > 2.0) {
+            ++counts.clearOfficialWins;
+        } else {
+            ++counts.overlap;
+        }
+        if (adaptiveLatencyForward < officialLatencyForward && adaptiveLatencyReverse < officialLatencyReverse) {
+            ++counts.stableCandidateWins;
+        } else if (adaptiveLatencyForward > officialLatencyForward &&
+                   adaptiveLatencyReverse > officialLatencyReverse) {
+            ++counts.stableOfficialWins;
+        } else {
+            ++counts.mixedOrder;
+        }
         CountPassCoverage(counts, m, n, k);
         if (candidateVariant == "WIDE_N_PANEL_ONLY" || candidateVariant == "WIDE_N_WINDOW_ONLY" ||
             candidateVariant == "WIDE_N_SHALLOW_K_BASE") {
@@ -878,6 +899,8 @@ int main(int argc, char **argv)
                 "\"official_target\":%lu,\"candidate_selected\":%lu,\"official_preserved\":%lu,"
                 "\"target_passes\":%lu,\"quota_met\":%s,\"passed\":%lu,\"failed\":%lu,"
                 "\"wide_n_shallow_k_passed\":%lu,"
+                "\"clear_candidate_wins\":%lu,\"false_positive_intercepts\":%lu,\"overlap\":%lu,"
+                "\"stable_candidate_wins\":%lu,\"stable_official_wins\":%lu,\"mixed_order\":%lu,"
                 "\"official_failed\":%lu,\"manifest_start_index\":%lu,"
                 "\"manifest_end_index\":%lu}\n",
                 CampaignName(),
@@ -892,13 +915,19 @@ int main(int argc, char **argv)
                 static_cast<unsigned long>(counts.passed),
                 static_cast<unsigned long>(counts.failed),
                 static_cast<unsigned long>(counts.wideNShallowKPassed),
+                static_cast<unsigned long>(counts.clearCandidateWins),
+                static_cast<unsigned long>(counts.clearOfficialWins),
+                static_cast<unsigned long>(counts.overlap),
+                static_cast<unsigned long>(counts.stableCandidateWins),
+                static_cast<unsigned long>(counts.stableOfficialWins),
+                static_cast<unsigned long>(counts.mixedOrder),
                 static_cast<unsigned long>(counts.officialFailed),
                 static_cast<unsigned long>(startIndex),
                 static_cast<unsigned long>(manifestIndex));
     std::printf("{\"measured_coverage\":true,"
-                "\"m\":{\"1_9\":%lu,\"10_31\":%lu,\"32_63\":%lu,\"64_95\":%lu,\"96_112\":%lu},"
-                "\"n\":{\"5376_7168\":%lu,\"7424_12288\":%lu,\"12544_18432\":%lu,\"18688_24576\":%lu,\"24832_32768\":%lu},"
-                "\"k\":{\"15104_15872\":%lu,\"16000_19456\":%lu,\"19584_23552\":%lu,\"23680_27264\":%lu}}\n",
+                "\"m\":{\"1_9\":%lu,\"10_31\":%lu,\"32_63\":%lu,\"64_95\":%lu,\"96_128\":%lu},"
+                "\"n\":{\"23296_24576\":%lu,\"24832_26624\":%lu,\"26880_28160\":%lu,\"28416_30464\":%lu,\"30720_32768\":%lu},"
+                "\"k\":{\"2048_8192\":%lu,\"8320_15872\":%lu,\"16000_27264\":%lu,\"27392_65536\":%lu}}\n",
                 static_cast<unsigned long>(counts.mCoverage[0]),
                 static_cast<unsigned long>(counts.mCoverage[1]),
                 static_cast<unsigned long>(counts.mCoverage[2]),
@@ -945,9 +974,9 @@ int main(int argc, char **argv)
                     static_cast<unsigned long>(inputCells * cellQuota),
                     static_cast<unsigned long>(counts.jointQuotaSkipped));
         const char *dtypeNames[] = {"fp16", "bf16"};
-        const char *mNames[] = {"1_9", "10_31", "32_63", "64_95", "96_112"};
-        const char *nNames[] = {"5376_7168", "7424_12288", "12544_18432", "18688_24576", "24832_32768"};
-        const char *kNames[] = {"15104_15872", "16000_19456", "19584_23552", "23680_27264"};
+        const char *mNames[] = {"1_9", "10_31", "32_63", "64_95", "96_128"};
+        const char *nNames[] = {"23296_24576", "24832_26624", "26880_28160", "28416_30464", "30720_32768"};
+        const char *kNames[] = {"2048_8192", "8320_15872", "16000_27264", "27392_65536"};
         bool first = true;
         std::printf("{\"joint_unmet_cells\":[");
         for (size_t index = 0; index < 200; ++index) {

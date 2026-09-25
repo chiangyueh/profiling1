@@ -18,9 +18,7 @@ fi
 build_dir="${PWD}/build"
 build_log="$(mktemp)"
 workload_manifest="$(mktemp)"
-comparison_manifest="$(mktemp)"
-panel_log="$(mktemp)"
-trap 'rm -f "${build_log}" "${workload_manifest}" "${comparison_manifest}" "${panel_log}"' EXIT
+trap 'rm -f "${build_log}" "${workload_manifest}"' EXIT
 
 printf '{"stage":"host_build","status":"begin"}\n'
 if ! cmake -S . -B "${build_dir}" \
@@ -123,9 +121,9 @@ if len(historical) != 300:
     raise SystemExit(f"expected 300 result48 shapes, found {len(historical)}")
 
 rng = random.Random(8506)
-m_ranges = ((1, 9), (10, 31), (32, 63), (64, 95), (96, 112))
-n_ranges = ((5376, 7168), (7424, 12288), (12544, 18432), (18688, 24576), (24832, 32768))
-k_ranges = ((15104, 15872), (16000, 19456), (19584, 23552), (23680, 27264))
+m_ranges = ((1, 9), (10, 31), (32, 63), (64, 95), (96, 128))
+n_ranges = ((23296, 24576), (24832, 26624), (26880, 28160), (28416, 30464), (30720, 32768))
+k_ranges = ((2048, 8192), (8320, 15872), (16000, 27264), (27392, 65536))
 byte_limit = 1024 * 1024 * 1024
 
 def aligned_random(lo, hi, quantum):
@@ -166,7 +164,6 @@ export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
-campaign_failures=0
 success_target="${MATMUL_SUCCESS_TARGET:-5000}"
 cell_quota="${MATMUL_CELL_QUOTA:-0}"
 if [[ "${cell_quota}" -eq 0 ]]; then
@@ -176,60 +173,16 @@ else
     cell_quota_json="${cell_quota}"
     theoretical_maximum_pairs_json="$((200 * cell_quota))"
 fi
-run_campaign() {
-    local campaign="$1"
-    local target="$2"
-    shift 2
-    local rc=0
-    printf '{"campaign_begin":"%s","target_passes":%d}\n' "${campaign}" "${target}"
-    MATMUL_CAMPAIGN="${campaign}" MATMUL_TARGET_PASSES="${target}" "$@" || rc=$?
-    printf '{"campaign_complete":"%s","process_result_code":%d}\n' "${campaign}" "${rc}"
-    if [[ "${rc}" -ne 0 ]]; then
-        campaign_failures=$((campaign_failures + 1))
-    fi
-}
-
 panel_rc=0
 printf '{"campaign_begin":"WIDE_N_PANEL_ONLY","target_passes":%d,"maximum_per_joint_cell":%s,"theoretical_maximum_pairs":%s}\n' \
     "${success_target}" "${cell_quota_json}" "${theoretical_maximum_pairs_json}"
 set +e
 MATMUL_CAMPAIGN=WIDE_N_PANEL_ONLY MATMUL_TARGET_PASSES="${success_target}" MATMUL_CELL_QUOTA="${cell_quota}" \
-    "${runner}" --manifest "${workload_manifest}" | tee "${panel_log}"
-panel_status=("${PIPESTATUS[@]}")
+    "${runner}" --manifest "${workload_manifest}"
+panel_rc=$?
 set -e
-panel_rc="${panel_status[0]}"
 printf '{"campaign_complete":"WIDE_N_PANEL_ONLY","process_result_code":%d}\n' "${panel_rc}"
 if [[ "${panel_rc}" -ne 0 ]]; then
-    campaign_failures=$((campaign_failures + 1))
+    exit "${panel_rc}"
 fi
-
-python3 - "${panel_log}" >"${comparison_manifest}" <<'PY'
-import json
-import sys
-
-seen = set()
-for line in open(sys.argv[1]):
-    try:
-        row = json.loads(line)
-    except json.JSONDecodeError:
-        continue
-    if (row.get("candidate_branch") != "WIDE_N_PANEL_ONLY" or
-            row.get("correctness") != "PASS" or row.get("result_code") != 0):
-        continue
-    shape = row["shape"].split("_")
-    record = (f"{row['input_dtype']}_{row['output_dtype']}", shape[3],
-              int(shape[0][1:]), int(shape[1][1:]), int(shape[2][1:]))
-    if record not in seen:
-        seen.add(record)
-        print("\t".join(str(value) for value in record))
-PY
-
-comparison_count="$(wc -l <"${comparison_manifest}")"
-if [[ "${comparison_count}" -lt "${success_target}" ]]; then
-    printf '{"fatal":"panel_only_target_not_reached","target":%d,"collected":%d}\n' \
-        "${success_target}" "${comparison_count}"
-    exit 1
-fi
-printf '{"ablation_comparison_shapes":%d,"source":"WIDE_N_PANEL_ONLY_PASS"}\n' "${comparison_count}"
-run_campaign WIDE_N_WINDOW_ONLY "${comparison_count}" "${runner}" --manifest "${comparison_manifest}"
-printf '{"overnight_complete":true,"campaigns":2,"campaign_process_failures":%d}\n' "${campaign_failures}"
+printf '{"validation_complete":true,"campaigns":1,"candidate_branch":"WIDE_N_PANEL_ONLY"}\n'

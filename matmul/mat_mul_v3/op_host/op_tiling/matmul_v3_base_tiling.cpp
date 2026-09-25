@@ -678,7 +678,6 @@ void MatmulV3BaseTiling::DoBasicTiling()
     DoIncreTiling();
     OptimizeLoadBalanceBasicKernel();
     DoSelectTiling();
-    DoWideNPanelReuseBaseTiling();
     // add nd2nz tiling here
     DoNd2NzVectorTiling();
     if (args_.hasBias) {
@@ -1640,16 +1639,11 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
         (args_.aType == ge::DT_FLOAT16 || args_.aType == ge::DT_BF16);
     if ((!panelOnly && !windowOnly && !panelAndWindow) ||
         !compileInfo_.supportL0c2out || compileInfo_.aicNum == 0 || args_.hasBias || !dtypeSupported ||
-        tilingEnable_.tilingEnableFullLoad != TilingEnableFullLoad::BASE ||
-        tilingEnable_.tilingEnableSplitCore != TilingEnableSplitCore::BASE ||
-        tilingEnable_.tilingEnableFixOpti != TilingEnableFixOpti::BASE ||
-        tilingEnable_.tilingEnableSpecialOpti != TilingEnableSpecialOpti::BASE ||
         args_.isATrans || args_.isBTrans ||
         args_.aFormat != ge::FORMAT_ND || args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
         args_.nd2nzA || args_.nd2nzB || args_.isNzA || args_.isNzB ||
         args_.mValue == 0 || args_.mValue > BASIC_BLOCK_SIZE_128 ||
         args_.kValue < 512UL ||
-        runInfo_.baseN != BASIC_BLOCK_SIZE_128 || runInfo_.baseK != BASIC_BLOCK_SIZE_128 ||
         aDtypeSize_ != DATA_SIZE_FP16 || bDtypeSize_ != DATA_SIZE_FP16) {
         return false;
     }
@@ -1664,7 +1658,12 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
 
     const uint64_t mTiles = MathUtil::CeilDivision(args_.mValue, baseM);
     const uint64_t nTiles = MathUtil::CeilDivision(args_.nValue, baseN);
-    if (mTiles != 1 || nTiles < compileInfo_.aicNum) {
+    const uint64_t narrowNTiles = MathUtil::CeilDivision(args_.nValue, BASIC_BLOCK_SIZE_128);
+    const uint64_t narrowNWaves = MathUtil::CeilDivision(narrowNTiles, compileInfo_.aicNum);
+    const uint64_t wideNWaves = MathUtil::CeilDivision(nTiles, compileInfo_.aicNum);
+    const uint64_t kBlocks = MathUtil::CeilDivision(args_.kValue, baseK);
+    if (mTiles != 1 || nTiles < compileInfo_.aicNum || narrowNWaves <= wideNWaves ||
+        narrowNWaves - wideNWaves < 5UL || kBlocks < 2UL * depthA1) {
         return false;
     }
 
@@ -1678,6 +1677,10 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
         runInfo_.l2Info.nTile = MathUtil::CeilDivision(officialNTiles, compileInfo_.aicNum);
         runInfo_.l2Info.mTileBlock = 1;
         runInfo_.l2Info.nTileBlock = compileInfo_.aicNum;
+        tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
+        tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::BASE;
+        tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
+        tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::BASE;
         runInfo_.needUpdate = true;
         (void)::setenv("MATMUL_BASE_EXPERIMENT_VARIANT", mode, 1);
         (void)::setenv("MATMUL_BASE_EXPERIMENT_SELECTED", "1", 1);
@@ -1745,6 +1748,10 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
     runInfo_.l2Info.mTileBlock = mWindowBlock;
     runInfo_.l2Info.nTileBlock = nWindowBlock;
     runInfo_.l2Info.calOrder = ITER_ROW_FIRST;
+    tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
+    tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::BASE;
+    tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
+    tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::BASE;
     runInfo_.needUpdate = true;
     (void)::setenv("MATMUL_BASE_EXPERIMENT_VARIANT", mode, 1);
     (void)::setenv("MATMUL_BASE_EXPERIMENT_SELECTED", "1", 1);
@@ -1765,6 +1772,10 @@ bool MatmulV3BaseTiling::DoExperimentalBaseTiling()
         selected = DoRectangularCubeTiling();
     } else if (std::strcmp(mode, "REUSE_DIRECTED") == 0) {
         selected = DoReuseDirectedTiling();
+    } else if (std::strcmp(mode, "WIDE_N_PANEL_ONLY") == 0 ||
+               std::strcmp(mode, "WIDE_N_WINDOW_ONLY") == 0 ||
+               std::strcmp(mode, "WIDE_N_SHALLOW_K_BASE") == 0) {
+        selected = DoWideNPanelReuseBaseTiling();
     }
     if (selected) (void)::setenv("MATMUL_BASE_EXPERIMENT_SELECTED", "1", 1);
     return selected;
