@@ -108,34 +108,72 @@ printf '{"stage":"runner_build","status":"passed"}\n'
 
 printf '{"stage":"workload_generation","status":"begin"}\n'
 python3 - >"${workload_manifest}" <<'PY'
+from collections import defaultdict, deque
 import random
 
-rng = random.Random(8509)
+rng = random.Random(8510)
 m_values = (1, 3, 7, 8, 12, 16, 24, 32, 48, 64, 80, 96, 112, 128)
-n_tiles = tuple(range(41, 131))
-k_values = (512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288,
-            15104, 16384, 18432, 20480, 24576, 32768, 49152, 65536)
+n_values = {
+    16, 17, 31, 32, 48, 63, 64, 65, 96, 127, 128, 129, 192, 255, 256, 257,
+    384, 511, 512, 513, 768, 1024, 1536, 2048, 3072, 4096, 5120, 6144, 7168,
+    8192, 10240, 12288, 14336, 16384, 18432, 20480, 24576, 28672, 32768,
+    40960, 49152, 57344, 65536,
+}
+for base_n in (128, 256, 512):
+    for wave in range(1, 9):
+        boundary = 20 * wave * base_n
+        for offset in (-base_n // 2, -17, -1, 0, 1, 17, base_n // 2):
+            n = boundary + offset
+            if 16 <= n <= 65536:
+                n_values.add(n)
+k_values = (
+    512, 576, 640, 768, 896, 1024, 1280, 1536, 1792, 2048, 2560, 3072,
+    3584, 4096, 5120, 6144, 7168, 8192, 10240, 12288, 14336, 15104, 16384,
+    18432, 20480, 24576, 28672, 32768, 40960, 49152, 57344, 65536,
+)
 byte_limit = 1024 * 1024 * 1024
 
 rows = set()
 for dtype in ("fp16_fp16", "bf16_bf16"):
     for m in m_values:
-        for n_tile in n_tiles:
-            for n_tail in (0, 17, 127):
-                n = n_tile * 256 + n_tail
-                for k in k_values:
-                    record = (dtype, "NN", m, n, k)
-                    total_bytes = 2 * (m * k + k * n + m * n)
-                    if total_bytes <= byte_limit:
-                        rows.add(record)
-rows = list(rows)
-rng.shuffle(rows)
+        for n in n_values:
+            for k in k_values:
+                record = (dtype, "NN", m, n, k)
+                total_bytes = 2 * (m * k + k * n + m * n)
+                if total_bytes <= byte_limit:
+                    rows.add(record)
+
+def bucket(value, limits):
+    for index, limit in enumerate(limits):
+        if value <= limit:
+            return index
+    return len(limits)
+
+strata = defaultdict(list)
 for record in rows:
-    print("\t".join(str(value) for value in record))
+    dtype, _, m, n, k = record
+    key = (
+        dtype,
+        bucket(m, (9, 31, 63, 95)),
+        bucket(n, (512, 2048, 8192, 24576)),
+        bucket(k, (2048, 8192, 24576)),
+    )
+    strata[key].append(record)
+for values in strata.values():
+    rng.shuffle(values)
+queues = {key: deque(values) for key, values in strata.items()}
+keys = list(queues)
+rng.shuffle(keys)
+remaining = len(rows)
+while remaining:
+    for key in keys:
+        if queues[key]:
+            print("\t".join(str(value) for value in queues[key].popleft()))
+            remaining -= 1
 PY
 
 adaptive_count="$(wc -l <"${workload_manifest}")"
-printf '{"stage":"workload_generation","status":"passed","coverage":"analytic_m_n_k_dtype_strata","candidates":%d}\n' "${adaptive_count}"
+printf '{"stage":"workload_generation","status":"passed","coverage":"base_route_small_to_large_n_k_strata","candidates":%d}\n' "${adaptive_count}"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1

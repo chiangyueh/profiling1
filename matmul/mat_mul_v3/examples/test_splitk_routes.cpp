@@ -100,8 +100,8 @@ uint64_t ReadEnvUnsigned(const char *name)
 void CountPassCoverage(RunCounts &counts, int64_t m, int64_t n, int64_t k)
 {
     const size_t mBucket = m <= 9 ? 0 : (m <= 31 ? 1 : (m <= 63 ? 2 : (m <= 95 ? 3 : 4)));
-    const size_t nBucket = n <= 24576 ? 0 : (n <= 26624 ? 1 : (n <= 28160 ? 2 : (n <= 30464 ? 3 : 4)));
-    const size_t kBucket = k <= 8192 ? 0 : (k <= 15872 ? 1 : (k <= 27264 ? 2 : 3));
+    const size_t nBucket = n <= 512 ? 0 : (n <= 2048 ? 1 : (n <= 8192 ? 2 : (n <= 24576 ? 3 : 4)));
+    const size_t kBucket = k <= 2048 ? 0 : (k <= 8192 ? 1 : (k <= 24576 ? 2 : 3));
     ++counts.mCoverage[mBucket];
     ++counts.nCoverage[nBucket];
     ++counts.kCoverage[kBucket];
@@ -111,8 +111,8 @@ size_t JointCoverageBucket(const DTypeSpec &dtype, int64_t m, int64_t n, int64_t
 {
     const size_t dtypeBucket = std::strcmp(dtype.inputName, "bf16") == 0 ? 1 : 0;
     const size_t mBucket = m <= 9 ? 0 : (m <= 31 ? 1 : (m <= 63 ? 2 : (m <= 95 ? 3 : 4)));
-    const size_t nBucket = n <= 24576 ? 0 : (n <= 26624 ? 1 : (n <= 28160 ? 2 : (n <= 30464 ? 3 : 4)));
-    const size_t kBucket = k <= 8192 ? 0 : (k <= 15872 ? 1 : (k <= 27264 ? 2 : 3));
+    const size_t nBucket = n <= 512 ? 0 : (n <= 2048 ? 1 : (n <= 8192 ? 2 : (n <= 24576 ? 3 : 4)));
+    const size_t kBucket = k <= 2048 ? 0 : (k <= 8192 ? 1 : (k <= 24576 ? 2 : 3));
     return (((dtypeBucket * 5 + mBucket) * 5 + nBucket) * 4 + kBucket);
 }
 
@@ -939,8 +939,8 @@ int main(int argc, char **argv)
                 static_cast<unsigned long>(manifestIndex));
     std::printf("{\"measured_coverage\":true,"
                 "\"m\":{\"1_9\":%lu,\"10_31\":%lu,\"32_63\":%lu,\"64_95\":%lu,\"96_128\":%lu},"
-                "\"n\":{\"23296_24576\":%lu,\"24832_26624\":%lu,\"26880_28160\":%lu,\"28416_30464\":%lu,\"30720_32768\":%lu},"
-                "\"k\":{\"2048_8192\":%lu,\"8320_15872\":%lu,\"16000_27264\":%lu,\"27392_65536\":%lu}}\n",
+                "\"n\":{\"16_512\":%lu,\"513_2048\":%lu,\"2049_8192\":%lu,\"8193_24576\":%lu,\"24577_65536\":%lu},"
+                "\"k\":{\"512_2048\":%lu,\"2049_8192\":%lu,\"8193_24576\":%lu,\"24577_65536\":%lu}}\n",
                 static_cast<unsigned long>(counts.mCoverage[0]),
                 static_cast<unsigned long>(counts.mCoverage[1]),
                 static_cast<unsigned long>(counts.mCoverage[2]),
@@ -988,8 +988,8 @@ int main(int argc, char **argv)
                     static_cast<unsigned long>(counts.jointQuotaSkipped));
         const char *dtypeNames[] = {"fp16", "bf16"};
         const char *mNames[] = {"1_9", "10_31", "32_63", "64_95", "96_128"};
-        const char *nNames[] = {"23296_24576", "24832_26624", "26880_28160", "28416_30464", "30720_32768"};
-        const char *kNames[] = {"2048_8192", "8320_15872", "16000_27264", "27392_65536"};
+        const char *nNames[] = {"16_512", "513_2048", "2049_8192", "8193_24576", "24577_65536"};
+        const char *kNames[] = {"512_2048", "2049_8192", "8193_24576", "24577_65536"};
         bool first = true;
         std::printf("{\"joint_unmet_cells\":[");
         for (size_t index = 0; index < 200; ++index) {
