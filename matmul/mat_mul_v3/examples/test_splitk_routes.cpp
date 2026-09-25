@@ -892,7 +892,7 @@ int main(int argc, char **argv)
         (void)RunWorkload(*dtype, *layout, m, n, k, stream, edgeFunction, counts, manifestIndex);
         if (counts.deterministic > officialBefore) ++counts.jointOfficial[jointBucket];
         if (counts.passed > passedBefore) ++counts.jointPassed[jointBucket];
-        if (counts.inputs != 0 && counts.inputs % 1000 == 0) {
+        if (counts.inputs != 0 && counts.inputs % 10000 == 0) {
             std::printf("{\"progress\":true,\"manifest_index\":%lu,\"inputs\":%lu,"
                         "\"passed\":%lu,\"official_failed\":%lu,\"non_target_route\":%lu}\n",
                         static_cast<unsigned long>(manifestIndex),

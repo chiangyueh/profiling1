@@ -28,7 +28,7 @@ build_log="$(mktemp)"
 workload_manifest="$(mktemp)"
 trap 'rm -f "${build_log}" "${workload_manifest}"' EXIT
 
-printf '{"stage":"host_build","status":"begin"}\n'
+printf '# stage=host_build status=begin\n'
 if ! cmake -S . -B "${build_dir}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DENABLE_CUSTOM=FALSE \
@@ -44,7 +44,7 @@ if ! cmake --build "${build_dir}" --target ophost_nn -- -j1 >>"${build_log}" 2>&
     cat "${build_log}" >&2
     exit 1
 fi
-printf '{"stage":"host_build","status":"passed"}\n'
+printf '# stage=host_build status=passed\n'
 
 host_library="${build_dir}/libophost_nn.so"
 opapi_nn=""
@@ -91,7 +91,7 @@ if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/li
     runtime_library="-lascendcl"
 fi
 runner="${build_dir}/test_wide_n_panel_reuse_base"
-printf '{"stage":"runner_build","status":"begin"}\n'
+printf '# stage=runner_build status=begin\n'
 if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
     matmul/mat_mul_v3/op_host/op_api/matmul.cpp \
     -std=gnu++17 -D_GLIBCXX_USE_CXX11_ABI=0 \
@@ -111,9 +111,9 @@ if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
     cat "${build_log}" >&2
     exit 1
 fi
-printf '{"stage":"runner_build","status":"passed"}\n'
+printf '# stage=runner_build status=passed\n'
 
-printf '{"stage":"workload_generation","status":"begin"}\n'
+printf '# stage=workload_generation status=begin\n'
 python3 - >"${workload_manifest}" <<'PY'
 from math import gcd
 
@@ -193,7 +193,7 @@ while active:
 PY
 
 adaptive_count="$(wc -l <"${workload_manifest}")"
-printf '{"stage":"workload_generation","status":"passed","coverage":"200_interleaved_multi_m_tile_dtype_m_n_k_cells","candidates":%d}\n' "${adaptive_count}"
+printf '# stage=workload_generation status=passed coverage=200_interleaved_multi_m_tile_dtype_m_n_k_cells candidates=%d\n' "${adaptive_count}"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
@@ -209,15 +209,19 @@ else
     theoretical_maximum_pairs_json="$((200 * cell_quota))"
 fi
 panel_rc=0
-printf '{"campaign_begin":"WIDE_N_ANALYTIC_SELECTOR","target_passes":%d,"maximum_per_joint_cell":%s,"theoretical_maximum_pairs":%s}\n' \
+printf '# campaign=WIDE_N_ANALYTIC_SELECTOR target_passes=%d maximum_per_joint_cell=%s theoretical_maximum_pairs=%s measurement_order=OCCO\n' \
     "${success_target}" "${cell_quota_json}" "${theoretical_maximum_pairs_json}"
 set +e
 MATMUL_CAMPAIGN=WIDE_N_ANALYTIC_SELECTOR MATMUL_TARGET_PASSES="${success_target}" MATMUL_CELL_QUOTA="${cell_quota}" \
-    "${runner}" --manifest "${workload_manifest}"
-panel_rc=$?
+    "${runner}" --manifest "${workload_manifest}" | python3 tools/compact_matmul_log.py
+pipeline_status=("${PIPESTATUS[@]}")
+panel_rc="${pipeline_status[0]}"
+converter_rc="${pipeline_status[1]}"
 set -e
-printf '{"campaign_complete":"WIDE_N_ANALYTIC_SELECTOR","process_result_code":%d}\n' "${panel_rc}"
+if [[ "${converter_rc}" -ne 0 ]]; then
+    printf 'fatal: CSV conversion failed rc=%d\n' "${converter_rc}" >&2
+    exit "${converter_rc}"
+fi
 if [[ "${panel_rc}" -ne 0 ]]; then
     exit "${panel_rc}"
 fi
-printf '{"validation_complete":true,"campaigns":1,"candidate_branch":"WIDE_N_ANALYTIC_SELECTOR"}\n'
