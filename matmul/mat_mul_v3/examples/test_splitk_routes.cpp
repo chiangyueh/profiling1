@@ -831,7 +831,7 @@ int main(int argc, char **argv)
     const uint64_t targetPasses = ReadEnvUnsigned("MATMUL_TARGET_PASSES");
     const uint64_t cellQuota = ReadEnvUnsigned("MATMUL_CELL_QUOTA");
     std::printf("{\"campaign_start\":\"%s\",\"target_passes\":%lu,"
-                "\"joint_cell_quota\":%lu,\"runner\":\"wide_n_mechanism_ablation_v2\"}\n",
+                "\"joint_cell_quota\":%lu,\"runner\":\"analytic_critical_path_v3\"}\n",
                 CampaignName(), static_cast<unsigned long>(targetPasses), static_cast<unsigned long>(cellQuota));
     std::fflush(stdout);
     const char *hostLibrary = std::getenv("MATMUL_HOST_LIBRARY");

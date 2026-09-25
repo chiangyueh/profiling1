@@ -110,7 +110,7 @@ printf '{"stage":"workload_generation","status":"begin"}\n'
 python3 - >"${workload_manifest}" <<'PY'
 import random
 
-rng = random.Random(8507)
+rng = random.Random(8509)
 m_values = (1, 3, 7, 8, 12, 16, 24, 32, 48, 64, 80, 96, 112, 128)
 n_tiles = tuple(range(41, 131))
 k_values = (512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288,

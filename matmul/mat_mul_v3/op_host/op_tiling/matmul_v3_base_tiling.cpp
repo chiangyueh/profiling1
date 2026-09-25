@@ -1658,10 +1658,10 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
             uint64_t baseK;
             uint64_t mTasks;
             uint64_t nTasks;
+            uint64_t tasks;
             uint64_t waves;
             uint64_t paddedK;
-            long double criticalCubeAndB;
-            long double replayedAPanel;
+            uint64_t criticalN;
             long double score;
             const char *name;
         };
@@ -1673,7 +1673,10 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
             {BASIC_BLOCK_SIZE_64, 512UL, 64UL, 0, 0, 0, 0, 0, 0, 0, 0, 0,
              "ANALYTIC_N512_K32"},
         };
-        constexpr uint64_t aReplayStageWeight = DB_SIZE * NUMBER_TWO;
+        constexpr long double aTransferStages = 2.0L;
+        constexpr long double taskIssueCost = static_cast<long double>(BASIC_BLOCK_SIZE_64);
+        constexpr long double kPipelineRefillCost = 5.0L * BASIC_BLOCK_SIZE_128;
+        constexpr long double waveSynchronizationCost = static_cast<long double>(BASIC_BLOCK_SIZE_256);
         size_t selectedIndex = 0;
         for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); ++index) {
             AnalyticCandidate &candidate = candidates[index];
@@ -1682,15 +1685,29 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
             candidate.baseM = CalBaseSize(candidate.nTasks, compileInfo_.aicNum,
                                           args_.mValue, candidate.maxBaseM);
             candidate.mTasks = MathUtil::CeilDivision(args_.mValue, candidate.baseM);
-            candidate.waves = MathUtil::CeilDivision(candidate.mTasks * candidate.nTasks,
-                                                      compileInfo_.aicNum);
+            candidate.tasks = candidate.mTasks * candidate.nTasks;
+            candidate.waves = MathUtil::CeilDivision(candidate.tasks, compileInfo_.aicNum);
             candidate.paddedK = MathUtil::CeilDivision(args_.kValue, candidate.baseK) * candidate.baseK;
-            candidate.criticalCubeAndB = static_cast<long double>(candidate.waves) *
-                candidate.baseN * candidate.paddedK;
-            candidate.replayedAPanel = static_cast<long double>(candidate.waves) *
-                candidate.baseM * args_.kValue;
-            candidate.score = candidate.criticalCubeAndB +
-                aReplayStageWeight * candidate.replayedAPanel;
+            candidate.criticalN = candidate.waves * candidate.baseN;
+            if (candidate.mTasks == 1) {
+                const uint64_t fullNTiles = args_.nValue / candidate.baseN;
+                const uint64_t tailN = args_.nValue % candidate.baseN;
+                candidate.criticalN = MathUtil::CeilDivision(fullNTiles, compileInfo_.aicNum) *
+                    candidate.baseN;
+                if (tailN != 0 && fullNTiles % compileInfo_.aicNum == 0) {
+                    candidate.criticalN += tailN;
+                }
+            }
+            const long double averageTasks = static_cast<long double>(candidate.tasks) /
+                compileInfo_.aicNum;
+            const long double kPipelinePressure = static_cast<long double>(candidate.waves) *
+                BASIC_BLOCK_SIZE_128 / candidate.baseK;
+            const long double normalizedCriticalPath = candidate.criticalN +
+                aTransferStages * candidate.waves * candidate.baseM +
+                taskIssueCost * averageTasks +
+                kPipelineRefillCost * kPipelinePressure +
+                waveSynchronizationCost * candidate.waves;
+            candidate.score = candidate.paddedK * normalizedCriticalPath;
             if (candidate.score < candidates[selectedIndex].score) {
                 selectedIndex = index;
             }
