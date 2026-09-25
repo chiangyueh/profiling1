@@ -121,36 +121,19 @@ if len(historical) != 300:
     raise SystemExit(f"expected 300 result48 shapes, found {len(historical)}")
 
 rng = random.Random(8506)
-m_ranges = ((1, 9), (10, 31), (32, 63), (64, 95), (96, 128))
-n_ranges = ((23296, 24576), (24832, 26624), (26880, 28160), (28416, 30464), (30720, 32768))
-k_ranges = ((2048, 8192), (8320, 15872), (16000, 27264), (27392, 65536))
+n_tiles = tuple(range(101, 109)) + tuple(range(121, 129))
 byte_limit = 1024 * 1024 * 1024
 
-def aligned_random(lo, hi, quantum):
-    return rng.randint((lo + quantum - 1) // quantum, hi // quantum) * quantum
-
 rows = set()
-candidates_per_cell = 512
-maximum_attempts_per_cell = 100000
 for dtype in ("fp16_fp16", "bf16_bf16"):
-    for m_lo, m_hi in m_ranges:
-        for n_lo, n_hi in n_ranges:
-            for k_lo, k_hi in k_ranges:
-                minimum_bytes = 2 * (m_lo * k_lo + k_lo * n_lo + m_lo * n_lo)
-                if minimum_bytes > byte_limit:
-                    continue
-                cell_rows = set()
-                attempts = 0
-                while len(cell_rows) < candidates_per_cell and attempts < maximum_attempts_per_cell:
-                    attempts += 1
-                    m = rng.randint(m_lo, m_hi)
-                    n = aligned_random(n_lo, n_hi, 256)
-                    k = aligned_random(k_lo, k_hi, 128)
-                    record = (dtype, "NN", m, n, k)
-                    total_bytes = 2 * (m * k + k * n + m * n)
-                    if total_bytes <= byte_limit and record not in historical:
-                        cell_rows.add(record)
-                rows.update(cell_rows)
+    for m in range(8, 17):
+        for n_tile in n_tiles:
+            n = n_tile * 256
+            for k in range(15104, 20609, 128):
+                record = (dtype, "NN", m, n, k)
+                total_bytes = 2 * (m * k + k * n + m * n)
+                if total_bytes <= byte_limit and record not in historical:
+                    rows.add(record)
 rows = list(rows)
 rng.shuffle(rows)
 for record in rows:

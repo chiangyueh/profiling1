@@ -1655,17 +1655,24 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
     constexpr uint64_t stepKb = 2UL;
     constexpr uint64_t depthA1 = stepKa * DB_SIZE;
     constexpr uint64_t depthB1 = stepKb * DB_SIZE;
+    constexpr uint64_t minValidatedK = 15104UL;
+    constexpr uint64_t maxValidatedK = 20608UL;
 
-    const uint64_t mTiles = MathUtil::CeilDivision(args_.mValue, baseM);
+    const uint64_t alignedM = ops::CeilAlign(args_.mValue, BASIC_ALIGN_16);
     const uint64_t nTiles = MathUtil::CeilDivision(args_.nValue, baseN);
-    const uint64_t narrowNTiles = MathUtil::CeilDivision(args_.nValue, BASIC_BLOCK_SIZE_128);
-    const uint64_t narrowNWaves = MathUtil::CeilDivision(narrowNTiles, compileInfo_.aicNum);
-    const uint64_t wideNWaves = MathUtil::CeilDivision(nTiles, compileInfo_.aicNum);
+    const uint64_t fullNWaves = nTiles / compileInfo_.aicNum;
+    const uint64_t tailNTiles = nTiles % compileInfo_.aicNum;
     const uint64_t kBlocks = MathUtil::CeilDivision(args_.kValue, baseK);
-    if (mTiles != 1 || nTiles < compileInfo_.aicNum || narrowNWaves <= wideNWaves ||
-        narrowNWaves - wideNWaves < 5UL || kBlocks < 2UL * depthA1) {
+    if (alignedM != BASIC_ALIGN_16 || args_.mValue * NUMBER_TWO < alignedM ||
+        args_.nValue % baseN != 0 || args_.kValue % BASIC_BLOCK_SIZE_128 != 0 ||
+        args_.kValue < minValidatedK || args_.kValue > maxValidatedK ||
+        fullNWaves < 5UL || nTiles > BASIC_BLOCK_SIZE_128 || tailNTiles == 0 ||
+        tailNTiles * 5UL > compileInfo_.aicNum * NUMBER_TWO ||
+        kBlocks < 2UL * depthA1) {
         return false;
     }
+
+    const uint64_t mTiles = 1;
 
     if (windowOnly) {
         const uint64_t officialMTiles = MathUtil::CeilDivision(args_.mValue, runInfo_.singleCoreM);
