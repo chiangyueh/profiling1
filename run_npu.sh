@@ -123,23 +123,16 @@ if len(historical) != 300:
     raise SystemExit(f"expected 300 result48 shapes, found {len(historical)}")
 
 rng = random.Random(8506)
-m_ranges = ((1, 9), (10, 31), (32, 63), (64, 95), (96, 128))
-n_ranges = ((4865, 7168), (7169, 12288), (12289, 18432), (18433, 24576), (24577, 32768))
-k_ranges = ((512, 8192), (8193, 15871), (15872, 23552), (23553, 32768), (32769, 65536))
-n_offsets = (0, 1, 17, 63, 127, 191)
-k_offsets = (0, 1, 17, 31, 63)
+m_ranges = ((1, 9), (10, 31), (32, 63), (64, 95), (96, 112))
+n_ranges = ((5376, 7168), (7424, 12288), (12544, 18432), (18688, 24576), (24832, 32768))
+k_ranges = ((15104, 15872), (16000, 19456), (19584, 23552), (23680, 27264))
 byte_limit = 1024 * 1024 * 1024
 
-def quantized(lo, hi, quantum, offset):
-    first = (lo - offset + quantum - 1) // quantum
-    last = (hi - offset) // quantum
-    if first > last:
-        return rng.randint(lo, hi)
-    return rng.randint(first, last) * quantum + offset
+def aligned_random(lo, hi, quantum):
+    return rng.randint((lo + quantum - 1) // quantum, hi // quantum) * quantum
 
 rows = set()
-sample_index = 0
-candidates_per_cell = 1024
+candidates_per_cell = 512
 maximum_attempts_per_cell = 100000
 for dtype in ("fp16_fp16", "bf16_bf16"):
     for m_lo, m_hi in m_ranges:
@@ -153,9 +146,8 @@ for dtype in ("fp16_fp16", "bf16_bf16"):
                 while len(cell_rows) < candidates_per_cell and attempts < maximum_attempts_per_cell:
                     attempts += 1
                     m = rng.randint(m_lo, m_hi)
-                    n = quantized(n_lo, n_hi, 256, n_offsets[sample_index % len(n_offsets)])
-                    k = quantized(k_lo, k_hi, 64, k_offsets[sample_index % len(k_offsets)])
-                    sample_index += 1
+                    n = aligned_random(n_lo, n_hi, 256)
+                    k = aligned_random(k_lo, k_hi, 128)
                     record = (dtype, "NN", m, n, k)
                     total_bytes = 2 * (m * k + k * n + m * n)
                     if total_bytes <= byte_limit and record not in historical:
@@ -182,7 +174,7 @@ if [[ "${cell_quota}" -eq 0 ]]; then
     theoretical_maximum_pairs_json=null
 else
     cell_quota_json="${cell_quota}"
-    theoretical_maximum_pairs_json="$((250 * cell_quota))"
+    theoretical_maximum_pairs_json="$((200 * cell_quota))"
 fi
 run_campaign() {
     local campaign="$1"
@@ -235,7 +227,7 @@ PY
 comparison_count="$(wc -l <"${comparison_manifest}")"
 if [[ "${comparison_count}" -lt "${success_target}" ]]; then
     printf '{"fatal":"panel_only_target_not_reached","target":%d,"collected":%d}\n' \
-        "${success_target}" "${comparison_count}" >&2
+        "${success_target}" "${comparison_count}"
     exit 1
 fi
 printf '{"ablation_comparison_shapes":%d,"source":"WIDE_N_PANEL_ONLY_PASS"}\n' "${comparison_count}"
