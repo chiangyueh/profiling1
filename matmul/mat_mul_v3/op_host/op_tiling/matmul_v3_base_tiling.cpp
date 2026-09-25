@@ -1405,6 +1405,9 @@ void MatmulV3BaseTiling::DoSelectTiling()
         case TilingCalcSelect::BASE:
             DO_CACL_TILING_ENABLE(DoL2CacheTiling())
             DO_CACL_TILING_ENABLE(DoL2CacheTiling310P())
+            // NEW BEGIN
+            DO_CACL_TILING_ENABLE(DoExperimentalBaseTiling())
+            // NEW END
             break;
         case TilingCalcSelect::SINGLE_CORE_SPLIT_K:
             DO_CACL_TILING_ENABLE(DoSingleCoreSplitKTiling())
@@ -1631,6 +1634,14 @@ bool MatmulV3BaseTiling::DoReuseDirectedTiling()
 bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
 {
     (void)::unsetenv("MATMUL_BASE_EXPERIMENT_VARIANT");
+    (void)::unsetenv("MATMUL_ANALYTIC_SCORE_N128");
+    (void)::unsetenv("MATMUL_ANALYTIC_SCORE_N256");
+    (void)::unsetenv("MATMUL_ANALYTIC_SCORE_N512");
+    (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_TASKS");
+    (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_WAVES");
+    (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_K_ITERATIONS");
+    (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_N_TAIL_WASTE");
+    (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_ACTIVE_CORES");
     const char *mode = std::getenv("MATMUL_BASE_MODE");
     const bool analyticSelector = mode != nullptr && std::strcmp(mode, "WIDE_N_ANALYTIC_SELECTOR") == 0;
     const bool panelOnly = mode != nullptr && std::strcmp(mode, "WIDE_N_PANEL_ONLY") == 0;
@@ -1643,7 +1654,7 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
         args_.isATrans || args_.isBTrans ||
         args_.aFormat != ge::FORMAT_ND || args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
         args_.nd2nzA || args_.nd2nzB || args_.isNzA || args_.isNzB ||
-        args_.mValue == 0 || args_.mValue > BASIC_BLOCK_SIZE_128 ||
+        args_.mValue == 0 ||
         args_.kValue < 512UL ||
         aDtypeSize_ != DATA_SIZE_FP16 || bDtypeSize_ != DATA_SIZE_FP16) {
         return false;
@@ -1654,28 +1665,29 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
             uint64_t maxBaseM;
             uint64_t baseN;
             uint64_t baseKBytes;
-            uint64_t baseM;
-            uint64_t baseK;
-            uint64_t mTasks;
-            uint64_t nTasks;
-            uint64_t tasks;
-            uint64_t waves;
-            uint64_t paddedK;
-            uint64_t criticalN;
-            long double score;
             const char *name;
+            uint64_t baseM = 0;
+            uint64_t baseK = 0;
+            uint64_t mTasks = 0;
+            uint64_t nTasks = 0;
+            uint64_t tasks = 0;
+            uint64_t waves = 0;
+            uint64_t kIterations = 0;
+            uint64_t paddedK = 0;
+            uint64_t paddedN = 0;
+            uint64_t tailWasteN = 0;
+            uint64_t criticalN = 0;
+            long double score = 0.0L;
         };
         AnalyticCandidate candidates[] = {
-            {BASIC_BLOCK_SIZE_128, BASIC_BLOCK_SIZE_128, 256UL, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-             "ANALYTIC_N128_K128"},
-            {BASIC_BLOCK_SIZE_128, BASIC_BLOCK_SIZE_256, 128UL, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-             "ANALYTIC_N256_K64"},
-            {BASIC_BLOCK_SIZE_64, 512UL, 64UL, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-             "ANALYTIC_N512_K32"},
+            {BASIC_BLOCK_SIZE_128, BASIC_BLOCK_SIZE_128, 256UL, "ANALYTIC_N128_K128"},
+            {BASIC_BLOCK_SIZE_128, BASIC_BLOCK_SIZE_256, 128UL, "ANALYTIC_N256_K64"},
+            {BASIC_BLOCK_SIZE_64, 512UL, 64UL, "ANALYTIC_N512_K32"},
         };
         constexpr long double aTransferStages = 2.0L;
         constexpr long double taskIssueCost = static_cast<long double>(BASIC_BLOCK_SIZE_64);
-        constexpr long double kPipelineRefillCost = 5.0L * BASIC_BLOCK_SIZE_128;
+        constexpr long double kLoopStartupCost = 5.0L * BASIC_BLOCK_SIZE_128 * BASIC_BLOCK_SIZE_128;
+        constexpr long double nTailPaddingCost = 0.5L;
         constexpr long double waveSynchronizationCost = static_cast<long double>(BASIC_BLOCK_SIZE_256);
         size_t selectedIndex = 0;
         for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); ++index) {
@@ -1687,7 +1699,10 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
             candidate.mTasks = MathUtil::CeilDivision(args_.mValue, candidate.baseM);
             candidate.tasks = candidate.mTasks * candidate.nTasks;
             candidate.waves = MathUtil::CeilDivision(candidate.tasks, compileInfo_.aicNum);
-            candidate.paddedK = MathUtil::CeilDivision(args_.kValue, candidate.baseK) * candidate.baseK;
+            candidate.kIterations = MathUtil::CeilDivision(args_.kValue, candidate.baseK);
+            candidate.paddedK = candidate.kIterations * candidate.baseK;
+            candidate.paddedN = candidate.nTasks * candidate.baseN;
+            candidate.tailWasteN = candidate.paddedN - args_.nValue;
             candidate.criticalN = candidate.waves * candidate.baseN;
             if (candidate.mTasks == 1) {
                 const uint64_t fullNTiles = args_.nValue / candidate.baseN;
@@ -1700,14 +1715,13 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
             }
             const long double averageTasks = static_cast<long double>(candidate.tasks) /
                 compileInfo_.aicNum;
-            const long double kPipelinePressure = static_cast<long double>(candidate.waves) *
-                BASIC_BLOCK_SIZE_128 / candidate.baseK;
-            const long double normalizedCriticalPath = candidate.criticalN +
+            const long double normalizedDataPath = candidate.criticalN +
                 aTransferStages * candidate.waves * candidate.baseM +
                 taskIssueCost * averageTasks +
-                kPipelineRefillCost * kPipelinePressure +
+                nTailPaddingCost * candidate.tailWasteN +
                 waveSynchronizationCost * candidate.waves;
-            candidate.score = candidate.paddedK * normalizedCriticalPath;
+            candidate.score = candidate.paddedK * normalizedDataPath +
+                kLoopStartupCost * candidate.waves * candidate.kIterations;
             if (candidate.score < candidates[selectedIndex].score) {
                 selectedIndex = index;
             }
@@ -1722,6 +1736,7 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
             return false;
         }
 
+        runInfo_ = MatmulV3RunInfo{};
         runInfo_.baseM = selected.baseM;
         runInfo_.baseN = selected.baseN;
         runInfo_.baseK = selected.baseK;
@@ -1730,24 +1745,18 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
         runInfo_.stepN = 1;
         CalL1Tiling();
 
-        const uint64_t l1ABytes = runInfo_.depthA1 * runInfo_.baseM * runInfo_.baseK * aDtypeSize_;
-        const uint64_t l1BBytes = runInfo_.depthB1 * runInfo_.baseN * runInfo_.baseK * bDtypeSize_;
-        if (l1ABytes + l1BBytes > compileInfo_.l1Size + 256UL) {
-            return false;
-        }
-
         const uint64_t aPanelBytes = runInfo_.baseM *
             ops::CeilAlign(args_.kValue * aDtypeSize_, CACHELINE);
         const uint64_t bPanelBytes = args_.kValue *
             ops::CeilAlign(runInfo_.baseN * bDtypeSize_, CACHELINE);
         const uint64_t cTileBytes = runInfo_.baseM * runInfo_.baseN * cDtypeSize_;
-        if (aPanelBytes >= compileInfo_.l2Size ||
-            bPanelBytes + cTileBytes > compileInfo_.l2Size - aPanelBytes) {
-            return false;
+        uint64_t nWindowBlock = 1;
+        if (aPanelBytes < compileInfo_.l2Size &&
+            bPanelBytes + cTileBytes <= compileInfo_.l2Size - aPanelBytes) {
+            const uint64_t maxNWindow = (compileInfo_.l2Size - aPanelBytes) /
+                (bPanelBytes + cTileBytes);
+            nWindowBlock = std::max(1UL, std::min({5UL, selected.nTasks, maxNWindow}));
         }
-        const uint64_t maxNWindow = (compileInfo_.l2Size - aPanelBytes) /
-            (bPanelBytes + cTileBytes);
-        const uint64_t nWindowBlock = std::max(1UL, std::min({5UL, selected.nTasks, maxNWindow}));
 
         runInfo_.usedCoreNum = std::min(compileInfo_.aicNum, selected.mTasks * selected.nTasks);
         runInfo_.iterateOrder = ITER_COL_FIRST;
@@ -1770,6 +1779,16 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
         exportScore("MATMUL_ANALYTIC_SCORE_N128", candidates[0].score);
         exportScore("MATMUL_ANALYTIC_SCORE_N256", candidates[1].score);
         exportScore("MATMUL_ANALYTIC_SCORE_N512", candidates[2].score);
+        auto exportUnsigned = [](const char *name, uint64_t value) {
+            char text[32] = {};
+            (void)snprintf(text, sizeof(text), "%lu", static_cast<unsigned long>(value));
+            (void)::setenv(name, text, 1);
+        };
+        exportUnsigned("MATMUL_ANALYTIC_SELECTED_TASKS", selected.tasks);
+        exportUnsigned("MATMUL_ANALYTIC_SELECTED_WAVES", selected.waves);
+        exportUnsigned("MATMUL_ANALYTIC_SELECTED_K_ITERATIONS", selected.kIterations);
+        exportUnsigned("MATMUL_ANALYTIC_SELECTED_N_TAIL_WASTE", selected.tailWasteN);
+        exportUnsigned("MATMUL_ANALYTIC_SELECTED_ACTIVE_CORES", runInfo_.usedCoreNum);
         (void)::setenv("MATMUL_BASE_EXPERIMENT_VARIANT", selected.name, 1);
         (void)::setenv("MATMUL_BASE_EXPERIMENT_SELECTED", "1", 1);
         return true;

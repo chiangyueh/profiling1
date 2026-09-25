@@ -99,9 +99,9 @@ uint64_t ReadEnvUnsigned(const char *name)
 
 void CountPassCoverage(RunCounts &counts, int64_t m, int64_t n, int64_t k)
 {
-    const size_t mBucket = m <= 9 ? 0 : (m <= 31 ? 1 : (m <= 63 ? 2 : (m <= 95 ? 3 : 4)));
+    const size_t mBucket = m <= 16 ? 0 : (m <= 64 ? 1 : (m <= 256 ? 2 : (m <= 1024 ? 3 : 4)));
     const size_t nBucket = n <= 512 ? 0 : (n <= 2048 ? 1 : (n <= 8192 ? 2 : (n <= 24576 ? 3 : 4)));
-    const size_t kBucket = k <= 2048 ? 0 : (k <= 8192 ? 1 : (k <= 24576 ? 2 : 3));
+    const size_t kBucket = k <= 8192 ? 0 : (k <= 16384 ? 1 : (k <= 24576 ? 2 : 3));
     ++counts.mCoverage[mBucket];
     ++counts.nCoverage[nBucket];
     ++counts.kCoverage[kBucket];
@@ -110,9 +110,9 @@ void CountPassCoverage(RunCounts &counts, int64_t m, int64_t n, int64_t k)
 size_t JointCoverageBucket(const DTypeSpec &dtype, int64_t m, int64_t n, int64_t k)
 {
     const size_t dtypeBucket = std::strcmp(dtype.inputName, "bf16") == 0 ? 1 : 0;
-    const size_t mBucket = m <= 9 ? 0 : (m <= 31 ? 1 : (m <= 63 ? 2 : (m <= 95 ? 3 : 4)));
+    const size_t mBucket = m <= 16 ? 0 : (m <= 64 ? 1 : (m <= 256 ? 2 : (m <= 1024 ? 3 : 4)));
     const size_t nBucket = n <= 512 ? 0 : (n <= 2048 ? 1 : (n <= 8192 ? 2 : (n <= 24576 ? 3 : 4)));
-    const size_t kBucket = k <= 2048 ? 0 : (k <= 8192 ? 1 : (k <= 24576 ? 2 : 3));
+    const size_t kBucket = k <= 8192 ? 0 : (k <= 16384 ? 1 : (k <= 24576 ? 2 : 3));
     return (((dtypeBucket * 5 + mBucket) * 5 + nBucket) * 4 + kBucket);
 }
 
@@ -745,10 +745,17 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     std::printf(",\"official_core\":%u,\"candidate_core\":%u", official.cores, adaptive.cores);
     if (std::strcmp(CampaignName(), "WIDE_N_ANALYTIC_SELECTOR") == 0) {
         std::printf(",\"analytic_score_n128\":%lu,\"analytic_score_n256\":%lu,"
-                    "\"analytic_score_n512\":%lu",
+                    "\"analytic_score_n512\":%lu,\"analytic_tasks\":%lu,"
+                    "\"analytic_waves\":%lu,\"analytic_k_iterations\":%lu,"
+                    "\"analytic_n_tail_waste\":%lu,\"analytic_active_cores\":%lu",
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SCORE_N128")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SCORE_N256")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SCORE_N512")));
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SCORE_N512")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SELECTED_TASKS")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SELECTED_WAVES")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SELECTED_K_ITERATIONS")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SELECTED_N_TAIL_WASTE")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SELECTED_ACTIVE_CORES")));
     }
     if (adaptiveCampaign) {
         std::printf(",\"old_partial_bytes\":%lu,\"new_partial_bytes\":%lu,"
@@ -938,9 +945,9 @@ int main(int argc, char **argv)
                 static_cast<unsigned long>(startIndex),
                 static_cast<unsigned long>(manifestIndex));
     std::printf("{\"measured_coverage\":true,"
-                "\"m\":{\"1_9\":%lu,\"10_31\":%lu,\"32_63\":%lu,\"64_95\":%lu,\"96_128\":%lu},"
+                "\"m\":{\"1_16\":%lu,\"17_64\":%lu,\"65_256\":%lu,\"257_1024\":%lu,\"1025_4096\":%lu},"
                 "\"n\":{\"16_512\":%lu,\"513_2048\":%lu,\"2049_8192\":%lu,\"8193_24576\":%lu,\"24577_65536\":%lu},"
-                "\"k\":{\"512_2048\":%lu,\"2049_8192\":%lu,\"8193_24576\":%lu,\"24577_65536\":%lu}}\n",
+                "\"k\":{\"512_8192\":%lu,\"8193_16384\":%lu,\"16385_24576\":%lu,\"24577_65536\":%lu}}\n",
                 static_cast<unsigned long>(counts.mCoverage[0]),
                 static_cast<unsigned long>(counts.mCoverage[1]),
                 static_cast<unsigned long>(counts.mCoverage[2]),
@@ -987,9 +994,9 @@ int main(int argc, char **argv)
                     static_cast<unsigned long>(inputCells * cellQuota),
                     static_cast<unsigned long>(counts.jointQuotaSkipped));
         const char *dtypeNames[] = {"fp16", "bf16"};
-        const char *mNames[] = {"1_9", "10_31", "32_63", "64_95", "96_128"};
+        const char *mNames[] = {"1_16", "17_64", "65_256", "257_1024", "1025_4096"};
         const char *nNames[] = {"16_512", "513_2048", "2049_8192", "8193_24576", "24577_65536"};
-        const char *kNames[] = {"512_2048", "2049_8192", "8193_24576", "24577_65536"};
+        const char *kNames[] = {"512_8192", "8193_16384", "16385_24576", "24577_65536"};
         bool first = true;
         std::printf("{\"joint_unmet_cells\":[");
         for (size_t index = 0; index < 200; ++index) {
