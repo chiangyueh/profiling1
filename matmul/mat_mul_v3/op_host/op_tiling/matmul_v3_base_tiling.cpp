@@ -1776,7 +1776,7 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
             }
         } else {
             l2Dimensions = 2;
-            const uint64_t l2Budget = compileInfo_.l2Size * 7UL / 10UL;
+            const uint64_t l2Budget = compileInfo_.l2Size;
             const long double panelRatio = static_cast<long double>(bPanelBytes) /
                 static_cast<long double>(aPanelBytes);
             const long double quadratic = panelRatio * cTileBytes;
