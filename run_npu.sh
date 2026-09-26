@@ -8,7 +8,9 @@ export ASCEND_GLOBAL_LOG_LEVEL=3
 export ASCEND_SLOG_PRINT_TO_STDOUT=0
 unset ASCEND_CUSTOM_OPP_PATH
 unset MATMUL_BASE_MODE MATMUL_BASE_EXPERIMENT_SELECTED MATMUL_SPLITK_MODE
-unset MATMUL_ANALYTIC_SCORE_N128 MATMUL_ANALYTIC_SCORE_N256 MATMUL_ANALYTIC_SCORE_N512
+unset MATMUL_STRUCTURAL_CANDIDATES MATMUL_STRUCTURAL_REFERENCE_BASE_N
+unset MATMUL_STRUCTURAL_REFERENCE_BASE_K MATMUL_STRUCTURAL_TOTAL_K_LOOPS
+unset MATMUL_STRUCTURAL_L2_MAX_N_BLOCK
 unset MATMUL_ANALYTIC_SELECTED_TASKS MATMUL_ANALYTIC_SELECTED_WAVES
 unset MATMUL_ANALYTIC_SELECTED_K_ITERATIONS MATMUL_ANALYTIC_SELECTED_N_TAIL_WASTE
 unset MATMUL_ANALYTIC_SELECTED_ACTIVE_CORES
@@ -122,27 +124,28 @@ def stepped(first, last, step, offsets=(0,)):
                    for offset in offsets if first <= base + offset <= last})
 
 m_groups = (
-    list(range(129, 257)),
-    list(range(257, 513)),
-    stepped(513, 1024, 4, (0, 1, 3)),
-    stepped(1025, 2048, 8, (0, 1, 7)),
-    stepped(2049, 4096, 16, (0, 1, 15)),
+    list(range(1, 17)),
+    list(range(17, 33)),
+    list(range(33, 65)),
+    list(range(65, 97)),
+    list(range(97, 129)),
 )
 n_groups = (
-    stepped(16, 512, 16, (0, 1, 15)),
-    stepped(513, 2048, 64, (0, 1, 63)),
-    stepped(2049, 8192, 128, (0, 1, 127)),
-    stepped(8193, 24576, 128, (0, 1, 127)),
-    stepped(24577, 65536, 256, (0, 1, 255)),
+    stepped(512, 4096, 128, (0, 1, 127)),
+    stepped(4097, 8192, 128, (0, 1, 127)),
+    stepped(8193, 16384, 128, (0, 1, 127)),
+    stepped(16385, 32768, 128, (0, 1, 127)),
+    stepped(32769, 65536, 256, (0, 1, 255)),
 )
 k_groups = (
-    sorted(set(stepped(512, 8192, 128, (0, 1))) | {8192}),
+    sorted(set(stepped(512, 4096, 128, (0, 1))) | {4096}),
+    sorted(set(stepped(4097, 8192, 128, (0, 1))) | {8192}),
     sorted(set(stepped(8193, 16384, 128, (0, 1))) | {16384}),
-    sorted(set(stepped(16385, 24576, 128, (0, 1))) | {24576}),
-    sorted(set(stepped(24577, 65536, 256, (0, 1))) | {65536}),
+    sorted(set(stepped(16385, 32768, 128, (0, 1))) | {32768}),
+    sorted(set(stepped(32769, 65536, 256, (0, 1))) | {65536}),
 )
 byte_limit = 1024 * 1024 * 1024
-per_cell_limit = 20000
+per_cell_limit = 1600
 
 def cell_records(dtype, dtype_index, m_index, n_index, k_index):
     ms = m_groups[m_index]
@@ -193,7 +196,7 @@ while active:
 PY
 
 adaptive_count="$(wc -l <"${workload_manifest}")"
-printf '# stage=workload_generation status=passed coverage=200_interleaved_multi_m_tile_dtype_m_n_k_cells candidates=%d\n' "${adaptive_count}"
+printf '# stage=workload_generation status=passed coverage=250_interleaved_single_m_tile_dtype_m_n_k_cells candidates=%d\n' "${adaptive_count}"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1

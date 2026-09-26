@@ -744,8 +744,9 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     PrintTiling("candidate_tiling", adaptive);
     std::printf(",\"official_core\":%u,\"candidate_core\":%u", official.cores, adaptive.cores);
     if (std::strcmp(CampaignName(), "WIDE_N_ANALYTIC_SELECTOR") == 0) {
-        std::printf(",\"analytic_score_n128\":%lu,\"analytic_score_n256\":%lu,"
-                    "\"analytic_score_n512\":%lu,\"analytic_tasks\":%lu,"
+        std::printf(",\"structural_candidates\":%lu,\"structural_reference_base_n\":%lu,"
+                    "\"structural_reference_base_k\":%lu,\"structural_total_k_loops\":%lu,"
+                    "\"structural_l2_max_n_block\":%lu,\"analytic_tasks\":%lu,"
                     "\"analytic_waves\":%lu,\"analytic_k_iterations\":%lu,"
                     "\"analytic_n_tail_waste\":%lu,\"analytic_active_cores\":%lu,"
                     "\"analytic_m_tasks\":%lu,\"analytic_n_tasks\":%lu,"
@@ -753,9 +754,11 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
                     "\"analytic_l2_n_block\":%lu,\"analytic_l2_m_windows\":%lu,"
                     "\"analytic_l2_n_windows\":%lu,\"analytic_l2_window_bytes\":%lu,"
                     "\"analytic_l2_estimated_traffic\":%lu",
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SCORE_N128")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SCORE_N256")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SCORE_N512")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_STRUCTURAL_CANDIDATES")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_STRUCTURAL_REFERENCE_BASE_N")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_STRUCTURAL_REFERENCE_BASE_K")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_STRUCTURAL_TOTAL_K_LOOPS")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_STRUCTURAL_L2_MAX_N_BLOCK")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SELECTED_TASKS")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SELECTED_WAVES")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SELECTED_K_ITERATIONS")),

@@ -18,7 +18,8 @@ FIELDS = [
 FIELDS += [f"official_{name}" for name in TILING_FIELDS]
 FIELDS += [f"candidate_{name}" for name in TILING_FIELDS]
 FIELDS += [
-    "analytic_score_n128", "analytic_score_n256", "analytic_score_n512", "analytic_tasks",
+    "structural_candidates", "structural_reference_base_n", "structural_reference_base_k",
+    "structural_total_k_loops", "structural_l2_max_n_block", "analytic_tasks",
     "analytic_waves", "analytic_k_iterations", "analytic_n_tail_waste", "analytic_active_cores",
     "analytic_m_tasks", "analytic_n_tasks", "analytic_l2_dimensions", "analytic_l2_m_block",
     "analytic_l2_n_block", "analytic_l2_m_windows", "analytic_l2_n_windows",
