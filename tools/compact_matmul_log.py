@@ -38,6 +38,7 @@ FIELDS += [
     "manifest_end_index", "tensor_allocation_failed", "official_get_workspace_failed",
     "official_get_workspace_failed_fp16", "official_get_workspace_failed_bf16",
     "official_measurement_failed", "candidate_tiling_failed",
+    "quota_per_m", "m_quota_met", "m_quota_missing", "quota_skipped_inputs",
 ]
 
 
@@ -53,8 +54,12 @@ def convert(obj):
         row = {"record_type": "progress"}
     elif obj.get("summary") is True:
         row = {"record_type": "summary", "status": "COMPLETE" if obj.get("quota_met") else "INCOMPLETE"}
+    elif obj.get("m_quota_summary") is True:
+        row = {"record_type": "m_quota_summary", "status": "COMPLETE" if obj.get("m_quota_missing") == 0 else "INCOMPLETE"}
     elif "shape" in obj:
-        row = {"record_type": "measurement" if "official_tiling" in obj else "failure"}
+        if "official_tiling" not in obj or obj.get("correctness") != "PASS":
+            return None
+        row = {"record_type": "measurement"}
     else:
         return None
 

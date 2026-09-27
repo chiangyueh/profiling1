@@ -95,6 +95,8 @@ struct RunCounts {
     uint64_t jointOfficial[200] = {};
     uint64_t jointPassed[200] = {};
     uint64_t jointQuotaSkipped = 0;
+    std::vector<uint32_t> passedPerM = std::vector<uint32_t>(4097, 0);
+    uint64_t mQuotaSkipped = 0;
 };
 
 uint64_t ReadEnvUnsigned(const char *name)
@@ -860,6 +862,7 @@ int main(int argc, char **argv)
     if (!IsBaseCampaign() && !IsAdaptiveCampaign()) return 4;
     const uint64_t targetPasses = ReadEnvUnsigned("MATMUL_TARGET_PASSES");
     const uint64_t cellQuota = ReadEnvUnsigned("MATMUL_CELL_QUOTA");
+    const uint64_t mQuota = ReadEnvUnsigned("MATMUL_M_QUOTA");
     std::printf("{\"campaign_start\":\"%s\",\"target_passes\":%lu,"
                 "\"joint_cell_quota\":%lu,\"runner\":\"analytic_critical_path_v3\"}\n",
                 CampaignName(), static_cast<unsigned long>(targetPasses), static_cast<unsigned long>(cellQuota));
@@ -890,6 +893,11 @@ int main(int argc, char **argv)
         const DTypeSpec *dtype = FindDType(dtypeName);
         const LayoutSpec *layout = FindLayout(layoutName);
         if (dtype == nullptr || layout == nullptr) return;
+        if (mQuota != 0 && m > 0 && static_cast<size_t>(m) < counts.passedPerM.size() &&
+            counts.passedPerM[static_cast<size_t>(m)] >= mQuota) {
+            ++counts.mQuotaSkipped;
+            return;
+        }
         const size_t jointBucket = JointCoverageBucket(*dtype, m, n, k);
         ++counts.jointInputs[jointBucket];
         if (cellQuota != 0 && counts.jointPassed[jointBucket] >= cellQuota) {
@@ -900,7 +908,12 @@ int main(int argc, char **argv)
         const uint64_t passedBefore = counts.passed;
         (void)RunWorkload(*dtype, *layout, m, n, k, stream, edgeFunction, counts, manifestIndex);
         if (counts.deterministic > officialBefore) ++counts.jointOfficial[jointBucket];
-        if (counts.passed > passedBefore) ++counts.jointPassed[jointBucket];
+        if (counts.passed > passedBefore) {
+            ++counts.jointPassed[jointBucket];
+            if (m > 0 && static_cast<size_t>(m) < counts.passedPerM.size()) {
+                ++counts.passedPerM[static_cast<size_t>(m)];
+            }
+        }
         if (counts.inputs != 0 && counts.inputs % 10000 == 0) {
             std::printf("{\"progress\":true,\"manifest_index\":%lu,\"inputs\":%lu,"
                         "\"passed\":%lu,\"official_failed\":%lu,\"non_target_route\":%lu}\n",
@@ -978,6 +991,22 @@ int main(int argc, char **argv)
                 static_cast<unsigned long>(counts.candidateTilingFailed),
                 static_cast<unsigned long>(startIndex),
                 static_cast<unsigned long>(manifestIndex));
+    if (mQuota != 0) {
+        uint64_t mMet = 0;
+        uint64_t mMissing = 0;
+        for (size_t m = 1; m < counts.passedPerM.size(); ++m) {
+            if (counts.passedPerM[m] >= mQuota) {
+                ++mMet;
+            } else {
+                ++mMissing;
+            }
+        }
+        std::printf("{\"m_quota_summary\":true,\"quota_per_m\":%lu,\"m_quota_met\":%lu,"
+                    "\"m_quota_missing\":%lu,\"quota_skipped_inputs\":%lu}\n",
+                    static_cast<unsigned long>(mQuota), static_cast<unsigned long>(mMet),
+                    static_cast<unsigned long>(mMissing),
+                    static_cast<unsigned long>(counts.mQuotaSkipped));
+    }
     std::printf("{\"measured_coverage\":true,"
                 "\"m\":{\"129_256\":%lu,\"257_512\":%lu,\"513_1024\":%lu,\"1025_2048\":%lu,\"2049_4096\":%lu},"
                 "\"n\":{\"16_512\":%lu,\"513_2048\":%lu,\"2049_8192\":%lu,\"8193_24576\":%lu,\"24577_65536\":%lu},"
@@ -1055,6 +1084,16 @@ int main(int argc, char **argv)
     (void)aclrtDestroyStream(stream);
     (void)aclrtResetDevice(0);
     (void)aclFinalize();
-    return counts.deterministic == 0 || (targetPasses != 0 && counts.passed < targetPasses) ? 4 : 0;
+    bool mQuotaComplete = true;
+    if (mQuota != 0) {
+        for (size_t m = 1; m < counts.passedPerM.size(); ++m) {
+            if (counts.passedPerM[m] < mQuota) {
+                mQuotaComplete = false;
+                break;
+            }
+        }
+    }
+    return counts.deterministic == 0 || (targetPasses != 0 && counts.passed < targetPasses) ||
+        !mQuotaComplete ? 4 : 0;
 }
 // NEW END

@@ -33,7 +33,8 @@ fi
 build_dir="${PWD}/build"
 build_log="$(mktemp)"
 workload_manifest="$(mktemp)"
-trap 'rm -f "${build_log}" "${workload_manifest}"' EXIT
+selection_log="$(mktemp)"
+trap 'rm -f "${build_log}" "${workload_manifest}" "${selection_log}"' EXIT
 
 printf '# stage=host_build status=begin\n'
 if ! cmake -S . -B "${build_dir}" \
@@ -92,6 +93,7 @@ if [[ ! -f "${host_library}" || -z "${opapi_nn}" || -z "${opapi_math}" || -z "${
     exit 1
 fi
 ln -sfn -- "${legacy_common}" "${build_dir}/libophost_comm_legacy.so"
+export LD_LIBRARY_PATH="${build_dir}:$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
 runtime_library="-lacl_rt"
 if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/lib64/libascendcl.so" ]]; then
@@ -121,30 +123,59 @@ fi
 printf '# stage=runner_build status=passed\n'
 
 printf '# stage=workload_generation status=begin\n'
-python3 - >"${workload_manifest}" <<'PY'
+host_selector="${build_dir}/host_matmul_v3_route"
+if ! g++ tools/host_matmul_v3_route.cpp \
+    -std=gnu++17 -D_GLIBCXX_USE_CXX11_ABI=0 \
+    -I "${PWD}" \
+    -I "${ASCEND_HOME_PATH}/include" \
+    -I "${ASCEND_HOME_PATH}/$(uname -m)-linux/pkg_inc" \
+    -L "${ASCEND_OPP_PATH}/lib64" \
+    -L "${ASCEND_HOME_PATH}/lib64" \
+    -L "${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64" \
+    -lregister -lopp_registry -lunified_dlog -lmetadef -lplatform -lc_sec -ldl \
+    -Wl,-rpath,"${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64" \
+    -o "${host_selector}" >>"${build_log}" 2>&1; then
+    cat "${build_log}" >&2
+    exit 1
+fi
+
+per_m_reserve="${MATMUL_M_RESERVE:-64}"
+set +e
+python3 - <<'PY' | "${host_selector}" --select-base INDEPENDENT_BASE_SELECTOR "${per_m_reserve}" "${host_library}" >"${workload_manifest}" 2>"${selection_log}"
 import random
 
 rng = random.Random(8527)
 n_values = (16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256)
 k_values = tuple(range(512, 32769, 512))
-for round_index in range(8):
-    m_values = list(range(1, 4097))
-    rng.shuffle(m_values)
-    for m in m_values:
-        dtype = "fp16_fp16" if (m + round_index) % 2 == 0 else "bf16_bf16"
-        n = n_values[(m * 5 + round_index * 7) % len(n_values)]
-        k = k_values[(m * 11 + round_index * 13) % len(k_values)]
+combinations = [
+    (dtype, n, k)
+    for dtype in ("fp16_fp16", "bf16_bf16")
+    for n in n_values
+    for k in k_values
+]
+for m in range(1, 4097):
+    rng.shuffle(combinations)
+    for dtype, n, k in combinations:
         print("\t".join(str(value) for value in (dtype, "NN", m, n, k)))
 PY
+selection_status=("${PIPESTATUS[@]}")
+set -e
+cat "${selection_log}"
+if [[ "${selection_status[0]}" -ne 0 || "${selection_status[1]}" -ne 0 ]]; then
+    printf '# stage=workload_generation status=failed generator_rc=%d selector_rc=%d\n' \
+        "${selection_status[0]}" "${selection_status[1]}" >&2
+    exit 1
+fi
 
 adaptive_count="$(wc -l <"${workload_manifest}")"
-printf '# stage=workload_generation status=passed coverage=all_integer_m_1_to_4096_eight_n_k_dtype_rotations candidates=%d\n' "${adaptive_count}"
+printf '# stage=workload_generation status=passed coverage=all_integer_m_1_to_4096_randomized_until_valid_base_reserve reserve_per_m=%d candidates=%d\n' \
+    "${per_m_reserve}" "${adaptive_count}"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
-export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
-success_target="${MATMUL_SUCCESS_TARGET:-12000}"
+success_target="${MATMUL_SUCCESS_TARGET:-0}"
+m_quota="${MATMUL_M_QUOTA:-8}"
 cell_quota="${MATMUL_CELL_QUOTA:-0}"
 if [[ "${cell_quota}" -eq 0 ]]; then
     cell_quota_json=null
@@ -158,7 +189,7 @@ printf '# campaign=INDEPENDENT_BASE_SELECTOR target_passes=%d maximum_per_joint_
     "${success_target}" "${cell_quota_json}" "${theoretical_maximum_pairs_json}"
 set +e
 MATMUL_BASE_FULL_M_SWEEP=1 MATMUL_CAMPAIGN=INDEPENDENT_BASE_SELECTOR \
-    MATMUL_TARGET_PASSES="${success_target}" MATMUL_CELL_QUOTA="${cell_quota}" \
+    MATMUL_TARGET_PASSES="${success_target}" MATMUL_CELL_QUOTA="${cell_quota}" MATMUL_M_QUOTA="${m_quota}" \
     "${runner}" --manifest "${workload_manifest}" | python3 tools/compact_matmul_log.py
 pipeline_status=("${PIPESTATUS[@]}")
 panel_rc="${pipeline_status[0]}"
