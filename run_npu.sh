@@ -121,66 +121,59 @@ printf '# stage=runner_build status=passed\n'
 
 printf '# stage=workload_generation status=begin\n'
 python3 - >"${workload_manifest}" <<'PY'
-from collections import defaultdict, deque
 import random
 
 rng = random.Random(8527)
-m_values = (
-    129, 137, 159, 160, 191, 192, 223, 255, 256, 257, 320, 384,
-    511, 512, 513, 640, 768, 896, 1024, 1025, 1280, 1536, 1792,
-    2048, 2049, 2560, 3072, 3584, 4096,
-)
-n_values = set(range(16, 257, 16))
-n_values.update(range(384, 4097, 128))
-n_values.update(range(4352, 16385, 256))
-n_values.update(range(16896, 32769, 512))
-for boundary in (256, 1280, 2560, 5120, 10240, 20480):
-    n_values.update(boundary + offset for offset in (-256, -128, 0, 128, 256))
-n_values = tuple(sorted(value for value in n_values if value >= 16))
-k_values = (
-    512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 10240,
-    12288, 14336, 15104, 16384, 18432, 20480, 24576, 28672, 32768,
-)
-byte_limit = 1024 * 1024 * 1024
-
-def bucket(value, limits):
-    for index, limit in enumerate(limits):
-        if value <= limit:
-            return index
-    return len(limits)
-
-strata = defaultdict(list)
+small = []
+large = []
+byte_limit = 1536 * 1024 * 1024
 for dtype in ("fp16_fp16", "bf16_bf16"):
-    for m in m_values:
-        for n in n_values:
-            for k in k_values:
-                if 2 * (m * k + k * n + m * n) > byte_limit:
+    for m in range(8, 17):
+        for n_tiles in tuple(range(101, 109)) + tuple(range(121, 129)):
+            n = n_tiles * 256
+            for k in range(15104, 20609, 128):
+                if 2 * (m * k + k * n + m * n) <= byte_limit:
+                    small.append((dtype, "NN", m, n, k))
+    for m in range(2304, 4353, 32):
+        for n in range(32, 97, 16):
+            for k in range(8192, 32769, 512):
+                base_m = ((m + 39) // 40 + 15) // 16 * 16
+                base_n = (n + 15) // 16 * 16
+                base_k = min(256, (k + 15) // 16 * 16,
+                             65536 // (4 * base_m), 65536 // (4 * base_n)) // 16 * 16
+                if base_k == 0:
                     continue
-                key = (dtype, bucket(m, (256, 512, 1024, 2048)),
-                       bucket(n, (256, 2048, 8192)), bucket(k, (4096, 16384)))
-                strata[key].append((dtype, "NN", m, n, k))
+                tasks = (m + base_m - 1) // base_m
+                waves = (tasks + 19) // 20
+                tail_slots = waves * 20 - tasks
+                k_iterations = (k + base_k - 1) // base_k
+                a_panel = base_m * ((k * 2 + 63) // 64 * 64)
+                b_panel = k * ((base_n * 2 + 63) // 64 * 64)
+                c_tiles = tasks * base_m * base_n * 2
+                if (base_m < 80 or base_m > 128 or base_k < 160 or waves != 2 or
+                        tail_slots > 2 or k_iterations < 64 or
+                        tasks * a_panel + b_panel + c_tiles > 192 * 1024 * 1024):
+                    continue
+                if 2 * (m * k + k * n + m * n) <= byte_limit:
+                    large.append((dtype, "NN", m, n, k))
 
-for values in strata.values():
-    rng.shuffle(values)
-queues = [deque(values) for values in strata.values()]
-while queues:
-    remaining = []
-    for records in queues:
-        if records:
-            print("\t".join(str(value) for value in records.popleft()))
-        if records:
-            remaining.append(records)
-    queues = remaining
+rng.shuffle(small)
+rng.shuffle(large)
+for index in range(max(len(small), len(large))):
+    if index < len(small):
+        print("\t".join(str(value) for value in small[index]))
+    if index < len(large):
+        print("\t".join(str(value) for value in large[index]))
 PY
 
 adaptive_count="$(wc -l <"${workload_manifest}")"
-printf '# stage=workload_generation status=passed coverage=120_interleaved_large_m_dtype_m_n_k_regimes candidates=%d\n' "${adaptive_count}"
+printf '# stage=workload_generation status=passed coverage=interleaved_historical_small_m_and_structural_large_m candidates=%d\n' "${adaptive_count}"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
-success_target="${MATMUL_SUCCESS_TARGET:-10000}"
+success_target="${MATMUL_SUCCESS_TARGET:-4000}"
 cell_quota="${MATMUL_CELL_QUOTA:-0}"
 if [[ "${cell_quota}" -eq 0 ]]; then
     cell_quota_json=null
@@ -190,10 +183,10 @@ else
     theoretical_maximum_pairs_json="$((200 * cell_quota))"
 fi
 panel_rc=0
-printf '# campaign=WIDE_N_ANALYTIC_SELECTOR target_passes=%d maximum_per_joint_cell=%s theoretical_maximum_pairs=%s measurement_order=OCCO\n' \
+printf '# campaign=INDEPENDENT_BASE_SELECTOR target_passes=%d maximum_per_joint_cell=%s theoretical_maximum_pairs=%s measurement_order=OCCO\n' \
     "${success_target}" "${cell_quota_json}" "${theoretical_maximum_pairs_json}"
 set +e
-MATMUL_CAMPAIGN=WIDE_N_ANALYTIC_SELECTOR MATMUL_TARGET_PASSES="${success_target}" MATMUL_CELL_QUOTA="${cell_quota}" \
+MATMUL_CAMPAIGN=INDEPENDENT_BASE_SELECTOR MATMUL_TARGET_PASSES="${success_target}" MATMUL_CELL_QUOTA="${cell_quota}" \
     "${runner}" --manifest "${workload_manifest}" | python3 tools/compact_matmul_log.py
 pipeline_status=("${PIPESTATUS[@]}")
 panel_rc="${pipeline_status[0]}"

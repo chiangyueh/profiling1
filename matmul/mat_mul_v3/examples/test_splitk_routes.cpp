@@ -216,6 +216,7 @@ bool IsBaseCampaign()
         (std::strcmp(campaign, "RECTANGULAR_CUBE") == 0 ||
          std::strcmp(campaign, "REUSE_DIRECTED") == 0 ||
          std::strcmp(campaign, "CUBE_VECTOR_EDGE") == 0 ||
+         std::strcmp(campaign, "INDEPENDENT_BASE_SELECTOR") == 0 ||
          std::strcmp(campaign, "WIDE_N_ANALYTIC_SELECTOR") == 0 ||
          std::strcmp(campaign, "WIDE_N_PANEL_ONLY") == 0 ||
          std::strcmp(campaign, "WIDE_N_WINDOW_ONLY") == 0 ||
@@ -228,6 +229,9 @@ const char *CampaignName()
     const char *campaign = std::getenv("MATMUL_CAMPAIGN");
     if (campaign != nullptr && std::strcmp(campaign, "REUSE_DIRECTED") == 0) return "REUSE_DIRECTED";
     if (campaign != nullptr && std::strcmp(campaign, "CUBE_VECTOR_EDGE") == 0) return "CUBE_VECTOR_EDGE";
+    if (campaign != nullptr && std::strcmp(campaign, "INDEPENDENT_BASE_SELECTOR") == 0) {
+        return "INDEPENDENT_BASE_SELECTOR";
+    }
     if (campaign != nullptr && std::strcmp(campaign, "WIDE_N_ANALYTIC_SELECTOR") == 0) {
         return "WIDE_N_ANALYTIC_SELECTOR";
     }
@@ -743,7 +747,8 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     std::printf(",");
     PrintTiling("candidate_tiling", adaptive);
     std::printf(",\"official_core\":%u,\"candidate_core\":%u", official.cores, adaptive.cores);
-    if (std::strcmp(CampaignName(), "WIDE_N_ANALYTIC_SELECTOR") == 0) {
+    if (std::strcmp(CampaignName(), "WIDE_N_ANALYTIC_SELECTOR") == 0 ||
+        std::strcmp(CampaignName(), "INDEPENDENT_BASE_SELECTOR") == 0) {
         std::printf(",\"structural_candidates\":%lu,\"analytic_n_quantum\":%lu,"
                     "\"analytic_min_base_k\":%lu,\"analytic_max_base_m\":%lu,"
                     "\"analytic_max_base_n\":%lu,\"analytic_target_tasks\":%lu,"

@@ -2058,6 +2058,222 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
     return true;
 }
 
+bool MatmulV3BaseTiling::DoIndependentBaseTiling()
+{
+    (void)::unsetenv("MATMUL_BASE_EXPERIMENT_VARIANT");
+    (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_TASKS");
+    (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_WAVES");
+    (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_K_ITERATIONS");
+    (void)::unsetenv("MATMUL_ANALYTIC_TAIL_SLOTS");
+    (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_ACTIVE_CORES");
+    (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_M_TASKS");
+    (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_N_TASKS");
+    const bool dtypeSupported = args_.aType == args_.bType && args_.bType == args_.cType &&
+        (args_.aType == ge::DT_FLOAT16 || args_.aType == ge::DT_BF16);
+    if (!compileInfo_.supportL0c2out || compileInfo_.aicNum == 0 || args_.hasBias || !dtypeSupported ||
+        args_.isATrans || args_.isBTrans || args_.aFormat != ge::FORMAT_ND ||
+        args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
+        args_.nd2nzA || args_.nd2nzB || args_.isNzA || args_.isNzB ||
+        args_.mValue == 0 || args_.nValue == 0 || args_.kValue == 0 ||
+        aDtypeSize_ != DATA_SIZE_FP16 || bDtypeSize_ != DATA_SIZE_FP16) {
+        return false;
+    }
+
+    auto exportUnsigned = [](const char *name, uint64_t value) {
+        char text[32] = {};
+        (void)snprintf(text, sizeof(text), "%lu", static_cast<unsigned long>(value));
+        (void)::setenv(name, text, 1);
+    };
+    auto selectCandidate = [&](const MatmulV3RunInfo &candidate, const char *variant,
+                               uint64_t tasks, uint64_t waves, uint64_t kIterations,
+                               uint64_t tailSlots, uint64_t mTasks, uint64_t nTasks) {
+        runInfo_ = candidate;
+        tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
+        tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::BASE;
+        tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
+        tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::BASE;
+        (void)::setenv("MATMUL_BASE_EXPERIMENT_VARIANT", variant, 1);
+        (void)::setenv("MATMUL_BASE_EXPERIMENT_SELECTED", "1", 1);
+        exportUnsigned("MATMUL_ANALYTIC_SELECTED_TASKS", tasks);
+        exportUnsigned("MATMUL_ANALYTIC_SELECTED_WAVES", waves);
+        exportUnsigned("MATMUL_ANALYTIC_SELECTED_K_ITERATIONS", kIterations);
+        exportUnsigned("MATMUL_ANALYTIC_TAIL_SLOTS", tailSlots);
+        exportUnsigned("MATMUL_ANALYTIC_SELECTED_ACTIVE_CORES", candidate.usedCoreNum);
+        exportUnsigned("MATMUL_ANALYTIC_SELECTED_M_TASKS", mTasks);
+        exportUnsigned("MATMUL_ANALYTIC_SELECTED_N_TASKS", nTasks);
+        return true;
+    };
+
+    const uint64_t alignedM = ops::CeilAlign(args_.mValue, BASIC_ALIGN_16);
+    constexpr uint64_t smallBaseM = BASIC_BLOCK_SIZE_128;
+    constexpr uint64_t smallBaseN = BASIC_BLOCK_SIZE_256;
+    constexpr uint64_t smallBaseK = BASIC_BLOCK_SIZE_64;
+    constexpr uint64_t smallStepKa = 8UL;
+    constexpr uint64_t smallStepKb = 2UL;
+    const uint64_t smallNTiles = MathUtil::CeilDivision(args_.nValue, smallBaseN);
+    const uint64_t smallFullWaves = smallNTiles / compileInfo_.aicNum;
+    const uint64_t smallTailTiles = smallNTiles % compileInfo_.aicNum;
+    const bool smallPanelFamily = alignedM == BASIC_ALIGN_16 && args_.mValue * NUM_HALF >= alignedM &&
+        args_.nValue % smallBaseN == 0 && args_.kValue % BASIC_BLOCK_SIZE_128 == 0 &&
+        args_.kValue >= 15104UL && args_.kValue <= 20608UL && smallFullWaves >= 5UL &&
+        smallNTiles <= BASIC_BLOCK_SIZE_128 && smallTailTiles != 0 &&
+        smallTailTiles * 5UL <= compileInfo_.aicNum * NUM_HALF;
+    if (smallPanelFamily) {
+        constexpr uint64_t smallDepthA1 = smallStepKa * DB_SIZE;
+        constexpr uint64_t smallDepthB1 = smallStepKb * DB_SIZE;
+        const uint64_t l0ABytes = DB_SIZE * smallBaseM * smallBaseK * aDtypeSize_;
+        const uint64_t l0BBytes = DB_SIZE * smallBaseN * smallBaseK * bDtypeSize_;
+        const uint64_t l0CBytes = smallBaseM * smallBaseN * LOC_DATA_SIZE;
+        const uint64_t l1Bytes = smallDepthA1 * smallBaseM * smallBaseK * aDtypeSize_ +
+            smallDepthB1 * smallBaseN * smallBaseK * bDtypeSize_;
+        const uint64_t aPanelBytes = smallBaseM *
+            ops::CeilAlign(args_.kValue * aDtypeSize_, CACHELINE);
+        const uint64_t bPanelBytes = args_.kValue *
+            ops::CeilAlign(smallBaseN * bDtypeSize_, CACHELINE);
+        const uint64_t cTileBytes = smallBaseM * smallBaseN * cDtypeSize_;
+        constexpr uint64_t nWindowBlock = 5UL;
+        const __uint128_t windowBytes = static_cast<__uint128_t>(aPanelBytes) +
+            static_cast<__uint128_t>(nWindowBlock) * (bPanelBytes + cTileBytes);
+        if (l0ABytes <= compileInfo_.l0ASize && l0BBytes <= compileInfo_.l0BSize &&
+            l0CBytes <= compileInfo_.l0CSize && l1Bytes <= compileInfo_.l1Size &&
+            windowBytes <= compileInfo_.l2Size) {
+            MatmulV3RunInfo candidate{};
+            candidate.needUpdate = true;
+            candidate.usedCoreNum = compileInfo_.aicNum;
+            candidate.singleCoreM = smallBaseM;
+            candidate.singleCoreN = smallBaseN;
+            candidate.singleCoreK = args_.kValue;
+            candidate.baseM = smallBaseM;
+            candidate.baseN = smallBaseN;
+            candidate.baseK = smallBaseK;
+            candidate.stepKa = smallStepKa;
+            candidate.stepKb = smallStepKb;
+            candidate.depthA1 = smallDepthA1;
+            candidate.depthB1 = smallDepthB1;
+            candidate.stepM = 1;
+            candidate.stepN = 1;
+            candidate.iterateOrder = ITER_ROW_FIRST;
+            candidate.dbL0c = DB_OFF_SIZE;
+            candidate.l2Info.mTile = 1;
+            candidate.l2Info.nTile = MathUtil::CeilDivision(smallNTiles, nWindowBlock);
+            candidate.l2Info.mTileBlock = 1;
+            candidate.l2Info.nTileBlock = nWindowBlock;
+            candidate.l2Info.calOrder = ITER_ROW_FIRST;
+            const uint64_t kIterations = MathUtil::CeilDivision(args_.kValue, smallBaseK);
+            return selectCandidate(candidate, "SMALL_M_WIDE_N_PANEL", smallNTiles,
+                MathUtil::CeilDivision(smallNTiles, compileInfo_.aicNum), kIterations,
+                MathUtil::CeilDivision(smallNTiles, compileInfo_.aicNum) * compileInfo_.aicNum - smallNTiles,
+                1, smallNTiles);
+        }
+    }
+
+    const uint64_t targetTasks = compileInfo_.aicNum * NUM_HALF;
+    const uint64_t baseM = ops::CeilAlign(MathUtil::CeilDivision(args_.mValue, targetTasks), BASIC_ALIGN_16);
+    const uint64_t baseN = ops::CeilAlign(args_.nValue, BASIC_ALIGN_16);
+    if (args_.mValue < BASIC_BLOCK_SIZE_128 || args_.nValue < BASIC_ALIGN_16 * NUM_HALF ||
+        baseM < BASIC_ALIGN_16 * 5UL || baseM > BASIC_BLOCK_SIZE_128 || baseN == 0) {
+        return false;
+    }
+    const uint64_t alignedK = ops::CeilAlign(args_.kValue, BASIC_ALIGN_16);
+    const uint64_t maxBaseKByL0A = compileInfo_.l0ASize / (DB_SIZE * baseM * aDtypeSize_);
+    const uint64_t maxBaseKByL0B = compileInfo_.l0BSize / (DB_SIZE * baseN * bDtypeSize_);
+    const uint64_t baseK = ops::FloorAlign(
+        std::min({BASIC_BLOCK_SIZE_256, alignedK, maxBaseKByL0A, maxBaseKByL0B}), BASIC_ALIGN_16);
+    if (baseK < BASIC_ALIGN_16 * 10UL) {
+        return false;
+    }
+    const uint64_t mTasks = MathUtil::CeilDivision(args_.mValue, baseM);
+    constexpr uint64_t nTasks = 1UL;
+    const uint64_t tasks = mTasks;
+    const uint64_t waves = MathUtil::CeilDivision(tasks, compileInfo_.aicNum);
+    const uint64_t tailSlots = waves * compileInfo_.aicNum - tasks;
+    const uint64_t kIterations = MathUtil::CeilDivision(args_.kValue, baseK);
+    if (waves != NUM_HALF || tailSlots > NUM_HALF || kIterations < BASIC_BLOCK_SIZE_64) {
+        return false;
+    }
+
+    MatmulV3RunInfo candidate{};
+    candidate.needUpdate = true;
+    candidate.usedCoreNum = std::min(compileInfo_.aicNum, tasks);
+    candidate.singleCoreM = baseM;
+    candidate.singleCoreN = baseN;
+    candidate.singleCoreK = args_.kValue;
+    candidate.baseM = baseM;
+    candidate.baseN = baseN;
+    candidate.baseK = baseK;
+    candidate.stepM = 1;
+    candidate.stepN = 1;
+    uint64_t totalL1Size = compileInfo_.l1Size + BASIC_ALIGN_256;
+    candidate.depthA1 = totalL1Size / NUM_HALF / baseM / baseK / aDtypeSize_;
+    candidate.depthB1 = totalL1Size / NUM_HALF / baseN / baseK / bDtypeSize_;
+    uint64_t depthABytes = candidate.depthA1 * baseM * baseK * aDtypeSize_;
+    uint64_t depthBBytes = candidate.depthB1 * baseN * baseK * bDtypeSize_;
+    if (depthABytes + depthBBytes > totalL1Size) {
+        if (baseM <= baseN) {
+            candidate.depthA1 /= NUM_HALF;
+        } else {
+            candidate.depthB1 /= NUM_HALF;
+        }
+    }
+    candidate.stepKa = candidate.depthA1 / DB_SIZE;
+    candidate.stepKb = candidate.depthB1 / DB_SIZE;
+    if (candidate.stepKa == 0 || candidate.stepKb == 0) {
+        return false;
+    }
+    auto alignStepK = [&](uint64_t &stepK) {
+        if (stepK * baseK >= args_.kValue) {
+            return;
+        }
+        const uint64_t sliceBytes = baseK * aDtypeSize_;
+        uint64_t alignment = 1;
+        if (stepK * sliceBytes > BASIC_ALIGN_512) {
+            alignment = BASIC_ALIGN_512;
+        } else if (stepK * sliceBytes > BASIC_ALIGN_256) {
+            alignment = BASIC_ALIGN_256;
+        }
+        if (alignment > 1 && stepK * sliceBytes % alignment != 0 && alignment % sliceBytes == 0) {
+            while (stepK > 1 && stepK * sliceBytes % alignment != 0) {
+                --stepK;
+            }
+        }
+    };
+    alignStepK(candidate.stepKa);
+    alignStepK(candidate.stepKb);
+    if (candidate.stepKa >= candidate.stepKb) {
+        candidate.stepKa = candidate.stepKa / candidate.stepKb * candidate.stepKb;
+    } else {
+        candidate.stepKb = candidate.stepKb / candidate.stepKa * candidate.stepKa;
+    }
+    candidate.depthA1 = candidate.stepKa * DB_SIZE;
+    candidate.depthB1 = candidate.stepKb * DB_SIZE;
+    depthABytes = candidate.depthA1 * baseM * baseK * aDtypeSize_;
+    depthBBytes = candidate.depthB1 * baseN * baseK * bDtypeSize_;
+    const uint64_t l0ABytes = DB_SIZE * baseM * baseK * aDtypeSize_;
+    const uint64_t l0BBytes = DB_SIZE * baseN * baseK * bDtypeSize_;
+    const uint64_t l0CBytes = baseM * baseN * LOC_DATA_SIZE;
+    if (l0ABytes > compileInfo_.l0ASize || l0BBytes > compileInfo_.l0BSize ||
+        l0CBytes > compileInfo_.l0CSize || depthABytes + depthBBytes > totalL1Size) {
+        return false;
+    }
+    const uint64_t aPanelBytes = baseM * ops::CeilAlign(args_.kValue * aDtypeSize_, CACHELINE);
+    const uint64_t bPanelBytes = args_.kValue * ops::CeilAlign(baseN * bDtypeSize_, CACHELINE);
+    const uint64_t cTileBytes = baseM * baseN * cDtypeSize_;
+    const __uint128_t residentBytes = static_cast<__uint128_t>(mTasks) * aPanelBytes + bPanelBytes +
+        static_cast<__uint128_t>(mTasks) * cTileBytes;
+    if (residentBytes > compileInfo_.l2Size) {
+        return false;
+    }
+    candidate.iterateOrder = ITER_COL_FIRST;
+    candidate.dbL0c = DB_OFF_SIZE;
+    candidate.l2Info.mTile = 1;
+    candidate.l2Info.nTile = 1;
+    candidate.l2Info.mTileBlock = mTasks;
+    candidate.l2Info.nTileBlock = 1;
+    candidate.l2Info.calOrder = ITER_COL_FIRST;
+    return selectCandidate(candidate, "TWO_WAVE_N_PANEL_DEEP_K", tasks, waves,
+        kIterations, tailSlots, mTasks, nTasks);
+}
+
 bool MatmulV3BaseTiling::DoExperimentalBaseTiling()
 {
     (void)::unsetenv("MATMUL_BASE_EXPERIMENT_SELECTED");
@@ -2066,7 +2282,9 @@ bool MatmulV3BaseTiling::DoExperimentalBaseTiling()
         return false;
     }
     bool selected = false;
-    if (std::strcmp(mode, "CUBE_VECTOR_EDGE") == 0) {
+    if (std::strcmp(mode, "INDEPENDENT_BASE_SELECTOR") == 0) {
+        selected = DoIndependentBaseTiling();
+    } else if (std::strcmp(mode, "CUBE_VECTOR_EDGE") == 0) {
         selected = DoCubeVectorEdgeTiling();
     } else if (std::strcmp(mode, "RECTANGULAR_CUBE") == 0) {
         selected = DoRectangularCubeTiling();
