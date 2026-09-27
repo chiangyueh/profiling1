@@ -34,7 +34,8 @@ build_dir="${PWD}/build"
 build_log="$(mktemp)"
 workload_manifest="$(mktemp)"
 selection_log="$(mktemp)"
-trap 'rm -f "${build_log}" "${workload_manifest}" "${selection_log}"' EXIT
+producer_status="$(mktemp)"
+trap 'rm -f "${build_log}" "${workload_manifest}" "${selection_log}" "${producer_status}"' EXIT
 
 printf '# stage=host_build status=begin\n'
 if ! cmake -S . -B "${build_dir}" \
@@ -140,6 +141,9 @@ if ! g++ tools/host_matmul_v3_route.cpp \
 fi
 
 per_cell_reserve="${MATMUL_CELL_RESERVE:-8}"
+rm -f "${workload_manifest}"
+mkfifo "${workload_manifest}"
+(
 set +e
 python3 - <<'PY' | "${host_selector}" --select-base-stratified INDEPENDENT_BASE_SELECTOR "${per_cell_reserve}" "${host_library}" >"${workload_manifest}" 2>"${selection_log}"
 import random
@@ -160,17 +164,15 @@ for offset in range(1, 101):
             print("\t".join(str(value) for value in (dtype, "NN", m, n, k)))
 PY
 selection_status=("${PIPESTATUS[@]}")
-set -e
-cat "${selection_log}"
+printf '%d %d\n' "${selection_status[0]}" "${selection_status[1]}" >"${producer_status}"
 if [[ "${selection_status[0]}" -ne 0 || "${selection_status[1]}" -ne 0 ]]; then
-    printf '# stage=workload_generation status=failed generator_rc=%d selector_rc=%d\n' \
-        "${selection_status[0]}" "${selection_status[1]}" >&2
     exit 1
 fi
+) &
+producer_pid="$!"
 
-adaptive_count="$(wc -l <"${workload_manifest}")"
-printf '# stage=workload_generation status=passed coverage=interleaved_m_1_to_4096_x_2dtype_x_3n_x_3k reserve_per_stratum=%d candidates=%d\n' \
-    "${per_cell_reserve}" "${adaptive_count}"
+printf '# stage=workload_generation status=streaming coverage=interleaved_m_1_to_4096_x_2dtype_x_3n_x_3k reserve_per_stratum=%d\n' \
+    "${per_cell_reserve}"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
@@ -197,7 +199,17 @@ MATMUL_BASE_FULL_M_SWEEP=1 MATMUL_CAMPAIGN=INDEPENDENT_BASE_SELECTOR \
 pipeline_status=("${PIPESTATUS[@]}")
 panel_rc="${pipeline_status[0]}"
 converter_rc="${pipeline_status[1]}"
+wait "${producer_pid}"
+producer_rc="$?"
 set -e
+cat "${selection_log}"
+if [[ "${producer_rc}" -ne 0 ]]; then
+    read -r generator_rc selector_rc <"${producer_status}" || true
+    printf '# stage=workload_generation status=failed generator_rc=%s selector_rc=%s\n' \
+        "${generator_rc:-unknown}" "${selector_rc:-unknown}" >&2
+    exit "${producer_rc}"
+fi
+printf '# stage=workload_generation status=passed\n'
 if [[ "${converter_rc}" -ne 0 ]]; then
     printf 'fatal: CSV conversion failed rc=%d\n' "${converter_rc}" >&2
     exit "${converter_rc}"

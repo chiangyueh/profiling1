@@ -864,6 +864,11 @@ int main(int argc, char **argv)
     const bool manifestMode = argc == 3 && std::strcmp(argv[1], "--manifest") == 0;
     if (!manifestMode && (argc < 6 || (argc - 1) % 5 != 0)) return 2;
     if (!IsBaseCampaign() && !IsAdaptiveCampaign()) return 4;
+    std::ifstream manifestInput;
+    if (manifestMode) {
+        manifestInput.open(argv[2]);
+        if (!manifestInput) return 4;
+    }
     const uint64_t targetPasses = ReadEnvUnsigned("MATMUL_TARGET_PASSES");
     const uint64_t cellQuota = ReadEnvUnsigned("MATMUL_CELL_QUOTA");
     const uint64_t mQuota = ReadEnvUnsigned("MATMUL_M_QUOTA");
@@ -942,15 +947,13 @@ int main(int argc, char **argv)
         }
     };
     if (manifestMode) {
-        std::ifstream input(argv[2]);
-        if (!input) return 4;
         std::string dtypeName;
         std::string layoutName;
         int64_t m = 0;
         int64_t n = 0;
         int64_t k = 0;
         uint32_t stratum = 0;
-        while (input >> dtypeName >> layoutName >> m >> n >> k >> stratum) {
+        while (manifestInput >> dtypeName >> layoutName >> m >> n >> k >> stratum) {
             ++manifestIndex;
             if (manifestIndex <= startIndex) continue;
             runOne(dtypeName.c_str(), layoutName.c_str(), m, n, k, stratum);
