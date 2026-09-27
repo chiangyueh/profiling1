@@ -744,8 +744,9 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     PrintTiling("candidate_tiling", adaptive);
     std::printf(",\"official_core\":%u,\"candidate_core\":%u", official.cores, adaptive.cores);
     if (std::strcmp(CampaignName(), "WIDE_N_ANALYTIC_SELECTOR") == 0) {
-        std::printf(",\"structural_candidates\":%lu,\"structural_reference_base_n\":%lu,"
-                    "\"structural_reference_base_k\":%lu,\"structural_total_k_loops\":%lu,"
+        std::printf(",\"structural_candidates\":%lu,\"analytic_n_quantum\":%lu,"
+                    "\"analytic_min_base_k\":%lu,\"analytic_max_base_n\":%lu,"
+                    "\"analytic_target_n_tasks\":%lu,\"structural_total_k_loops\":%lu,"
                     "\"structural_l2_max_n_block\":%lu,\"analytic_tasks\":%lu,"
                     "\"analytic_waves\":%lu,\"analytic_k_iterations\":%lu,"
                     "\"analytic_n_tail_waste\":%lu,\"analytic_active_cores\":%lu,"
@@ -755,8 +756,10 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
                     "\"analytic_l2_n_windows\":%lu,\"analytic_l2_window_bytes\":%lu,"
                     "\"analytic_l2_estimated_traffic\":%lu",
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_STRUCTURAL_CANDIDATES")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_STRUCTURAL_REFERENCE_BASE_N")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_STRUCTURAL_REFERENCE_BASE_K")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_N_QUANTUM")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_MIN_BASE_K")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_MAX_BASE_N")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_TARGET_N_TASKS")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_STRUCTURAL_TOTAL_K_LOOPS")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_STRUCTURAL_L2_MAX_N_BLOCK")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SELECTED_TASKS")),
@@ -824,7 +827,8 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
             ++counts.mixedOrder;
         }
         CountPassCoverage(counts, m, n, k);
-        if (candidateVariant == "ANALYTIC_N128_K128" || candidateVariant == "ANALYTIC_N256_K64" ||
+        if (candidateVariant.compare(0, 8, "DIRECT_M") == 0 ||
+            candidateVariant == "ANALYTIC_N128_K128" || candidateVariant == "ANALYTIC_N256_K64" ||
             candidateVariant == "ANALYTIC_N512_K32" || candidateVariant == "WIDE_N_PANEL_ONLY" ||
             candidateVariant == "WIDE_N_WINDOW_ONLY" ||
             candidateVariant == "WIDE_N_SHALLOW_K_BASE") {

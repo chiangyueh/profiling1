@@ -18,7 +18,8 @@ FIELDS = [
 FIELDS += [f"official_{name}" for name in TILING_FIELDS]
 FIELDS += [f"candidate_{name}" for name in TILING_FIELDS]
 FIELDS += [
-    "structural_candidates", "structural_reference_base_n", "structural_reference_base_k",
+    "structural_candidates", "analytic_n_quantum", "analytic_min_base_k", "analytic_max_base_n",
+    "analytic_target_n_tasks",
     "structural_total_k_loops", "structural_l2_max_n_block", "analytic_tasks",
     "analytic_waves", "analytic_k_iterations", "analytic_n_tail_waste", "analytic_active_cores",
     "analytic_m_tasks", "analytic_n_tasks", "analytic_l2_dimensions", "analytic_l2_m_block",
@@ -48,7 +49,7 @@ def convert(obj):
     if obj.get("progress") is True:
         row = {"record_type": "progress"}
     elif obj.get("summary") is True:
-        row = {"record_type": "summary", "status": "COMPLETE"}
+        row = {"record_type": "summary", "status": "COMPLETE" if obj.get("quota_met") else "INCOMPLETE"}
     elif "shape" in obj:
         row = {"record_type": "measurement" if "official_tiling" in obj else "failure"}
     else:

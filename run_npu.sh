@@ -11,6 +11,8 @@ unset MATMUL_BASE_MODE MATMUL_BASE_EXPERIMENT_SELECTED MATMUL_SPLITK_MODE
 unset MATMUL_STRUCTURAL_CANDIDATES MATMUL_STRUCTURAL_REFERENCE_BASE_N
 unset MATMUL_STRUCTURAL_REFERENCE_BASE_K MATMUL_STRUCTURAL_TOTAL_K_LOOPS
 unset MATMUL_STRUCTURAL_L2_MAX_N_BLOCK
+unset MATMUL_ANALYTIC_N_QUANTUM MATMUL_ANALYTIC_MIN_BASE_K
+unset MATMUL_ANALYTIC_MAX_BASE_N MATMUL_ANALYTIC_TARGET_N_TASKS
 unset MATMUL_ANALYTIC_SELECTED_TASKS MATMUL_ANALYTIC_SELECTED_WAVES
 unset MATMUL_ANALYTIC_SELECTED_K_ITERATIONS MATMUL_ANALYTIC_SELECTED_N_TAIL_WASTE
 unset MATMUL_ANALYTIC_SELECTED_ACTIVE_CORES
@@ -117,92 +119,64 @@ printf '# stage=runner_build status=passed\n'
 
 printf '# stage=workload_generation status=begin\n'
 python3 - >"${workload_manifest}" <<'PY'
-from math import gcd
+from collections import defaultdict, deque
+import random
 
-def stepped(first, last, step, offsets=(0,)):
-    return sorted({base + offset for base in range(first, last + 1, step)
-                   for offset in offsets if first <= base + offset <= last})
-
-m_groups = (
-    list(range(1, 17)),
-    list(range(17, 33)),
-    list(range(33, 65)),
-    list(range(65, 97)),
-    list(range(97, 129)),
+rng = random.Random(8527)
+m_values = (
+    1, 3, 5, 7, 9, 12, 16, 17, 20, 24, 28, 32, 33, 40, 48, 56,
+    64, 65, 72, 80, 96, 112, 127, 128,
 )
-n_groups = (
-    stepped(512, 4096, 128, (0, 1, 127)),
-    stepped(4097, 8192, 128, (0, 1, 127)),
-    stepped(8193, 16384, 128, (0, 1, 127)),
-    stepped(16385, 32768, 128, (0, 1, 127)),
-    stepped(32769, 65536, 256, (0, 1, 255)),
-)
-k_groups = (
-    sorted(set(stepped(512, 4096, 128, (0, 1))) | {4096}),
-    sorted(set(stepped(4097, 8192, 128, (0, 1))) | {8192}),
-    sorted(set(stepped(8193, 16384, 128, (0, 1))) | {16384}),
-    sorted(set(stepped(16385, 32768, 128, (0, 1))) | {32768}),
-    sorted(set(stepped(32769, 65536, 256, (0, 1))) | {65536}),
+n_values = set(range(1024, 4097, 128))
+n_values.update(range(4224, 10241, 256))
+n_values.update(range(10752, 32769, 512))
+for boundary in (2560, 5120, 10240):
+    n_values.update(boundary + offset for offset in (-256, -128, 0, 128, 256))
+n_values = tuple(sorted(value for value in n_values if value >= 1024))
+k_values = (
+    512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 10240,
+    12288, 14336, 15104, 16384, 18432, 20480, 24576, 28672, 32768,
 )
 byte_limit = 1024 * 1024 * 1024
-per_cell_limit = 1600
 
-def cell_records(dtype, dtype_index, m_index, n_index, k_index):
-    ms = m_groups[m_index]
-    ns = n_groups[n_index]
-    ks = k_groups[k_index]
-    total = len(ms) * len(ns) * len(ks)
-    seed = 8510 + dtype_index * 1009 + m_index * 211 + n_index * 43 + k_index * 17
-    offset = seed % total
-    stride = (seed * 2 + 1) % total
-    if stride == 0:
-        stride = 1
-    while gcd(stride, total) != 1:
-        stride += 2
-        if stride >= total:
-            stride = 1
-    emitted = 0
-    attempt_limit = min(total, per_cell_limit * 8)
-    for iteration in range(attempt_limit):
-        flat = (offset + iteration * stride) % total
-        k = ks[flat % len(ks)]
-        flat //= len(ks)
-        n = ns[flat % len(ns)]
-        flat //= len(ns)
-        m = ms[flat]
-        if 2 * (m * k + k * n + m * n) > byte_limit:
-            continue
-        yield dtype, "NN", m, n, k
-        emitted += 1
-        if emitted >= per_cell_limit:
-            break
+def bucket(value, limits):
+    for index, limit in enumerate(limits):
+        if value <= limit:
+            return index
+    return len(limits)
 
-active = []
-for dtype_index, dtype in enumerate(("fp16_fp16", "bf16_bf16")):
-    for m_index in range(len(m_groups)):
-        for n_index in range(len(n_groups)):
-            for k_index in range(len(k_groups)):
-                active.append(cell_records(dtype, dtype_index, m_index, n_index, k_index))
+strata = defaultdict(list)
+for dtype in ("fp16_fp16", "bf16_bf16"):
+    for m in m_values:
+        for n in n_values:
+            for k in k_values:
+                if 2 * (m * k + k * n + m * n) > byte_limit:
+                    continue
+                key = (dtype, bucket(m, (16, 32, 64)),
+                       bucket(n, (4096, 10240)), bucket(k, (4096, 16384)))
+                strata[key].append((dtype, "NN", m, n, k))
 
-while active:
-    next_active = []
-    for records in active:
-        try:
-            print("\t".join(str(value) for value in next(records)))
-            next_active.append(records)
-        except StopIteration:
-            pass
-    active = next_active
+for values in strata.values():
+    rng.shuffle(values)
+queues = [deque(values) for values in strata.values()]
+while queues:
+    remaining = []
+    for records in queues:
+        if records:
+            print("\t".join(str(value) for value in records.popleft()))
+        if records:
+            remaining.append(records)
+    queues = remaining
 PY
 
 adaptive_count="$(wc -l <"${workload_manifest}")"
-printf '# stage=workload_generation status=passed coverage=250_interleaved_single_m_tile_dtype_m_n_k_cells candidates=%d\n' "${adaptive_count}"
+printf '# stage=workload_generation status=passed coverage=72_interleaved_dtype_m_n_k_regimes candidates=%d\n' "${adaptive_count}"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
-success_target="${MATMUL_SUCCESS_TARGET:-10000}"
+success_target="${MATMUL_SUCCESS_TARGET:-5000}"
 cell_quota="${MATMUL_CELL_QUOTA:-0}"
 if [[ "${cell_quota}" -eq 0 ]]; then
     cell_quota_json=null

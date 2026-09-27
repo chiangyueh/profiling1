@@ -1639,6 +1639,10 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
     (void)::unsetenv("MATMUL_STRUCTURAL_REFERENCE_BASE_K");
     (void)::unsetenv("MATMUL_STRUCTURAL_TOTAL_K_LOOPS");
     (void)::unsetenv("MATMUL_STRUCTURAL_L2_MAX_N_BLOCK");
+    (void)::unsetenv("MATMUL_ANALYTIC_N_QUANTUM");
+    (void)::unsetenv("MATMUL_ANALYTIC_MIN_BASE_K");
+    (void)::unsetenv("MATMUL_ANALYTIC_MAX_BASE_N");
+    (void)::unsetenv("MATMUL_ANALYTIC_TARGET_N_TASKS");
     (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_TASKS");
     (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_WAVES");
     (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_K_ITERATIONS");
@@ -1672,124 +1676,104 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
     }
 
     if (analyticSelector) {
-        struct AnalyticCandidate {
-            uint64_t maxBaseM;
-            uint64_t baseN;
-            uint64_t baseKBytes;
-            const char *name;
-            uint64_t baseM = 0;
-            uint64_t baseK = 0;
-            uint64_t mTasks = 0;
-            uint64_t nTasks = 0;
-            uint64_t tasks = 0;
-            uint64_t waves = 0;
-            uint64_t kIterations = 0;
-            uint64_t paddedK = 0;
-            uint64_t paddedN = 0;
-            uint64_t tailWasteN = 0;
-            uint64_t totalKLoops = 0;
-            uint64_t loadSpan = 0;
-            bool legal = false;
-        };
-        AnalyticCandidate candidates[] = {
-            {BASIC_BLOCK_SIZE_64, BASIC_BLOCK_SIZE_64, 512UL, "STRUCTURAL_N64_K256"},
-            {BASIC_BLOCK_SIZE_128, BASIC_BLOCK_SIZE_128, 256UL, "STRUCTURAL_N128_K128"},
-            {BASIC_BLOCK_SIZE_128, BASIC_BLOCK_SIZE_256, 128UL, "STRUCTURAL_N128_TO_N256"},
-            {BASIC_BLOCK_SIZE_64, 512UL, 64UL, "STRUCTURAL_N512_K32"},
-        };
-        for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); ++index) {
-            AnalyticCandidate &candidate = candidates[index];
-            candidate.baseK = candidate.baseKBytes / aDtypeSize_;
-            candidate.nTasks = MathUtil::CeilDivision(args_.nValue, candidate.baseN);
-            candidate.baseM = CalBaseSize(candidate.nTasks, compileInfo_.aicNum,
-                                          args_.mValue, candidate.maxBaseM);
-            candidate.mTasks = MathUtil::CeilDivision(args_.mValue, candidate.baseM);
-            candidate.tasks = candidate.mTasks * candidate.nTasks;
-            candidate.waves = MathUtil::CeilDivision(candidate.tasks, compileInfo_.aicNum);
-            candidate.kIterations = MathUtil::CeilDivision(args_.kValue, candidate.baseK);
-            candidate.paddedK = candidate.kIterations * candidate.baseK;
-            candidate.paddedN = candidate.nTasks * candidate.baseN;
-            candidate.tailWasteN = candidate.paddedN - args_.nValue;
-            candidate.totalKLoops = candidate.tasks * candidate.kIterations;
-            candidate.loadSpan = (candidate.baseM + candidate.baseN) * candidate.waves;
-            const uint64_t l0ABytes = DB_SIZE * candidate.baseM * candidate.baseK * aDtypeSize_;
-            const uint64_t l0BBytes = DB_SIZE * candidate.baseN * candidate.baseK * bDtypeSize_;
-            const uint64_t l0CBytes = candidate.baseM * candidate.baseN * LOC_DATA_SIZE;
-            candidate.legal = l0ABytes <= compileInfo_.l0ASize && l0BBytes <= compileInfo_.l0BSize &&
-                l0CBytes <= compileInfo_.l0CSize;
-        }
-
-        constexpr size_t referenceOrder[] = {2, 1, 3};
-        size_t referenceIndex = referenceOrder[0];
-        for (size_t orderIndex = 1; orderIndex < sizeof(referenceOrder) / sizeof(referenceOrder[0]); ++orderIndex) {
-            const size_t index = referenceOrder[orderIndex];
-            if (candidates[index].legal && candidates[index].loadSpan < candidates[referenceIndex].loadSpan) {
-                referenceIndex = index;
-            }
-        }
-        const AnalyticCandidate &reference = candidates[referenceIndex];
-        const AnalyticCandidate &wider = candidates[2];
-        const __uint128_t referencePaddedNk =
-            static_cast<__uint128_t>(reference.paddedN) * reference.paddedK;
-        const __uint128_t widerPaddedNk = static_cast<__uint128_t>(wider.paddedN) * wider.paddedK;
-        const bool structuralImprovement = referenceIndex == 1 && reference.legal && wider.legal &&
-            reference.mTasks == 1 && wider.mTasks == 1 && reference.baseM == wider.baseM &&
-            wider.nTasks < reference.nTasks && wider.tasks < reference.tasks &&
-            wider.totalKLoops <= reference.totalKLoops && widerPaddedNk <= referencePaddedNk;
-        if (!structuralImprovement) {
+        if (args_.nValue == 0 || args_.mValue > BASIC_BLOCK_SIZE_128) {
             return false;
         }
-        const AnalyticCandidate &selected = wider;
+        const uint64_t baseM = ops::CeilAlign(args_.mValue, BASIC_ALIGN_16);
+        const uint64_t nTransferQuantum = BASIC_BLOCK_SIZE_128;
+        const uint64_t minBaseK = baseM == BASIC_ALIGN_16 ? 32UL : BASIC_BLOCK_SIZE_64;
+        const uint64_t maxBaseK = BASIC_BLOCK_SIZE_256;
+        const uint64_t maxBaseNByL0C = ops::FloorAlign(
+            compileInfo_.l0CSize / (LOC_DATA_SIZE * baseM), BASIC_ALIGN_16);
+        const uint64_t maxBaseNByL0B = ops::FloorAlign(
+            compileInfo_.l0BSize / (DB_SIZE * minBaseK * bDtypeSize_), BASIC_ALIGN_16);
+        const uint64_t maxBaseN = std::min({512UL, maxBaseNByL0C, maxBaseNByL0B});
+        if (maxBaseN < BASIC_ALIGN_16) {
+            return false;
+        }
+
+        uint64_t maxBaseNForFullWave = BASIC_ALIGN_16;
+        if (compileInfo_.aicNum > 1 && args_.nValue >= compileInfo_.aicNum) {
+            maxBaseNForFullWave = (args_.nValue - 1) / (compileInfo_.aicNum - 1);
+        }
+        const uint64_t boundedBaseN = std::min(maxBaseN, maxBaseNForFullWave);
+        uint64_t baseN = boundedBaseN >= nTransferQuantum ?
+            ops::FloorAlign(boundedBaseN, nTransferQuantum) :
+            ops::FloorAlign(boundedBaseN, BASIC_ALIGN_16);
+        if (baseN == 0) {
+            baseN = BASIC_ALIGN_16;
+        }
+        baseN = std::min(baseN, ops::CeilAlign(args_.nValue, BASIC_ALIGN_16));
+
+        const uint64_t maxBaseKByL0A = compileInfo_.l0ASize /
+            (DB_SIZE * baseM * aDtypeSize_);
+        const uint64_t maxBaseKByL0B = compileInfo_.l0BSize /
+            (DB_SIZE * baseN * bDtypeSize_);
+        const uint64_t alignedK = ops::CeilAlign(args_.kValue, BASIC_ALIGN_16);
+        const uint64_t baseK = ops::FloorAlign(
+            std::min({maxBaseK, alignedK, maxBaseKByL0A, maxBaseKByL0B}), BASIC_ALIGN_16);
+        if (baseK < minBaseK) {
+            return false;
+        }
+
+        const uint64_t mTasks = MathUtil::CeilDivision(args_.mValue, baseM);
+        const uint64_t nTasks = MathUtil::CeilDivision(args_.nValue, baseN);
+        const uint64_t tasks = mTasks * nTasks;
+        const uint64_t waves = MathUtil::CeilDivision(tasks, compileInfo_.aicNum);
+        const uint64_t kIterations = MathUtil::CeilDivision(args_.kValue, baseK);
+        const uint64_t paddedN = nTasks * baseN;
+        const uint64_t tailWasteN = paddedN - args_.nValue;
+        const uint64_t totalKLoops = tasks * kIterations;
+        const uint64_t l0ABytes = DB_SIZE * baseM * baseK * aDtypeSize_;
+        const uint64_t l0BBytes = DB_SIZE * baseN * baseK * bDtypeSize_;
+        const uint64_t l0CBytes = baseM * baseN * LOC_DATA_SIZE;
+        if (l0ABytes > compileInfo_.l0ASize || l0BBytes > compileInfo_.l0BSize ||
+            l0CBytes > compileInfo_.l0CSize) {
+            return false;
+        }
 
         runInfo_ = MatmulV3RunInfo{};
-        runInfo_.baseM = selected.baseM;
-        runInfo_.baseN = selected.baseN;
-        runInfo_.baseK = selected.baseK;
+        runInfo_.baseM = baseM;
+        runInfo_.baseN = baseN;
+        runInfo_.baseK = baseK;
         runInfo_.singleCoreK = args_.kValue;
         runInfo_.stepM = 1;
         runInfo_.stepN = 1;
         CalL1Tiling();
-        const uint64_t l1ABytes = runInfo_.depthA1 * runInfo_.baseM * runInfo_.baseK * aDtypeSize_;
-        const uint64_t l1BBytes = runInfo_.depthB1 * runInfo_.baseN * runInfo_.baseK * bDtypeSize_;
+        const uint64_t l1ABytes = runInfo_.depthA1 * baseM * baseK * aDtypeSize_;
+        const uint64_t l1BBytes = runInfo_.depthB1 * baseN * baseK * bDtypeSize_;
         if (l1ABytes + l1BBytes > compileInfo_.l1Size + 256UL) {
             return false;
         }
 
-        const uint64_t aPanelBytes = runInfo_.baseM *
+        const uint64_t aPanelBytes = baseM *
             ops::CeilAlign(args_.kValue * aDtypeSize_, CACHELINE);
         const uint64_t bPanelBytes = args_.kValue *
-            ops::CeilAlign(runInfo_.baseN * bDtypeSize_, CACHELINE);
-        const uint64_t cTileBytes = runInfo_.baseM * runInfo_.baseN * cDtypeSize_;
+            ops::CeilAlign(baseN * bDtypeSize_, CACHELINE);
+        const uint64_t cTileBytes = baseM * baseN * cDtypeSize_;
         uint64_t mWindowBlock = 1;
         uint64_t nWindowBlock = 1;
-        uint64_t l2Dimensions = 1;
         uint64_t maxNWindow = 1;
         auto windowBytes = [&](uint64_t mBlock, uint64_t nBlock) -> __uint128_t {
             return static_cast<__uint128_t>(mBlock) * aPanelBytes +
                 static_cast<__uint128_t>(nBlock) * bPanelBytes +
                 static_cast<__uint128_t>(mBlock) * nBlock * cTileBytes;
         };
-        if (selected.mTasks == 1) {
-            if (aPanelBytes < compileInfo_.l2Size &&
-                bPanelBytes + cTileBytes <= compileInfo_.l2Size - aPanelBytes) {
-                maxNWindow = (compileInfo_.l2Size - aPanelBytes) /
-                    (bPanelBytes + cTileBytes);
-                const uint64_t activeCores = std::min(compileInfo_.aicNum, selected.nTasks);
-                const uint64_t targetNBlock = std::max(1UL,
-                    std::min({activeCores, selected.nTasks, maxNWindow}));
-                const uint64_t nWindows = MathUtil::CeilDivision(selected.nTasks, targetNBlock);
-                nWindowBlock = MathUtil::CeilDivision(selected.nTasks, nWindows);
-            }
+        if (aPanelBytes < compileInfo_.l2Size &&
+            bPanelBytes + cTileBytes <= compileInfo_.l2Size - aPanelBytes) {
+            maxNWindow = (compileInfo_.l2Size - aPanelBytes) / (bPanelBytes + cTileBytes);
+            const uint64_t coreGridN = std::max(1UL, compileInfo_.aicNum / 4UL);
+            nWindowBlock = std::max(1UL, std::min({coreGridN, nTasks, maxNWindow}));
         }
         if (windowBytes(mWindowBlock, nWindowBlock) > compileInfo_.l2Size) {
             return false;
         }
 
-        runInfo_.usedCoreNum = std::min(compileInfo_.aicNum, selected.mTasks * selected.nTasks);
+        runInfo_.usedCoreNum = std::min(compileInfo_.aicNum, tasks);
         runInfo_.iterateOrder = ITER_COL_FIRST;
         runInfo_.dbL0c = DB_OFF_SIZE;
-        runInfo_.l2Info.mTile = MathUtil::CeilDivision(selected.mTasks, mWindowBlock);
-        runInfo_.l2Info.nTile = MathUtil::CeilDivision(selected.nTasks, nWindowBlock);
+        runInfo_.l2Info.mTile = MathUtil::CeilDivision(mTasks, mWindowBlock);
+        runInfo_.l2Info.nTile = MathUtil::CeilDivision(nTasks, nWindowBlock);
         runInfo_.l2Info.mTileBlock = mWindowBlock;
         runInfo_.l2Info.nTileBlock = nWindowBlock;
         runInfo_.l2Info.calOrder = ITER_COL_FIRST;
@@ -1803,35 +1787,40 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
             (void)snprintf(text, sizeof(text), "%lu", static_cast<unsigned long>(value));
             (void)::setenv(name, text, 1);
         };
-        exportUnsigned("MATMUL_STRUCTURAL_CANDIDATES",
-            sizeof(candidates) / sizeof(candidates[0]));
-        exportUnsigned("MATMUL_STRUCTURAL_REFERENCE_BASE_N", reference.baseN);
-        exportUnsigned("MATMUL_STRUCTURAL_REFERENCE_BASE_K", reference.baseK);
-        exportUnsigned("MATMUL_STRUCTURAL_TOTAL_K_LOOPS", selected.totalKLoops);
+        exportUnsigned("MATMUL_STRUCTURAL_CANDIDATES", 0);
+        exportUnsigned("MATMUL_ANALYTIC_N_QUANTUM", nTransferQuantum);
+        exportUnsigned("MATMUL_ANALYTIC_MIN_BASE_K", minBaseK);
+        exportUnsigned("MATMUL_ANALYTIC_MAX_BASE_N", maxBaseN);
+        exportUnsigned("MATMUL_ANALYTIC_TARGET_N_TASKS", compileInfo_.aicNum);
+        exportUnsigned("MATMUL_STRUCTURAL_TOTAL_K_LOOPS", totalKLoops);
         exportUnsigned("MATMUL_STRUCTURAL_L2_MAX_N_BLOCK", maxNWindow);
-        exportUnsigned("MATMUL_ANALYTIC_SELECTED_TASKS", selected.tasks);
-        exportUnsigned("MATMUL_ANALYTIC_SELECTED_WAVES", selected.waves);
-        exportUnsigned("MATMUL_ANALYTIC_SELECTED_K_ITERATIONS", selected.kIterations);
-        exportUnsigned("MATMUL_ANALYTIC_SELECTED_N_TAIL_WASTE", selected.tailWasteN);
+        exportUnsigned("MATMUL_ANALYTIC_SELECTED_TASKS", tasks);
+        exportUnsigned("MATMUL_ANALYTIC_SELECTED_WAVES", waves);
+        exportUnsigned("MATMUL_ANALYTIC_SELECTED_K_ITERATIONS", kIterations);
+        exportUnsigned("MATMUL_ANALYTIC_SELECTED_N_TAIL_WASTE", tailWasteN);
         exportUnsigned("MATMUL_ANALYTIC_SELECTED_ACTIVE_CORES", runInfo_.usedCoreNum);
-        exportUnsigned("MATMUL_ANALYTIC_SELECTED_M_TASKS", selected.mTasks);
-        exportUnsigned("MATMUL_ANALYTIC_SELECTED_N_TASKS", selected.nTasks);
-        exportUnsigned("MATMUL_ANALYTIC_L2_DIMENSIONS", l2Dimensions);
+        exportUnsigned("MATMUL_ANALYTIC_SELECTED_M_TASKS", mTasks);
+        exportUnsigned("MATMUL_ANALYTIC_SELECTED_N_TASKS", nTasks);
+        exportUnsigned("MATMUL_ANALYTIC_L2_DIMENSIONS", 1);
         exportUnsigned("MATMUL_ANALYTIC_L2_M_BLOCK", mWindowBlock);
         exportUnsigned("MATMUL_ANALYTIC_L2_N_BLOCK", nWindowBlock);
         exportUnsigned("MATMUL_ANALYTIC_L2_M_WINDOWS", runInfo_.l2Info.mTile);
         exportUnsigned("MATMUL_ANALYTIC_L2_N_WINDOWS", runInfo_.l2Info.nTile);
         const __uint128_t selectedWindowBytes = windowBytes(mWindowBlock, nWindowBlock);
         const __uint128_t estimatedTraffic =
-            static_cast<__uint128_t>(selected.mTasks) * runInfo_.l2Info.nTile * aPanelBytes +
-            static_cast<__uint128_t>(selected.nTasks) * runInfo_.l2Info.mTile * bPanelBytes +
-            static_cast<__uint128_t>(selected.mTasks) * selected.nTasks * cTileBytes;
+            static_cast<__uint128_t>(mTasks) * runInfo_.l2Info.nTile * aPanelBytes +
+            static_cast<__uint128_t>(nTasks) * runInfo_.l2Info.mTile * bPanelBytes +
+            static_cast<__uint128_t>(mTasks) * nTasks * cTileBytes;
         const uint64_t uint64Max = std::numeric_limits<uint64_t>::max();
         exportUnsigned("MATMUL_ANALYTIC_L2_WINDOW_BYTES",
             selectedWindowBytes > uint64Max ? uint64Max : static_cast<uint64_t>(selectedWindowBytes));
         exportUnsigned("MATMUL_ANALYTIC_L2_ESTIMATED_TRAFFIC",
             estimatedTraffic > uint64Max ? uint64Max : static_cast<uint64_t>(estimatedTraffic));
-        (void)::setenv("MATMUL_BASE_EXPERIMENT_VARIANT", selected.name, 1);
+        char variant[64] = {};
+        (void)snprintf(variant, sizeof(variant), "DIRECT_M%lu_N%lu_K%lu",
+            static_cast<unsigned long>(baseM), static_cast<unsigned long>(baseN),
+            static_cast<unsigned long>(baseK));
+        (void)::setenv("MATMUL_BASE_EXPERIMENT_VARIANT", variant, 1);
         (void)::setenv("MATMUL_BASE_EXPERIMENT_SELECTED", "1", 1);
         return true;
     }
