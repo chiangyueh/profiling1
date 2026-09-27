@@ -23,6 +23,7 @@ unset MATMUL_ANALYTIC_L2_DIMENSIONS MATMUL_ANALYTIC_L2_M_BLOCK MATMUL_ANALYTIC_L
 unset MATMUL_ANALYTIC_L2_M_WINDOWS MATMUL_ANALYTIC_L2_N_WINDOWS
 unset MATMUL_ANALYTIC_L2_WINDOW_BYTES MATMUL_ANALYTIC_L2_ESTIMATED_TRAFFIC
 unset MATMUL_DETERMINISTIC_ADAPTIVE MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED
+unset MATMUL_BASE_FULL_M_SWEEP
 unset MATMUL_CAMPAIGN
 
 if [[ "$#" -ne 0 ]]; then
@@ -124,56 +125,26 @@ python3 - >"${workload_manifest}" <<'PY'
 import random
 
 rng = random.Random(8527)
-small = []
-large = []
-byte_limit = 1536 * 1024 * 1024
-for dtype in ("fp16_fp16", "bf16_bf16"):
-    for m in range(8, 17):
-        for n_tiles in tuple(range(101, 109)) + tuple(range(121, 129)):
-            n = n_tiles * 256
-            for k in range(15104, 20609, 128):
-                if 2 * (m * k + k * n + m * n) <= byte_limit:
-                    small.append((dtype, "NN", m, n, k))
-    for m in range(2304, 4353, 32):
-        for n in range(32, 97, 16):
-            for k in range(8192, 32769, 512):
-                base_m = ((m + 39) // 40 + 15) // 16 * 16
-                base_n = (n + 15) // 16 * 16
-                base_k = min(256, (k + 15) // 16 * 16,
-                             65536 // (4 * base_m), 65536 // (4 * base_n)) // 16 * 16
-                if base_k == 0:
-                    continue
-                tasks = (m + base_m - 1) // base_m
-                waves = (tasks + 19) // 20
-                tail_slots = waves * 20 - tasks
-                k_iterations = (k + base_k - 1) // base_k
-                a_panel = base_m * ((k * 2 + 63) // 64 * 64)
-                b_panel = k * ((base_n * 2 + 63) // 64 * 64)
-                c_tiles = tasks * base_m * base_n * 2
-                if (base_m < 80 or base_m > 128 or base_k < 160 or waves != 2 or
-                        tail_slots > 2 or k_iterations < 64 or
-                        tasks * a_panel + b_panel + c_tiles > 192 * 1024 * 1024):
-                    continue
-                if 2 * (m * k + k * n + m * n) <= byte_limit:
-                    large.append((dtype, "NN", m, n, k))
-
-rng.shuffle(small)
-rng.shuffle(large)
-for index in range(max(len(small), len(large))):
-    if index < len(small):
-        print("\t".join(str(value) for value in small[index]))
-    if index < len(large):
-        print("\t".join(str(value) for value in large[index]))
+n_values = (16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256)
+k_values = tuple(range(512, 32769, 512))
+for round_index in range(8):
+    m_values = list(range(1, 4097))
+    rng.shuffle(m_values)
+    for m in m_values:
+        dtype = "fp16_fp16" if (m + round_index) % 2 == 0 else "bf16_bf16"
+        n = n_values[(m * 5 + round_index * 7) % len(n_values)]
+        k = k_values[(m * 11 + round_index * 13) % len(k_values)]
+        print("\t".join(str(value) for value in (dtype, "NN", m, n, k)))
 PY
 
 adaptive_count="$(wc -l <"${workload_manifest}")"
-printf '# stage=workload_generation status=passed coverage=interleaved_historical_small_m_and_structural_large_m candidates=%d\n' "${adaptive_count}"
+printf '# stage=workload_generation status=passed coverage=all_integer_m_1_to_4096_eight_n_k_dtype_rotations candidates=%d\n' "${adaptive_count}"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
-success_target="${MATMUL_SUCCESS_TARGET:-4000}"
+success_target="${MATMUL_SUCCESS_TARGET:-12000}"
 cell_quota="${MATMUL_CELL_QUOTA:-0}"
 if [[ "${cell_quota}" -eq 0 ]]; then
     cell_quota_json=null
@@ -186,7 +157,8 @@ panel_rc=0
 printf '# campaign=INDEPENDENT_BASE_SELECTOR target_passes=%d maximum_per_joint_cell=%s theoretical_maximum_pairs=%s measurement_order=OCCO\n' \
     "${success_target}" "${cell_quota_json}" "${theoretical_maximum_pairs_json}"
 set +e
-MATMUL_CAMPAIGN=INDEPENDENT_BASE_SELECTOR MATMUL_TARGET_PASSES="${success_target}" MATMUL_CELL_QUOTA="${cell_quota}" \
+MATMUL_BASE_FULL_M_SWEEP=1 MATMUL_CAMPAIGN=INDEPENDENT_BASE_SELECTOR \
+    MATMUL_TARGET_PASSES="${success_target}" MATMUL_CELL_QUOTA="${cell_quota}" \
     "${runner}" --manifest "${workload_manifest}" | python3 tools/compact_matmul_log.py
 pipeline_status=("${PIPESTATUS[@]}")
 panel_rc="${pipeline_status[0]}"

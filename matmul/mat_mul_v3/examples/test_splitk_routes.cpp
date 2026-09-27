@@ -470,6 +470,12 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     }
     if (rc != ACL_SUCCESS) {
         ++counts.officialFailed;
+        std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
+                    "\"output_dtype\":\"%s\",\"candidate_branch\":\"%s\","
+                    "\"status\":\"TENSOR_ALLOCATION_FAILED\",\"result_code\":%d}\n",
+                    static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
+                    dtype.inputName, dtype.outputName, CampaignName(), rc);
+        std::fflush(stdout);
         ReleaseTensor(cTensor);
         ReleaseTensor(bTensor);
         ReleaseTensor(aTensor);
@@ -491,13 +497,12 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     const TilingSnapshot official = ReadTilingSnapshot();
     if (rc != ACL_SUCCESS || officialExecutor == nullptr) {
         ++counts.officialFailed;
-        if (rc != 561103) {
-            std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
-                        "\"output_dtype\":\"%s\",\"status\":\"OFFICIAL_GET_WORKSPACE_FAILED\",\"result_code\":%d}\n",
-                        static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
-                        dtype.inputName, dtype.outputName, rc == ACL_SUCCESS ? 4 : rc);
-            std::fflush(stdout);
-        }
+        std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
+                    "\"output_dtype\":\"%s\",\"candidate_branch\":\"%s\","
+                    "\"status\":\"OFFICIAL_GET_WORKSPACE_FAILED\",\"result_code\":%d}\n",
+                    static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
+                    dtype.inputName, dtype.outputName, CampaignName(), rc == ACL_SUCCESS ? 4 : rc);
+        std::fflush(stdout);
         if (officialExecutor != nullptr) (void)aclDestroyAclOpExecutor(officialExecutor);
         ReleaseTensor(cTensor);
         ReleaseTensor(bTensor);
@@ -516,6 +521,13 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         (adaptiveCampaign ? IsDeterministicSplitK(official.key) : false);
     if (!officialRouteMatched) {
         ++counts.nonDeterministic;
+        std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
+                    "\"output_dtype\":\"%s\",\"candidate_branch\":\"%s\","
+                    "\"status\":\"NON_BASE_ROUTE\",\"result_code\":0,\"official_key\":%lu}\n",
+                    static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
+                    dtype.inputName, dtype.outputName, CampaignName(),
+                    static_cast<unsigned long>(official.key));
+        std::fflush(stdout);
         (void)aclDestroyAclOpExecutor(officialExecutor);
         ReleaseTensor(cTensor);
         ReleaseTensor(bTensor);
