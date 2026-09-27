@@ -96,7 +96,9 @@ struct RunCounts {
     uint64_t jointPassed[200] = {};
     uint64_t jointQuotaSkipped = 0;
     std::vector<uint32_t> passedPerM = std::vector<uint32_t>(4097, 0);
+    std::vector<uint32_t> passedPerMCell = std::vector<uint32_t>(4097 * 18, 0);
     uint64_t mQuotaSkipped = 0;
+    uint64_t mCellQuotaSkipped = 0;
 };
 
 uint64_t ReadEnvUnsigned(const char *name)
@@ -453,7 +455,7 @@ void PrintTiling(const char *name, const TilingSnapshot &value)
 
 int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int64_t n, int64_t k,
                 aclrtStream stream, aclrtFuncHandle edgeFunction, RunCounts &counts,
-                uint64_t manifestIndex)
+                uint64_t manifestIndex, uint32_t stratum)
 {
     const bool baseCampaign = IsBaseCampaign();
     const bool edgeCampaign = std::strcmp(CampaignName(), "CUBE_VECTOR_EDGE") == 0;
@@ -725,11 +727,13 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     const int64_t partialDelta = static_cast<int64_t>(newPartialBytes) - static_cast<int64_t>(oldPartialBytes);
     const double partialSaved = oldPartialBytes > 0 && newPartialBytes <= oldPartialBytes ?
         static_cast<double>(oldPartialBytes - newPartialBytes) * 100.0 / oldPartialBytes : 0.0;
-    std::printf("{\"manifest_index\":%lu,\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
+    std::printf("{\"manifest_index\":%lu,\"stratum\":%u,\"n_band\":%u,\"k_band\":%u,"
+                "\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
                 "\"output_dtype\":\"%s\","
                 "\"candidate_branch\":\"%s\",\"candidate_variant\":\"%s\","
                 "\"candidate_selected\":%s,\"tiling_changed\":%s,",
                 static_cast<unsigned long>(manifestIndex),
+                stratum, (stratum % 9U) / 3U, stratum % 3U,
                 static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
                 dtype.inputName, dtype.outputName,
                 CampaignName(), candidateVariant.c_str(),
@@ -863,6 +867,7 @@ int main(int argc, char **argv)
     const uint64_t targetPasses = ReadEnvUnsigned("MATMUL_TARGET_PASSES");
     const uint64_t cellQuota = ReadEnvUnsigned("MATMUL_CELL_QUOTA");
     const uint64_t mQuota = ReadEnvUnsigned("MATMUL_M_QUOTA");
+    const uint64_t mCellQuota = ReadEnvUnsigned("MATMUL_M_CELL_QUOTA");
     std::printf("{\"campaign_start\":\"%s\",\"target_passes\":%lu,"
                 "\"joint_cell_quota\":%lu,\"runner\":\"analytic_critical_path_v3\"}\n",
                 CampaignName(), static_cast<unsigned long>(targetPasses), static_cast<unsigned long>(cellQuota));
@@ -889,13 +894,21 @@ int main(int argc, char **argv)
     RunCounts counts;
     const uint64_t startIndex = ReadEnvUnsigned("MATMUL_START_INDEX");
     uint64_t manifestIndex = 0;
-    auto runOne = [&](const char *dtypeName, const char *layoutName, int64_t m, int64_t n, int64_t k) {
+    auto runOne = [&](const char *dtypeName, const char *layoutName, int64_t m, int64_t n, int64_t k,
+                      uint32_t stratum) {
         const DTypeSpec *dtype = FindDType(dtypeName);
         const LayoutSpec *layout = FindLayout(layoutName);
         if (dtype == nullptr || layout == nullptr) return;
         if (mQuota != 0 && m > 0 && static_cast<size_t>(m) < counts.passedPerM.size() &&
             counts.passedPerM[static_cast<size_t>(m)] >= mQuota) {
             ++counts.mQuotaSkipped;
+            return;
+        }
+        const size_t mCellIndex = m > 0 && m <= 4096 && stratum < 18 ?
+            static_cast<size_t>(m) * 18 + stratum : counts.passedPerMCell.size();
+        if (mCellQuota != 0 && mCellIndex < counts.passedPerMCell.size() &&
+            counts.passedPerMCell[mCellIndex] >= mCellQuota) {
+            ++counts.mCellQuotaSkipped;
             return;
         }
         const size_t jointBucket = JointCoverageBucket(*dtype, m, n, k);
@@ -906,12 +919,15 @@ int main(int argc, char **argv)
         }
         const uint64_t officialBefore = counts.deterministic;
         const uint64_t passedBefore = counts.passed;
-        (void)RunWorkload(*dtype, *layout, m, n, k, stream, edgeFunction, counts, manifestIndex);
+        (void)RunWorkload(*dtype, *layout, m, n, k, stream, edgeFunction, counts, manifestIndex, stratum);
         if (counts.deterministic > officialBefore) ++counts.jointOfficial[jointBucket];
         if (counts.passed > passedBefore) {
             ++counts.jointPassed[jointBucket];
             if (m > 0 && static_cast<size_t>(m) < counts.passedPerM.size()) {
                 ++counts.passedPerM[static_cast<size_t>(m)];
+            }
+            if (mCellIndex < counts.passedPerMCell.size()) {
+                ++counts.passedPerMCell[mCellIndex];
             }
         }
         if (counts.inputs != 0 && counts.inputs % 10000 == 0) {
@@ -933,10 +949,11 @@ int main(int argc, char **argv)
         int64_t m = 0;
         int64_t n = 0;
         int64_t k = 0;
-        while (input >> dtypeName >> layoutName >> m >> n >> k) {
+        uint32_t stratum = 0;
+        while (input >> dtypeName >> layoutName >> m >> n >> k >> stratum) {
             ++manifestIndex;
             if (manifestIndex <= startIndex) continue;
-            runOne(dtypeName.c_str(), layoutName.c_str(), m, n, k);
+            runOne(dtypeName.c_str(), layoutName.c_str(), m, n, k, stratum);
             if (targetPasses != 0 && counts.passed >= targetPasses) break;
         }
     } else {
@@ -946,7 +963,7 @@ int main(int argc, char **argv)
             runOne(argv[index], argv[index + 1],
                    std::strtoll(argv[index + 2], nullptr, 10),
                    std::strtoll(argv[index + 3], nullptr, 10),
-                   std::strtoll(argv[index + 4], nullptr, 10));
+                   std::strtoll(argv[index + 4], nullptr, 10), 0);
             if (targetPasses != 0 && counts.passed >= targetPasses) break;
         }
     }
@@ -1006,6 +1023,30 @@ int main(int argc, char **argv)
                     static_cast<unsigned long>(mQuota), static_cast<unsigned long>(mMet),
                     static_cast<unsigned long>(mMissing),
                     static_cast<unsigned long>(counts.mQuotaSkipped));
+    }
+    if (mCellQuota != 0) {
+        uint64_t cellsMet = 0;
+        uint64_t cellsMissing = 0;
+        uint64_t mComplete = 0;
+        for (size_t m = 1; m <= 4096; ++m) {
+            bool complete = true;
+            for (size_t cell = 0; cell < 18; ++cell) {
+                if (counts.passedPerMCell[m * 18 + cell] >= mCellQuota) {
+                    ++cellsMet;
+                } else {
+                    ++cellsMissing;
+                    complete = false;
+                }
+            }
+            if (complete) ++mComplete;
+        }
+        std::printf("{\"m_cell_quota_summary\":true,\"strata_per_m\":18,"
+                    "\"quota_per_stratum\":%lu,\"strata_quota_met\":%lu,"
+                    "\"strata_quota_missing\":%lu,\"m_complete\":%lu,"
+                    "\"quota_skipped_inputs\":%lu}\n",
+                    static_cast<unsigned long>(mCellQuota), static_cast<unsigned long>(cellsMet),
+                    static_cast<unsigned long>(cellsMissing), static_cast<unsigned long>(mComplete),
+                    static_cast<unsigned long>(counts.mCellQuotaSkipped));
     }
     std::printf("{\"measured_coverage\":true,"
                 "\"m\":{\"129_256\":%lu,\"257_512\":%lu,\"513_1024\":%lu,\"1025_2048\":%lu,\"2049_4096\":%lu},"
@@ -1093,7 +1134,18 @@ int main(int argc, char **argv)
             }
         }
     }
+    bool mCellQuotaComplete = true;
+    if (mCellQuota != 0) {
+        for (size_t m = 1; m <= 4096 && mCellQuotaComplete; ++m) {
+            for (size_t cell = 0; cell < 18; ++cell) {
+                if (counts.passedPerMCell[m * 18 + cell] < mCellQuota) {
+                    mCellQuotaComplete = false;
+                    break;
+                }
+            }
+        }
+    }
     return counts.deterministic == 0 || (targetPasses != 0 && counts.passed < targetPasses) ||
-        !mQuotaComplete ? 4 : 0;
+        !mQuotaComplete || !mCellQuotaComplete ? 4 : 0;
 }
 // NEW END

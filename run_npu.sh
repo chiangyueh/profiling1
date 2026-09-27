@@ -139,9 +139,9 @@ if ! g++ tools/host_matmul_v3_route.cpp \
     exit 1
 fi
 
-per_m_reserve="${MATMUL_M_RESERVE:-64}"
+per_cell_reserve="${MATMUL_CELL_RESERVE:-8}"
 set +e
-python3 - <<'PY' | "${host_selector}" --select-base INDEPENDENT_BASE_SELECTOR "${per_m_reserve}" "${host_library}" >"${workload_manifest}" 2>"${selection_log}"
+python3 - <<'PY' | "${host_selector}" --select-base-stratified INDEPENDENT_BASE_SELECTOR "${per_cell_reserve}" "${host_library}" >"${workload_manifest}" 2>"${selection_log}"
 import random
 
 rng = random.Random(8527)
@@ -153,10 +153,11 @@ combinations = [
     for n in n_values
     for k in k_values
 ]
-for m in range(1, 4097):
-    rng.shuffle(combinations)
-    for dtype, n, k in combinations:
-        print("\t".join(str(value) for value in (dtype, "NN", m, n, k)))
+for offset in range(1, 101):
+    for m in range(offset, 4097, 100):
+        rng.shuffle(combinations)
+        for dtype, n, k in combinations:
+            print("\t".join(str(value) for value in (dtype, "NN", m, n, k)))
 PY
 selection_status=("${PIPESTATUS[@]}")
 set -e
@@ -168,14 +169,15 @@ if [[ "${selection_status[0]}" -ne 0 || "${selection_status[1]}" -ne 0 ]]; then
 fi
 
 adaptive_count="$(wc -l <"${workload_manifest}")"
-printf '# stage=workload_generation status=passed coverage=all_integer_m_1_to_4096_randomized_until_valid_base_reserve reserve_per_m=%d candidates=%d\n' \
-    "${per_m_reserve}" "${adaptive_count}"
+printf '# stage=workload_generation status=passed coverage=interleaved_m_1_to_4096_x_2dtype_x_3n_x_3k reserve_per_stratum=%d candidates=%d\n' \
+    "${per_cell_reserve}" "${adaptive_count}"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
 
 success_target="${MATMUL_SUCCESS_TARGET:-0}"
-m_quota="${MATMUL_M_QUOTA:-8}"
+m_quota="${MATMUL_M_QUOTA:-0}"
+m_cell_quota="${MATMUL_M_CELL_QUOTA:-1}"
 cell_quota="${MATMUL_CELL_QUOTA:-0}"
 if [[ "${cell_quota}" -eq 0 ]]; then
     cell_quota_json=null
@@ -190,6 +192,7 @@ printf '# campaign=INDEPENDENT_BASE_SELECTOR target_passes=%d maximum_per_joint_
 set +e
 MATMUL_BASE_FULL_M_SWEEP=1 MATMUL_CAMPAIGN=INDEPENDENT_BASE_SELECTOR \
     MATMUL_TARGET_PASSES="${success_target}" MATMUL_CELL_QUOTA="${cell_quota}" MATMUL_M_QUOTA="${m_quota}" \
+    MATMUL_M_CELL_QUOTA="${m_cell_quota}" \
     "${runner}" --manifest "${workload_manifest}" | python3 tools/compact_matmul_log.py
 pipeline_status=("${PIPESTATUS[@]}")
 panel_rc="${pipeline_status[0]}"

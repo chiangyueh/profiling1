@@ -6,6 +6,7 @@
 #include <iostream>
 #include <memory>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -223,10 +224,13 @@ RouteResult RunOne(const gert::OpImplKernelRegistry::OpImplFunctionsV2 *impl, co
 
 int main(int argc, char **argv)
 {
-    const bool selectMode = argc == 5 && std::strcmp(argv[1], "--select-base") == 0;
+    const bool stratifiedMode = argc == 5 && std::strcmp(argv[1], "--select-base-stratified") == 0;
+    const bool selectMode = argc == 5 &&
+        (std::strcmp(argv[1], "--select-base") == 0 || stratifiedMode);
     if (argc != 2 && !selectMode) {
         std::cerr << "usage: host_matmul_v3_route LIBOPHOST_NN_SO\n"
-                  << "       host_matmul_v3_route --select-base CAMPAIGN PER_M_RESERVE LIBOPHOST_NN_SO\n";
+                  << "       host_matmul_v3_route --select-base CAMPAIGN PER_M_RESERVE LIBOPHOST_NN_SO\n"
+                  << "       host_matmul_v3_route --select-base-stratified CAMPAIGN PER_CELL_RESERVE LIBOPHOST_NN_SO\n";
         return 2;
     }
     const char *campaign = selectMode ? argv[2] : nullptr;
@@ -260,6 +264,56 @@ int main(int argc, char **argv)
     size_t candidateSelected = 0;
     std::map<int64_t, size_t> selectedPerM;
     std::map<int64_t, size_t> seenPerM;
+    std::vector<Workload> eligibleForM;
+    int64_t currentM = 0;
+    size_t cellsMet = 0;
+    size_t cellsMissing = 0;
+    auto nBucket = [](int64_t n) -> size_t {
+        return n <= 64 ? 0 : (n <= 160 ? 1 : 2);
+    };
+    auto dtypeBucket = [](const std::string &dtype) -> size_t {
+        return dtype == "bf16" || dtype == "bf16_bf16" ? 1 : 0;
+    };
+    auto flushStratified = [&]() {
+        if (!stratifiedMode || eligibleForM.empty()) {
+            eligibleForM.clear();
+            return;
+        }
+        std::set<int64_t> kValues[2][3];
+        for (const Workload &workload : eligibleForM) {
+            kValues[dtypeBucket(workload.dtype)][nBucket(workload.n)].insert(workload.k);
+        }
+        std::vector<int64_t> orderedK[2][3];
+        for (size_t dtype = 0; dtype < 2; ++dtype) {
+            for (size_t n = 0; n < 3; ++n) {
+                orderedK[dtype][n].assign(kValues[dtype][n].begin(), kValues[dtype][n].end());
+            }
+        }
+        size_t selected[18] = {};
+        for (const Workload &workload : eligibleForM) {
+            const size_t dtype = dtypeBucket(workload.dtype);
+            const size_t n = nBucket(workload.n);
+            const auto &values = orderedK[dtype][n];
+            const auto position = std::lower_bound(values.begin(), values.end(), workload.k);
+            const size_t rank = static_cast<size_t>(position - values.begin());
+            const size_t k = std::min<size_t>(2, rank * 3 / values.size());
+            const size_t cell = dtype * 9 + n * 3 + k;
+            if (selected[cell] >= perMReserve) {
+                continue;
+            }
+            ++selected[cell];
+            std::cout << workload.dtype << '\t' << workload.layout << '\t' << workload.m << '\t'
+                      << workload.n << '\t' << workload.k << '\t' << cell << '\n';
+        }
+        for (size_t cell = 0; cell < 18; ++cell) {
+            if (selected[cell] >= perMReserve) {
+                ++cellsMet;
+            } else {
+                ++cellsMissing;
+            }
+        }
+        eligibleForM.clear();
+    };
     while (std::getline(std::cin, line)) {
         if (line.empty()) {
             continue;
@@ -269,8 +323,12 @@ int main(int argc, char **argv)
             ++invalid;
             continue;
         }
+        if (stratifiedMode && currentM != 0 && workload.m != currentM) {
+            flushStratified();
+        }
+        currentM = workload.m;
         ++seenPerM[workload.m];
-        if (selectMode && selectedPerM[workload.m] >= perMReserve) {
+        if (selectMode && !stratifiedMode && selectedPerM[workload.m] >= perMReserve) {
             continue;
         }
         (void)unsetenv("MATMUL_BASE_MODE");
@@ -299,10 +357,15 @@ int main(int argc, char **argv)
             continue;
         }
         ++candidateSelected;
+        if (stratifiedMode) {
+            eligibleForM.push_back(workload);
+            continue;
+        }
         ++selectedPerM[workload.m];
         std::cout << workload.dtype << '\t' << workload.layout << '\t' << workload.m << '\t'
                   << workload.n << '\t' << workload.k << '\n';
     }
+    flushStratified();
     if (selectMode) {
         size_t met = 0;
         size_t missing = 0;
@@ -313,10 +376,17 @@ int main(int argc, char **argv)
                 ++missing;
             }
         }
-        std::cerr << "# host_selection campaign=" << campaign << " m_seen=" << seenPerM.size()
-                  << " reserve_per_m=" << perMReserve << " m_reserve_met=" << met
-                  << " m_reserve_missing=" << missing << " official_base=" << officialBase
-                  << " candidate_selected=" << candidateSelected << '\n';
+        if (stratifiedMode) {
+            std::cerr << "# host_selection campaign=" << campaign << " m_seen=" << seenPerM.size()
+                      << " strata=18 reserve_per_stratum=" << perMReserve
+                      << " strata_reserve_met=" << cellsMet << " strata_reserve_missing=" << cellsMissing
+                      << " official_base=" << officialBase << " candidate_selected=" << candidateSelected << '\n';
+        } else {
+            std::cerr << "# host_selection campaign=" << campaign << " m_seen=" << seenPerM.size()
+                      << " reserve_per_m=" << perMReserve << " m_reserve_met=" << met
+                      << " m_reserve_missing=" << missing << " official_base=" << officialBase
+                      << " candidate_selected=" << candidateSelected << '\n';
+        }
     }
     return invalid == 0 && (selectMode || failed == 0) ? 0 : 1;
 }
