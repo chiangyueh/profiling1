@@ -18,8 +18,9 @@ FIELDS = [
 FIELDS += [f"official_{name}" for name in TILING_FIELDS]
 FIELDS += [f"candidate_{name}" for name in TILING_FIELDS]
 FIELDS += [
-    "structural_candidates", "analytic_n_quantum", "analytic_min_base_k", "analytic_max_base_n",
-    "analytic_target_n_tasks",
+    "structural_candidates", "analytic_n_quantum", "analytic_min_base_k", "analytic_max_base_m",
+    "analytic_max_base_n", "analytic_target_tasks", "analytic_tail_slots", "analytic_critical_cube", "analytic_total_cube",
+    "analytic_panel_traffic",
     "structural_total_k_loops", "structural_l2_max_n_block", "analytic_tasks",
     "analytic_waves", "analytic_k_iterations", "analytic_n_tail_waste", "analytic_active_cores",
     "analytic_m_tasks", "analytic_n_tasks", "analytic_l2_dimensions", "analytic_l2_m_block",
@@ -31,7 +32,7 @@ FIELDS += [
     "official_workspace", "candidate_workspace", "official_latency_ms", "candidate_latency_ms",
     "delta_pct", "max_abs_diff", "max_rel_diff", "correctness", "inputs", "skipped_non_v3",
     "non_target_route", "official_target", "candidate_selected_count", "official_preserved",
-    "target_passes", "quota_met", "passed", "failed", "wide_n_shallow_k_passed",
+    "target_passes", "quota_met", "passed", "failed", "analytic_selector_passed",
     "clear_candidate_wins", "false_positive_intercepts", "overlap", "stable_candidate_wins",
     "stable_official_wins", "mixed_order", "official_failed", "manifest_start_index",
     "manifest_end_index",

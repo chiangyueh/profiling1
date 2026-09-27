@@ -75,7 +75,7 @@ struct RunCounts {
     uint64_t failed = 0;
     uint64_t officialFailed = 0;
     uint64_t skippedNonV3 = 0;
-    uint64_t wideNShallowKPassed = 0;
+    uint64_t analyticSelectorPassed = 0;
     uint64_t clearCandidateWins = 0;
     uint64_t clearOfficialWins = 0;
     uint64_t overlap = 0;
@@ -745,8 +745,11 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     std::printf(",\"official_core\":%u,\"candidate_core\":%u", official.cores, adaptive.cores);
     if (std::strcmp(CampaignName(), "WIDE_N_ANALYTIC_SELECTOR") == 0) {
         std::printf(",\"structural_candidates\":%lu,\"analytic_n_quantum\":%lu,"
-                    "\"analytic_min_base_k\":%lu,\"analytic_max_base_n\":%lu,"
-                    "\"analytic_target_n_tasks\":%lu,\"structural_total_k_loops\":%lu,"
+                    "\"analytic_min_base_k\":%lu,\"analytic_max_base_m\":%lu,"
+                    "\"analytic_max_base_n\":%lu,\"analytic_target_tasks\":%lu,"
+                    "\"analytic_tail_slots\":%lu,"
+                    "\"analytic_critical_cube\":%lu,\"analytic_total_cube\":%lu,"
+                    "\"analytic_panel_traffic\":%lu,\"structural_total_k_loops\":%lu,"
                     "\"structural_l2_max_n_block\":%lu,\"analytic_tasks\":%lu,"
                     "\"analytic_waves\":%lu,\"analytic_k_iterations\":%lu,"
                     "\"analytic_n_tail_waste\":%lu,\"analytic_active_cores\":%lu,"
@@ -758,8 +761,13 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_STRUCTURAL_CANDIDATES")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_N_QUANTUM")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_MIN_BASE_K")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_MAX_BASE_M")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_MAX_BASE_N")),
-                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_TARGET_N_TASKS")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_TARGET_TASKS")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_TAIL_SLOTS")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_CRITICAL_CUBE")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_TOTAL_CUBE")),
+                    static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_PANEL_TRAFFIC")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_STRUCTURAL_TOTAL_K_LOOPS")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_STRUCTURAL_L2_MAX_N_BLOCK")),
                     static_cast<unsigned long>(ReadEnvUnsigned("MATMUL_ANALYTIC_SELECTED_TASKS")),
@@ -832,7 +840,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
             candidateVariant == "ANALYTIC_N512_K32" || candidateVariant == "WIDE_N_PANEL_ONLY" ||
             candidateVariant == "WIDE_N_WINDOW_ONLY" ||
             candidateVariant == "WIDE_N_SHALLOW_K_BASE") {
-            ++counts.wideNShallowKPassed;
+            ++counts.analyticSelectorPassed;
         }
     } else {
         ++counts.failed;
@@ -939,7 +947,7 @@ int main(int argc, char **argv)
                 "\"non_target_route\":%lu,"
                 "\"official_target\":%lu,\"candidate_selected\":%lu,\"official_preserved\":%lu,"
                 "\"target_passes\":%lu,\"quota_met\":%s,\"passed\":%lu,\"failed\":%lu,"
-                "\"wide_n_shallow_k_passed\":%lu,"
+                "\"analytic_selector_passed\":%lu,"
                 "\"clear_candidate_wins\":%lu,\"false_positive_intercepts\":%lu,\"overlap\":%lu,"
                 "\"stable_candidate_wins\":%lu,\"stable_official_wins\":%lu,\"mixed_order\":%lu,"
                 "\"official_failed\":%lu,\"manifest_start_index\":%lu,"
@@ -955,7 +963,7 @@ int main(int argc, char **argv)
                 (targetPasses == 0 || counts.passed >= targetPasses) ? "true" : "false",
                 static_cast<unsigned long>(counts.passed),
                 static_cast<unsigned long>(counts.failed),
-                static_cast<unsigned long>(counts.wideNShallowKPassed),
+                static_cast<unsigned long>(counts.analyticSelectorPassed),
                 static_cast<unsigned long>(counts.clearCandidateWins),
                 static_cast<unsigned long>(counts.clearOfficialWins),
                 static_cast<unsigned long>(counts.overlap),

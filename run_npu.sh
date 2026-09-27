@@ -12,7 +12,9 @@ unset MATMUL_STRUCTURAL_CANDIDATES MATMUL_STRUCTURAL_REFERENCE_BASE_N
 unset MATMUL_STRUCTURAL_REFERENCE_BASE_K MATMUL_STRUCTURAL_TOTAL_K_LOOPS
 unset MATMUL_STRUCTURAL_L2_MAX_N_BLOCK
 unset MATMUL_ANALYTIC_N_QUANTUM MATMUL_ANALYTIC_MIN_BASE_K
-unset MATMUL_ANALYTIC_MAX_BASE_N MATMUL_ANALYTIC_TARGET_N_TASKS
+unset MATMUL_ANALYTIC_MAX_BASE_M MATMUL_ANALYTIC_MAX_BASE_N MATMUL_ANALYTIC_TARGET_TASKS
+unset MATMUL_ANALYTIC_TAIL_SLOTS MATMUL_ANALYTIC_CRITICAL_CUBE
+unset MATMUL_ANALYTIC_TOTAL_CUBE MATMUL_ANALYTIC_PANEL_TRAFFIC
 unset MATMUL_ANALYTIC_SELECTED_TASKS MATMUL_ANALYTIC_SELECTED_WAVES
 unset MATMUL_ANALYTIC_SELECTED_K_ITERATIONS MATMUL_ANALYTIC_SELECTED_N_TAIL_WASTE
 unset MATMUL_ANALYTIC_SELECTED_ACTIVE_CORES
@@ -124,15 +126,17 @@ import random
 
 rng = random.Random(8527)
 m_values = (
-    1, 3, 5, 7, 9, 12, 16, 17, 20, 24, 28, 32, 33, 40, 48, 56,
-    64, 65, 72, 80, 96, 112, 127, 128,
+    129, 137, 159, 160, 191, 192, 223, 255, 256, 257, 320, 384,
+    511, 512, 513, 640, 768, 896, 1024, 1025, 1280, 1536, 1792,
+    2048, 2049, 2560, 3072, 3584, 4096,
 )
-n_values = set(range(1024, 4097, 128))
-n_values.update(range(4224, 10241, 256))
-n_values.update(range(10752, 32769, 512))
-for boundary in (2560, 5120, 10240):
+n_values = set(range(16, 257, 16))
+n_values.update(range(384, 4097, 128))
+n_values.update(range(4352, 16385, 256))
+n_values.update(range(16896, 32769, 512))
+for boundary in (256, 1280, 2560, 5120, 10240, 20480):
     n_values.update(boundary + offset for offset in (-256, -128, 0, 128, 256))
-n_values = tuple(sorted(value for value in n_values if value >= 1024))
+n_values = tuple(sorted(value for value in n_values if value >= 16))
 k_values = (
     512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 10240,
     12288, 14336, 15104, 16384, 18432, 20480, 24576, 28672, 32768,
@@ -152,8 +156,8 @@ for dtype in ("fp16_fp16", "bf16_bf16"):
             for k in k_values:
                 if 2 * (m * k + k * n + m * n) > byte_limit:
                     continue
-                key = (dtype, bucket(m, (16, 32, 64)),
-                       bucket(n, (4096, 10240)), bucket(k, (4096, 16384)))
+                key = (dtype, bucket(m, (256, 512, 1024, 2048)),
+                       bucket(n, (256, 2048, 8192)), bucket(k, (4096, 16384)))
                 strata[key].append((dtype, "NN", m, n, k))
 
 for values in strata.values():
@@ -170,13 +174,13 @@ while queues:
 PY
 
 adaptive_count="$(wc -l <"${workload_manifest}")"
-printf '# stage=workload_generation status=passed coverage=72_interleaved_dtype_m_n_k_regimes candidates=%d\n' "${adaptive_count}"
+printf '# stage=workload_generation status=passed coverage=120_interleaved_large_m_dtype_m_n_k_regimes candidates=%d\n' "${adaptive_count}"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
-success_target="${MATMUL_SUCCESS_TARGET:-5000}"
+success_target="${MATMUL_SUCCESS_TARGET:-10000}"
 cell_quota="${MATMUL_CELL_QUOTA:-0}"
 if [[ "${cell_quota}" -eq 0 ]]; then
     cell_quota_json=null
