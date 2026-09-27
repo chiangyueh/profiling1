@@ -35,7 +35,9 @@ FIELDS += [
     "target_passes", "quota_met", "passed", "failed", "analytic_selector_passed",
     "clear_candidate_wins", "false_positive_intercepts", "overlap", "stable_candidate_wins",
     "stable_official_wins", "mixed_order", "official_failed", "manifest_start_index",
-    "manifest_end_index",
+    "manifest_end_index", "tensor_allocation_failed", "official_get_workspace_failed",
+    "official_get_workspace_failed_fp16", "official_get_workspace_failed_bf16",
+    "official_measurement_failed", "candidate_tiling_failed",
 ]
 
 

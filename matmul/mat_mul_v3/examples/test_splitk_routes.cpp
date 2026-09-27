@@ -74,6 +74,12 @@ struct RunCounts {
     uint64_t passed = 0;
     uint64_t failed = 0;
     uint64_t officialFailed = 0;
+    uint64_t tensorAllocationFailed = 0;
+    uint64_t officialGetWorkspaceFailed = 0;
+    uint64_t officialGetWorkspaceFailedFp16 = 0;
+    uint64_t officialGetWorkspaceFailedBf16 = 0;
+    uint64_t officialMeasurementFailed = 0;
+    uint64_t candidateTilingFailed = 0;
     uint64_t skippedNonV3 = 0;
     uint64_t analyticSelectorPassed = 0;
     uint64_t clearCandidateWins = 0;
@@ -470,12 +476,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     }
     if (rc != ACL_SUCCESS) {
         ++counts.officialFailed;
-        std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
-                    "\"output_dtype\":\"%s\",\"candidate_branch\":\"%s\","
-                    "\"status\":\"TENSOR_ALLOCATION_FAILED\",\"result_code\":%d}\n",
-                    static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
-                    dtype.inputName, dtype.outputName, CampaignName(), rc);
-        std::fflush(stdout);
+        ++counts.tensorAllocationFailed;
         ReleaseTensor(cTensor);
         ReleaseTensor(bTensor);
         ReleaseTensor(aTensor);
@@ -497,12 +498,12 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     const TilingSnapshot official = ReadTilingSnapshot();
     if (rc != ACL_SUCCESS || officialExecutor == nullptr) {
         ++counts.officialFailed;
-        std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
-                    "\"output_dtype\":\"%s\",\"candidate_branch\":\"%s\","
-                    "\"status\":\"OFFICIAL_GET_WORKSPACE_FAILED\",\"result_code\":%d}\n",
-                    static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
-                    dtype.inputName, dtype.outputName, CampaignName(), rc == ACL_SUCCESS ? 4 : rc);
-        std::fflush(stdout);
+        ++counts.officialGetWorkspaceFailed;
+        if (std::strcmp(dtype.inputName, "fp16") == 0) {
+            ++counts.officialGetWorkspaceFailedFp16;
+        } else if (std::strcmp(dtype.inputName, "bf16") == 0) {
+            ++counts.officialGetWorkspaceFailedBf16;
+        }
         if (officialExecutor != nullptr) (void)aclDestroyAclOpExecutor(officialExecutor);
         ReleaseTensor(cTensor);
         ReleaseTensor(bTensor);
@@ -521,13 +522,6 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         (adaptiveCampaign ? IsDeterministicSplitK(official.key) : false);
     if (!officialRouteMatched) {
         ++counts.nonDeterministic;
-        std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
-                    "\"output_dtype\":\"%s\",\"candidate_branch\":\"%s\","
-                    "\"status\":\"NON_BASE_ROUTE\",\"result_code\":0,\"official_key\":%lu}\n",
-                    static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
-                    dtype.inputName, dtype.outputName, CampaignName(),
-                    static_cast<unsigned long>(official.key));
-        std::fflush(stdout);
         (void)aclDestroyAclOpExecutor(officialExecutor);
         ReleaseTensor(cTensor);
         ReleaseTensor(bTensor);
@@ -581,13 +575,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     if (baseCampaign && !changed) {
         if (rc != ACL_SUCCESS) {
             ++counts.failed;
-            std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
-                        "\"output_dtype\":\"%s\",\"candidate_branch\":\"%s\","
-                        "\"status\":\"CANDIDATE_TILING_FAILED\",\"result_code\":%d}\n",
-                        static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
-                        dtype.inputName, dtype.outputName,
-                        CampaignName(), rc);
-            std::fflush(stdout);
+            ++counts.candidateTilingFailed;
         }
         if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
         (void)aclDestroyAclOpExecutor(officialExecutor);
@@ -606,14 +594,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     if (rc == ACL_SUCCESS && !candidateRouteMatched) rc = 4;
     if (rc != ACL_SUCCESS) {
         ++counts.failed;
-        std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
-                    "\"output_dtype\":\"%s\",\"candidate_branch\":\"%s\","
-                    "\"status\":\"%s\",\"result_code\":%d}\n",
-                    static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
-                    dtype.inputName, dtype.outputName,
-                    CampaignName(),
-                    invariantPassed ? "CANDIDATE_TILING_FAILED" : "CANDIDATE_INVARIANT_FAILED", rc);
-        std::fflush(stdout);
+        ++counts.candidateTilingFailed;
         if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
         (void)aclDestroyAclOpExecutor(officialExecutor);
         (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE");
@@ -674,11 +655,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     const std::vector<uint8_t> officialOutput = rc == ACL_SUCCESS ? CopyDeviceOutput(cTensor) : std::vector<uint8_t>{};
     if (rc != ACL_SUCCESS || officialOutput.empty()) {
         ++counts.officialFailed;
-        std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
-                    "\"output_dtype\":\"%s\",\"status\":\"OFFICIAL_MEASUREMENT_FAILED\",\"result_code\":%d}\n",
-                    static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
-                    dtype.inputName, dtype.outputName, rc == ACL_SUCCESS ? 4 : rc);
-        std::fflush(stdout);
+        ++counts.officialMeasurementFailed;
         if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
         if (officialWorkspace != nullptr) (void)aclrtFree(officialWorkspace);
         (void)aclDestroyAclOpExecutor(officialExecutor);
@@ -967,7 +944,12 @@ int main(int argc, char **argv)
                 "\"analytic_selector_passed\":%lu,"
                 "\"clear_candidate_wins\":%lu,\"false_positive_intercepts\":%lu,\"overlap\":%lu,"
                 "\"stable_candidate_wins\":%lu,\"stable_official_wins\":%lu,\"mixed_order\":%lu,"
-                "\"official_failed\":%lu,\"manifest_start_index\":%lu,"
+                "\"official_failed\":%lu,\"tensor_allocation_failed\":%lu,"
+                "\"official_get_workspace_failed\":%lu,"
+                "\"official_get_workspace_failed_fp16\":%lu,"
+                "\"official_get_workspace_failed_bf16\":%lu,"
+                "\"official_measurement_failed\":%lu,\"candidate_tiling_failed\":%lu,"
+                "\"manifest_start_index\":%lu,"
                 "\"manifest_end_index\":%lu}\n",
                 CampaignName(),
                 static_cast<unsigned long>(counts.inputs),
@@ -988,6 +970,12 @@ int main(int argc, char **argv)
                 static_cast<unsigned long>(counts.stableOfficialWins),
                 static_cast<unsigned long>(counts.mixedOrder),
                 static_cast<unsigned long>(counts.officialFailed),
+                static_cast<unsigned long>(counts.tensorAllocationFailed),
+                static_cast<unsigned long>(counts.officialGetWorkspaceFailed),
+                static_cast<unsigned long>(counts.officialGetWorkspaceFailedFp16),
+                static_cast<unsigned long>(counts.officialGetWorkspaceFailedBf16),
+                static_cast<unsigned long>(counts.officialMeasurementFailed),
+                static_cast<unsigned long>(counts.candidateTilingFailed),
                 static_cast<unsigned long>(startIndex),
                 static_cast<unsigned long>(manifestIndex));
     std::printf("{\"measured_coverage\":true,"
