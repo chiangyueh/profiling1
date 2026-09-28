@@ -24,6 +24,7 @@ unset MATMUL_ANALYTIC_L2_M_WINDOWS MATMUL_ANALYTIC_L2_N_WINDOWS
 unset MATMUL_ANALYTIC_L2_WINDOW_BYTES MATMUL_ANALYTIC_L2_ESTIMATED_TRAFFIC
 unset MATMUL_DETERMINISTIC_ADAPTIVE MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED
 unset MATMUL_BASE_FULL_M_SWEEP
+unset MATMUL_FORCE_BASE_ONLY
 unset MATMUL_CAMPAIGN
 
 if [[ "$#" -ne 0 ]]; then
@@ -131,22 +132,46 @@ if ! manifest_audit="$(awk -F '\t' '
     NF != 6 { invalid++ }
     NF == 6 {
         rows++
+        dtype = $1
+        layout = $2
         m = $3 + 0
-        if (m < 1 || m > 4096) invalid++
+        n = $4 + 0
+        k = $5 + 0
+        cell = $6 + 0
+        dtype_band = dtype == "bf16_bf16" ? 1 : 0
+        n_band = n <= 512 ? 0 : (n <= 8192 ? 1 : 2)
+        k_band = k <= 512 ? 0 : (k <= 8192 ? 1 : 2)
+        expected_cell = dtype_band * 9 + n_band * 3 + k_band
+        if ((dtype != "fp16_fp16" && dtype != "bf16_bf16") || layout != "NN" ||
+            m < 1 || m > 4096 || n < 1 || n > 65536 || k < 1 || k > 65536 ||
+            cell < 0 || cell > 17 || cell != expected_cell) invalid++
         seen[m]++
+        seen_cell[m, cell]++
+        if (rows == 1 || n < min_n) min_n = n
+        if (rows == 1 || k < min_k) min_k = k
+        if (n > max_n) max_n = n
+        if (k > max_k) max_k = k
+        if (n % 16 == 0) aligned_n++; else unaligned_n++
+        if (k % 16 == 0) aligned_k++; else unaligned_k++
     }
     END {
         missing = 0
+        bad_cells = 0
         minimum = 999999
         maximum = 0
         for (m = 1; m <= 4096; ++m) {
             if (seen[m] == 0) missing++
             if (seen[m] < minimum) minimum = seen[m]
             if (seen[m] > maximum) maximum = seen[m]
+            for (cell = 0; cell < 18; ++cell) {
+                if (seen_cell[m, cell] != 2) bad_cells++
+            }
         }
-        printf "rows=%d distinct_m=%d missing_m=%d candidates_per_m_min=%d candidates_per_m_max=%d invalid=%d", \
-            rows, length(seen), missing, minimum, maximum, invalid
-        exit(invalid != 0 || missing != 0 || length(seen) != 4096)
+        printf "rows=%d distinct_m=%d missing_m=%d candidates_per_m_min=%d candidates_per_m_max=%d bad_cells=%d n_range=%d..%d k_range=%d..%d invalid=%d", \
+            rows, length(seen), missing, minimum, maximum, bad_cells, min_n, max_n, min_k, max_k, invalid
+        exit(invalid != 0 || missing != 0 || length(seen) != 4096 || bad_cells != 0 ||
+             rows != 147456 || min_n != 1 || max_n != 65536 || min_k != 1 || max_k != 65536 ||
+             aligned_n == 0 || unaligned_n == 0 || aligned_k == 0 || unaligned_k == 0)
     }
 ' "${workload_manifest}")"; then
     printf '{"fatal":"manifest_does_not_cover_every_m","audit":"%s"}\n' "${manifest_audit}" >&2
@@ -157,10 +182,11 @@ printf '# stage=workload_generation status=passed source=host_preverified_all_m_
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
 export MATMUL_BASE_FULL_M_SWEEP=1
+export MATMUL_FORCE_BASE_ONLY=1
 
 success_target="${MATMUL_SUCCESS_TARGET:-0}"
-m_quota=1
-m_cell_quota="${MATMUL_M_CELL_QUOTA:-0}"
+m_quota=0
+m_cell_quota="${MATMUL_M_CELL_QUOTA:-1}"
 cell_quota="${MATMUL_CELL_QUOTA:-0}"
 if [[ "${cell_quota}" -eq 0 ]]; then
     cell_quota_json=null

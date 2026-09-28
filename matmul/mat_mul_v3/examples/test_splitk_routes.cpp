@@ -10,7 +10,10 @@
 #include <vector>
 
 #include "acl/acl.h"
+#include "aclnn_kernels/contiguous.h"
+#include "opdev/make_op_executor.h"
 #include "matmul/mat_mul_v3/op_host/op_api/aclnn_matmul.h"
+#include "matmul/mat_mul_v3/op_host/op_api/matmul.h"
 
 extern "C" uint32_t TbeLoadSoAndSaveToRegistry(const char *soPath);
 
@@ -64,6 +67,22 @@ struct TilingSnapshot {
     uint32_t l2NBlock = 0;
     uint32_t l2Order = 0;
 };
+
+aclnnStatus ForcedMatmulV3GetWorkspaceSize(const aclTensor *a, const aclTensor *b, aclTensor *out,
+                                           const LayoutSpec &layout, size_t *workspaceSize,
+                                           aclOpExecutor **executor)
+{
+    auto uniqueExecutor = CREATE_EXECUTOR();
+    if (uniqueExecutor.get() == nullptr) return 561101;
+    const aclTensor *mmOut = l0op::MatMulV3Nd(
+        a, b, nullptr, layout.transA, layout.transB, false, 0x1, uniqueExecutor.get());
+    if (mmOut == nullptr) return 561103;
+    const aclTensor *copied = l0op::ViewCopy(mmOut, out, uniqueExecutor.get());
+    if (copied == nullptr) return 561103;
+    *workspaceSize = uniqueExecutor->GetWorkspaceSize();
+    uniqueExecutor.ReleaseTo(executor);
+    return ACL_SUCCESS;
+}
 
 struct RunCounts {
     uint64_t inputs = 0;
@@ -192,7 +211,7 @@ bool IsDeterministicSplitK(uint64_t key)
 bool IsPlainBase(uint64_t key)
 {
     return (key & 0x0fU) == 0U && ((key >> 4U) & 0xffU) == 0U &&
-        ((key >> 12U) & 0x0fU) == 0U && ((key >> 16U) & 0x0fU) == 1U &&
+        ((key >> 12U) & 0x0fU) == 0U && ((key >> 16U) & 0x0fU) <= 1U &&
         ((key >> 20U) & 0x0fU) == 0U;
 }
 
@@ -497,8 +516,8 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     ClearObservedTiling();
     uint64_t officialWorkspaceSize = 0;
     aclOpExecutor *officialExecutor = nullptr;
-    rc = aclnnMatmulGetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, 1,
-                                     &officialWorkspaceSize, &officialExecutor);
+    rc = ForcedMatmulV3GetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, layout,
+                                        &officialWorkspaceSize, &officialExecutor);
     const TilingSnapshot official = ReadTilingSnapshot();
     if (rc != ACL_SUCCESS || officialExecutor == nullptr) {
         ++counts.officialFailed;
@@ -514,7 +533,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         ReleaseTensor(aTensor);
         return rc == ACL_SUCCESS ? 4 : rc;
     }
-    if (official.key == 0) {
+    if (official.cores == 0) {
         ++counts.skippedNonV3;
         (void)aclDestroyAclOpExecutor(officialExecutor);
         ReleaseTensor(cTensor);
@@ -562,8 +581,8 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     ClearObservedTiling();
     uint64_t adaptiveWorkspaceSize = 0;
     aclOpExecutor *adaptiveExecutor = nullptr;
-    rc = aclnnMatmulGetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, 1,
-                                     &adaptiveWorkspaceSize, &adaptiveExecutor);
+    rc = ForcedMatmulV3GetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, layout,
+                                        &adaptiveWorkspaceSize, &adaptiveExecutor);
     const TilingSnapshot adaptive = ReadTilingSnapshot();
     const char *variantText = std::getenv("MATMUL_BASE_EXPERIMENT_VARIANT");
     const std::string candidateVariant = variantText == nullptr ? "" : variantText;
@@ -839,7 +858,9 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
             candidateVariant == "ANALYTIC_N128_K128" || candidateVariant == "ANALYTIC_N256_K64" ||
             candidateVariant == "ANALYTIC_N512_K32" || candidateVariant == "WIDE_N_PANEL_ONLY" ||
             candidateVariant == "WIDE_N_WINDOW_ONLY" ||
-            candidateVariant == "WIDE_N_SHALLOW_K_BASE") {
+            candidateVariant == "WIDE_N_SHALLOW_K_BASE" ||
+            candidateVariant == "SMALL_M_WIDE_N_PANEL" ||
+            candidateVariant == "TWO_DIMENSIONAL_FULL_DOMAIN") {
             ++counts.analyticSelectorPassed;
         }
     } else {
@@ -1052,9 +1073,9 @@ int main(int argc, char **argv)
                     static_cast<unsigned long>(counts.mCellQuotaSkipped));
     }
     std::printf("{\"measured_coverage\":true,"
-                "\"m\":{\"129_256\":%lu,\"257_512\":%lu,\"513_1024\":%lu,\"1025_2048\":%lu,\"2049_4096\":%lu},"
-                "\"n\":{\"16_512\":%lu,\"513_2048\":%lu,\"2049_8192\":%lu,\"8193_24576\":%lu,\"24577_65536\":%lu},"
-                "\"k\":{\"512_8192\":%lu,\"8193_16384\":%lu,\"16385_24576\":%lu,\"24577_65536\":%lu}}\n",
+                "\"m\":{\"1_256\":%lu,\"257_512\":%lu,\"513_1024\":%lu,\"1025_2048\":%lu,\"2049_4096\":%lu},"
+                "\"n\":{\"1_512\":%lu,\"513_2048\":%lu,\"2049_8192\":%lu,\"8193_24576\":%lu,\"24577_65536\":%lu},"
+                "\"k\":{\"1_8192\":%lu,\"8193_16384\":%lu,\"16385_24576\":%lu,\"24577_65536\":%lu}}\n",
                 static_cast<unsigned long>(counts.mCoverage[0]),
                 static_cast<unsigned long>(counts.mCoverage[1]),
                 static_cast<unsigned long>(counts.mCoverage[2]),

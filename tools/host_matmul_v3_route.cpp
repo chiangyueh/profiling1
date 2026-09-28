@@ -147,7 +147,7 @@ const char *Family(uint64_t key)
     const uint64_t fix = (key >> 12U) & 0xFULL;
     const uint64_t nd2nz = (key >> 16U) & 0xFULL;
     const uint64_t special = (key >> 20U) & 0xFULL;
-    if (load == 0 && split == 0 && fix == 0 && nd2nz == 1 && special == 0) {
+    if (load == 0 && split == 0 && fix == 0 && nd2nz <= 1 && special == 0) {
         return "BASE";
     }
     return "NON_BASE";
@@ -272,13 +272,15 @@ int main(int argc, char **argv)
     const char *campaign = selectMode ? argv[2] : nullptr;
     const size_t perMReserve = selectMode ? std::strtoull(argv[3], nullptr, 10) : 0;
     const char *hostLibrary = selectMode ? argv[4] : argv[1];
+    const char *forceBaseText = std::getenv("MATMUL_FORCE_BASE_ONLY");
+    const bool forceBase = forceBaseText != nullptr && forceBaseText[0] == '1' && forceBaseText[1] == '\0';
     if (selectMode && perMReserve == 0) {
         std::cerr << "PER_M_RESERVE must be positive\n";
         return 2;
     }
     void *legacyHandle = nullptr;
     LegacyMmCheckHitV3Shape publicRouteCheck = nullptr;
-    if (selectMode) {
+    if (selectMode && !forceBase) {
         legacyHandle = dlopen(argv[5], RTLD_NOW | RTLD_LOCAL);
         if (legacyHandle == nullptr) {
             std::cerr << "failed to load legacy route library: " << dlerror() << '\n';
@@ -321,8 +323,8 @@ int main(int argc, char **argv)
     int64_t currentM = 0;
     size_t cellsMet = 0;
     size_t cellsMissing = 0;
-    auto nBucket = [](int64_t n) -> size_t {
-        return n <= 64 ? 0 : (n <= 160 ? 1 : 2);
+    auto dimensionBucket = [](int64_t value) -> size_t {
+        return value <= 512 ? 0 : (value <= 8192 ? 1 : 2);
     };
     auto dtypeBucket = [](const std::string &dtype) -> size_t {
         return dtype == "bf16" || dtype == "bf16_bf16" ? 1 : 0;
@@ -332,24 +334,11 @@ int main(int argc, char **argv)
             eligibleForM.clear();
             return;
         }
-        std::set<int64_t> kValues[2][3];
-        for (const Workload &workload : eligibleForM) {
-            kValues[dtypeBucket(workload.dtype)][nBucket(workload.n)].insert(workload.k);
-        }
-        std::vector<int64_t> orderedK[2][3];
-        for (size_t dtype = 0; dtype < 2; ++dtype) {
-            for (size_t n = 0; n < 3; ++n) {
-                orderedK[dtype][n].assign(kValues[dtype][n].begin(), kValues[dtype][n].end());
-            }
-        }
         size_t selected[18] = {};
         for (const Workload &workload : eligibleForM) {
             const size_t dtype = dtypeBucket(workload.dtype);
-            const size_t n = nBucket(workload.n);
-            const auto &values = orderedK[dtype][n];
-            const auto position = std::lower_bound(values.begin(), values.end(), workload.k);
-            const size_t rank = static_cast<size_t>(position - values.begin());
-            const size_t k = std::min<size_t>(2, rank * 3 / values.size());
+            const size_t n = dimensionBucket(workload.n);
+            const size_t k = dimensionBucket(workload.k);
             const size_t cell = dtype * 9 + n * 3 + k;
             if (selected[cell] >= perMReserve) {
                 continue;
@@ -384,7 +373,7 @@ int main(int argc, char **argv)
         if (selectMode && !stratifiedMode && selectedPerM[workload.m] >= perMReserve) {
             continue;
         }
-        if (selectMode && !PublicRouteUsesV3(publicRouteCheck, workload)) {
+        if (selectMode && !forceBase && !PublicRouteUsesV3(publicRouteCheck, workload)) {
             continue;
         }
         if (selectMode) {
