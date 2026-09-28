@@ -10,9 +10,33 @@
 #include <vector>
 
 #include "acl/acl.h"
+#include "aclnn_kernels/common/op_error_check.h"
+#include "aclnn_kernels/contiguous.h"
 #include "matmul/mat_mul_v3/op_host/op_api/aclnn_matmul.h"
+#include "matmul/mat_mul_v3/op_host/op_api/matmul.h"
+#include "opdev/make_op_executor.h"
 
 extern "C" uint32_t TbeLoadSoAndSaveToRegistry(const char *soPath);
+
+aclnnStatus DirectMatmulV3GetWorkspaceSize(
+    const aclTensor *self, const aclTensor *mat2, aclTensor *out,
+    uint64_t *workspaceSize, aclOpExecutor **executor)
+{
+    if (self == nullptr || mat2 == nullptr || out == nullptr ||
+        workspaceSize == nullptr || executor == nullptr) {
+        return ACLNN_ERR_PARAM_NULLPTR;
+    }
+    auto uniqueExecutor = CREATE_EXECUTOR();
+    if (uniqueExecutor.get() == nullptr) return ACLNN_ERR_INNER_CREATE_EXECUTOR;
+    const aclTensor *matmulOut =
+        l0op::MatMulV3Nd(self, mat2, nullptr, false, false, false, 1, uniqueExecutor.get());
+    if (matmulOut == nullptr) return ACLNN_ERR_INNER_NULLPTR;
+    const aclTensor *copied = l0op::ViewCopy(matmulOut, out, uniqueExecutor.get());
+    if (copied == nullptr) return ACLNN_ERR_INNER_NULLPTR;
+    *workspaceSize = uniqueExecutor->GetWorkspaceSize();
+    uniqueExecutor.ReleaseTo(executor);
+    return ACLNN_SUCCESS;
+}
 
 constexpr int WARMUP = 1;
 constexpr int SAMPLES = 3;
@@ -478,6 +502,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     const bool baseCampaign = IsBaseCampaign();
     const bool edgeCampaign = std::strcmp(CampaignName(), "CUBE_VECTOR_EDGE") == 0;
     const bool adaptiveCampaign = IsAdaptiveCampaign();
+    const bool directV3Campaign = std::strcmp(CampaignName(), "THREE_SHAPE_BASE") == 0;
     ++counts.inputs;
     Tensor aTensor;
     Tensor bTensor;
@@ -516,8 +541,11 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     ClearObservedTiling();
     uint64_t officialWorkspaceSize = 0;
     aclOpExecutor *officialExecutor = nullptr;
-    rc = aclnnMatmulGetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, 1,
-                                     &officialWorkspaceSize, &officialExecutor);
+    rc = directV3Campaign ?
+        DirectMatmulV3GetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor,
+                                       &officialWorkspaceSize, &officialExecutor) :
+        aclnnMatmulGetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, 1,
+                                    &officialWorkspaceSize, &officialExecutor);
     const TilingSnapshot official = ReadTilingSnapshot();
     if (rc != ACL_SUCCESS || officialExecutor == nullptr) {
         ++counts.officialFailed;
@@ -583,8 +611,11 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     ClearObservedTiling();
     uint64_t adaptiveWorkspaceSize = 0;
     aclOpExecutor *adaptiveExecutor = nullptr;
-    rc = aclnnMatmulGetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, 1,
-                                     &adaptiveWorkspaceSize, &adaptiveExecutor);
+    rc = directV3Campaign ?
+        DirectMatmulV3GetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor,
+                                       &adaptiveWorkspaceSize, &adaptiveExecutor) :
+        aclnnMatmulGetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, 1,
+                                    &adaptiveWorkspaceSize, &adaptiveExecutor);
     const TilingSnapshot adaptive = ReadTilingSnapshot();
     const char *variantText = std::getenv("MATMUL_BASE_EXPERIMENT_VARIANT");
     const std::string candidateVariant = variantText == nullptr ? "" : variantText;
