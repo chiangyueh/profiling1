@@ -2060,6 +2060,7 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
 
 bool MatmulV3BaseTiling::DoIndependentBaseTiling()
 {
+    const MatmulV3RunInfo reference = runInfo_;
     (void)::unsetenv("MATMUL_BASE_EXPERIMENT_VARIANT");
     (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_TASKS");
     (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_WAVES");
@@ -2120,7 +2121,7 @@ bool MatmulV3BaseTiling::DoIndependentBaseTiling()
         args_.kValue >= 15104UL && args_.kValue <= 20608UL && smallFullWaves >= 5UL &&
         smallNTiles <= BASIC_BLOCK_SIZE_128 && smallTailTiles != 0 &&
         smallTailTiles * 5UL <= compileInfo_.aicNum * NUM_HALF;
-    if (!fullMSweep && smallPanelFamily) {
+    if (smallPanelFamily) {
         constexpr uint64_t smallDepthA1 = smallStepKa * DB_SIZE;
         constexpr uint64_t smallDepthB1 = smallStepKb * DB_SIZE;
         const uint64_t l0ABytes = DB_SIZE * smallBaseM * smallBaseK * aDtypeSize_;
@@ -2172,9 +2173,7 @@ bool MatmulV3BaseTiling::DoIndependentBaseTiling()
     const uint64_t targetTasks = compileInfo_.aicNum * NUM_HALF;
     const uint64_t baseM = ops::CeilAlign(MathUtil::CeilDivision(args_.mValue, targetTasks), BASIC_ALIGN_16);
     const uint64_t baseN = ops::CeilAlign(args_.nValue, BASIC_ALIGN_16);
-    if (baseM == 0 || baseM > BASIC_BLOCK_SIZE_128 || baseN == 0 ||
-        (!fullMSweep && (args_.mValue < BASIC_BLOCK_SIZE_128 ||
-         args_.nValue < BASIC_ALIGN_16 * NUM_HALF || baseM < BASIC_ALIGN_16 * 5UL))) {
+    if (baseM == 0 || baseM > BASIC_BLOCK_SIZE_128 || baseN == 0) {
         return false;
     }
     const uint64_t alignedK = ops::CeilAlign(args_.kValue, BASIC_ALIGN_16);
@@ -2182,7 +2181,7 @@ bool MatmulV3BaseTiling::DoIndependentBaseTiling()
     const uint64_t maxBaseKByL0B = compileInfo_.l0BSize / (DB_SIZE * baseN * bDtypeSize_);
     const uint64_t baseK = ops::FloorAlign(
         std::min({BASIC_BLOCK_SIZE_256, alignedK, maxBaseKByL0A, maxBaseKByL0B}), BASIC_ALIGN_16);
-    if (baseK < BASIC_ALIGN_16 || (!fullMSweep && baseK < BASIC_ALIGN_16 * 10UL)) {
+    if (baseK < BASIC_ALIGN_16) {
         return false;
     }
     const uint64_t mTasks = MathUtil::CeilDivision(args_.mValue, baseM);
@@ -2191,10 +2190,6 @@ bool MatmulV3BaseTiling::DoIndependentBaseTiling()
     const uint64_t waves = MathUtil::CeilDivision(tasks, compileInfo_.aicNum);
     const uint64_t tailSlots = waves * compileInfo_.aicNum - tasks;
     const uint64_t kIterations = MathUtil::CeilDivision(args_.kValue, baseK);
-    if (!fullMSweep && (waves != NUM_HALF || tailSlots > NUM_HALF ||
-        kIterations < BASIC_BLOCK_SIZE_64)) {
-        return false;
-    }
 
     MatmulV3RunInfo candidate{};
     candidate.needUpdate = true;
@@ -2274,7 +2269,26 @@ bool MatmulV3BaseTiling::DoIndependentBaseTiling()
     candidate.l2Info.mTileBlock = mWindowBlock;
     candidate.l2Info.nTileBlock = 1;
     candidate.l2Info.calOrder = ITER_COL_FIRST;
-    return selectCandidate(candidate, fullMSweep ? "N_PANEL_FULL_M_SWEEP" : "TWO_WAVE_N_PANEL_DEEP_K",
+    if (!fullMSweep) {
+        if (reference.singleCoreM == 0 || reference.singleCoreN == 0 || reference.baseM == 0 ||
+            reference.baseN == 0 || reference.baseK == 0) {
+            return false;
+        }
+        const uint64_t referenceMTasks = MathUtil::CeilDivision(args_.mValue, reference.singleCoreM);
+        const uint64_t referenceNTasks = MathUtil::CeilDivision(args_.nValue, reference.singleCoreN);
+        const uint64_t referenceTasks = referenceMTasks * referenceNTasks;
+        const uint64_t referenceWaves = MathUtil::CeilDivision(referenceTasks, compileInfo_.aicNum);
+        const uint64_t nCubeBlocks = MathUtil::CeilDivision(args_.nValue, BASIC_ALIGN_16);
+        const __uint128_t referenceCritical = static_cast<__uint128_t>(referenceWaves) * reference.baseM *
+            reference.baseN * MathUtil::CeilDivision(args_.kValue, reference.baseK) * reference.baseK;
+        const __uint128_t candidateCritical = static_cast<__uint128_t>(waves) * candidate.baseM *
+            candidate.baseN * MathUtil::CeilDivision(args_.kValue, candidate.baseK) * candidate.baseK;
+        if (waves != referenceWaves || tailSlots > NUM_HALF || nCubeBlocks < NUM_HALF ||
+            nCubeBlocks > 6UL || candidateCritical * 4UL > referenceCritical * 3UL) {
+            return false;
+        }
+    }
+    return selectCandidate(candidate, fullMSweep ? "N_PANEL_FULL_M_SWEEP" : "WAVE_PRESERVING_N_PANEL",
         tasks, waves,
         kIterations, tailSlots, mTasks, nTasks);
 }

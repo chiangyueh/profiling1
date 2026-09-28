@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -37,6 +38,10 @@ struct RouteResult {
     uint64_t key = 0;
     uint32_t blockDim = 0;
 };
+
+using LegacyMmCheckHitV3Shape = bool (*)(
+    const gert::Tensor *, const gert::Tensor *, const gert::Tensor *, bool, bool, ge::Format, bool,
+    uint32_t, const std::string &);
 
 ge::DataType ParseDtype(const std::string &value)
 {
@@ -81,6 +86,29 @@ bool ParseLine(const std::string &line, Workload &workload)
            (workload.layout == "NN" || workload.layout == "NT" ||
             workload.layout == "TN" || workload.layout == "TT") &&
            ParsePositive(m, workload.m) && ParsePositive(n, workload.n) && ParsePositive(k, workload.k);
+}
+
+bool PublicRouteUsesV3(LegacyMmCheckHitV3Shape check, const Workload &workload)
+{
+    const bool transA = workload.layout[0] == 'T';
+    const bool transB = workload.layout[1] == 'T';
+    const ge::DataType dtype = ParseDtype(workload.dtype);
+    const gert::StorageShape aShape = transA ?
+        gert::StorageShape({workload.k, workload.m}, {workload.k, workload.m}) :
+        gert::StorageShape({workload.m, workload.k}, {workload.m, workload.k});
+    const gert::StorageShape bShape = transB ?
+        gert::StorageShape({workload.n, workload.k}, {workload.n, workload.k}) :
+        gert::StorageShape({workload.k, workload.n}, {workload.k, workload.n});
+    const gert::StorageFormat ndFormat(ge::FORMAT_ND, ge::FORMAT_ND, {});
+    gert::Tensor a(aShape, ndFormat, dtype);
+    gert::Tensor b(bShape, ndFormat, dtype);
+    const uint64_t largestOuter = static_cast<uint64_t>(std::max(workload.m, workload.n));
+    const uint64_t k = static_cast<uint64_t>(workload.k);
+    const bool fp16SplitK = dtype == ge::DT_FLOAT16 && k >= 8UL * largestOuter;
+    const bool singleCoreSplitK = (dtype == ge::DT_FLOAT16 || dtype == ge::DT_BF16) &&
+        k >= 27392UL && k >= 2UL * largestOuter;
+    return check(&a, &b, nullptr, transA, transB, ge::FORMAT_ND,
+                 fp16SplitK || singleCoreSplitK, 20U, "Ascend910B3");
 }
 
 const gert::OpImplKernelRegistry::OpImplFunctionsV2 *GetMatmulV3Impl()
@@ -224,13 +252,17 @@ RouteResult RunOne(const gert::OpImplKernelRegistry::OpImplFunctionsV2 *impl, co
 
 int main(int argc, char **argv)
 {
-    const bool stratifiedMode = argc == 5 && std::strcmp(argv[1], "--select-base-stratified") == 0;
-    const bool selectMode = argc == 5 &&
+    const bool fullMSweepMode = argc == 6 &&
+        std::strcmp(argv[1], "--select-base-stratified-full-m") == 0;
+    const bool stratifiedMode = argc == 6 &&
+        (std::strcmp(argv[1], "--select-base-stratified") == 0 || fullMSweepMode);
+    const bool selectMode = argc == 6 &&
         (std::strcmp(argv[1], "--select-base") == 0 || stratifiedMode);
     if (argc != 2 && !selectMode) {
         std::cerr << "usage: host_matmul_v3_route LIBOPHOST_NN_SO\n"
-                  << "       host_matmul_v3_route --select-base CAMPAIGN PER_M_RESERVE LIBOPHOST_NN_SO\n"
-                  << "       host_matmul_v3_route --select-base-stratified CAMPAIGN PER_CELL_RESERVE LIBOPHOST_NN_SO\n";
+                  << "       host_matmul_v3_route --select-base CAMPAIGN PER_M_RESERVE LIBOPHOST_NN_SO LEGACY_SO\n"
+                  << "       host_matmul_v3_route --select-base-stratified CAMPAIGN PER_CELL_RESERVE LIBOPHOST_NN_SO LEGACY_SO\n"
+                  << "       host_matmul_v3_route --select-base-stratified-full-m CAMPAIGN PER_CELL_RESERVE LIBOPHOST_NN_SO LEGACY_SO\n";
         return 2;
     }
     const char *campaign = selectMode ? argv[2] : nullptr;
@@ -239,6 +271,22 @@ int main(int argc, char **argv)
     if (selectMode && perMReserve == 0) {
         std::cerr << "PER_M_RESERVE must be positive\n";
         return 2;
+    }
+    void *legacyHandle = nullptr;
+    LegacyMmCheckHitV3Shape publicRouteCheck = nullptr;
+    if (selectMode) {
+        legacyHandle = dlopen(argv[5], RTLD_NOW | RTLD_LOCAL);
+        if (legacyHandle == nullptr) {
+            std::cerr << "failed to load legacy route library: " << dlerror() << '\n';
+            return 2;
+        }
+        publicRouteCheck = reinterpret_cast<LegacyMmCheckHitV3Shape>(
+            dlsym(legacyHandle, "LegacyMmCheckHitV3Shape"));
+        if (publicRouteCheck == nullptr) {
+            std::cerr << "LegacyMmCheckHitV3Shape is unavailable\n";
+            dlclose(legacyHandle);
+            return 2;
+        }
     }
     setenv("MATMUL_DISABLE_REPO", "1", 1);
     unsetenv("MATMUL_BASE_MODE");
@@ -262,6 +310,7 @@ int main(int argc, char **argv)
     size_t failed = 0;
     size_t officialBase = 0;
     size_t candidateSelected = 0;
+    size_t publicV3 = 0;
     std::map<int64_t, size_t> selectedPerM;
     std::map<int64_t, size_t> seenPerM;
     std::vector<Workload> eligibleForM;
@@ -331,6 +380,12 @@ int main(int argc, char **argv)
         if (selectMode && !stratifiedMode && selectedPerM[workload.m] >= perMReserve) {
             continue;
         }
+        if (selectMode && !PublicRouteUsesV3(publicRouteCheck, workload)) {
+            continue;
+        }
+        if (selectMode) {
+            ++publicV3;
+        }
         (void)unsetenv("MATMUL_BASE_MODE");
         (void)unsetenv("MATMUL_BASE_FULL_M_SWEEP");
         (void)unsetenv("MATMUL_BASE_EXPERIMENT_SELECTED");
@@ -348,7 +403,11 @@ int main(int argc, char **argv)
         }
         ++officialBase;
         (void)setenv("MATMUL_BASE_MODE", campaign, 1);
-        (void)setenv("MATMUL_BASE_FULL_M_SWEEP", "1", 1);
+        if (fullMSweepMode) {
+            (void)setenv("MATMUL_BASE_FULL_M_SWEEP", "1", 1);
+        } else {
+            (void)unsetenv("MATMUL_BASE_FULL_M_SWEEP");
+        }
         (void)unsetenv("MATMUL_BASE_EXPERIMENT_SELECTED");
         (void)unsetenv("MATMUL_EXPERIMENT_BRANCH");
         const RouteResult candidate = RunOne(impl, workload, false);
@@ -380,13 +439,18 @@ int main(int argc, char **argv)
             std::cerr << "# host_selection campaign=" << campaign << " m_seen=" << seenPerM.size()
                       << " strata=18 reserve_per_stratum=" << perMReserve
                       << " strata_reserve_met=" << cellsMet << " strata_reserve_missing=" << cellsMissing
-                      << " official_base=" << officialBase << " candidate_selected=" << candidateSelected << '\n';
+                      << " public_v3=" << publicV3 << " official_base=" << officialBase
+                      << " candidate_selected=" << candidateSelected << '\n';
         } else {
             std::cerr << "# host_selection campaign=" << campaign << " m_seen=" << seenPerM.size()
                       << " reserve_per_m=" << perMReserve << " m_reserve_met=" << met
-                      << " m_reserve_missing=" << missing << " official_base=" << officialBase
+                      << " m_reserve_missing=" << missing << " public_v3=" << publicV3
+                      << " official_base=" << officialBase
                       << " candidate_selected=" << candidateSelected << '\n';
         }
+    }
+    if (legacyHandle != nullptr) {
+        dlclose(legacyHandle);
     }
     return invalid == 0 && (selectMode || failed == 0) ? 0 : 1;
 }
