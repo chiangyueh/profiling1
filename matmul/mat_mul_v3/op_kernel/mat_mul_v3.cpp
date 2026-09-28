@@ -25,18 +25,11 @@
 #include "mat_mul_unaligned_sc_splitk_kernel_gm_to_l1.h"
 #include "mat_mul_optimized_fixpipe_algorithm.h"
 #include "mat_mul_l1_full_load.h"
-// NEW BEGIN
-#include "mat_mul_vector_dot.h"
-#include "mat_mul_cube_vector_edge_kernel.h"
-// NEW END
 #include "mat_mul_v3_tiling_key.h"
 
 
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220 || (defined(__NPU_ARCH__) && __NPU_ARCH__ == 3003)
 #include "mat_mul_multi_core_splitk_kernel.h"
-// NEW BEGIN
-#include "mat_mul_tail_stream_k_kernel.h"
-// NEW END
 #endif
 
 using namespace AscendC;
@@ -212,24 +205,6 @@ __global__ __aicore__ void mat_mul_v3(
         );
     }
 #else
-    // NEW BEGIN
-    if constexpr (
-        LOADMODE == MAT_MUL_V3_BASE_FULLLOAD && SPLITCOREMODE == MAT_MUL_V3_BASE_SPLIT_K &&
-        FIXOPTI == MAT_MUL_V3_BASE_FIXOPTI && MIXND2NZ == MAT_MUL_V3_MIXND2NZ_FALSE &&
-        SPECIALOPT == MAT_MUL_V3_VECTOR_DOT) {
-        MatMulVectorDot(aGM, bGM, cGM, tilingData);
-    } else if constexpr (
-        LOADMODE == MAT_MUL_V3_BASE_FULLLOAD && SPLITCOREMODE == MAT_MUL_V3_BASE_SPLIT_K &&
-        FIXOPTI == MAT_MUL_V3_BASE_FIXOPTI && MIXND2NZ == MAT_MUL_V3_MIXND2NZ_FALSE &&
-        SPECIALOPT == MAT_MUL_V3_CUBE_VECTOR_EDGE) {
-        MMV3_IMPL(MatMulCubeVectorEdge, format_x1, FIXPIPE_OPT_SELECT::BASE);
-    } else if constexpr (
-        LOADMODE == MAT_MUL_V3_BASE_FULLLOAD && SPLITCOREMODE == MAT_MUL_V3_BASE_SPLIT_K &&
-        FIXOPTI == MAT_MUL_V3_BASE_FIXOPTI && MIXND2NZ == MAT_MUL_V3_MIXND2NZ_FALSE &&
-        (SPECIALOPT == MAT_MUL_V3_RECTANGULAR_CUBE || SPECIALOPT == MAT_MUL_V3_REUSE_DIRECTED)) {
-        MMV3_IMPL_CLASS(MatmulBaseKernel, format_x1, MatmulBaseBlock, MM_CFG_NO_PRELOAD);
-    } else
-    // NEW END
     if constexpr (
         LOADMODE == MAT_MUL_V3_BASE_FULLLOAD && SPLITCOREMODE == MAT_MUL_V3_BASE_SPLIT_K &&
         FIXOPTI == MAT_MUL_V3_BASE_FIXOPTI && MIXND2NZ == MAT_MUL_V3_MIXND2NZ_FALSE &&
@@ -290,20 +265,6 @@ __global__ __aicore__ void mat_mul_v3(
         MMV3_IMPL(
             MatMulMultiCoreSplitK, format_x1, FIXPIPE_OPT_SELECT::BASE
         );
-    // NEW BEGIN
-    } else if constexpr (
-        LOADMODE == MAT_MUL_V3_BASE_FULLLOAD && SPLITCOREMODE == MAT_MUL_V3_ATOMIC_SPLIT_K &&
-        FIXOPTI == MAT_MUL_V3_BASE_FIXOPTI && MIXND2NZ == MAT_MUL_V3_MIXND2NZ_FALSE) {
-        MMV3_IMPL(
-            MatMulMultiCoreSplitK, format_x1, FIXPIPE_OPT_SELECT::BASE
-        );
-    } else if constexpr (
-        LOADMODE == MAT_MUL_V3_BASE_FULLLOAD && SPLITCOREMODE == MAT_MUL_V3_TAIL_STREAM_K &&
-        FIXOPTI == MAT_MUL_V3_BASE_FIXOPTI && MIXND2NZ == MAT_MUL_V3_MIXND2NZ_FALSE) {
-        MMV3_IMPL(
-            MatMulTailStreamK, format_x1, FIXPIPE_OPT_SELECT::BASE
-        );
-    // NEW END
     } else if constexpr (
         LOADMODE == MAT_MUL_V3_BASE_FULLLOAD && SPLITCOREMODE == MAT_MUL_V3_BASE_SPLIT_K &&
         FIXOPTI == MAT_MUL_V3_BASE_FIXOPTI && MIXND2NZ == MAT_MUL_V3_MIXND2NZ_FALSE) {
