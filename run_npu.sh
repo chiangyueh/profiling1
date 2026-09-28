@@ -62,6 +62,6 @@ if ! g++ matmul/mat_mul_v3/examples/test_aclnn_matmul.cpp \
     exit 1
 fi
 
-export LD_LIBRARY_PATH="${build_dir}:${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 export MATMUL_HOST_LIBRARY="${build_dir}/libophost_nn.so"
 exec "${runner}"
