@@ -2081,23 +2081,31 @@ bool MatmulV3BaseTiling::DoThreeShapeBaseTiling()
     uint64_t baseN = 0;
     uint64_t usedCoreNum = 20;
     uint64_t iterateOrder = ITER_COL_FIRST;
+    uint64_t mWindowBlock = 0;
+    uint64_t nWindowBlock = 0;
     const char *variant = nullptr;
     if (args_.mValue == 2048UL && args_.nValue == 1536UL && args_.kValue == 7168UL) {
         baseM = BASIC_BLOCK_SIZE_128;
         baseN = BASIC_BLOCK_SIZE_256;
         iterateOrder = ITER_COL_FIRST;
-        variant = "TARGET_M2048_K7168_N1536";
+        mWindowBlock = 16UL;
+        nWindowBlock = 6UL;
+        variant = "CONTROL_M2048_K7168_N1536";
     } else if (args_.mValue == 2048UL && args_.nValue == 7168UL && args_.kValue == 2048UL) {
-        baseM = BASIC_BLOCK_SIZE_256;
-        baseN = BASIC_BLOCK_SIZE_128;
-        iterateOrder = ITER_ROW_FIRST;
-        variant = "TARGET_M2048_K2048_N7168";
+        baseM = BASIC_BLOCK_SIZE_128;
+        baseN = BASIC_BLOCK_SIZE_256;
+        iterateOrder = ITER_COL_FIRST;
+        mWindowBlock = 16UL;
+        nWindowBlock = 20UL;
+        variant = "B_REUSE_WAVE_PRESERVING_WINDOWS_M2048_K2048_N7168";
     } else if (args_.mValue == 4096UL && args_.nValue == 512UL && args_.kValue == 7168UL) {
         baseM = BASIC_BLOCK_SIZE_128;
         baseN = BASIC_BLOCK_SIZE_256;
         usedCoreNum = 16;
         iterateOrder = ITER_COL_FIRST;
-        variant = "TARGET_M4096_K7168_N512";
+        mWindowBlock = 16UL;
+        nWindowBlock = 2UL;
+        variant = "BALANCED_16_CORE_TWO_L2_WINDOWS_M4096_K7168_N512";
     } else {
         return false;
     }
@@ -2122,9 +2130,13 @@ bool MatmulV3BaseTiling::DoThreeShapeBaseTiling()
     const uint64_t aPanelBytes = baseM * ops::CeilAlign(args_.kValue * aDtypeSize_, CACHELINE);
     const uint64_t bPanelBytes = args_.kValue * ops::CeilAlign(baseN * bDtypeSize_, CACHELINE);
     const uint64_t cTileBytes = baseM * baseN * cDtypeSize_;
-    const __uint128_t l2WindowBytes = static_cast<__uint128_t>(mTasks) * aPanelBytes +
-        static_cast<__uint128_t>(nTasks) * bPanelBytes +
-        static_cast<__uint128_t>(mTasks) * nTasks * cTileBytes;
+    if (mWindowBlock == 0 || nWindowBlock == 0 ||
+        mWindowBlock > mTasks || nWindowBlock > nTasks) {
+        return false;
+    }
+    const __uint128_t l2WindowBytes = static_cast<__uint128_t>(mWindowBlock) * aPanelBytes +
+        static_cast<__uint128_t>(nWindowBlock) * bPanelBytes +
+        static_cast<__uint128_t>(mWindowBlock) * nWindowBlock * cTileBytes;
     if (l2WindowBytes > compileInfo_.l2Size) {
         return false;
     }
@@ -2146,10 +2158,10 @@ bool MatmulV3BaseTiling::DoThreeShapeBaseTiling()
     candidate.depthB1 = depthB1;
     candidate.iterateOrder = iterateOrder;
     candidate.dbL0c = DB_OFF_SIZE;
-    candidate.l2Info.mTile = 1;
-    candidate.l2Info.nTile = 1;
-    candidate.l2Info.mTileBlock = mTasks;
-    candidate.l2Info.nTileBlock = nTasks;
+    candidate.l2Info.mTile = MathUtil::CeilDivision(mTasks, mWindowBlock);
+    candidate.l2Info.nTile = MathUtil::CeilDivision(nTasks, nWindowBlock);
+    candidate.l2Info.mTileBlock = mWindowBlock;
+    candidate.l2Info.nTileBlock = nWindowBlock;
     candidate.l2Info.calOrder = iterateOrder;
     runInfo_ = candidate;
     tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
