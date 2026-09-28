@@ -2068,9 +2068,15 @@ bool MatmulV3BaseTiling::DoIndependentBaseTiling()
     (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_ACTIVE_CORES");
     (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_M_TASKS");
     (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_N_TASKS");
+    const bool unresolvedBase =
+        tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::BASE &&
+        tilingEnable_.tilingEnableFullLoad == TilingEnableFullLoad::BASE &&
+        tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE &&
+        tilingEnable_.tilingEnableSpecialOpti == TilingEnableSpecialOpti::BASE;
     const bool dtypeSupported = args_.aType == args_.bType && args_.bType == args_.cType &&
         (args_.aType == ge::DT_FLOAT16 || args_.aType == ge::DT_BF16);
-    if (!compileInfo_.supportL0c2out || compileInfo_.aicNum == 0 || args_.hasBias || !dtypeSupported ||
+    if (!unresolvedBase || !compileInfo_.supportL0c2out || compileInfo_.aicNum == 0 ||
+        args_.hasBias || !dtypeSupported ||
         args_.isATrans || args_.isBTrans || args_.aFormat != ge::FORMAT_ND ||
         args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
         args_.nd2nzA || args_.nd2nzB || args_.isNzA || args_.isNzB ||
