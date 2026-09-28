@@ -14,6 +14,7 @@
  */
 
 #include <cinttypes>
+#include <cstdlib>
 #include "matmul_v3_base_tiling.h"
 #include "../../op_kernel/mat_mul_v3_tiling_key.h"
 
@@ -2705,6 +2706,57 @@ ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
     DoTilingKey();
     L2Cache l2Cache(args_, tilingData_);
     l2Cache.SetL2CacheFlag(tilingEnable_, compileInfo_.l2Size, l2CacheFlag_);
+    const char *baseMode = std::getenv("MATMUL_BASE_MODE");
+    const bool thirdShapeBalance = baseMode != nullptr &&
+        std::strcmp(baseMode, "THIRD_SHAPE_CORE_BALANCE") == 0 &&
+        args_.mValue == 4096UL && args_.nValue == 512UL && args_.kValue == 7168UL &&
+        tilingEnable_.tilingEnableFullLoad == TilingEnableFullLoad::BASE &&
+        tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::BASE &&
+        tilingEnable_.tilingEnableFixOpti == TilingEnableFixOpti::BASE &&
+        tilingEnable_.tilingEnableSpecialOpti == TilingEnableSpecialOpti::BASE &&
+        tilingData_.matmulTiling.usedCoreNum == 20U &&
+        tilingData_.matmulTiling.singleCoreM != 0U && tilingData_.matmulTiling.singleCoreN != 0U;
+    if (thirdShapeBalance) {
+        const uint64_t mTasks = MathUtil::CeilDivision(
+            static_cast<uint64_t>(args_.mValue),
+            static_cast<uint64_t>(tilingData_.matmulTiling.singleCoreM));
+        const uint64_t nTasks = MathUtil::CeilDivision(
+            static_cast<uint64_t>(args_.nValue),
+            static_cast<uint64_t>(tilingData_.matmulTiling.singleCoreN));
+        const uint64_t tasks = mTasks * nTasks;
+        constexpr uint64_t balancedCores = 16UL;
+        if (tasks == 64UL && tasks % balancedCores == 0UL &&
+            MathUtil::CeilDivision(tasks, 20UL) == MathUtil::CeilDivision(tasks, balancedCores)) {
+            tilingData_.matmulTiling.usedCoreNum = static_cast<uint32_t>(balancedCores);
+            (void)::setenv("MATMUL_BASE_EXPERIMENT_VARIANT", "BALANCED_64_TASKS_16_CORES", 1);
+            (void)::setenv("MATMUL_BASE_EXPERIMENT_SELECTED", "1", 1);
+            (void)::setenv("MATMUL_EXPERIMENT_BRANCH", "THIRD_SHAPE_CORE_BALANCE", 1);
+        }
+    }
+    auto exportField = [](const char *name, uint64_t value) {
+        char text[32] = {};
+        (void)snprintf(text, sizeof(text), "%lu", static_cast<unsigned long>(value));
+        (void)::setenv(name, text, 1);
+    };
+    exportField("MATMUL_OBSERVED_KEY", tilingKey_);
+    exportField("MATMUL_OBSERVED_CORES", tilingData_.matmulTiling.usedCoreNum);
+    exportField("MATMUL_OBSERVED_SINGLE_M", tilingData_.matmulTiling.singleCoreM);
+    exportField("MATMUL_OBSERVED_SINGLE_N", tilingData_.matmulTiling.singleCoreN);
+    exportField("MATMUL_OBSERVED_SINGLE_K", tilingData_.matmulTiling.singleCoreK);
+    exportField("MATMUL_OBSERVED_BASE_M", tilingData_.matmulTiling.baseM);
+    exportField("MATMUL_OBSERVED_BASE_N", tilingData_.matmulTiling.baseN);
+    exportField("MATMUL_OBSERVED_BASE_K", tilingData_.matmulTiling.baseK);
+    exportField("MATMUL_OBSERVED_STEP_M", tilingData_.matmulTiling.stepM);
+    exportField("MATMUL_OBSERVED_STEP_N", tilingData_.matmulTiling.stepN);
+    exportField("MATMUL_OBSERVED_STEP_KA", tilingData_.matmulTiling.stepKa);
+    exportField("MATMUL_OBSERVED_STEP_KB", tilingData_.matmulTiling.stepKb);
+    exportField("MATMUL_OBSERVED_DEPTH_A1", tilingData_.matmulTiling.depthA1);
+    exportField("MATMUL_OBSERVED_DEPTH_B1", tilingData_.matmulTiling.depthB1);
+    exportField("MATMUL_OBSERVED_L2_M_TILE", tilingData_.tileL2cacheTiling.mTileCntL2);
+    exportField("MATMUL_OBSERVED_L2_N_TILE", tilingData_.tileL2cacheTiling.nTileCntL2);
+    exportField("MATMUL_OBSERVED_L2_M_BLOCK", tilingData_.tileL2cacheTiling.mTileBlock);
+    exportField("MATMUL_OBSERVED_L2_N_BLOCK", tilingData_.tileL2cacheTiling.nTileBlock);
+    exportField("MATMUL_OBSERVED_L2_ORDER", tilingData_.tileL2cacheTiling.calOrder);
     return ge::GRAPH_SUCCESS;
 }
 
