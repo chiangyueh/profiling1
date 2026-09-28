@@ -253,14 +253,18 @@ RouteResult RunOne(const gert::OpImplKernelRegistry::OpImplFunctionsV2 *impl, co
 int main(int argc, char **argv)
 {
     const bool fullMSweepMode = argc == 6 &&
-        std::strcmp(argv[1], "--select-base-stratified-full-m") == 0;
+        (std::strcmp(argv[1], "--select-base-full-m") == 0 ||
+         std::strcmp(argv[1], "--select-base-stratified-full-m") == 0);
     const bool stratifiedMode = argc == 6 &&
-        (std::strcmp(argv[1], "--select-base-stratified") == 0 || fullMSweepMode);
+        (std::strcmp(argv[1], "--select-base-stratified") == 0 ||
+         std::strcmp(argv[1], "--select-base-stratified-full-m") == 0);
     const bool selectMode = argc == 6 &&
-        (std::strcmp(argv[1], "--select-base") == 0 || stratifiedMode);
+        (std::strcmp(argv[1], "--select-base") == 0 ||
+         std::strcmp(argv[1], "--select-base-full-m") == 0 || stratifiedMode);
     if (argc != 2 && !selectMode) {
         std::cerr << "usage: host_matmul_v3_route LIBOPHOST_NN_SO\n"
                   << "       host_matmul_v3_route --select-base CAMPAIGN PER_M_RESERVE LIBOPHOST_NN_SO LEGACY_SO\n"
+                  << "       host_matmul_v3_route --select-base-full-m CAMPAIGN PER_M_RESERVE LIBOPHOST_NN_SO LEGACY_SO\n"
                   << "       host_matmul_v3_route --select-base-stratified CAMPAIGN PER_CELL_RESERVE LIBOPHOST_NN_SO LEGACY_SO\n"
                   << "       host_matmul_v3_route --select-base-stratified-full-m CAMPAIGN PER_CELL_RESERVE LIBOPHOST_NN_SO LEGACY_SO\n";
         return 2;

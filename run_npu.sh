@@ -127,14 +127,39 @@ if [[ ! -s "${workload_manifest}" ]]; then
     exit 1
 fi
 manifest_rows="$(wc -l < "${workload_manifest}")"
-printf '# stage=workload_generation status=passed source=preverified_npu_base rows=%d\n' "${manifest_rows}"
+if ! manifest_audit="$(awk -F '\t' '
+    NF != 6 { invalid++ }
+    NF == 6 {
+        rows++
+        m = $3 + 0
+        if (m < 1 || m > 4096) invalid++
+        seen[m]++
+    }
+    END {
+        missing = 0
+        minimum = 999999
+        maximum = 0
+        for (m = 1; m <= 4096; ++m) {
+            if (seen[m] == 0) missing++
+            if (seen[m] < minimum) minimum = seen[m]
+            if (seen[m] > maximum) maximum = seen[m]
+        }
+        printf "rows=%d distinct_m=%d missing_m=%d candidates_per_m_min=%d candidates_per_m_max=%d invalid=%d", \
+            rows, length(seen), missing, minimum, maximum, invalid
+        exit(invalid != 0 || missing != 0 || length(seen) != 4096)
+    }
+' "${workload_manifest}")"; then
+    printf '{"fatal":"manifest_does_not_cover_every_m","audit":"%s"}\n' "${manifest_audit}" >&2
+    exit 1
+fi
+printf '# stage=workload_generation status=passed source=host_preverified_all_m_base %s\n' "${manifest_audit}"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
 export MATMUL_BASE_FULL_M_SWEEP=1
 
 success_target="${MATMUL_SUCCESS_TARGET:-0}"
-m_quota="${MATMUL_M_QUOTA:-0}"
+m_quota=1
 m_cell_quota="${MATMUL_M_CELL_QUOTA:-0}"
 cell_quota="${MATMUL_CELL_QUOTA:-0}"
 if [[ "${cell_quota}" -eq 0 ]]; then
