@@ -10,10 +10,7 @@
 #include <vector>
 
 #include "acl/acl.h"
-#include "aclnn_kernels/contiguous.h"
-#include "opdev/make_op_executor.h"
 #include "matmul/mat_mul_v3/op_host/op_api/aclnn_matmul.h"
-#include "matmul/mat_mul_v3/op_host/op_api/matmul.h"
 
 extern "C" uint32_t TbeLoadSoAndSaveToRegistry(const char *soPath);
 
@@ -67,22 +64,6 @@ struct TilingSnapshot {
     uint32_t l2NBlock = 0;
     uint32_t l2Order = 0;
 };
-
-aclnnStatus ForcedMatmulV3GetWorkspaceSize(const aclTensor *a, const aclTensor *b, aclTensor *out,
-                                           const LayoutSpec &layout, size_t *workspaceSize,
-                                           aclOpExecutor **executor)
-{
-    auto uniqueExecutor = CREATE_EXECUTOR();
-    if (uniqueExecutor.get() == nullptr) return 561101;
-    const aclTensor *mmOut = l0op::MatMulV3Nd(
-        a, b, nullptr, layout.transA, layout.transB, false, 0x1, uniqueExecutor.get());
-    if (mmOut == nullptr) return 561103;
-    const aclTensor *copied = l0op::ViewCopy(mmOut, out, uniqueExecutor.get());
-    if (copied == nullptr) return 561103;
-    *workspaceSize = uniqueExecutor->GetWorkspaceSize();
-    uniqueExecutor.ReleaseTo(executor);
-    return ACL_SUCCESS;
-}
 
 struct RunCounts {
     uint64_t inputs = 0;
@@ -535,8 +516,8 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     ClearObservedTiling();
     uint64_t officialWorkspaceSize = 0;
     aclOpExecutor *officialExecutor = nullptr;
-    rc = ForcedMatmulV3GetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, layout,
-                                        &officialWorkspaceSize, &officialExecutor);
+    rc = aclnnMatmulGetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, 1,
+                                     &officialWorkspaceSize, &officialExecutor);
     const TilingSnapshot official = ReadTilingSnapshot();
     if (rc != ACL_SUCCESS || officialExecutor == nullptr) {
         ++counts.officialFailed;
@@ -602,8 +583,8 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     ClearObservedTiling();
     uint64_t adaptiveWorkspaceSize = 0;
     aclOpExecutor *adaptiveExecutor = nullptr;
-    rc = ForcedMatmulV3GetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, layout,
-                                        &adaptiveWorkspaceSize, &adaptiveExecutor);
+    rc = aclnnMatmulGetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, 1,
+                                     &adaptiveWorkspaceSize, &adaptiveExecutor);
     const TilingSnapshot adaptive = ReadTilingSnapshot();
     const char *variantText = std::getenv("MATMUL_BASE_EXPERIMENT_VARIANT");
     const std::string candidateVariant = variantText == nullptr ? "" : variantText;
