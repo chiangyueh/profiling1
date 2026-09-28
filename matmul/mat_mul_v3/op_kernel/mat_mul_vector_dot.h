@@ -1,4 +1,4 @@
-// NEW BEGIN
+//NEW BEGIN
 #ifndef MAT_MUL_VECTOR_DOT_H
 #define MAT_MUL_VECTOR_DOT_H
 
@@ -67,4 +67,4 @@ __aicore__ inline void MatMulVectorDot(
 }
 
 #endif
-// NEW END
+//NEW END

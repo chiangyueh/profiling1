@@ -102,19 +102,12 @@ protected:
     void SetBaseBlockTiling();
     void DoSmallShapeTiling();
     void DoSelectTiling();
-    // NEW BEGIN
+    //NEW BEGIN
+    bool BranchEnabled(const char *name) const;
     bool DoVectorDotTiling();
-    bool DoExperimentalBaseTiling();
-    bool DoCubeVectorEdgeTiling();
-    bool DoRectangularCubeTiling();
-    bool DoReuseDirectedTiling();
-    bool DoWideNPanelReuseBaseTiling();
-    bool DoIndependentBaseTiling();
-    bool DoExperimentalSplitKTiling();
-    bool DoAtomicSplitKTiling();
-    bool DoTailStreamKTiling();
-    void ExportExperimentalTiling();
-    // NEW END
+    bool DoValidatedBaseTiling();
+    void ExportVectorDotTiling();
+    //NEW END
     bool IsSupportSingleCoreSplitSmallK(uint64_t xDim, uint64_t yDim) const;
     bool IsSupportSingleCoreSplitK() const;
     bool DoSingleCoreSplitKTiling();

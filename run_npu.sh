@@ -1,29 +1,15 @@
 #!/usr/bin/env bash
+# //NEW BEGIN
 set -euo pipefail
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
-source /usr/local/Ascend/cann-8.5.0/set_env.sh >/dev/null
+cann_root="${CANN_ROOT:-/usr/local/Ascend/cann-8.5.0}"
+source "${cann_root}/set_env.sh" >/dev/null
 export ASCEND_RT_VISIBLE_DEVICES=2
 export ASCEND_GLOBAL_LOG_LEVEL=3
 export ASCEND_SLOG_PRINT_TO_STDOUT=0
-unset ASCEND_CUSTOM_OPP_PATH
-unset MATMUL_BASE_MODE MATMUL_BASE_EXPERIMENT_SELECTED MATMUL_SPLITK_MODE
-unset MATMUL_STRUCTURAL_CANDIDATES MATMUL_STRUCTURAL_REFERENCE_BASE_N
-unset MATMUL_STRUCTURAL_REFERENCE_BASE_K MATMUL_STRUCTURAL_TOTAL_K_LOOPS
-unset MATMUL_STRUCTURAL_L2_MAX_N_BLOCK
-unset MATMUL_ANALYTIC_N_QUANTUM MATMUL_ANALYTIC_MIN_BASE_K
-unset MATMUL_ANALYTIC_MAX_BASE_M MATMUL_ANALYTIC_MAX_BASE_N MATMUL_ANALYTIC_TARGET_TASKS
-unset MATMUL_ANALYTIC_TAIL_SLOTS MATMUL_ANALYTIC_CRITICAL_CUBE
-unset MATMUL_ANALYTIC_TOTAL_CUBE MATMUL_ANALYTIC_PANEL_TRAFFIC
-unset MATMUL_ANALYTIC_SELECTED_TASKS MATMUL_ANALYTIC_SELECTED_WAVES
-unset MATMUL_ANALYTIC_SELECTED_K_ITERATIONS MATMUL_ANALYTIC_SELECTED_N_TAIL_WASTE
-unset MATMUL_ANALYTIC_SELECTED_ACTIVE_CORES
-unset MATMUL_ANALYTIC_SELECTED_M_TASKS MATMUL_ANALYTIC_SELECTED_N_TASKS
-unset MATMUL_ANALYTIC_L2_DIMENSIONS MATMUL_ANALYTIC_L2_M_BLOCK MATMUL_ANALYTIC_L2_N_BLOCK
-unset MATMUL_ANALYTIC_L2_M_WINDOWS MATMUL_ANALYTIC_L2_N_WINDOWS
-unset MATMUL_ANALYTIC_L2_WINDOW_BYTES MATMUL_ANALYTIC_L2_ESTIMATED_TRAFFIC
-unset MATMUL_DETERMINISTIC_ADAPTIVE MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED
-unset MATMUL_CAMPAIGN
+export MATMUL_DISABLE_REPO=1
+unset ASCEND_CUSTOM_OPP_PATH MATMUL_OPT_BRANCH MATMUL_OPT_SELECTED
 
 if [[ "$#" -ne 0 ]]; then
     exit 2
@@ -31,10 +17,8 @@ fi
 
 build_dir="${PWD}/build"
 build_log="$(mktemp)"
-workload_manifest="$(mktemp)"
-trap 'rm -f "${build_log}" "${workload_manifest}"' EXIT
+trap 'rm -f "${build_log}"' EXIT
 
-printf '# stage=host_build status=begin\n'
 if ! cmake -S . -B "${build_dir}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DENABLE_CUSTOM=FALSE \
@@ -50,7 +34,6 @@ if ! cmake --build "${build_dir}" --target ophost_nn -- -j1 >>"${build_log}" 2>&
     cat "${build_log}" >&2
     exit 1
 fi
-printf '# stage=host_build status=passed\n'
 
 host_library="${build_dir}/libophost_nn.so"
 opapi_nn=""
@@ -83,11 +66,6 @@ for path in \
     fi
 done
 if [[ ! -f "${host_library}" || -z "${opapi_nn}" || -z "${opapi_math}" || -z "${legacy_common}" ]]; then
-    printf '{"fatal":"required_library_missing","host":%s,"opapi_nn":%s,"opapi_math":%s,"legacy":%s}\n' \
-        "$([[ -f "${host_library}" ]] && printf true || printf false)" \
-        "$([[ -n "${opapi_nn}" ]] && printf true || printf false)" \
-        "$([[ -n "${opapi_math}" ]] && printf true || printf false)" \
-        "$([[ -n "${legacy_common}" ]] && printf true || printf false)" >&2
     exit 1
 fi
 ln -sfn -- "${legacy_common}" "${build_dir}/libophost_comm_legacy.so"
@@ -96,9 +74,8 @@ runtime_library="-lacl_rt"
 if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/lib64/libascendcl.so" ]]; then
     runtime_library="-lascendcl"
 fi
-runner="${build_dir}/test_wide_n_panel_reuse_base"
-printf '# stage=runner_build status=begin\n'
-if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
+runner="${build_dir}/test_minimal_optimizations"
+if ! g++ matmul/mat_mul_v3/examples/test_minimal_optimizations.cpp \
     matmul/mat_mul_v3/op_host/op_api/matmul.cpp \
     -std=gnu++17 -D_GLIBCXX_USE_CXX11_ABI=0 \
     -I "${PWD}" \
@@ -117,85 +94,74 @@ if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
     cat "${build_log}" >&2
     exit 1
 fi
-printf '# stage=runner_build status=passed\n'
 
-printf '# stage=workload_generation status=begin\n'
-python3 - >"${workload_manifest}" <<'PY'
-import random
-
-rng = random.Random(8527)
-small = []
-large = []
-byte_limit = 1536 * 1024 * 1024
-for dtype in ("fp16_fp16", "bf16_bf16"):
-    for m in range(8, 17):
-        for n_tiles in tuple(range(101, 109)) + tuple(range(121, 129)):
-            n = n_tiles * 256
-            for k in range(15104, 20609, 128):
-                if 2 * (m * k + k * n + m * n) <= byte_limit:
-                    small.append((dtype, "NN", m, n, k))
-    for m in range(2304, 4353, 32):
-        for n in range(32, 97, 16):
-            for k in range(8192, 32769, 512):
-                base_m = ((m + 39) // 40 + 15) // 16 * 16
-                base_n = (n + 15) // 16 * 16
-                base_k = min(256, (k + 15) // 16 * 16,
-                             65536 // (4 * base_m), 65536 // (4 * base_n)) // 16 * 16
-                if base_k == 0:
-                    continue
-                tasks = (m + base_m - 1) // base_m
-                waves = (tasks + 19) // 20
-                tail_slots = waves * 20 - tasks
-                k_iterations = (k + base_k - 1) // base_k
-                a_panel = base_m * ((k * 2 + 63) // 64 * 64)
-                b_panel = k * ((base_n * 2 + 63) // 64 * 64)
-                c_tiles = tasks * base_m * base_n * 2
-                if (base_m < 80 or base_m > 128 or base_k < 160 or waves != 2 or
-                        tail_slots > 2 or k_iterations < 64 or
-                        tasks * a_panel + b_panel + c_tiles > 192 * 1024 * 1024):
-                    continue
-                if 2 * (m * k + k * n + m * n) <= byte_limit:
-                    large.append((dtype, "NN", m, n, k))
-
-rng.shuffle(small)
-rng.shuffle(large)
-for index in range(max(len(small), len(large))):
-    if index < len(small):
-        print("\t".join(str(value) for value in small[index]))
-    if index < len(large):
-        print("\t".join(str(value) for value in large[index]))
+kernel_name="MatMulV3_VectorDot"
+kernel_dir="${build_dir}/vector_dot_bin"
+vector_binary="${kernel_dir}/${kernel_name}.o"
+metadata="${kernel_dir}/${kernel_name}.json"
+if [[ ! -f "${vector_binary}" || ! -f "${metadata}" ]] ||
+   find matmul/mat_mul_v3/op_kernel -type f -newer "${vector_binary}" -print -quit | grep -q .; then
+    ascendc_dir="${build_dir}/tbe/ascendc"
+    dynamic_dir="${build_dir}/tbe/dynamic"
+    param_dir="${build_dir}/vector_dot_params"
+    rm -rf -- "${kernel_dir}" "${param_dir}" "${ascendc_dir}/mat_mul_v3"
+    mkdir -p -- "${kernel_dir}" "${ascendc_dir}/mat_mul_v3" \
+        "${ascendc_dir}/common/act" "${ascendc_dir}/common/matmul_act" \
+        "${dynamic_dir}" "${param_dir}"
+    cp -a matmul/mat_mul_v3/op_kernel/. "${ascendc_dir}/mat_mul_v3/"
+    cp -a common/act/. "${ascendc_dir}/common/act/"
+    cp -a matmul/common/matmul_act/. "${ascendc_dir}/common/matmul_act/"
+    ops_info="${build_dir}/autogen/exc/aic-ascend910b-ops-info.ini"
+    opc_options="${build_dir}/autogen/custom_opc_options.ini"
+    python3 scripts/util/ascendc_impl_build.py "${ops_info}" "" "" \
+        "${ascendc_dir}" "${dynamic_dir}" "${build_dir}/autogen" >>"${build_log}" 2>&1
+    python3 scripts/util/ascendc_bin_param_build.py "${ops_info}" "${param_dir}" ascend910b \
+        --opc-config-file "${opc_options}" --ops MatMulV3 >>"${build_log}" 2>&1
+    fp32_param="$(python3 - "${param_dir}" <<'PY'
+import glob
+import json
+import os
+import sys
+for path in sorted(glob.glob(os.path.join(sys.argv[1], "*_param.json"))):
+    with open(path, encoding="utf-8") as stream:
+        node = json.load(stream)["op_list"][0]
+    values = [item for item in node["inputs"] + node["outputs"] if item.get("paramType") == "required"]
+    if len(values) == 3 and all(item.get("dtype") == "float32" and item.get("format") == "ND" for item in values):
+        print(path)
+        break
 PY
+)"
+    if [[ -z "${fp32_param}" ]]; then
+        cat "${build_log}" >&2
+        exit 1
+    fi
+    python3 - "${fp32_param}" "${kernel_name}" <<'PY'
+import json
+import sys
+path, name = sys.argv[1:]
+with open(path, encoding="utf-8") as stream:
+    data = json.load(stream)
+data["op_list"][0]["bin_filename"] = name
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(data, stream, separators=(",", ":"))
+PY
+    if ! asc_opc "${dynamic_dir}/mat_mul_v3.py" --main_func=mat_mul_v3 \
+        --input_param="${fp32_param}" --soc_version=Ascend910B1 --output="${kernel_dir}" \
+        --impl_mode=high_performance,optional --simplified_key_mode=0 --op_mode=dynamic \
+        --deterministic=false --tiling_key=2162688 >>"${build_log}" 2>&1; then
+        cat "${build_log}" >&2
+        exit 1
+    fi
+fi
 
-adaptive_count="$(wc -l <"${workload_manifest}")"
-printf '# stage=workload_generation status=passed coverage=interleaved_historical_small_m_and_structural_large_m candidates=%d\n' "${adaptive_count}"
+if [[ ! -f "${vector_binary}" ]] || ! readelf -Ws "${vector_binary}" | awk \
+    '$4 == "FUNC" && $5 == "GLOBAL" && $8 == "MatMulV3_VectorDot_2162688" {found=1} END {exit !found}'; then
+    cat "${build_log}" >&2
+    exit 1
+fi
 
 export MATMUL_HOST_LIBRARY="${host_library}"
-export MATMUL_DISABLE_REPO=1
+export MATMUL_VECTOR_BINARY="${vector_binary}"
 export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
-
-success_target="${MATMUL_SUCCESS_TARGET:-4000}"
-cell_quota="${MATMUL_CELL_QUOTA:-0}"
-if [[ "${cell_quota}" -eq 0 ]]; then
-    cell_quota_json=null
-    theoretical_maximum_pairs_json=null
-else
-    cell_quota_json="${cell_quota}"
-    theoretical_maximum_pairs_json="$((200 * cell_quota))"
-fi
-panel_rc=0
-printf '# campaign=INDEPENDENT_BASE_SELECTOR target_passes=%d maximum_per_joint_cell=%s theoretical_maximum_pairs=%s measurement_order=OCCO\n' \
-    "${success_target}" "${cell_quota_json}" "${theoretical_maximum_pairs_json}"
-set +e
-MATMUL_CAMPAIGN=INDEPENDENT_BASE_SELECTOR MATMUL_TARGET_PASSES="${success_target}" MATMUL_CELL_QUOTA="${cell_quota}" \
-    "${runner}" --manifest "${workload_manifest}" | python3 tools/compact_matmul_log.py
-pipeline_status=("${PIPESTATUS[@]}")
-panel_rc="${pipeline_status[0]}"
-converter_rc="${pipeline_status[1]}"
-set -e
-if [[ "${converter_rc}" -ne 0 ]]; then
-    printf 'fatal: CSV conversion failed rc=%d\n' "${converter_rc}" >&2
-    exit "${converter_rc}"
-fi
-if [[ "${panel_rc}" -ne 0 ]]; then
-    exit "${panel_rc}"
-fi
+exec "${runner}"
+# //NEW END
