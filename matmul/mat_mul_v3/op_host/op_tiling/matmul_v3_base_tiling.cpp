@@ -2096,16 +2096,15 @@ bool MatmulV3BaseTiling::DoThreeShapeBaseTiling()
         baseN = BASIC_BLOCK_SIZE_256;
         iterateOrder = ITER_COL_FIRST;
         mWindowBlock = 16UL;
-        nWindowBlock = 20UL;
-        variant = "B_REUSE_WAVE_PRESERVING_WINDOWS_M2048_K2048_N7168";
+        nWindowBlock = 28UL;
+        variant = "CONTROL_M2048_K2048_N7168";
     } else if (args_.mValue == 4096UL && args_.nValue == 512UL && args_.kValue == 7168UL) {
         baseM = BASIC_BLOCK_SIZE_128;
         baseN = BASIC_BLOCK_SIZE_256;
-        usedCoreNum = 16;
         iterateOrder = ITER_COL_FIRST;
-        mWindowBlock = 16UL;
+        mWindowBlock = 32UL;
         nWindowBlock = 2UL;
-        variant = "BALANCED_16_CORE_TWO_L2_WINDOWS_M4096_K7168_N512";
+        variant = "POST_TILING_BALANCED_16_CORE_M4096_K7168_N512";
     } else {
         return false;
     }
@@ -3978,6 +3977,22 @@ ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
     L2Cache l2Cache(args_, tilingData_);
     l2Cache.SetL2CacheFlag(tilingEnable_, compileInfo_.l2Size, l2CacheFlag_);
     // NEW BEGIN
+    const char *baseMode = std::getenv("MATMUL_BASE_MODE");
+    if (baseMode != nullptr && std::strcmp(baseMode, "THREE_SHAPE_BASE") == 0 &&
+        args_.mValue == 4096UL && args_.nValue == 512UL && args_.kValue == 7168UL &&
+        tilingData_.matmulTiling.usedCoreNum == 20U &&
+        tilingData_.matmulTiling.singleCoreM == 128U &&
+        tilingData_.matmulTiling.singleCoreN == 256U &&
+        tilingData_.tileL2cacheTiling.mTileBlock == 32U &&
+        tilingData_.tileL2cacheTiling.nTileBlock == 2U) {
+        constexpr uint64_t balancedCores = 16UL;
+        const uint64_t tasks = 32UL * 2UL;
+        const uint64_t officialWaves = MathUtil::CeilDivision(tasks, 20UL);
+        const uint64_t balancedWaves = MathUtil::CeilDivision(tasks, balancedCores);
+        if (officialWaves == balancedWaves) {
+            tilingData_.matmulTiling.usedCoreNum = static_cast<uint32_t>(balancedCores);
+        }
+    }
     ExportExperimentalTiling();
     // NEW END
     return ge::GRAPH_SUCCESS;
