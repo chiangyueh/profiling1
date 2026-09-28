@@ -38,6 +38,7 @@ FIELDS += [
     "manifest_end_index", "tensor_allocation_failed", "official_get_workspace_failed",
     "official_get_workspace_failed_fp16", "official_get_workspace_failed_bf16",
     "official_measurement_failed", "candidate_tiling_failed",
+    "first_failure_stage", "first_failure_shape", "first_failure_rc", "first_failure_manifest_index",
     "quota_per_m", "m_quota_met", "m_quota_missing", "quota_skipped_inputs",
     "strata_per_m", "quota_per_stratum", "strata_quota_met", "strata_quota_missing", "m_complete",
 ]

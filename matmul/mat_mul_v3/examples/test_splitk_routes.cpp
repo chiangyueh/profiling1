@@ -118,7 +118,23 @@ struct RunCounts {
     std::vector<uint32_t> passedPerMCell = std::vector<uint32_t>(4097 * 18, 0);
     uint64_t mQuotaSkipped = 0;
     uint64_t mCellQuotaSkipped = 0;
+    std::string firstFailureStage;
+    std::string firstFailureShape;
+    int firstFailureRc = 0;
+    uint64_t firstFailureManifestIndex = 0;
 };
+
+void RecordFirstFailure(RunCounts &counts, const char *stage, int rc, const DTypeSpec &dtype,
+                        const LayoutSpec &layout, int64_t m, int64_t n, int64_t k,
+                        uint64_t manifestIndex)
+{
+    if (!counts.firstFailureStage.empty()) return;
+    counts.firstFailureStage = stage;
+    counts.firstFailureShape = "M" + std::to_string(m) + "_N" + std::to_string(n) + "_K" +
+        std::to_string(k) + "_" + layout.name + "_" + dtype.inputName;
+    counts.firstFailureRc = rc;
+    counts.firstFailureManifestIndex = manifestIndex;
+}
 
 uint64_t ReadEnvUnsigned(const char *name)
 {
@@ -500,6 +516,7 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     if (rc != ACL_SUCCESS) {
         ++counts.officialFailed;
         ++counts.tensorAllocationFailed;
+        RecordFirstFailure(counts, "tensor_allocation", rc, dtype, layout, m, n, k, manifestIndex);
         ReleaseTensor(cTensor);
         ReleaseTensor(bTensor);
         ReleaseTensor(aTensor);
@@ -527,6 +544,8 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         } else if (std::strcmp(dtype.inputName, "bf16") == 0) {
             ++counts.officialGetWorkspaceFailedBf16;
         }
+        RecordFirstFailure(counts, "official_get_workspace", rc == ACL_SUCCESS ? 4 : rc,
+                           dtype, layout, m, n, k, manifestIndex);
         if (officialExecutor != nullptr) (void)aclDestroyAclOpExecutor(officialExecutor);
         ReleaseTensor(cTensor);
         ReleaseTensor(bTensor);
@@ -599,6 +618,8 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         if (rc != ACL_SUCCESS) {
             ++counts.failed;
             ++counts.candidateTilingFailed;
+            RecordFirstFailure(counts, "candidate_get_workspace", rc, dtype, layout,
+                               m, n, k, manifestIndex);
         }
         if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
         (void)aclDestroyAclOpExecutor(officialExecutor);
@@ -618,6 +639,8 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     if (rc != ACL_SUCCESS) {
         ++counts.failed;
         ++counts.candidateTilingFailed;
+        RecordFirstFailure(counts, "candidate_get_workspace", rc, dtype, layout,
+                           m, n, k, manifestIndex);
         if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
         (void)aclDestroyAclOpExecutor(officialExecutor);
         (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE");
@@ -865,6 +888,8 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
         }
     } else {
         ++counts.failed;
+        RecordFirstFailure(counts, "measurement_or_correctness", rc == ACL_SUCCESS ? 3 : rc,
+                           dtype, layout, m, n, k, manifestIndex);
     }
     if (tilingDevice != nullptr) (void)aclrtFree(tilingDevice);
     if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
@@ -899,12 +924,37 @@ int main(int argc, char **argv)
                 CampaignName(), static_cast<unsigned long>(targetPasses), static_cast<unsigned long>(cellQuota));
     std::fflush(stdout);
     const char *hostLibrary = std::getenv("MATMUL_HOST_LIBRARY");
-    if (hostLibrary == nullptr) return 4;
+    if (hostLibrary == nullptr) {
+        std::fprintf(stderr, "fatal: MATMUL_HOST_LIBRARY is not set\n");
+        return 4;
+    }
     int rc = aclInit(nullptr);
-    if (rc == ACL_SUCCESS) rc = aclrtSetDevice(0);
+    if (rc != ACL_SUCCESS) {
+        std::fprintf(stderr, "fatal: NPU initialization failed stage=aclInit rc=%d\n", rc);
+        return 4;
+    }
+    rc = aclrtSetDevice(0);
+    if (rc != ACL_SUCCESS) {
+        std::fprintf(stderr, "fatal: NPU initialization failed stage=aclrtSetDevice rc=%d\n", rc);
+        (void)aclFinalize();
+        return 4;
+    }
     aclrtStream stream = nullptr;
-    if (rc == ACL_SUCCESS) rc = aclrtCreateStream(&stream);
-    if (rc != ACL_SUCCESS || TbeLoadSoAndSaveToRegistry(hostLibrary) != 0U) return 4;
+    rc = aclrtCreateStream(&stream);
+    if (rc != ACL_SUCCESS) {
+        std::fprintf(stderr, "fatal: NPU initialization failed stage=aclrtCreateStream rc=%d\n", rc);
+        (void)aclrtResetDevice(0);
+        (void)aclFinalize();
+        return 4;
+    }
+    const uint32_t registryRc = TbeLoadSoAndSaveToRegistry(hostLibrary);
+    if (registryRc != 0U) {
+        std::fprintf(stderr, "fatal: host registration failed rc=%u library=%s\n", registryRc, hostLibrary);
+        (void)aclrtDestroyStream(stream);
+        (void)aclrtResetDevice(0);
+        (void)aclFinalize();
+        return 4;
+    }
     aclrtBinHandle edgeBinary = nullptr;
     aclrtFuncHandle edgeFunction = nullptr;
     if (std::strcmp(CampaignName(), "CUBE_VECTOR_EDGE") == 0) {
@@ -1004,7 +1054,9 @@ int main(int argc, char **argv)
                 "\"official_get_workspace_failed_bf16\":%lu,"
                 "\"official_measurement_failed\":%lu,\"candidate_tiling_failed\":%lu,"
                 "\"manifest_start_index\":%lu,"
-                "\"manifest_end_index\":%lu}\n",
+                "\"manifest_end_index\":%lu,"
+                "\"first_failure_stage\":\"%s\",\"first_failure_shape\":\"%s\","
+                "\"first_failure_rc\":%d,\"first_failure_manifest_index\":%lu}\n",
                 CampaignName(),
                 static_cast<unsigned long>(counts.inputs),
                 static_cast<unsigned long>(counts.skippedNonV3),
@@ -1031,7 +1083,10 @@ int main(int argc, char **argv)
                 static_cast<unsigned long>(counts.officialMeasurementFailed),
                 static_cast<unsigned long>(counts.candidateTilingFailed),
                 static_cast<unsigned long>(startIndex),
-                static_cast<unsigned long>(manifestIndex));
+                static_cast<unsigned long>(manifestIndex),
+                counts.firstFailureStage.c_str(), counts.firstFailureShape.c_str(),
+                counts.firstFailureRc,
+                static_cast<unsigned long>(counts.firstFailureManifestIndex));
     if (mQuota != 0) {
         uint64_t mMet = 0;
         uint64_t mMissing = 0;
@@ -1149,6 +1204,16 @@ int main(int argc, char **argv)
     (void)aclrtDestroyStream(stream);
     (void)aclrtResetDevice(0);
     (void)aclFinalize();
+    if (counts.passed == 0) {
+        std::fprintf(stderr,
+            "fatal: campaign produced zero NPU measurements inputs=%lu official_target=%lu "
+            "official_failed=%lu candidate_tiling_failed=%lu first_stage=%s first_shape=%s first_rc=%d\n",
+            static_cast<unsigned long>(counts.inputs),
+            static_cast<unsigned long>(counts.deterministic),
+            static_cast<unsigned long>(counts.officialFailed),
+            static_cast<unsigned long>(counts.candidateTilingFailed),
+            counts.firstFailureStage.c_str(), counts.firstFailureShape.c_str(), counts.firstFailureRc);
+    }
     bool mQuotaComplete = true;
     if (mQuota != 0) {
         for (size_t m = 1; m < counts.passedPerM.size(); ++m) {
