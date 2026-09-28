@@ -104,6 +104,10 @@ enum class TilingEnableSplitCore : int32_t // 互斥flag, 对应不同切K模板
     MULTI_CORE_SPLIT_K = 4,
     SINGLE_CORE_NKM_SPLIT_K = 5,
     SINGLE_CORE_SPLIT_K_GM_TO_L1 = 6,
+    // NEW BEGIN
+    ATOMIC_SPLIT_K = 8,
+    TAIL_STREAM_K = 9,
+    // NEW END
     MAX = 10 //模板类别不能超过10个
 };
 
@@ -127,6 +131,12 @@ enum class TilingEnableSpecialOpti : int32_t // 互斥flag, 对应不同的优�
 {
     BASE = 0,
     ENABLE_K_SHIFT = 1,  // K轴错峰
+    // NEW BEGIN
+    VECTOR_DOT = 2,
+    CUBE_VECTOR_EDGE = 3,
+    RECTANGULAR_CUBE = 4,
+    REUSE_DIRECTED = 5,
+    // NEW END
     MAX = 10 //模板类别不能超过10个
 };
 

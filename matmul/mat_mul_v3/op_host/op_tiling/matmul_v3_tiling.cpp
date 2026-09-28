@@ -14,6 +14,9 @@
  */
 #include "matmul_v3_tiling.h"
 
+// NEW BEGIN
+#include <cstdlib>
+// NEW END
 #include <type_traits>
 
 #include "op_cache_tiling.h"
@@ -71,6 +74,9 @@ static ge::graphStatus TilingPrepareForMatmulV3(gert::TilingParseContext *contex
   compileInfoPtr->supportL0c2out = !val.empty();
   compileInfoPtr->supportL12BtBf16 = (dataMoveL12Bt.find("bf16") != std::string::npos);
   compileInfoPtr->aicNum = ascendcPlatform.GetCoreNumAic();
+  // NEW BEGIN
+  compileInfoPtr->aivNum = ascendcPlatform.GetCoreNumAiv();
+  // NEW END
   compileInfoPtr->socVersion = ascendcPlatform.GetSocVersion();
   compileInfoPtr->btSize = compileInfoPtr->supportL0c2out ? 1024UL : 0UL;                       // 1024 is btSize
   compileInfoPtr->btSize = compileInfoPtr->supportL12BtBf16 ? 4096UL : compileInfoPtr->btSize;  // 4096 is btSize
@@ -81,7 +87,32 @@ static ge::graphStatus TilingPrepareForMatmulV3(gert::TilingParseContext *contex
   ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_C, compileInfoPtr->l0CSize);
   ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L2, compileInfoPtr->l2Size);
 
-  if(!TilingPrepareForOpCache(context)) {
+  // NEW BEGIN
+  auto readRate = [platformInfo](const char *section, const char *key, double fallback) {
+      std::string text;
+      platformInfo->GetPlatformRes(section, key, text);
+      if (text.empty()) {
+          return fallback;
+      }
+      char *end = nullptr;
+      const double value = std::strtod(text.c_str(), &end);
+      return end != text.c_str() && value > 0.0 ? value : fallback;
+  };
+  compileInfoPtr->cubeFreq = static_cast<float>(readRate("AICoreSpec", "cube_freq", 1800.0));
+  compileInfoPtr->vectorBytesPerCycle = readRate("AICoreSpec", "vec_calc_size", 128.0);
+  compileInfoPtr->ddrReadRate = readRate("AICoreMemoryRates", "ddr_read_rate", 32.0);
+  compileInfoPtr->ddrWriteRate = readRate("AICoreMemoryRates", "ddr_write_rate", 32.0);
+  compileInfoPtr->l2ReadRate = readRate("AICoreMemoryRates", "l2_read_rate", 110.0);
+  compileInfoPtr->l2WriteRate = readRate("AICoreMemoryRates", "l2_write_rate", 86.0);
+  compileInfoPtr->l1ToL0ARate = readRate("AICoreMemoryRates", "l1_to_l0_a_rate", 512.0);
+  compileInfoPtr->l1ToL0BRate = readRate("AICoreMemoryRates", "l1_to_l0_b_rate", 256.0);
+  // NEW END
+
+  // NEW BEGIN
+  const char *disableRepo = std::getenv("MATMUL_DISABLE_REPO");
+  const bool repoDisabled = disableRepo != nullptr && disableRepo[0] == '1' && disableRepo[1] == '\0';
+  if(!repoDisabled && !TilingPrepareForOpCache(context)) {
+  // NEW END
       OP_LOGE(context->GetNodeName(), "TilingPrepareForOpCache fail");
       return ge::GRAPH_FAILED;
   }
