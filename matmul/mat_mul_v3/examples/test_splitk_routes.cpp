@@ -1222,16 +1222,6 @@ int main(int argc, char **argv)
     (void)aclrtDestroyStream(stream);
     (void)aclrtResetDevice(0);
     (void)aclFinalize();
-    if (counts.passed == 0) {
-        std::fprintf(stderr,
-            "fatal: campaign produced zero NPU measurements inputs=%lu official_target=%lu "
-            "official_failed=%lu candidate_tiling_failed=%lu first_stage=%s first_shape=%s first_rc=%d\n",
-            static_cast<unsigned long>(counts.inputs),
-            static_cast<unsigned long>(counts.deterministic),
-            static_cast<unsigned long>(counts.officialFailed),
-            static_cast<unsigned long>(counts.candidateTilingFailed),
-            counts.firstFailureStage.c_str(), counts.firstFailureShape.c_str(), counts.firstFailureRc);
-    }
     bool mQuotaComplete = true;
     if (mQuota != 0) {
         for (size_t m = 1; m < counts.passedPerM.size(); ++m) {

@@ -39,8 +39,9 @@ for raw in sys.stdin:
         print(raw.rstrip(), file=sys.stderr)
         continue
     if obj.get("summary") is True:
+        prefix = "fatal:" if obj.get("passed", 0) == 0 else "# summary"
         print(
-            "# summary "
+            f"{prefix} "
             f"inputs={obj.get('inputs', '')} "
             f"official_target={obj.get('official_target', '')} "
             f"candidate_selected={obj.get('candidate_selected', '')} "

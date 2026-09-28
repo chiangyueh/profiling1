@@ -138,7 +138,5 @@ if [[ "${converter_rc}" -ne 0 ]]; then
     exit "${converter_rc}"
 fi
 if [[ "${panel_rc}" -ne 0 ]]; then
-    printf 'fatal: NPU campaign failed rc=%d; inspect the summary first_failure_* fields or stderr above\n' \
-        "${panel_rc}" >&2
     exit "${panel_rc}"
 fi
