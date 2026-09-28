@@ -2077,16 +2077,30 @@ bool MatmulV3BaseTiling::DoThreeShapeBaseTiling()
         return false;
     }
 
-    if (args_.mValue != 4096UL || args_.nValue != 512UL || args_.kValue != 7168UL) {
+    uint64_t baseM = 0;
+    uint64_t baseN = 0;
+    uint64_t usedCoreNum = 20;
+    uint64_t iterateOrder = ITER_COL_FIRST;
+    const char *variant = nullptr;
+    if (args_.mValue == 2048UL && args_.nValue == 1536UL && args_.kValue == 7168UL) {
+        baseM = BASIC_BLOCK_SIZE_128;
+        baseN = BASIC_BLOCK_SIZE_256;
+        iterateOrder = ITER_COL_FIRST;
+        variant = "TARGET_M2048_K7168_N1536";
+    } else if (args_.mValue == 2048UL && args_.nValue == 7168UL && args_.kValue == 2048UL) {
+        baseM = BASIC_BLOCK_SIZE_256;
+        baseN = BASIC_BLOCK_SIZE_128;
+        iterateOrder = ITER_ROW_FIRST;
+        variant = "TARGET_M2048_K2048_N7168";
+    } else if (args_.mValue == 4096UL && args_.nValue == 512UL && args_.kValue == 7168UL) {
+        baseM = BASIC_BLOCK_SIZE_128;
+        baseN = BASIC_BLOCK_SIZE_256;
+        usedCoreNum = 16;
+        iterateOrder = ITER_COL_FIRST;
+        variant = "TARGET_M4096_K7168_N512";
+    } else {
         return false;
     }
-    const uint64_t baseM = BASIC_BLOCK_SIZE_128;
-    const uint64_t baseN = BASIC_BLOCK_SIZE_256;
-    const uint64_t usedCoreNum = 20UL;
-    const uint64_t iterateOrder = ITER_COL_FIRST;
-    const uint64_t mWindowBlock = 32UL;
-    const uint64_t nWindowBlock = 2UL;
-    const char *variant = "POST_TILING_BALANCED_16_CORE_M4096_K7168_N512";
 
     constexpr uint64_t baseK = BASIC_BLOCK_SIZE_64;
     const uint64_t stepKa = baseM == BASIC_BLOCK_SIZE_256 ? 4UL : 8UL;
@@ -2108,13 +2122,9 @@ bool MatmulV3BaseTiling::DoThreeShapeBaseTiling()
     const uint64_t aPanelBytes = baseM * ops::CeilAlign(args_.kValue * aDtypeSize_, CACHELINE);
     const uint64_t bPanelBytes = args_.kValue * ops::CeilAlign(baseN * bDtypeSize_, CACHELINE);
     const uint64_t cTileBytes = baseM * baseN * cDtypeSize_;
-    if (mWindowBlock == 0 || nWindowBlock == 0 ||
-        mWindowBlock > mTasks || nWindowBlock > nTasks) {
-        return false;
-    }
-    const __uint128_t l2WindowBytes = static_cast<__uint128_t>(mWindowBlock) * aPanelBytes +
-        static_cast<__uint128_t>(nWindowBlock) * bPanelBytes +
-        static_cast<__uint128_t>(mWindowBlock) * nWindowBlock * cTileBytes;
+    const __uint128_t l2WindowBytes = static_cast<__uint128_t>(mTasks) * aPanelBytes +
+        static_cast<__uint128_t>(nTasks) * bPanelBytes +
+        static_cast<__uint128_t>(mTasks) * nTasks * cTileBytes;
     if (l2WindowBytes > compileInfo_.l2Size) {
         return false;
     }
@@ -2136,10 +2146,10 @@ bool MatmulV3BaseTiling::DoThreeShapeBaseTiling()
     candidate.depthB1 = depthB1;
     candidate.iterateOrder = iterateOrder;
     candidate.dbL0c = DB_OFF_SIZE;
-    candidate.l2Info.mTile = MathUtil::CeilDivision(mTasks, mWindowBlock);
-    candidate.l2Info.nTile = MathUtil::CeilDivision(nTasks, nWindowBlock);
-    candidate.l2Info.mTileBlock = mWindowBlock;
-    candidate.l2Info.nTileBlock = nWindowBlock;
+    candidate.l2Info.mTile = 1;
+    candidate.l2Info.nTile = 1;
+    candidate.l2Info.mTileBlock = mTasks;
+    candidate.l2Info.nTileBlock = nTasks;
     candidate.l2Info.calOrder = iterateOrder;
     runInfo_ = candidate;
     tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
@@ -3956,22 +3966,6 @@ ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
     L2Cache l2Cache(args_, tilingData_);
     l2Cache.SetL2CacheFlag(tilingEnable_, compileInfo_.l2Size, l2CacheFlag_);
     // NEW BEGIN
-    const char *baseMode = std::getenv("MATMUL_BASE_MODE");
-    if (baseMode != nullptr && std::strcmp(baseMode, "THREE_SHAPE_BASE") == 0 &&
-        args_.mValue == 4096UL && args_.nValue == 512UL && args_.kValue == 7168UL &&
-        tilingData_.matmulTiling.usedCoreNum == 20U &&
-        tilingData_.matmulTiling.singleCoreM == 128U &&
-        tilingData_.matmulTiling.singleCoreN == 256U &&
-        tilingData_.tileL2cacheTiling.mTileBlock == 32U &&
-        tilingData_.tileL2cacheTiling.nTileBlock == 2U) {
-        constexpr uint64_t balancedCores = 16UL;
-        const uint64_t tasks = 32UL * 2UL;
-        const uint64_t officialWaves = MathUtil::CeilDivision(tasks, 20UL);
-        const uint64_t balancedWaves = MathUtil::CeilDivision(tasks, balancedCores);
-        if (officialWaves == balancedWaves) {
-            tilingData_.matmulTiling.usedCoreNum = static_cast<uint32_t>(balancedCores);
-        }
-    }
     ExportExperimentalTiling();
     // NEW END
     return ge::GRAPH_SUCCESS;

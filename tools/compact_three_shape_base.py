@@ -38,22 +38,6 @@ for raw in sys.stdin:
     except json.JSONDecodeError:
         print(raw.rstrip(), file=sys.stderr)
         continue
-    if obj.get("summary") is True:
-        print(
-            "# summary "
-            f"inputs={obj.get('inputs', '')} "
-            f"official_target={obj.get('official_target', '')} "
-            f"candidate_selected={obj.get('candidate_selected', '')} "
-            f"passed={obj.get('passed', '')} "
-            f"failed={obj.get('failed', '')} "
-            f"official_failed={obj.get('official_failed', '')} "
-            f"candidate_tiling_failed={obj.get('candidate_tiling_failed', '')} "
-            f"first_failure_stage={obj.get('first_failure_stage', '')} "
-            f"first_failure_shape={obj.get('first_failure_shape', '')} "
-            f"first_failure_rc={obj.get('first_failure_rc', '')}",
-            file=sys.stderr,
-        )
-        continue
     if "shape" not in obj:
         continue
     writer.writerow({

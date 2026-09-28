@@ -11,9 +11,9 @@
 
 #include "acl/acl.h"
 #include "aclnn_kernels/contiguous.h"
+#include "opdev/make_op_executor.h"
 #include "matmul/mat_mul_v3/op_host/op_api/aclnn_matmul.h"
 #include "matmul/mat_mul_v3/op_host/op_api/matmul.h"
-#include "opdev/make_op_executor.h"
 
 extern "C" uint32_t TbeLoadSoAndSaveToRegistry(const char *soPath);
 
