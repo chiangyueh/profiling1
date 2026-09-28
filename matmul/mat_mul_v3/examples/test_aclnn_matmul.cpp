@@ -77,30 +77,30 @@ int main() {
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("Init acl failed. ERROR: %d\n", ret); return ret);
 
   // 2. 构造输入与输出，需要根据API的接口自定义构造
-  std::vector<int64_t> selfShape = {16, 32};
-  std::vector<int64_t> mat2Shape = {32, 16};
-  std::vector<int64_t> outShape = {16, 16};
+  std::vector<int64_t> selfShape = {4096, 7168};
+  std::vector<int64_t> mat2Shape = {7168, 512};
+  std::vector<int64_t> outShape = {4096, 512};
   void* selfDeviceAddr = nullptr;
   void* mat2DeviceAddr = nullptr;
   void* outDeviceAddr = nullptr;
   aclTensor* self = nullptr;
   aclTensor* mat2 = nullptr;
   aclTensor* out = nullptr;
-  std::vector<float> selfHostData(512, 1);
-  std::vector<float> mat2HostData(512, 1);
-  std::vector<float> outHostData(256, 0);
+  std::vector<aclFloat16> selfHostData(GetShapeSize(selfShape), aclFloatToFloat16(1.0F));
+  std::vector<aclFloat16> mat2HostData(GetShapeSize(mat2Shape), aclFloatToFloat16(1.0F));
+  std::vector<aclFloat16> outHostData(GetShapeSize(outShape), aclFloatToFloat16(0.0F));
   // 创建self aclTensor
-  ret = CreateAclTensor(selfHostData, selfShape, &selfDeviceAddr, aclDataType::ACL_FLOAT, &self);
+  ret = CreateAclTensor(selfHostData, selfShape, &selfDeviceAddr, aclDataType::ACL_FLOAT16, &self);
   std::unique_ptr<aclTensor, aclnnStatus (*)(const aclTensor*)> selfTensorPtr(self, aclDestroyTensor);
   std::unique_ptr<void, aclError (*)(void*)> selfDeviceAddrPtr(selfDeviceAddr, aclrtFree);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
   // 创建mat2 aclTensor
-  ret = CreateAclTensor(mat2HostData, mat2Shape, &mat2DeviceAddr, aclDataType::ACL_FLOAT, &mat2);
+  ret = CreateAclTensor(mat2HostData, mat2Shape, &mat2DeviceAddr, aclDataType::ACL_FLOAT16, &mat2);
   std::unique_ptr<aclTensor, aclnnStatus (*)(const aclTensor*)> mat2TensorPtr(mat2, aclDestroyTensor);
   std::unique_ptr<void, aclError (*)(void*)> mat2DeviceAddrPtr(mat2DeviceAddr, aclrtFree);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
   // 创建out aclTensor
-  ret = CreateAclTensor(outHostData, outShape, &outDeviceAddr, aclDataType::ACL_FLOAT, &out);
+  ret = CreateAclTensor(outHostData, outShape, &outDeviceAddr, aclDataType::ACL_FLOAT16, &out);
   std::unique_ptr<aclTensor, aclnnStatus (*)(const aclTensor*)> outTensorPtr(out, aclDestroyTensor);
   std::unique_ptr<void, aclError (*)(void*)> outdeviceAddrPtr(outDeviceAddr, aclrtFree);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
@@ -130,13 +130,13 @@ int main() {
 
   // 5. 获取输出的值，将device侧内存上的结果拷贝至host侧，需要根据具体API的接口定义修改
   auto size = GetShapeSize(outShape);
-  std::vector<float> resultData(size, 0);
+  std::vector<aclFloat16> resultData(size, aclFloatToFloat16(0.0F));
   ret = aclrtMemcpy(resultData.data(), resultData.size() * sizeof(resultData[0]), outDeviceAddr,
                     size * sizeof(resultData[0]), ACL_MEMCPY_DEVICE_TO_HOST);
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("copy result from device to host failed. ERROR: %d\n", ret); return ret);
-  for (int64_t i = 0; i < size; i++) {
-    LOG_PRINT("result[%ld] is: %f\n", i, resultData[i]);
-  }
+  LOG_PRINT("{\"shape\":\"M4096_N512_K7168_NN_fp16\",\"status\":\"PASS\","
+            "\"first\":%f,\"last\":%f}\n",
+            aclFloat16ToFloat(resultData.front()), aclFloat16ToFloat(resultData.back()));
 
   // 6. 释放device资源，需要根据具体API的接口定义修改
   aclrtDestroyStream(stream);

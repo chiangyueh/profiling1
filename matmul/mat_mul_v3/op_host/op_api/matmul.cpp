@@ -14,7 +14,6 @@
 #include "opdev/op_dfx.h"
 #include "opdev/op_executor.h"
 #include "opdev/op_log.h"
-#include "aclnn_kernels/contiguous.h"
 #include "aclnn_kernels/common/op_error_check.h"
 
 using namespace op;
@@ -142,27 +141,6 @@ const aclTensor* MatMulV3Nd(
         x1, x2, bias, x1->GetDataType(), Format::FORMAT_ND, Format::FORMAT_ND, transposeX1, transposeX2, offsetX,
         opImplMode, executor);
 };
-
-aclnnStatus AddMatMulV3NdToExecutor(
-    const aclTensor* x1, const aclTensor* x2, aclTensor* out, const bool transposeX1, const bool transposeX2,
-    const bool offsetX, const int64_t opImplMode, aclOpExecutor* executor)
-{
-    const aclTensor* bias = nullptr;
-    const aclTensor* offsetW = nullptr;
-    auto mmOut = executor->AllocTensor(out->GetViewShape(), out->GetDataType());
-    if (mmOut == nullptr) {
-        return ACLNN_ERR_INNER_NULLPTR;
-    }
-    const uint32_t execMode =
-        opImplMode == 0x40 ? static_cast<uint32_t>(OpExecMode::OP_EXEC_MODE_HF32) : 0U;
-    const aclnnStatus status = ADD_TO_LAUNCHER_LIST_AICORE(
-        MatMulV3, OP_INPUT(x1, x2, bias, offsetW), OP_OUTPUT(mmOut),
-        OP_ATTR(transposeX1, transposeX2, offsetX, opImplMode), OP_MODE(execMode));
-    if (status != ACLNN_SUCCESS) {
-        return status;
-    }
-    return l0op::ViewCopy(mmOut, out, executor) == nullptr ? ACLNN_ERR_INNER_NULLPTR : ACLNN_SUCCESS;
-}
 
 const aclTensor* MatMulV3NdFp162Fp32(
     const aclTensor* x1, const aclTensor* x2, const aclTensor* bias, const bool transposeX1, const bool transposeX2,

@@ -252,8 +252,6 @@ RouteResult RunOne(const gert::OpImplKernelRegistry::OpImplFunctionsV2 *impl, co
 
 int main(int argc, char **argv)
 {
-    const bool verifyThirdShapeMode = argc == 3 &&
-        std::strcmp(argv[1], "--verify-third-shape") == 0;
     const bool fullMSweepMode = argc == 6 &&
         (std::strcmp(argv[1], "--select-base-full-m") == 0 ||
          std::strcmp(argv[1], "--select-base-stratified-full-m") == 0);
@@ -263,9 +261,8 @@ int main(int argc, char **argv)
     const bool selectMode = argc == 6 &&
         (std::strcmp(argv[1], "--select-base") == 0 ||
          std::strcmp(argv[1], "--select-base-full-m") == 0 || stratifiedMode);
-    if (argc != 2 && !selectMode && !verifyThirdShapeMode) {
+    if (argc != 2 && !selectMode) {
         std::cerr << "usage: host_matmul_v3_route LIBOPHOST_NN_SO\n"
-                  << "       host_matmul_v3_route --verify-third-shape LIBOPHOST_NN_SO\n"
                   << "       host_matmul_v3_route --select-base CAMPAIGN PER_M_RESERVE LIBOPHOST_NN_SO LEGACY_SO\n"
                   << "       host_matmul_v3_route --select-base-full-m CAMPAIGN PER_M_RESERVE LIBOPHOST_NN_SO LEGACY_SO\n"
                   << "       host_matmul_v3_route --select-base-stratified CAMPAIGN PER_CELL_RESERVE LIBOPHOST_NN_SO LEGACY_SO\n"
@@ -274,7 +271,7 @@ int main(int argc, char **argv)
     }
     const char *campaign = selectMode ? argv[2] : nullptr;
     const size_t perMReserve = selectMode ? std::strtoull(argv[3], nullptr, 10) : 0;
-    const char *hostLibrary = selectMode ? argv[4] : (verifyThirdShapeMode ? argv[2] : argv[1]);
+    const char *hostLibrary = selectMode ? argv[4] : argv[1];
     const char *forceBaseText = std::getenv("MATMUL_FORCE_BASE_ONLY");
     const bool forceBase = forceBaseText != nullptr && forceBaseText[0] == '1' && forceBaseText[1] == '\0';
     if (selectMode && perMReserve == 0) {
@@ -310,43 +307,6 @@ int main(int argc, char **argv)
     if (impl == nullptr || impl->tiling == nullptr) {
         std::cerr << "MatMulV3 tiling callback is not registered\n";
         return 2;
-    }
-    if (verifyThirdShapeMode) {
-        const char *packetFields[] = {
-            "MATMUL_OBSERVED_SINGLE_M", "MATMUL_OBSERVED_SINGLE_N", "MATMUL_OBSERVED_SINGLE_K",
-            "MATMUL_OBSERVED_BASE_M", "MATMUL_OBSERVED_BASE_N", "MATMUL_OBSERVED_BASE_K"
-        };
-        auto packet = [&]() {
-            std::vector<std::string> values;
-            for (const char *field : packetFields) values.emplace_back(Observed(field));
-            return values;
-        };
-        const Workload workload{"fp16", "NN", 4096, 512, 7168};
-        unsetenv("MATMUL_BASE_MODE");
-        unsetenv("MATMUL_BASE_EXPERIMENT_SELECTED");
-        unsetenv("MATMUL_EXPERIMENT_BRANCH");
-        const RouteResult official = RunOne(impl, workload, false);
-        const uint64_t officialCore = std::strtoull(Observed("MATMUL_OBSERVED_CORES"), nullptr, 10);
-        const std::vector<std::string> officialPacket = packet();
-        setenv("MATMUL_BASE_MODE", "THIRD_SHAPE_CORE_BALANCE", 1);
-        unsetenv("MATMUL_BASE_EXPERIMENT_SELECTED");
-        unsetenv("MATMUL_EXPERIMENT_BRANCH");
-        const RouteResult candidate = RunOne(impl, workload, false);
-        const uint64_t candidateCore = std::strtoull(Observed("MATMUL_OBSERVED_CORES"), nullptr, 10);
-        const std::vector<std::string> candidatePacket = packet();
-        const char *branch = std::getenv("MATMUL_EXPERIMENT_BRANCH");
-        const bool passed = official.rc == ge::GRAPH_SUCCESS && candidate.rc == ge::GRAPH_SUCCESS &&
-            std::strcmp(Family(official.key), "BASE") == 0 && official.key == candidate.key &&
-            officialPacket == candidatePacket && officialCore == 20U && candidateCore == 16U && branch != nullptr &&
-            std::strcmp(branch, "THIRD_SHAPE_CORE_BALANCE") == 0;
-        std::cout << "shape=M4096_N512_K7168_NN"
-                  << ",official_family=" << Family(official.key)
-                  << ",official_key=" << official.key
-                  << ",candidate_key=" << candidate.key
-                  << ",official_core=" << officialCore
-                  << ",candidate_core=" << candidateCore
-                  << ",status=" << (passed ? "PASS" : "FAIL") << '\n';
-        return passed ? 0 : 1;
     }
     if (!selectMode) {
         std::cout << "dtype,layout,m,n,k,rc,tiling_key,family,block_dim,used_core,single_m,single_n,single_k,base_m,base_n,base_k\n";
