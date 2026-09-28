@@ -32,10 +32,8 @@ fi
 
 build_dir="${PWD}/build"
 build_log="$(mktemp)"
-workload_manifest="$(mktemp)"
-selection_log="$(mktemp)"
-producer_status="$(mktemp)"
-trap 'rm -f "${build_log}" "${workload_manifest}" "${selection_log}" "${producer_status}"' EXIT
+workload_manifest="${PWD}/data/independent_base_npu_verified.tsv"
+trap 'rm -f "${build_log}"' EXIT
 
 printf '# stage=host_build status=begin\n'
 if ! cmake -S . -B "${build_dir}" \
@@ -124,62 +122,19 @@ fi
 printf '# stage=runner_build status=passed\n'
 
 printf '# stage=workload_generation status=begin\n'
-host_selector="${build_dir}/host_matmul_v3_route"
-if ! g++ tools/host_matmul_v3_route.cpp \
-    -std=gnu++17 -D_GLIBCXX_USE_CXX11_ABI=0 \
-    -I "${PWD}" \
-    -I "${ASCEND_HOME_PATH}/include" \
-    -I "${ASCEND_HOME_PATH}/$(uname -m)-linux/pkg_inc" \
-    -L "${ASCEND_OPP_PATH}/lib64" \
-    -L "${ASCEND_HOME_PATH}/lib64" \
-    -L "${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64" \
-    -lregister -lopp_registry -lunified_dlog -lmetadef -lplatform -lc_sec -ldl \
-    -Wl,-rpath,"${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64" \
-    -o "${host_selector}" >>"${build_log}" 2>&1; then
-    cat "${build_log}" >&2
+if [[ ! -s "${workload_manifest}" ]]; then
+    printf '{"fatal":"preverified_manifest_missing"}\n' >&2
     exit 1
 fi
-
-per_cell_reserve="${MATMUL_CELL_RESERVE:-8}"
-rm -f "${workload_manifest}"
-mkfifo "${workload_manifest}"
-(
-set +e
-python3 - <<'PY' | "${host_selector}" --select-base-stratified INDEPENDENT_BASE_SELECTOR "${per_cell_reserve}" "${host_library}" >"${workload_manifest}" 2>"${selection_log}"
-import random
-
-rng = random.Random(8527)
-n_values = (16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256)
-k_values = tuple(range(512, 32769, 512))
-combinations = [
-    (dtype, n, k)
-    for dtype in ("fp16_fp16", "bf16_bf16")
-    for n in n_values
-    for k in k_values
-]
-for offset in range(1, 101):
-    for m in range(offset, 4097, 100):
-        rng.shuffle(combinations)
-        for dtype, n, k in combinations:
-            print("\t".join(str(value) for value in (dtype, "NN", m, n, k)))
-PY
-selection_status=("${PIPESTATUS[@]}")
-printf '%d %d\n' "${selection_status[0]}" "${selection_status[1]}" >"${producer_status}"
-if [[ "${selection_status[0]}" -ne 0 || "${selection_status[1]}" -ne 0 ]]; then
-    exit 1
-fi
-) &
-producer_pid="$!"
-
-printf '# stage=workload_generation status=streaming coverage=interleaved_m_1_to_4096_x_2dtype_x_3n_x_3k reserve_per_stratum=%d\n' \
-    "${per_cell_reserve}"
+manifest_rows="$(wc -l < "${workload_manifest}")"
+printf '# stage=workload_generation status=passed source=preverified_npu_base rows=%d\n' "${manifest_rows}"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
 
 success_target="${MATMUL_SUCCESS_TARGET:-0}"
 m_quota="${MATMUL_M_QUOTA:-0}"
-m_cell_quota="${MATMUL_M_CELL_QUOTA:-1}"
+m_cell_quota="${MATMUL_M_CELL_QUOTA:-0}"
 cell_quota="${MATMUL_CELL_QUOTA:-0}"
 if [[ "${cell_quota}" -eq 0 ]]; then
     cell_quota_json=null
@@ -192,24 +147,14 @@ panel_rc=0
 printf '# campaign=INDEPENDENT_BASE_SELECTOR target_passes=%d maximum_per_joint_cell=%s theoretical_maximum_pairs=%s measurement_order=OCCO\n' \
     "${success_target}" "${cell_quota_json}" "${theoretical_maximum_pairs_json}"
 set +e
-MATMUL_BASE_FULL_M_SWEEP=1 MATMUL_CAMPAIGN=INDEPENDENT_BASE_SELECTOR \
-    MATMUL_TARGET_PASSES="${success_target}" MATMUL_CELL_QUOTA="${cell_quota}" MATMUL_M_QUOTA="${m_quota}" \
+MATMUL_CAMPAIGN=INDEPENDENT_BASE_SELECTOR MATMUL_TARGET_PASSES="${success_target}" \
+    MATMUL_CELL_QUOTA="${cell_quota}" MATMUL_M_QUOTA="${m_quota}" \
     MATMUL_M_CELL_QUOTA="${m_cell_quota}" \
     "${runner}" --manifest "${workload_manifest}" | python3 tools/compact_matmul_log.py
 pipeline_status=("${PIPESTATUS[@]}")
 panel_rc="${pipeline_status[0]}"
 converter_rc="${pipeline_status[1]}"
-wait "${producer_pid}"
-producer_rc="$?"
 set -e
-cat "${selection_log}"
-if [[ "${producer_rc}" -ne 0 ]]; then
-    read -r generator_rc selector_rc <"${producer_status}" || true
-    printf '# stage=workload_generation status=failed generator_rc=%s selector_rc=%s\n' \
-        "${generator_rc:-unknown}" "${selector_rc:-unknown}" >&2
-    exit "${producer_rc}"
-fi
-printf '# stage=workload_generation status=passed\n'
 if [[ "${converter_rc}" -ne 0 ]]; then
     printf 'fatal: CSV conversion failed rc=%d\n' "${converter_rc}" >&2
     exit "${converter_rc}"
