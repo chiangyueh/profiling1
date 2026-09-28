@@ -2077,37 +2077,16 @@ bool MatmulV3BaseTiling::DoThreeShapeBaseTiling()
         return false;
     }
 
-    uint64_t baseM = 0;
-    uint64_t baseN = 0;
-    uint64_t usedCoreNum = 20;
-    uint64_t iterateOrder = ITER_COL_FIRST;
-    uint64_t mWindowBlock = 0;
-    uint64_t nWindowBlock = 0;
-    const char *variant = nullptr;
-    if (args_.mValue == 2048UL && args_.nValue == 1536UL && args_.kValue == 7168UL) {
-        baseM = BASIC_BLOCK_SIZE_128;
-        baseN = BASIC_BLOCK_SIZE_256;
-        iterateOrder = ITER_COL_FIRST;
-        mWindowBlock = 16UL;
-        nWindowBlock = 6UL;
-        variant = "CONTROL_M2048_K7168_N1536";
-    } else if (args_.mValue == 2048UL && args_.nValue == 7168UL && args_.kValue == 2048UL) {
-        baseM = BASIC_BLOCK_SIZE_128;
-        baseN = BASIC_BLOCK_SIZE_256;
-        iterateOrder = ITER_COL_FIRST;
-        mWindowBlock = 16UL;
-        nWindowBlock = 28UL;
-        variant = "CONTROL_M2048_K2048_N7168";
-    } else if (args_.mValue == 4096UL && args_.nValue == 512UL && args_.kValue == 7168UL) {
-        baseM = BASIC_BLOCK_SIZE_128;
-        baseN = BASIC_BLOCK_SIZE_256;
-        iterateOrder = ITER_COL_FIRST;
-        mWindowBlock = 32UL;
-        nWindowBlock = 2UL;
-        variant = "POST_TILING_BALANCED_16_CORE_M4096_K7168_N512";
-    } else {
+    if (args_.mValue != 4096UL || args_.nValue != 512UL || args_.kValue != 7168UL) {
         return false;
     }
+    const uint64_t baseM = BASIC_BLOCK_SIZE_128;
+    const uint64_t baseN = BASIC_BLOCK_SIZE_256;
+    const uint64_t usedCoreNum = 20UL;
+    const uint64_t iterateOrder = ITER_COL_FIRST;
+    const uint64_t mWindowBlock = 32UL;
+    const uint64_t nWindowBlock = 2UL;
+    const char *variant = "POST_TILING_BALANCED_16_CORE_M4096_K7168_N512";
 
     constexpr uint64_t baseK = BASIC_BLOCK_SIZE_64;
     const uint64_t stepKa = baseM == BASIC_BLOCK_SIZE_256 ? 4UL : 8UL;

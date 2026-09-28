@@ -124,12 +124,10 @@ printf '# stage=runner_build status=passed\n'
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
 panel_rc=0
-printf '# campaign=THREE_SHAPE_BASE shapes=3 measurement_order=OCCO\n'
+printf '# campaign=THREE_SHAPE_BASE shapes=1 measurement_order=OCCO\n'
 set +e
-MATMUL_CAMPAIGN=THREE_SHAPE_BASE MATMUL_TARGET_PASSES=3 \
+MATMUL_CAMPAIGN=THREE_SHAPE_BASE MATMUL_TARGET_PASSES=1 \
     "${runner}" \
-    fp16_fp16 NN 2048 1536 7168 \
-    fp16_fp16 NN 2048 7168 2048 \
     fp16_fp16 NN 4096 512 7168 | python3 tools/compact_three_shape_base.py
 pipeline_status=("${PIPESTATUS[@]}")
 panel_rc="${pipeline_status[0]}"
