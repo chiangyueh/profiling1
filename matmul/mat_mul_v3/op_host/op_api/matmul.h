@@ -45,6 +45,10 @@ const aclTensor* MatMulV3Nd(
     const aclTensor* x1, const aclTensor* x2, const aclTensor* bias, const bool transposeX1, const bool transposeX2,
     const bool offsetX, const int64_t opImplMode, aclOpExecutor* executor);
 
+aclnnStatus AddMatMulV3NdToExecutor(
+    const aclTensor* x1, const aclTensor* x2, aclTensor* out, const bool transposeX1, const bool transposeX2,
+    const bool offsetX, const int64_t opImplMode, aclOpExecutor* executor);
+
 const aclTensor* MatMulV3NdFp162Fp32(
     const aclTensor* x1, const aclTensor* x2, const aclTensor* bias, const bool transposeX1, const bool transposeX2,
     const bool offsetX, const int64_t opImplMode, aclOpExecutor* executor);

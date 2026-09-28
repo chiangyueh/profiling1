@@ -74,11 +74,9 @@ aclnnStatus ForcedMatmulV3GetWorkspaceSize(const aclTensor *a, const aclTensor *
 {
     auto uniqueExecutor = CREATE_EXECUTOR();
     if (uniqueExecutor.get() == nullptr) return 561101;
-    const aclTensor *mmOut = l0op::MatMulV3Nd(
-        a, b, nullptr, layout.transA, layout.transB, false, 0x1, uniqueExecutor.get());
-    if (mmOut == nullptr) return 561103;
-    const aclTensor *copied = l0op::ViewCopy(mmOut, out, uniqueExecutor.get());
-    if (copied == nullptr) return 561103;
+    const aclnnStatus status = l0op::AddMatMulV3NdToExecutor(
+        a, b, out, layout.transA, layout.transB, false, 0x1, uniqueExecutor.get());
+    if (status != ACL_SUCCESS) return status;
     *workspaceSize = uniqueExecutor->GetWorkspaceSize();
     uniqueExecutor.ReleaseTo(executor);
     return ACL_SUCCESS;
