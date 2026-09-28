@@ -1385,19 +1385,11 @@ void MatmulV3BaseTiling::DoSmallShapeTiling()
 
 void MatmulV3BaseTiling::DoSelectTiling()
 {
-    // NEW BEGIN
-    const char *forceBaseText = std::getenv("MATMUL_FORCE_BASE_ONLY");
-    const bool forceBase = forceBaseText != nullptr && forceBaseText[0] == '1' && forceBaseText[1] == '\0';
-    const TilingCalcSelect effectiveSelect = forceBase ? TilingCalcSelect::BASE : tilingSelect_;
-    // NEW END
-    switch (effectiveSelect) {
+    switch (tilingSelect_) {
         case TilingCalcSelect::ALL:
             DO_CACL_TILING_ENABLE(DoBL1FullloadWithFixpipeTiling())
             DO_CACL_TILING_ENABLE(DoAL1FullLoadTiling())
             DO_CACL_TILING_ENABLE(DoBL1FullLoadTiling())
-            // NEW BEGIN
-            DO_CACL_TILING_ENABLE(DoExperimentalBaseTiling())
-            // NEW END
             DO_CACL_TILING_ENABLE(DoL2CacheTiling())
             DO_CACL_TILING_ENABLE(DoSingleCoreSplitKTiling())
             // NEW BEGIN
@@ -1407,14 +1399,15 @@ void MatmulV3BaseTiling::DoSelectTiling()
             DO_CACL_TILING_ENABLE(DoL2CacheTiling310P())
             // NEW BEGIN
             DO_CACL_TILING_ENABLE(DoVectorDotTiling())
+            DO_CACL_TILING_ENABLE(DoExperimentalBaseTiling())
             // NEW END
             break;
         case TilingCalcSelect::BASE:
+            DO_CACL_TILING_ENABLE(DoL2CacheTiling())
+            DO_CACL_TILING_ENABLE(DoL2CacheTiling310P())
             // NEW BEGIN
             DO_CACL_TILING_ENABLE(DoExperimentalBaseTiling())
             // NEW END
-            DO_CACL_TILING_ENABLE(DoL2CacheTiling())
-            DO_CACL_TILING_ENABLE(DoL2CacheTiling310P())
             break;
         case TilingCalcSelect::SINGLE_CORE_SPLIT_K:
             DO_CACL_TILING_ENABLE(DoSingleCoreSplitKTiling())
@@ -2067,7 +2060,6 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
 
 bool MatmulV3BaseTiling::DoIndependentBaseTiling()
 {
-    const MatmulV3RunInfo reference = runInfo_;
     (void)::unsetenv("MATMUL_BASE_EXPERIMENT_VARIANT");
     (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_TASKS");
     (void)::unsetenv("MATMUL_ANALYTIC_SELECTED_WAVES");
@@ -2081,13 +2073,11 @@ bool MatmulV3BaseTiling::DoIndependentBaseTiling()
     if (!compileInfo_.supportL0c2out || compileInfo_.aicNum == 0 || args_.hasBias || !dtypeSupported ||
         args_.isATrans || args_.isBTrans || args_.aFormat != ge::FORMAT_ND ||
         args_.bFormat != ge::FORMAT_ND || args_.outFormat != ge::FORMAT_ND ||
-        args_.isNzA || args_.isNzB ||
+        args_.nd2nzA || args_.nd2nzB || args_.isNzA || args_.isNzB ||
         args_.mValue == 0 || args_.nValue == 0 || args_.kValue == 0 ||
         aDtypeSize_ != DATA_SIZE_FP16 || bDtypeSize_ != DATA_SIZE_FP16) {
         return false;
     }
-    const char *sweepText = std::getenv("MATMUL_BASE_FULL_M_SWEEP");
-    const bool fullMSweep = sweepText != nullptr && sweepText[0] == '1' && sweepText[1] == '\0';
 
     auto exportUnsigned = [](const char *name, uint64_t value) {
         char text[32] = {};
@@ -2178,36 +2168,10 @@ bool MatmulV3BaseTiling::DoIndependentBaseTiling()
     }
 
     const uint64_t targetTasks = compileInfo_.aicNum * NUM_HALF;
-    const uint64_t alignedN = ops::CeilAlign(args_.nValue, BASIC_ALIGN_16);
-    const uint64_t maxBaseM = std::min(BASIC_BLOCK_SIZE_128, alignedM);
-    const uint64_t maxBaseN = std::min(BASIC_BLOCK_SIZE_256, alignedN);
-    const uint64_t minMTasks = MathUtil::CeilDivision(args_.mValue, maxBaseM);
-    const uint64_t minNTasks = MathUtil::CeilDivision(args_.nValue, maxBaseN);
-    const uint64_t maxMTasks = MathUtil::CeilDivision(args_.mValue, BASIC_ALIGN_16);
-    const uint64_t maxNTasks = MathUtil::CeilDivision(args_.nValue, BASIC_ALIGN_16);
-    const uint64_t attainableTasks = std::min(targetTasks, maxMTasks * maxNTasks);
-    uint64_t targetMTasks = minMTasks;
-    uint64_t targetNTasks = minNTasks;
-    if (minMTasks * minNTasks < attainableTasks) {
-        const long double aspect = static_cast<long double>(attainableTasks) * args_.mValue * maxBaseN /
-            (static_cast<long double>(args_.nValue) * maxBaseM);
-        const uint64_t lowerMTasks = std::max(minMTasks,
-            MathUtil::CeilDivision(attainableTasks, maxNTasks));
-        const uint64_t upperMTasks = std::min(maxMTasks,
-            std::max(lowerMTasks, attainableTasks / minNTasks));
-        const uint64_t idealMTasks = static_cast<uint64_t>(std::llround(std::sqrt(aspect)));
-        targetMTasks = std::max(lowerMTasks, std::min(upperMTasks, std::max(1UL, idealMTasks)));
-        targetNTasks = std::max(minNTasks,
-            std::min(maxNTasks, MathUtil::CeilDivision(attainableTasks, targetMTasks)));
-        targetMTasks = std::max(targetMTasks,
-            MathUtil::CeilDivision(attainableTasks, targetNTasks));
-    }
-    const uint64_t baseM = ops::CeilAlign(
-        MathUtil::CeilDivision(args_.mValue, targetMTasks), BASIC_ALIGN_16);
-    const uint64_t baseN = ops::CeilAlign(
-        MathUtil::CeilDivision(args_.nValue, targetNTasks), BASIC_ALIGN_16);
-    if (baseM == 0 || baseM > maxBaseM || baseN == 0 || baseN > maxBaseN ||
-        baseM * baseN * LOC_DATA_SIZE > compileInfo_.l0CSize) {
+    const uint64_t baseM = ops::CeilAlign(MathUtil::CeilDivision(args_.mValue, targetTasks), BASIC_ALIGN_16);
+    const uint64_t baseN = ops::CeilAlign(args_.nValue, BASIC_ALIGN_16);
+    if (args_.mValue < BASIC_BLOCK_SIZE_128 || args_.nValue < BASIC_ALIGN_16 * NUM_HALF ||
+        baseM < BASIC_ALIGN_16 * 5UL || baseM > BASIC_BLOCK_SIZE_128 || baseN == 0) {
         return false;
     }
     const uint64_t alignedK = ops::CeilAlign(args_.kValue, BASIC_ALIGN_16);
@@ -2215,15 +2179,18 @@ bool MatmulV3BaseTiling::DoIndependentBaseTiling()
     const uint64_t maxBaseKByL0B = compileInfo_.l0BSize / (DB_SIZE * baseN * bDtypeSize_);
     const uint64_t baseK = ops::FloorAlign(
         std::min({BASIC_BLOCK_SIZE_256, alignedK, maxBaseKByL0A, maxBaseKByL0B}), BASIC_ALIGN_16);
-    if (baseK < BASIC_ALIGN_16) {
+    if (baseK < BASIC_ALIGN_16 * 10UL) {
         return false;
     }
     const uint64_t mTasks = MathUtil::CeilDivision(args_.mValue, baseM);
-    const uint64_t nTasks = MathUtil::CeilDivision(args_.nValue, baseN);
-    const uint64_t tasks = mTasks * nTasks;
+    constexpr uint64_t nTasks = 1UL;
+    const uint64_t tasks = mTasks;
     const uint64_t waves = MathUtil::CeilDivision(tasks, compileInfo_.aicNum);
     const uint64_t tailSlots = waves * compileInfo_.aicNum - tasks;
     const uint64_t kIterations = MathUtil::CeilDivision(args_.kValue, baseK);
+    if (waves != NUM_HALF || tailSlots > NUM_HALF || kIterations < BASIC_BLOCK_SIZE_64) {
+        return false;
+    }
 
     MatmulV3RunInfo candidate{};
     candidate.needUpdate = true;
@@ -2291,63 +2258,19 @@ bool MatmulV3BaseTiling::DoIndependentBaseTiling()
     const uint64_t aPanelBytes = baseM * ops::CeilAlign(args_.kValue * aDtypeSize_, CACHELINE);
     const uint64_t bPanelBytes = args_.kValue * ops::CeilAlign(baseN * bDtypeSize_, CACHELINE);
     const uint64_t cTileBytes = baseM * baseN * cDtypeSize_;
-    if (aPanelBytes >= compileInfo_.l2Size || bPanelBytes >= compileInfo_.l2Size ||
-        aPanelBytes + cTileBytes > compileInfo_.l2Size - bPanelBytes) {
+    const __uint128_t residentBytes = static_cast<__uint128_t>(mTasks) * aPanelBytes + bPanelBytes +
+        static_cast<__uint128_t>(mTasks) * cTileBytes;
+    if (residentBytes > compileInfo_.l2Size) {
         return false;
     }
-    const uint64_t aBytes = args_.mValue * args_.kValue * aDtypeSize_;
-    const uint64_t bBytes = args_.nValue * args_.kValue * bDtypeSize_;
-    const bool preserveA = static_cast<__uint128_t>(aBytes) * nTasks >=
-        static_cast<__uint128_t>(bBytes) * mTasks;
-    uint64_t mWindowBlock = 1;
-    uint64_t nWindowBlock = 1;
-    if (preserveA) {
-        nWindowBlock = std::max(1UL, std::min(nTasks,
-            (compileInfo_.l2Size - aPanelBytes) / (bPanelBytes + cTileBytes)));
-        const uint64_t fixedBytes = nWindowBlock * bPanelBytes;
-        if (fixedBytes >= compileInfo_.l2Size) {
-            return false;
-        }
-        mWindowBlock = std::max(1UL, std::min(mTasks,
-            (compileInfo_.l2Size - fixedBytes) / (aPanelBytes + nWindowBlock * cTileBytes)));
-    } else {
-        mWindowBlock = std::max(1UL, std::min(mTasks,
-            (compileInfo_.l2Size - bPanelBytes) / (aPanelBytes + cTileBytes)));
-        const uint64_t fixedBytes = mWindowBlock * aPanelBytes;
-        if (fixedBytes >= compileInfo_.l2Size) {
-            return false;
-        }
-        nWindowBlock = std::max(1UL, std::min(nTasks,
-            (compileInfo_.l2Size - fixedBytes) / (bPanelBytes + mWindowBlock * cTileBytes)));
-    }
-    candidate.iterateOrder = preserveA ? ITER_ROW_FIRST : ITER_COL_FIRST;
+    candidate.iterateOrder = ITER_COL_FIRST;
     candidate.dbL0c = DB_OFF_SIZE;
-    candidate.l2Info.mTile = MathUtil::CeilDivision(mTasks, mWindowBlock);
-    candidate.l2Info.nTile = MathUtil::CeilDivision(nTasks, nWindowBlock);
-    candidate.l2Info.mTileBlock = mWindowBlock;
-    candidate.l2Info.nTileBlock = nWindowBlock;
-    candidate.l2Info.calOrder = candidate.iterateOrder;
-    if (!fullMSweep) {
-        if (reference.singleCoreM == 0 || reference.singleCoreN == 0 || reference.baseM == 0 ||
-            reference.baseN == 0 || reference.baseK == 0) {
-            return false;
-        }
-        const uint64_t referenceMTasks = MathUtil::CeilDivision(args_.mValue, reference.singleCoreM);
-        const uint64_t referenceNTasks = MathUtil::CeilDivision(args_.nValue, reference.singleCoreN);
-        const uint64_t referenceTasks = referenceMTasks * referenceNTasks;
-        const uint64_t referenceWaves = MathUtil::CeilDivision(referenceTasks, compileInfo_.aicNum);
-        const uint64_t nCubeBlocks = MathUtil::CeilDivision(args_.nValue, BASIC_ALIGN_16);
-        const __uint128_t referenceCritical = static_cast<__uint128_t>(referenceWaves) * reference.baseM *
-            reference.baseN * MathUtil::CeilDivision(args_.kValue, reference.baseK) * reference.baseK;
-        const __uint128_t candidateCritical = static_cast<__uint128_t>(waves) * candidate.baseM *
-            candidate.baseN * MathUtil::CeilDivision(args_.kValue, candidate.baseK) * candidate.baseK;
-        if (waves != referenceWaves || tailSlots > NUM_HALF || nCubeBlocks < NUM_HALF ||
-            nCubeBlocks > 6UL || candidateCritical * 4UL > referenceCritical * 3UL) {
-            return false;
-        }
-    }
-    return selectCandidate(candidate, fullMSweep ? "TWO_DIMENSIONAL_FULL_DOMAIN" : "WAVE_PRESERVING_2D_GRID",
-        tasks, waves,
+    candidate.l2Info.mTile = 1;
+    candidate.l2Info.nTile = 1;
+    candidate.l2Info.mTileBlock = mTasks;
+    candidate.l2Info.nTileBlock = 1;
+    candidate.l2Info.calOrder = ITER_COL_FIRST;
+    return selectCandidate(candidate, "TWO_WAVE_N_PANEL_DEEP_K", tasks, waves,
         kIterations, tailSlots, mTasks, nTasks);
 }
 

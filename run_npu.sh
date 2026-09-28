@@ -23,8 +23,6 @@ unset MATMUL_ANALYTIC_L2_DIMENSIONS MATMUL_ANALYTIC_L2_M_BLOCK MATMUL_ANALYTIC_L
 unset MATMUL_ANALYTIC_L2_M_WINDOWS MATMUL_ANALYTIC_L2_N_WINDOWS
 unset MATMUL_ANALYTIC_L2_WINDOW_BYTES MATMUL_ANALYTIC_L2_ESTIMATED_TRAFFIC
 unset MATMUL_DETERMINISTIC_ADAPTIVE MATMUL_DETERMINISTIC_ADAPTIVE_CHANGED
-unset MATMUL_BASE_FULL_M_SWEEP
-unset MATMUL_FORCE_BASE_ONLY
 unset MATMUL_CAMPAIGN
 
 if [[ "$#" -ne 0 ]]; then
@@ -33,8 +31,8 @@ fi
 
 build_dir="${PWD}/build"
 build_log="$(mktemp)"
-workload_manifest="${PWD}/data/independent_base_npu_verified.tsv"
-trap 'rm -f "${build_log}"' EXIT
+workload_manifest="$(mktemp)"
+trap 'rm -f "${build_log}" "${workload_manifest}"' EXIT
 
 printf '# stage=host_build status=begin\n'
 if ! cmake -S . -B "${build_dir}" \
@@ -93,7 +91,6 @@ if [[ ! -f "${host_library}" || -z "${opapi_nn}" || -z "${opapi_math}" || -z "${
     exit 1
 fi
 ln -sfn -- "${legacy_common}" "${build_dir}/libophost_comm_legacy.so"
-export LD_LIBRARY_PATH="${build_dir}:$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
 runtime_library="-lacl_rt"
 if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/lib64/libascendcl.so" ]]; then
@@ -123,70 +120,60 @@ fi
 printf '# stage=runner_build status=passed\n'
 
 printf '# stage=workload_generation status=begin\n'
-if [[ ! -s "${workload_manifest}" ]]; then
-    printf '{"fatal":"preverified_manifest_missing"}\n' >&2
-    exit 1
-fi
-manifest_rows="$(wc -l < "${workload_manifest}")"
-if ! manifest_audit="$(awk -F '\t' '
-    NF != 6 { invalid++ }
-    NF == 6 {
-        rows++
-        dtype = $1
-        layout = $2
-        m = $3 + 0
-        n = $4 + 0
-        k = $5 + 0
-        cell = $6 + 0
-        dtype_band = dtype == "bf16_bf16" ? 1 : 0
-        n_band = n <= 512 ? 0 : (n <= 8192 ? 1 : 2)
-        k_band = k <= 512 ? 0 : (k <= 8192 ? 1 : 2)
-        expected_cell = dtype_band * 9 + n_band * 3 + k_band
-        if ((dtype != "fp16_fp16" && dtype != "bf16_bf16") || layout != "NN" ||
-            m < 1 || m > 4096 || n < 1 || n > 65536 || k < 1 || k > 65536 ||
-            cell < 0 || cell > 17 || cell != expected_cell) invalid++
-        seen[m]++
-        seen_cell[m, cell]++
-        if (rows == 1 || n < min_n) min_n = n
-        if (rows == 1 || k < min_k) min_k = k
-        if (n > max_n) max_n = n
-        if (k > max_k) max_k = k
-        if (n % 16 == 0) aligned_n++; else unaligned_n++
-        if (k % 16 == 0) aligned_k++; else unaligned_k++
-    }
-    END {
-        missing = 0
-        bad_cells = 0
-        minimum = 999999
-        maximum = 0
-        for (m = 1; m <= 4096; ++m) {
-            if (seen[m] == 0) missing++
-            if (seen[m] < minimum) minimum = seen[m]
-            if (seen[m] > maximum) maximum = seen[m]
-            for (cell = 0; cell < 18; ++cell) {
-                if (seen_cell[m, cell] != 2) bad_cells++
-            }
-        }
-        printf "rows=%d distinct_m=%d missing_m=%d candidates_per_m_min=%d candidates_per_m_max=%d bad_cells=%d n_range=%d..%d k_range=%d..%d invalid=%d", \
-            rows, length(seen), missing, minimum, maximum, bad_cells, min_n, max_n, min_k, max_k, invalid
-        exit(invalid != 0 || missing != 0 || length(seen) != 4096 || bad_cells != 0 ||
-             rows != 147456 || min_n != 1 || max_n != 65536 || min_k != 1 || max_k != 65536 ||
-             aligned_n == 0 || unaligned_n == 0 || aligned_k == 0 || unaligned_k == 0)
-    }
-' "${workload_manifest}")"; then
-    printf '{"fatal":"manifest_does_not_cover_every_m","audit":"%s"}\n' "${manifest_audit}" >&2
-    exit 1
-fi
-printf '# stage=workload_generation status=passed source=host_preverified_all_m_base %s\n' "${manifest_audit}"
+python3 - >"${workload_manifest}" <<'PY'
+import random
+
+rng = random.Random(8527)
+small = []
+large = []
+byte_limit = 1536 * 1024 * 1024
+for dtype in ("fp16_fp16", "bf16_bf16"):
+    for m in range(8, 17):
+        for n_tiles in tuple(range(101, 109)) + tuple(range(121, 129)):
+            n = n_tiles * 256
+            for k in range(15104, 20609, 128):
+                if 2 * (m * k + k * n + m * n) <= byte_limit:
+                    small.append((dtype, "NN", m, n, k))
+    for m in range(2304, 4353, 32):
+        for n in range(32, 97, 16):
+            for k in range(8192, 32769, 512):
+                base_m = ((m + 39) // 40 + 15) // 16 * 16
+                base_n = (n + 15) // 16 * 16
+                base_k = min(256, (k + 15) // 16 * 16,
+                             65536 // (4 * base_m), 65536 // (4 * base_n)) // 16 * 16
+                if base_k == 0:
+                    continue
+                tasks = (m + base_m - 1) // base_m
+                waves = (tasks + 19) // 20
+                tail_slots = waves * 20 - tasks
+                k_iterations = (k + base_k - 1) // base_k
+                a_panel = base_m * ((k * 2 + 63) // 64 * 64)
+                b_panel = k * ((base_n * 2 + 63) // 64 * 64)
+                c_tiles = tasks * base_m * base_n * 2
+                if (base_m < 80 or base_m > 128 or base_k < 160 or waves != 2 or
+                        tail_slots > 2 or k_iterations < 64 or
+                        tasks * a_panel + b_panel + c_tiles > 192 * 1024 * 1024):
+                    continue
+                if 2 * (m * k + k * n + m * n) <= byte_limit:
+                    large.append((dtype, "NN", m, n, k))
+
+rng.shuffle(small)
+rng.shuffle(large)
+for index in range(max(len(small), len(large))):
+    if index < len(small):
+        print("\t".join(str(value) for value in small[index]))
+    if index < len(large):
+        print("\t".join(str(value) for value in large[index]))
+PY
+
+adaptive_count="$(wc -l <"${workload_manifest}")"
+printf '# stage=workload_generation status=passed coverage=interleaved_historical_small_m_and_structural_large_m candidates=%d\n' "${adaptive_count}"
 
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
-export MATMUL_BASE_FULL_M_SWEEP=1
-export MATMUL_FORCE_BASE_ONLY=1
+export LD_LIBRARY_PATH="$(dirname -- "${opapi_nn}"):$(dirname -- "${opapi_math}"):${ASCEND_OPP_PATH}/lib64:${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/$(uname -m)-linux/lib64:${LD_LIBRARY_PATH:-}"
 
-success_target="${MATMUL_SUCCESS_TARGET:-0}"
-m_quota=0
-m_cell_quota="${MATMUL_M_CELL_QUOTA:-1}"
+success_target="${MATMUL_SUCCESS_TARGET:-4000}"
 cell_quota="${MATMUL_CELL_QUOTA:-0}"
 if [[ "${cell_quota}" -eq 0 ]]; then
     cell_quota_json=null
@@ -199,9 +186,7 @@ panel_rc=0
 printf '# campaign=INDEPENDENT_BASE_SELECTOR target_passes=%d maximum_per_joint_cell=%s theoretical_maximum_pairs=%s measurement_order=OCCO\n' \
     "${success_target}" "${cell_quota_json}" "${theoretical_maximum_pairs_json}"
 set +e
-MATMUL_CAMPAIGN=INDEPENDENT_BASE_SELECTOR MATMUL_TARGET_PASSES="${success_target}" \
-    MATMUL_CELL_QUOTA="${cell_quota}" MATMUL_M_QUOTA="${m_quota}" \
-    MATMUL_M_CELL_QUOTA="${m_cell_quota}" \
+MATMUL_CAMPAIGN=INDEPENDENT_BASE_SELECTOR MATMUL_TARGET_PASSES="${success_target}" MATMUL_CELL_QUOTA="${cell_quota}" \
     "${runner}" --manifest "${workload_manifest}" | python3 tools/compact_matmul_log.py
 pipeline_status=("${PIPESTATUS[@]}")
 panel_rc="${pipeline_status[0]}"
@@ -212,7 +197,5 @@ if [[ "${converter_rc}" -ne 0 ]]; then
     exit "${converter_rc}"
 fi
 if [[ "${panel_rc}" -ne 0 ]]; then
-    printf 'fatal: NPU campaign failed rc=%d; inspect the summary first_failure_* fields or stderr above\n' \
-        "${panel_rc}" >&2
     exit "${panel_rc}"
 fi

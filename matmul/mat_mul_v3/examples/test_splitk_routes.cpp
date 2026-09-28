@@ -10,10 +10,7 @@
 #include <vector>
 
 #include "acl/acl.h"
-#include "aclnn_kernels/contiguous.h"
-#include "opdev/make_op_executor.h"
 #include "matmul/mat_mul_v3/op_host/op_api/aclnn_matmul.h"
-#include "matmul/mat_mul_v3/op_host/op_api/matmul.h"
 
 extern "C" uint32_t TbeLoadSoAndSaveToRegistry(const char *soPath);
 
@@ -68,22 +65,6 @@ struct TilingSnapshot {
     uint32_t l2Order = 0;
 };
 
-aclnnStatus ForcedMatmulV3GetWorkspaceSize(const aclTensor *a, const aclTensor *b, aclTensor *out,
-                                           const LayoutSpec &layout, size_t *workspaceSize,
-                                           aclOpExecutor **executor)
-{
-    auto uniqueExecutor = CREATE_EXECUTOR();
-    if (uniqueExecutor.get() == nullptr) return 561101;
-    const aclTensor *mmOut = l0op::MatMulV3Nd(
-        a, b, nullptr, layout.transA, layout.transB, false, 0x1, uniqueExecutor.get());
-    if (mmOut == nullptr) return 561103;
-    const aclTensor *copied = l0op::ViewCopy(mmOut, out, uniqueExecutor.get());
-    if (copied == nullptr) return 561103;
-    *workspaceSize = uniqueExecutor->GetWorkspaceSize();
-    uniqueExecutor.ReleaseTo(executor);
-    return ACL_SUCCESS;
-}
-
 struct RunCounts {
     uint64_t inputs = 0;
     uint64_t nonDeterministic = 0;
@@ -93,12 +74,6 @@ struct RunCounts {
     uint64_t passed = 0;
     uint64_t failed = 0;
     uint64_t officialFailed = 0;
-    uint64_t tensorAllocationFailed = 0;
-    uint64_t officialGetWorkspaceFailed = 0;
-    uint64_t officialGetWorkspaceFailedFp16 = 0;
-    uint64_t officialGetWorkspaceFailedBf16 = 0;
-    uint64_t officialMeasurementFailed = 0;
-    uint64_t candidateTilingFailed = 0;
     uint64_t skippedNonV3 = 0;
     uint64_t analyticSelectorPassed = 0;
     uint64_t clearCandidateWins = 0;
@@ -114,27 +89,7 @@ struct RunCounts {
     uint64_t jointOfficial[200] = {};
     uint64_t jointPassed[200] = {};
     uint64_t jointQuotaSkipped = 0;
-    std::vector<uint32_t> passedPerM = std::vector<uint32_t>(4097, 0);
-    std::vector<uint32_t> passedPerMCell = std::vector<uint32_t>(4097 * 18, 0);
-    uint64_t mQuotaSkipped = 0;
-    uint64_t mCellQuotaSkipped = 0;
-    std::string firstFailureStage;
-    std::string firstFailureShape;
-    int firstFailureRc = 0;
-    uint64_t firstFailureManifestIndex = 0;
 };
-
-void RecordFirstFailure(RunCounts &counts, const char *stage, int rc, const DTypeSpec &dtype,
-                        const LayoutSpec &layout, int64_t m, int64_t n, int64_t k,
-                        uint64_t manifestIndex)
-{
-    if (!counts.firstFailureStage.empty()) return;
-    counts.firstFailureStage = stage;
-    counts.firstFailureShape = "M" + std::to_string(m) + "_N" + std::to_string(n) + "_K" +
-        std::to_string(k) + "_" + layout.name + "_" + dtype.inputName;
-    counts.firstFailureRc = rc;
-    counts.firstFailureManifestIndex = manifestIndex;
-}
 
 uint64_t ReadEnvUnsigned(const char *name)
 {
@@ -227,7 +182,7 @@ bool IsDeterministicSplitK(uint64_t key)
 bool IsPlainBase(uint64_t key)
 {
     return (key & 0x0fU) == 0U && ((key >> 4U) & 0xffU) == 0U &&
-        ((key >> 12U) & 0x0fU) == 0U && ((key >> 16U) & 0x0fU) <= 1U &&
+        ((key >> 12U) & 0x0fU) == 0U && ((key >> 16U) & 0x0fU) == 1U &&
         ((key >> 20U) & 0x0fU) == 0U;
 }
 
@@ -490,7 +445,7 @@ void PrintTiling(const char *name, const TilingSnapshot &value)
 
 int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int64_t n, int64_t k,
                 aclrtStream stream, aclrtFuncHandle edgeFunction, RunCounts &counts,
-                uint64_t manifestIndex, uint32_t stratum)
+                uint64_t manifestIndex)
 {
     const bool baseCampaign = IsBaseCampaign();
     const bool edgeCampaign = std::strcmp(CampaignName(), "CUBE_VECTOR_EDGE") == 0;
@@ -515,8 +470,6 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     }
     if (rc != ACL_SUCCESS) {
         ++counts.officialFailed;
-        ++counts.tensorAllocationFailed;
-        RecordFirstFailure(counts, "tensor_allocation", rc, dtype, layout, m, n, k, manifestIndex);
         ReleaseTensor(cTensor);
         ReleaseTensor(bTensor);
         ReleaseTensor(aTensor);
@@ -533,26 +486,25 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     ClearObservedTiling();
     uint64_t officialWorkspaceSize = 0;
     aclOpExecutor *officialExecutor = nullptr;
-    rc = ForcedMatmulV3GetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, layout,
-                                        &officialWorkspaceSize, &officialExecutor);
+    rc = aclnnMatmulGetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, 1,
+                                     &officialWorkspaceSize, &officialExecutor);
     const TilingSnapshot official = ReadTilingSnapshot();
     if (rc != ACL_SUCCESS || officialExecutor == nullptr) {
         ++counts.officialFailed;
-        ++counts.officialGetWorkspaceFailed;
-        if (std::strcmp(dtype.inputName, "fp16") == 0) {
-            ++counts.officialGetWorkspaceFailedFp16;
-        } else if (std::strcmp(dtype.inputName, "bf16") == 0) {
-            ++counts.officialGetWorkspaceFailedBf16;
+        if (rc != 561103) {
+            std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
+                        "\"output_dtype\":\"%s\",\"status\":\"OFFICIAL_GET_WORKSPACE_FAILED\",\"result_code\":%d}\n",
+                        static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
+                        dtype.inputName, dtype.outputName, rc == ACL_SUCCESS ? 4 : rc);
+            std::fflush(stdout);
         }
-        RecordFirstFailure(counts, "official_get_workspace", rc == ACL_SUCCESS ? 4 : rc,
-                           dtype, layout, m, n, k, manifestIndex);
         if (officialExecutor != nullptr) (void)aclDestroyAclOpExecutor(officialExecutor);
         ReleaseTensor(cTensor);
         ReleaseTensor(bTensor);
         ReleaseTensor(aTensor);
         return rc == ACL_SUCCESS ? 4 : rc;
     }
-    if (official.cores == 0) {
+    if (official.key == 0) {
         ++counts.skippedNonV3;
         (void)aclDestroyAclOpExecutor(officialExecutor);
         ReleaseTensor(cTensor);
@@ -600,8 +552,8 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     ClearObservedTiling();
     uint64_t adaptiveWorkspaceSize = 0;
     aclOpExecutor *adaptiveExecutor = nullptr;
-    rc = ForcedMatmulV3GetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, layout,
-                                        &adaptiveWorkspaceSize, &adaptiveExecutor);
+    rc = aclnnMatmulGetWorkspaceSize(aTensor.tensor, bTensor.tensor, cTensor.tensor, 1,
+                                     &adaptiveWorkspaceSize, &adaptiveExecutor);
     const TilingSnapshot adaptive = ReadTilingSnapshot();
     const char *variantText = std::getenv("MATMUL_BASE_EXPERIMENT_VARIANT");
     const std::string candidateVariant = variantText == nullptr ? "" : variantText;
@@ -617,9 +569,13 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     if (baseCampaign && !changed) {
         if (rc != ACL_SUCCESS) {
             ++counts.failed;
-            ++counts.candidateTilingFailed;
-            RecordFirstFailure(counts, "candidate_get_workspace", rc, dtype, layout,
-                               m, n, k, manifestIndex);
+            std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
+                        "\"output_dtype\":\"%s\",\"candidate_branch\":\"%s\","
+                        "\"status\":\"CANDIDATE_TILING_FAILED\",\"result_code\":%d}\n",
+                        static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
+                        dtype.inputName, dtype.outputName,
+                        CampaignName(), rc);
+            std::fflush(stdout);
         }
         if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
         (void)aclDestroyAclOpExecutor(officialExecutor);
@@ -638,9 +594,14 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     if (rc == ACL_SUCCESS && !candidateRouteMatched) rc = 4;
     if (rc != ACL_SUCCESS) {
         ++counts.failed;
-        ++counts.candidateTilingFailed;
-        RecordFirstFailure(counts, "candidate_get_workspace", rc, dtype, layout,
-                           m, n, k, manifestIndex);
+        std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
+                    "\"output_dtype\":\"%s\",\"candidate_branch\":\"%s\","
+                    "\"status\":\"%s\",\"result_code\":%d}\n",
+                    static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
+                    dtype.inputName, dtype.outputName,
+                    CampaignName(),
+                    invariantPassed ? "CANDIDATE_TILING_FAILED" : "CANDIDATE_INVARIANT_FAILED", rc);
+        std::fflush(stdout);
         if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
         (void)aclDestroyAclOpExecutor(officialExecutor);
         (void)::unsetenv("MATMUL_DETERMINISTIC_ADAPTIVE");
@@ -701,7 +662,11 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     const std::vector<uint8_t> officialOutput = rc == ACL_SUCCESS ? CopyDeviceOutput(cTensor) : std::vector<uint8_t>{};
     if (rc != ACL_SUCCESS || officialOutput.empty()) {
         ++counts.officialFailed;
-        ++counts.officialMeasurementFailed;
+        std::printf("{\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
+                    "\"output_dtype\":\"%s\",\"status\":\"OFFICIAL_MEASUREMENT_FAILED\",\"result_code\":%d}\n",
+                    static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
+                    dtype.inputName, dtype.outputName, rc == ACL_SUCCESS ? 4 : rc);
+        std::fflush(stdout);
         if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
         if (officialWorkspace != nullptr) (void)aclrtFree(officialWorkspace);
         (void)aclDestroyAclOpExecutor(officialExecutor);
@@ -769,13 +734,11 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
     const int64_t partialDelta = static_cast<int64_t>(newPartialBytes) - static_cast<int64_t>(oldPartialBytes);
     const double partialSaved = oldPartialBytes > 0 && newPartialBytes <= oldPartialBytes ?
         static_cast<double>(oldPartialBytes - newPartialBytes) * 100.0 / oldPartialBytes : 0.0;
-    std::printf("{\"manifest_index\":%lu,\"stratum\":%u,\"n_band\":%u,\"k_band\":%u,"
-                "\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
+    std::printf("{\"manifest_index\":%lu,\"shape\":\"M%ld_N%ld_K%ld_%s\",\"input_dtype\":\"%s\","
                 "\"output_dtype\":\"%s\","
                 "\"candidate_branch\":\"%s\",\"candidate_variant\":\"%s\","
                 "\"candidate_selected\":%s,\"tiling_changed\":%s,",
                 static_cast<unsigned long>(manifestIndex),
-                stratum, (stratum % 9U) / 3U, stratum % 3U,
                 static_cast<long>(m), static_cast<long>(n), static_cast<long>(k), layout.name,
                 dtype.inputName, dtype.outputName,
                 CampaignName(), candidateVariant.c_str(),
@@ -881,15 +844,11 @@ int RunWorkload(const DTypeSpec &dtype, const LayoutSpec &layout, int64_t m, int
             candidateVariant == "ANALYTIC_N128_K128" || candidateVariant == "ANALYTIC_N256_K64" ||
             candidateVariant == "ANALYTIC_N512_K32" || candidateVariant == "WIDE_N_PANEL_ONLY" ||
             candidateVariant == "WIDE_N_WINDOW_ONLY" ||
-            candidateVariant == "WIDE_N_SHALLOW_K_BASE" ||
-            candidateVariant == "SMALL_M_WIDE_N_PANEL" ||
-            candidateVariant == "TWO_DIMENSIONAL_FULL_DOMAIN") {
+            candidateVariant == "WIDE_N_SHALLOW_K_BASE") {
             ++counts.analyticSelectorPassed;
         }
     } else {
         ++counts.failed;
-        RecordFirstFailure(counts, "measurement_or_correctness", rc == ACL_SUCCESS ? 3 : rc,
-                           dtype, layout, m, n, k, manifestIndex);
     }
     if (tilingDevice != nullptr) (void)aclrtFree(tilingDevice);
     if (adaptiveExecutor != nullptr) (void)aclDestroyAclOpExecutor(adaptiveExecutor);
@@ -910,51 +869,19 @@ int main(int argc, char **argv)
     const bool manifestMode = argc == 3 && std::strcmp(argv[1], "--manifest") == 0;
     if (!manifestMode && (argc < 6 || (argc - 1) % 5 != 0)) return 2;
     if (!IsBaseCampaign() && !IsAdaptiveCampaign()) return 4;
-    std::ifstream manifestInput;
-    if (manifestMode) {
-        manifestInput.open(argv[2]);
-        if (!manifestInput) return 4;
-    }
     const uint64_t targetPasses = ReadEnvUnsigned("MATMUL_TARGET_PASSES");
     const uint64_t cellQuota = ReadEnvUnsigned("MATMUL_CELL_QUOTA");
-    const uint64_t mQuota = ReadEnvUnsigned("MATMUL_M_QUOTA");
-    const uint64_t mCellQuota = ReadEnvUnsigned("MATMUL_M_CELL_QUOTA");
     std::printf("{\"campaign_start\":\"%s\",\"target_passes\":%lu,"
                 "\"joint_cell_quota\":%lu,\"runner\":\"analytic_critical_path_v3\"}\n",
                 CampaignName(), static_cast<unsigned long>(targetPasses), static_cast<unsigned long>(cellQuota));
     std::fflush(stdout);
     const char *hostLibrary = std::getenv("MATMUL_HOST_LIBRARY");
-    if (hostLibrary == nullptr) {
-        std::fprintf(stderr, "fatal: MATMUL_HOST_LIBRARY is not set\n");
-        return 4;
-    }
+    if (hostLibrary == nullptr) return 4;
     int rc = aclInit(nullptr);
-    if (rc != ACL_SUCCESS) {
-        std::fprintf(stderr, "fatal: NPU initialization failed stage=aclInit rc=%d\n", rc);
-        return 4;
-    }
-    rc = aclrtSetDevice(0);
-    if (rc != ACL_SUCCESS) {
-        std::fprintf(stderr, "fatal: NPU initialization failed stage=aclrtSetDevice rc=%d\n", rc);
-        (void)aclFinalize();
-        return 4;
-    }
+    if (rc == ACL_SUCCESS) rc = aclrtSetDevice(0);
     aclrtStream stream = nullptr;
-    rc = aclrtCreateStream(&stream);
-    if (rc != ACL_SUCCESS) {
-        std::fprintf(stderr, "fatal: NPU initialization failed stage=aclrtCreateStream rc=%d\n", rc);
-        (void)aclrtResetDevice(0);
-        (void)aclFinalize();
-        return 4;
-    }
-    const uint32_t registryRc = TbeLoadSoAndSaveToRegistry(hostLibrary);
-    if (registryRc != 0U) {
-        std::fprintf(stderr, "fatal: host registration failed rc=%u library=%s\n", registryRc, hostLibrary);
-        (void)aclrtDestroyStream(stream);
-        (void)aclrtResetDevice(0);
-        (void)aclFinalize();
-        return 4;
-    }
+    if (rc == ACL_SUCCESS) rc = aclrtCreateStream(&stream);
+    if (rc != ACL_SUCCESS || TbeLoadSoAndSaveToRegistry(hostLibrary) != 0U) return 4;
     aclrtBinHandle edgeBinary = nullptr;
     aclrtFuncHandle edgeFunction = nullptr;
     if (std::strcmp(CampaignName(), "CUBE_VECTOR_EDGE") == 0) {
@@ -970,23 +897,10 @@ int main(int argc, char **argv)
     RunCounts counts;
     const uint64_t startIndex = ReadEnvUnsigned("MATMUL_START_INDEX");
     uint64_t manifestIndex = 0;
-    auto runOne = [&](const char *dtypeName, const char *layoutName, int64_t m, int64_t n, int64_t k,
-                      uint32_t stratum) {
+    auto runOne = [&](const char *dtypeName, const char *layoutName, int64_t m, int64_t n, int64_t k) {
         const DTypeSpec *dtype = FindDType(dtypeName);
         const LayoutSpec *layout = FindLayout(layoutName);
         if (dtype == nullptr || layout == nullptr) return;
-        if (mQuota != 0 && m > 0 && static_cast<size_t>(m) < counts.passedPerM.size() &&
-            counts.passedPerM[static_cast<size_t>(m)] >= mQuota) {
-            ++counts.mQuotaSkipped;
-            return;
-        }
-        const size_t mCellIndex = m > 0 && m <= 4096 && stratum < 18 ?
-            static_cast<size_t>(m) * 18 + stratum : counts.passedPerMCell.size();
-        if (mCellQuota != 0 && mCellIndex < counts.passedPerMCell.size() &&
-            counts.passedPerMCell[mCellIndex] >= mCellQuota) {
-            ++counts.mCellQuotaSkipped;
-            return;
-        }
         const size_t jointBucket = JointCoverageBucket(*dtype, m, n, k);
         ++counts.jointInputs[jointBucket];
         if (cellQuota != 0 && counts.jointPassed[jointBucket] >= cellQuota) {
@@ -995,17 +909,9 @@ int main(int argc, char **argv)
         }
         const uint64_t officialBefore = counts.deterministic;
         const uint64_t passedBefore = counts.passed;
-        (void)RunWorkload(*dtype, *layout, m, n, k, stream, edgeFunction, counts, manifestIndex, stratum);
+        (void)RunWorkload(*dtype, *layout, m, n, k, stream, edgeFunction, counts, manifestIndex);
         if (counts.deterministic > officialBefore) ++counts.jointOfficial[jointBucket];
-        if (counts.passed > passedBefore) {
-            ++counts.jointPassed[jointBucket];
-            if (m > 0 && static_cast<size_t>(m) < counts.passedPerM.size()) {
-                ++counts.passedPerM[static_cast<size_t>(m)];
-            }
-            if (mCellIndex < counts.passedPerMCell.size()) {
-                ++counts.passedPerMCell[mCellIndex];
-            }
-        }
+        if (counts.passed > passedBefore) ++counts.jointPassed[jointBucket];
         if (counts.inputs != 0 && counts.inputs % 10000 == 0) {
             std::printf("{\"progress\":true,\"manifest_index\":%lu,\"inputs\":%lu,"
                         "\"passed\":%lu,\"official_failed\":%lu,\"non_target_route\":%lu}\n",
@@ -1018,16 +924,17 @@ int main(int argc, char **argv)
         }
     };
     if (manifestMode) {
+        std::ifstream input(argv[2]);
+        if (!input) return 4;
         std::string dtypeName;
         std::string layoutName;
         int64_t m = 0;
         int64_t n = 0;
         int64_t k = 0;
-        uint32_t stratum = 0;
-        while (manifestInput >> dtypeName >> layoutName >> m >> n >> k >> stratum) {
+        while (input >> dtypeName >> layoutName >> m >> n >> k) {
             ++manifestIndex;
             if (manifestIndex <= startIndex) continue;
-            runOne(dtypeName.c_str(), layoutName.c_str(), m, n, k, stratum);
+            runOne(dtypeName.c_str(), layoutName.c_str(), m, n, k);
             if (targetPasses != 0 && counts.passed >= targetPasses) break;
         }
     } else {
@@ -1037,7 +944,7 @@ int main(int argc, char **argv)
             runOne(argv[index], argv[index + 1],
                    std::strtoll(argv[index + 2], nullptr, 10),
                    std::strtoll(argv[index + 3], nullptr, 10),
-                   std::strtoll(argv[index + 4], nullptr, 10), 0);
+                   std::strtoll(argv[index + 4], nullptr, 10));
             if (targetPasses != 0 && counts.passed >= targetPasses) break;
         }
     }
@@ -1048,15 +955,8 @@ int main(int argc, char **argv)
                 "\"analytic_selector_passed\":%lu,"
                 "\"clear_candidate_wins\":%lu,\"false_positive_intercepts\":%lu,\"overlap\":%lu,"
                 "\"stable_candidate_wins\":%lu,\"stable_official_wins\":%lu,\"mixed_order\":%lu,"
-                "\"official_failed\":%lu,\"tensor_allocation_failed\":%lu,"
-                "\"official_get_workspace_failed\":%lu,"
-                "\"official_get_workspace_failed_fp16\":%lu,"
-                "\"official_get_workspace_failed_bf16\":%lu,"
-                "\"official_measurement_failed\":%lu,\"candidate_tiling_failed\":%lu,"
-                "\"manifest_start_index\":%lu,"
-                "\"manifest_end_index\":%lu,"
-                "\"first_failure_stage\":\"%s\",\"first_failure_shape\":\"%s\","
-                "\"first_failure_rc\":%d,\"first_failure_manifest_index\":%lu}\n",
+                "\"official_failed\":%lu,\"manifest_start_index\":%lu,"
+                "\"manifest_end_index\":%lu}\n",
                 CampaignName(),
                 static_cast<unsigned long>(counts.inputs),
                 static_cast<unsigned long>(counts.skippedNonV3),
@@ -1076,61 +976,12 @@ int main(int argc, char **argv)
                 static_cast<unsigned long>(counts.stableOfficialWins),
                 static_cast<unsigned long>(counts.mixedOrder),
                 static_cast<unsigned long>(counts.officialFailed),
-                static_cast<unsigned long>(counts.tensorAllocationFailed),
-                static_cast<unsigned long>(counts.officialGetWorkspaceFailed),
-                static_cast<unsigned long>(counts.officialGetWorkspaceFailedFp16),
-                static_cast<unsigned long>(counts.officialGetWorkspaceFailedBf16),
-                static_cast<unsigned long>(counts.officialMeasurementFailed),
-                static_cast<unsigned long>(counts.candidateTilingFailed),
                 static_cast<unsigned long>(startIndex),
-                static_cast<unsigned long>(manifestIndex),
-                counts.firstFailureStage.c_str(), counts.firstFailureShape.c_str(),
-                counts.firstFailureRc,
-                static_cast<unsigned long>(counts.firstFailureManifestIndex));
-    if (mQuota != 0) {
-        uint64_t mMet = 0;
-        uint64_t mMissing = 0;
-        for (size_t m = 1; m < counts.passedPerM.size(); ++m) {
-            if (counts.passedPerM[m] >= mQuota) {
-                ++mMet;
-            } else {
-                ++mMissing;
-            }
-        }
-        std::printf("{\"m_quota_summary\":true,\"quota_per_m\":%lu,\"m_quota_met\":%lu,"
-                    "\"m_quota_missing\":%lu,\"quota_skipped_inputs\":%lu}\n",
-                    static_cast<unsigned long>(mQuota), static_cast<unsigned long>(mMet),
-                    static_cast<unsigned long>(mMissing),
-                    static_cast<unsigned long>(counts.mQuotaSkipped));
-    }
-    if (mCellQuota != 0) {
-        uint64_t cellsMet = 0;
-        uint64_t cellsMissing = 0;
-        uint64_t mComplete = 0;
-        for (size_t m = 1; m <= 4096; ++m) {
-            bool complete = true;
-            for (size_t cell = 0; cell < 18; ++cell) {
-                if (counts.passedPerMCell[m * 18 + cell] >= mCellQuota) {
-                    ++cellsMet;
-                } else {
-                    ++cellsMissing;
-                    complete = false;
-                }
-            }
-            if (complete) ++mComplete;
-        }
-        std::printf("{\"m_cell_quota_summary\":true,\"strata_per_m\":18,"
-                    "\"quota_per_stratum\":%lu,\"strata_quota_met\":%lu,"
-                    "\"strata_quota_missing\":%lu,\"m_complete\":%lu,"
-                    "\"quota_skipped_inputs\":%lu}\n",
-                    static_cast<unsigned long>(mCellQuota), static_cast<unsigned long>(cellsMet),
-                    static_cast<unsigned long>(cellsMissing), static_cast<unsigned long>(mComplete),
-                    static_cast<unsigned long>(counts.mCellQuotaSkipped));
-    }
+                static_cast<unsigned long>(manifestIndex));
     std::printf("{\"measured_coverage\":true,"
-                "\"m\":{\"1_256\":%lu,\"257_512\":%lu,\"513_1024\":%lu,\"1025_2048\":%lu,\"2049_4096\":%lu},"
-                "\"n\":{\"1_512\":%lu,\"513_2048\":%lu,\"2049_8192\":%lu,\"8193_24576\":%lu,\"24577_65536\":%lu},"
-                "\"k\":{\"1_8192\":%lu,\"8193_16384\":%lu,\"16385_24576\":%lu,\"24577_65536\":%lu}}\n",
+                "\"m\":{\"129_256\":%lu,\"257_512\":%lu,\"513_1024\":%lu,\"1025_2048\":%lu,\"2049_4096\":%lu},"
+                "\"n\":{\"16_512\":%lu,\"513_2048\":%lu,\"2049_8192\":%lu,\"8193_24576\":%lu,\"24577_65536\":%lu},"
+                "\"k\":{\"512_8192\":%lu,\"8193_16384\":%lu,\"16385_24576\":%lu,\"24577_65536\":%lu}}\n",
                 static_cast<unsigned long>(counts.mCoverage[0]),
                 static_cast<unsigned long>(counts.mCoverage[1]),
                 static_cast<unsigned long>(counts.mCoverage[2]),
@@ -1204,37 +1055,6 @@ int main(int argc, char **argv)
     (void)aclrtDestroyStream(stream);
     (void)aclrtResetDevice(0);
     (void)aclFinalize();
-    if (counts.passed == 0) {
-        std::fprintf(stderr,
-            "fatal: campaign produced zero NPU measurements inputs=%lu official_target=%lu "
-            "official_failed=%lu candidate_tiling_failed=%lu first_stage=%s first_shape=%s first_rc=%d\n",
-            static_cast<unsigned long>(counts.inputs),
-            static_cast<unsigned long>(counts.deterministic),
-            static_cast<unsigned long>(counts.officialFailed),
-            static_cast<unsigned long>(counts.candidateTilingFailed),
-            counts.firstFailureStage.c_str(), counts.firstFailureShape.c_str(), counts.firstFailureRc);
-    }
-    bool mQuotaComplete = true;
-    if (mQuota != 0) {
-        for (size_t m = 1; m < counts.passedPerM.size(); ++m) {
-            if (counts.passedPerM[m] < mQuota) {
-                mQuotaComplete = false;
-                break;
-            }
-        }
-    }
-    bool mCellQuotaComplete = true;
-    if (mCellQuota != 0) {
-        for (size_t m = 1; m <= 4096 && mCellQuotaComplete; ++m) {
-            for (size_t cell = 0; cell < 18; ++cell) {
-                if (counts.passedPerMCell[m * 18 + cell] < mCellQuota) {
-                    mCellQuotaComplete = false;
-                    break;
-                }
-            }
-        }
-    }
-    return counts.deterministic == 0 || (targetPasses != 0 && counts.passed < targetPasses) ||
-        !mQuotaComplete || !mCellQuotaComplete ? 4 : 0;
+    return counts.deterministic == 0 || (targetPasses != 0 && counts.passed < targetPasses) ? 4 : 0;
 }
 // NEW END

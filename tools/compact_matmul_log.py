@@ -12,7 +12,7 @@ TILING_FIELDS = (
 )
 
 FIELDS = [
-    "record_type", "manifest_index", "stratum", "n_band", "k_band", "shape", "input_dtype", "output_dtype",
+    "record_type", "manifest_index", "shape", "input_dtype", "output_dtype",
     "candidate_branch", "candidate_variant", "candidate_selected", "tiling_changed", "status", "result_code",
 ]
 FIELDS += [f"official_{name}" for name in TILING_FIELDS]
@@ -35,12 +35,7 @@ FIELDS += [
     "target_passes", "quota_met", "passed", "failed", "analytic_selector_passed",
     "clear_candidate_wins", "false_positive_intercepts", "overlap", "stable_candidate_wins",
     "stable_official_wins", "mixed_order", "official_failed", "manifest_start_index",
-    "manifest_end_index", "tensor_allocation_failed", "official_get_workspace_failed",
-    "official_get_workspace_failed_fp16", "official_get_workspace_failed_bf16",
-    "official_measurement_failed", "candidate_tiling_failed",
-    "first_failure_stage", "first_failure_shape", "first_failure_rc", "first_failure_manifest_index",
-    "quota_per_m", "m_quota_met", "m_quota_missing", "quota_skipped_inputs",
-    "strata_per_m", "quota_per_stratum", "strata_quota_met", "strata_quota_missing", "m_complete",
+    "manifest_end_index",
 ]
 
 
@@ -56,14 +51,8 @@ def convert(obj):
         row = {"record_type": "progress"}
     elif obj.get("summary") is True:
         row = {"record_type": "summary", "status": "COMPLETE" if obj.get("quota_met") else "INCOMPLETE"}
-    elif obj.get("m_quota_summary") is True:
-        row = {"record_type": "m_quota_summary", "status": "COMPLETE" if obj.get("m_quota_missing") == 0 else "INCOMPLETE"}
-    elif obj.get("m_cell_quota_summary") is True:
-        row = {"record_type": "m_cell_quota_summary", "status": "COMPLETE" if obj.get("strata_quota_missing") == 0 else "INCOMPLETE"}
     elif "shape" in obj:
-        if "official_tiling" not in obj or obj.get("correctness") != "PASS":
-            return None
-        row = {"record_type": "measurement"}
+        row = {"record_type": "measurement" if "official_tiling" in obj else "failure"}
     else:
         return None
 
