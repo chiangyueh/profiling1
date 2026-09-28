@@ -14,6 +14,7 @@
  */
 
 #include <cinttypes>
+#include <cstdlib>
 #include "matmul_v3_base_tiling.h"
 #include "../../op_kernel/mat_mul_v3_tiling_key.h"
 
@@ -2705,6 +2706,37 @@ ge::graphStatus MatmulV3BaseTiling::DoLibApiTiling()
     DoTilingKey();
     L2Cache l2Cache(args_, tilingData_);
     l2Cache.SetL2CacheFlag(tilingEnable_, compileInfo_.l2Size, l2CacheFlag_);
+    // NEW BEGIN
+    const bool targetShape = args_.mValue == 4096UL && args_.nValue == 512UL && args_.kValue == 7168UL;
+    const bool targetBaseTiling =
+        tilingEnable_.tilingEnableSplitCore == TilingEnableSplitCore::BASE &&
+        tilingData_.matmulTiling.usedCoreNum == 20U &&
+        tilingData_.matmulTiling.singleCoreM == 128U &&
+        tilingData_.matmulTiling.singleCoreN == 256U &&
+        tilingData_.matmulTiling.baseM == 128U &&
+        tilingData_.matmulTiling.baseN == 256U &&
+        tilingData_.matmulTiling.baseK == 64U;
+    if (targetShape && targetBaseTiling) {
+        (void)setenv("MATMUL_THIRD_SHAPE_OFFICIAL_SEEN", "1", 1);
+        const char *mode = std::getenv("MATMUL_THIRD_SHAPE_BALANCE");
+        if (mode != nullptr && mode[0] == '1' && mode[1] == '\0') {
+            const uint64_t mTasks = MathUtil::CeilDivision(
+                args_.mValue, static_cast<uint64_t>(tilingData_.matmulTiling.singleCoreM));
+            const uint64_t nTasks = MathUtil::CeilDivision(
+                args_.nValue, static_cast<uint64_t>(tilingData_.matmulTiling.singleCoreN));
+            const uint64_t tasks = mTasks * nTasks;
+            const uint64_t officialCores = tilingData_.matmulTiling.usedCoreNum;
+            const uint64_t waves = MathUtil::CeilDivision(tasks, officialCores);
+            const uint64_t balancedCores = MathUtil::CeilDivision(tasks, waves);
+            if (balancedCores < officialCores &&
+                MathUtil::CeilDivision(tasks, balancedCores) == waves &&
+                tasks % balancedCores == 0UL) {
+                tilingData_.matmulTiling.usedCoreNum = static_cast<uint32_t>(balancedCores);
+                (void)setenv("MATMUL_THIRD_SHAPE_BALANCE_APPLIED", "1", 1);
+            }
+        }
+    }
+    // NEW END
     return ge::GRAPH_SUCCESS;
 }
 

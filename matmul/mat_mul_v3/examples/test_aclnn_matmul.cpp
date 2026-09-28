@@ -8,11 +8,106 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <vector>
 #include "acl/acl.h"
-#include "aclnnop/aclnn_matmul.h"
+#include "matmul/mat_mul_v3/op_host/op_api/aclnn_matmul.h"
+
+// NEW BEGIN
+extern "C" uint32_t TbeLoadSoAndSaveToRegistry(const char* soPath);
+
+struct PreparedMatmul {
+  uint64_t workspaceSize = 0;
+  void* workspace = nullptr;
+  aclOpExecutor* executor = nullptr;
+};
+
+int PrepareMatmul(const aclTensor* self, const aclTensor* mat2, aclTensor* out, bool balanced,
+                  PreparedMatmul* prepared) {
+  unsetenv("MATMUL_THIRD_SHAPE_OFFICIAL_SEEN");
+  unsetenv("MATMUL_THIRD_SHAPE_BALANCE_APPLIED");
+  if (balanced) {
+    setenv("MATMUL_THIRD_SHAPE_BALANCE", "1", 1);
+  } else {
+    unsetenv("MATMUL_THIRD_SHAPE_BALANCE");
+  }
+  int ret = aclnnMatmulGetWorkspaceSize(self, mat2, out, 1, &prepared->workspaceSize, &prepared->executor);
+  unsetenv("MATMUL_THIRD_SHAPE_BALANCE");
+  if (ret != ACL_SUCCESS) {
+    return ret;
+  }
+  const bool seen = std::getenv("MATMUL_THIRD_SHAPE_OFFICIAL_SEEN") != nullptr;
+  const bool applied = std::getenv("MATMUL_THIRD_SHAPE_BALANCE_APPLIED") != nullptr;
+  if (!seen || applied != balanced) {
+    return 4;
+  }
+  if (prepared->workspaceSize > 0) {
+    ret = aclrtMalloc(&prepared->workspace, prepared->workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+    if (ret != ACL_SUCCESS) {
+      return ret;
+    }
+  }
+  return aclSetAclOpExecutorRepeatable(prepared->executor);
+}
+
+void ReleaseMatmul(PreparedMatmul* prepared) {
+  if (prepared->executor != nullptr) {
+    aclDestroyAclOpExecutor(prepared->executor);
+  }
+  if (prepared->workspace != nullptr) {
+    aclrtFree(prepared->workspace);
+  }
+}
+
+int LaunchMatmul(const PreparedMatmul& prepared, aclrtStream stream) {
+  return aclnnMatmul(prepared.workspace, prepared.workspaceSize, prepared.executor, stream);
+}
+
+int MeasureMatmul(const PreparedMatmul& prepared, aclrtStream stream, float* latency) {
+  constexpr int repeats = 10;
+  aclrtEvent begin = nullptr;
+  aclrtEvent end = nullptr;
+  int ret = aclrtCreateEvent(&begin);
+  if (ret == ACL_SUCCESS) {
+    ret = aclrtCreateEvent(&end);
+  }
+  if (ret == ACL_SUCCESS) {
+    ret = aclrtRecordEvent(begin, stream);
+  }
+  for (int index = 0; ret == ACL_SUCCESS && index < repeats; ++index) {
+    ret = LaunchMatmul(prepared, stream);
+  }
+  if (ret == ACL_SUCCESS) {
+    ret = aclrtRecordEvent(end, stream);
+  }
+  if (ret == ACL_SUCCESS) {
+    ret = aclrtSynchronizeEvent(end);
+  }
+  float elapsed = 0.0F;
+  if (ret == ACL_SUCCESS) {
+    ret = aclrtEventElapsedTime(&elapsed, begin, end);
+  }
+  if (end != nullptr) {
+    aclrtDestroyEvent(end);
+  }
+  if (begin != nullptr) {
+    aclrtDestroyEvent(begin);
+  }
+  if (ret == ACL_SUCCESS) {
+    *latency = elapsed / repeats;
+  }
+  return ret;
+}
+
+float Median(std::vector<float> values) {
+  std::sort(values.begin(), values.end());
+  return values[values.size() / 2];
+}
+// NEW END
 
 #define CHECK_RET(cond, return_expr) \
   do {                               \
@@ -76,6 +171,12 @@ int main() {
   auto ret = Init(deviceId, &stream);
   CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("Init acl failed. ERROR: %d\n", ret); return ret);
 
+  // NEW BEGIN
+  const char* hostLibrary = std::getenv("MATMUL_HOST_LIBRARY");
+  CHECK_RET(hostLibrary != nullptr && TbeLoadSoAndSaveToRegistry(hostLibrary) == 0U,
+            LOG_PRINT("load local MatMulV3 host library failed\n"); return 4);
+  // NEW END
+
   // 2. 构造输入与输出，需要根据API的接口自定义构造
   std::vector<int64_t> selfShape = {4096, 7168};
   std::vector<int64_t> mat2Shape = {7168, 512};
@@ -105,38 +206,79 @@ int main() {
   std::unique_ptr<void, aclError (*)(void*)> outdeviceAddrPtr(outDeviceAddr, aclrtFree);
   CHECK_RET(ret == ACL_SUCCESS, return ret);
 
-  // 3. 调用CANN算子库API，需要修改为具体的Api名称
-  int8_t cubeMathType = 1;
-  uint64_t workspaceSize = 0;
-  aclOpExecutor* executor = nullptr;
-  std::unique_ptr<void, aclError (*)(void*)> executorAddrPtr(nullptr, aclrtFree);
-  // 调用aclnnMatmul第一段接口
-  ret = aclnnMatmulGetWorkspaceSize(self, mat2, out, cubeMathType, &workspaceSize, &executor);
-  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMatmulGetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
-  // 根据第一段接口计算出的workspaceSize申请device内存
-  void* workspaceAddr = nullptr;
-  if (workspaceSize > 0) {
-    ret = aclrtMalloc(&workspaceAddr, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
-    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("allocate workspace failed. ERROR: %d\n", ret); return ret);
-    executorAddrPtr.reset(workspaceAddr);
+  // NEW BEGIN
+  PreparedMatmul original;
+  PreparedMatmul balanced;
+  ret = PrepareMatmul(self, mat2, out, false, &original);
+  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("prepare original failed. ERROR: %d\n", ret); return ret);
+  ret = PrepareMatmul(self, mat2, out, true, &balanced);
+  CHECK_RET(ret == ACL_SUCCESS,
+            ReleaseMatmul(&original); LOG_PRINT("prepare balanced failed. ERROR: %d\n", ret); return ret);
+
+  ret = LaunchMatmul(original, stream);
+  if (ret == ACL_SUCCESS) {
+    ret = LaunchMatmul(balanced, stream);
   }
-  // 调用aclnnMatmul第二段接口
-  ret = aclnnMatmul(workspaceAddr, workspaceSize, executor, stream);
-  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMatmul failed. ERROR: %d\n", ret); return ret);
+  if (ret == ACL_SUCCESS) {
+    ret = aclrtSynchronizeStream(stream);
+  }
+  CHECK_RET(ret == ACL_SUCCESS,
+            ReleaseMatmul(&balanced); ReleaseMatmul(&original);
+            LOG_PRINT("warmup failed. ERROR: %d\n", ret); return ret);
 
-  // 4. （固定写法）同步等待任务执行结束
-  ret = aclrtSynchronizeStream(stream);
-  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSynchronizeStream failed. ERROR: %d\n", ret); return ret);
+  std::vector<float> originalSamples;
+  std::vector<float> balancedSamples;
+  for (int sample = 0; sample < 5; ++sample) {
+    float originalLatency = 0.0F;
+    float balancedLatency = 0.0F;
+    if ((sample & 1) == 0) {
+      ret = MeasureMatmul(original, stream, &originalLatency);
+      if (ret == ACL_SUCCESS) ret = MeasureMatmul(balanced, stream, &balancedLatency);
+    } else {
+      ret = MeasureMatmul(balanced, stream, &balancedLatency);
+      if (ret == ACL_SUCCESS) ret = MeasureMatmul(original, stream, &originalLatency);
+    }
+    CHECK_RET(ret == ACL_SUCCESS,
+              ReleaseMatmul(&balanced); ReleaseMatmul(&original);
+              LOG_PRINT("measurement failed. ERROR: %d\n", ret); return ret);
+    originalSamples.push_back(originalLatency);
+    balancedSamples.push_back(balancedLatency);
+  }
 
-  // 5. 获取输出的值，将device侧内存上的结果拷贝至host侧，需要根据具体API的接口定义修改
   auto size = GetShapeSize(outShape);
-  std::vector<aclFloat16> resultData(size, aclFloatToFloat16(0.0F));
-  ret = aclrtMemcpy(resultData.data(), resultData.size() * sizeof(resultData[0]), outDeviceAddr,
-                    size * sizeof(resultData[0]), ACL_MEMCPY_DEVICE_TO_HOST);
-  CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("copy result from device to host failed. ERROR: %d\n", ret); return ret);
-  LOG_PRINT("{\"shape\":\"M4096_N512_K7168_NN_fp16\",\"status\":\"PASS\","
-            "\"first\":%f,\"last\":%f}\n",
-            aclFloat16ToFloat(resultData.front()), aclFloat16ToFloat(resultData.back()));
+  std::vector<aclFloat16> originalResult(size);
+  std::vector<aclFloat16> balancedResult(size);
+  ret = LaunchMatmul(original, stream);
+  if (ret == ACL_SUCCESS) ret = aclrtSynchronizeStream(stream);
+  if (ret == ACL_SUCCESS) {
+    ret = aclrtMemcpy(originalResult.data(), originalResult.size() * sizeof(originalResult[0]), outDeviceAddr,
+                      originalResult.size() * sizeof(originalResult[0]), ACL_MEMCPY_DEVICE_TO_HOST);
+  }
+  if (ret == ACL_SUCCESS) ret = LaunchMatmul(balanced, stream);
+  if (ret == ACL_SUCCESS) ret = aclrtSynchronizeStream(stream);
+  if (ret == ACL_SUCCESS) {
+    ret = aclrtMemcpy(balancedResult.data(), balancedResult.size() * sizeof(balancedResult[0]), outDeviceAddr,
+                      balancedResult.size() * sizeof(balancedResult[0]), ACL_MEMCPY_DEVICE_TO_HOST);
+  }
+  bool correct = ret == ACL_SUCCESS;
+  for (int64_t index = 0; correct && index < size; ++index) {
+    const float reference = aclFloat16ToFloat(originalResult[index]);
+    const float candidate = aclFloat16ToFloat(balancedResult[index]);
+    correct = std::isfinite(reference) && reference == 7168.0F && candidate == reference;
+  }
+  const float originalLatency = Median(originalSamples);
+  const float balancedLatency = Median(balancedSamples);
+  const float delta = (balancedLatency / originalLatency - 1.0F) * 100.0F;
+  LOG_PRINT("{\"shape\":\"M4096_N512_K7168_NN_fp16\",\"original_branch\":\"BASE\","
+            "\"original_core\":20,\"original_latency_ms\":%.9f,"
+            "\"modified_branch\":\"BALANCED_BASE\",\"modified_core\":16,"
+            "\"modified_latency_ms\":%.9f,\"delta_pct\":%.6f,"
+            "\"correctness\":\"%s\"}\n",
+            originalLatency, balancedLatency, delta, correct ? "PASS" : "FAIL");
+  ReleaseMatmul(&balanced);
+  ReleaseMatmul(&original);
+  CHECK_RET(correct, return 3);
+  // NEW END
 
   // 6. 释放device资源，需要根据具体API的接口定义修改
   aclrtDestroyStream(stream);
