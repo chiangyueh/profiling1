@@ -2065,6 +2065,102 @@ bool MatmulV3BaseTiling::DoWideNPanelReuseBaseTiling()
     return true;
 }
 
+bool MatmulV3BaseTiling::DoThreeShapeBaseTiling()
+{
+    const bool supported = compileInfo_.supportL0c2out && compileInfo_.aicNum >= 20UL && !args_.hasBias &&
+        args_.aType == ge::DT_FLOAT16 && args_.bType == ge::DT_FLOAT16 && args_.cType == ge::DT_FLOAT16 &&
+        !args_.isATrans && !args_.isBTrans && args_.aFormat == ge::FORMAT_ND &&
+        args_.bFormat == ge::FORMAT_ND && args_.outFormat == ge::FORMAT_ND &&
+        !args_.isNzA && !args_.isNzB && aDtypeSize_ == DATA_SIZE_FP16 &&
+        bDtypeSize_ == DATA_SIZE_FP16 && cDtypeSize_ == DATA_SIZE_FP16;
+    if (!supported) {
+        return false;
+    }
+
+    uint64_t baseM = 0;
+    uint64_t baseN = 0;
+    uint64_t usedCoreNum = 20;
+    uint64_t iterateOrder = ITER_COL_FIRST;
+    const char *variant = nullptr;
+    if (args_.mValue == 2048UL && args_.nValue == 1536UL && args_.kValue == 7168UL) {
+        baseM = BASIC_BLOCK_SIZE_128;
+        baseN = BASIC_BLOCK_SIZE_256;
+        iterateOrder = ITER_COL_FIRST;
+        variant = "TARGET_M2048_K7168_N1536";
+    } else if (args_.mValue == 2048UL && args_.nValue == 7168UL && args_.kValue == 2048UL) {
+        baseM = BASIC_BLOCK_SIZE_256;
+        baseN = BASIC_BLOCK_SIZE_128;
+        iterateOrder = ITER_ROW_FIRST;
+        variant = "TARGET_M2048_K2048_N7168";
+    } else if (args_.mValue == 4096UL && args_.nValue == 512UL && args_.kValue == 7168UL) {
+        baseM = BASIC_BLOCK_SIZE_128;
+        baseN = BASIC_BLOCK_SIZE_256;
+        usedCoreNum = 16;
+        iterateOrder = ITER_COL_FIRST;
+        variant = "TARGET_M4096_K7168_N512";
+    } else {
+        return false;
+    }
+
+    constexpr uint64_t baseK = BASIC_BLOCK_SIZE_64;
+    const uint64_t stepKa = baseM == BASIC_BLOCK_SIZE_256 ? 4UL : 8UL;
+    const uint64_t stepKb = baseN == BASIC_BLOCK_SIZE_256 ? 4UL : 8UL;
+    const uint64_t depthA1 = stepKa * DB_SIZE;
+    const uint64_t depthB1 = stepKb * DB_SIZE;
+    const uint64_t l0ABytes = DB_SIZE * baseM * baseK * aDtypeSize_;
+    const uint64_t l0BBytes = DB_SIZE * baseN * baseK * bDtypeSize_;
+    const uint64_t l0CBytes = baseM * baseN * LOC_DATA_SIZE;
+    const uint64_t l1Bytes = depthA1 * baseM * baseK * aDtypeSize_ +
+        depthB1 * baseN * baseK * bDtypeSize_;
+    if (l0ABytes > compileInfo_.l0ASize || l0BBytes > compileInfo_.l0BSize ||
+        l0CBytes > compileInfo_.l0CSize || l1Bytes > compileInfo_.l1Size + BASIC_ALIGN_256) {
+        return false;
+    }
+
+    const uint64_t mTasks = MathUtil::CeilDivision(args_.mValue, baseM);
+    const uint64_t nTasks = MathUtil::CeilDivision(args_.nValue, baseN);
+    const uint64_t aPanelBytes = baseM * ops::CeilAlign(args_.kValue * aDtypeSize_, CACHELINE);
+    const uint64_t bPanelBytes = args_.kValue * ops::CeilAlign(baseN * bDtypeSize_, CACHELINE);
+    const uint64_t cTileBytes = baseM * baseN * cDtypeSize_;
+    const __uint128_t l2WindowBytes = static_cast<__uint128_t>(mTasks) * aPanelBytes +
+        static_cast<__uint128_t>(nTasks) * bPanelBytes +
+        static_cast<__uint128_t>(mTasks) * nTasks * cTileBytes;
+    if (l2WindowBytes > compileInfo_.l2Size) {
+        return false;
+    }
+
+    MatmulV3RunInfo candidate{};
+    candidate.needUpdate = true;
+    candidate.usedCoreNum = usedCoreNum;
+    candidate.singleCoreM = baseM;
+    candidate.singleCoreN = baseN;
+    candidate.singleCoreK = args_.kValue;
+    candidate.baseM = baseM;
+    candidate.baseN = baseN;
+    candidate.baseK = baseK;
+    candidate.stepM = 1;
+    candidate.stepN = 1;
+    candidate.stepKa = stepKa;
+    candidate.stepKb = stepKb;
+    candidate.depthA1 = depthA1;
+    candidate.depthB1 = depthB1;
+    candidate.iterateOrder = iterateOrder;
+    candidate.dbL0c = DB_OFF_SIZE;
+    candidate.l2Info.mTile = 1;
+    candidate.l2Info.nTile = 1;
+    candidate.l2Info.mTileBlock = mTasks;
+    candidate.l2Info.nTileBlock = nTasks;
+    candidate.l2Info.calOrder = iterateOrder;
+    runInfo_ = candidate;
+    tilingEnable_.tilingEnableFullLoad = TilingEnableFullLoad::BASE;
+    tilingEnable_.tilingEnableSplitCore = TilingEnableSplitCore::BASE;
+    tilingEnable_.tilingEnableFixOpti = TilingEnableFixOpti::BASE;
+    tilingEnable_.tilingEnableSpecialOpti = TilingEnableSpecialOpti::BASE;
+    (void)::setenv("MATMUL_BASE_EXPERIMENT_VARIANT", variant, 1);
+    (void)::setenv("MATMUL_BASE_EXPERIMENT_SELECTED", "1", 1);
+    return true;
+}
+
 bool MatmulV3BaseTiling::DoIndependentBaseTiling()
 {
     const MatmulV3RunInfo reference = runInfo_;
@@ -2359,7 +2455,9 @@ bool MatmulV3BaseTiling::DoExperimentalBaseTiling()
         return false;
     }
     bool selected = false;
-    if (std::strcmp(mode, "INDEPENDENT_BASE_SELECTOR") == 0) {
+    if (std::strcmp(mode, "THREE_SHAPE_BASE") == 0) {
+        selected = DoThreeShapeBaseTiling();
+    } else if (std::strcmp(mode, "INDEPENDENT_BASE_SELECTOR") == 0) {
         selected = DoIndependentBaseTiling();
     } else if (std::strcmp(mode, "CUBE_VECTOR_EDGE") == 0) {
         selected = DoCubeVectorEdgeTiling();

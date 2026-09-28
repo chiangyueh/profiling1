@@ -109,6 +109,7 @@ protected:
     bool DoRectangularCubeTiling();
     bool DoReuseDirectedTiling();
     bool DoWideNPanelReuseBaseTiling();
+    bool DoThreeShapeBaseTiling();
     bool DoIndependentBaseTiling();
     bool DoExperimentalSplitKTiling();
     bool DoAtomicSplitKTiling();

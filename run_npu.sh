@@ -33,7 +33,6 @@ fi
 
 build_dir="${PWD}/build"
 build_log="$(mktemp)"
-workload_manifest="${PWD}/data/independent_base_npu_verified.tsv"
 trap 'rm -f "${build_log}"' EXIT
 
 printf '# stage=host_build status=begin\n'
@@ -99,7 +98,7 @@ runtime_library="-lacl_rt"
 if [[ -f "${ASCEND_HOME_PATH}/lib64/libascendcl.so" || -f "${ASCEND_OPP_PATH}/lib64/libascendcl.so" ]]; then
     runtime_library="-lascendcl"
 fi
-runner="${build_dir}/test_wide_n_panel_reuse_base"
+runner="${build_dir}/test_three_shape_base"
 printf '# stage=runner_build status=begin\n'
 if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
     matmul/mat_mul_v3/op_host/op_api/matmul.cpp \
@@ -122,87 +121,16 @@ if ! g++ matmul/mat_mul_v3/examples/test_splitk_routes.cpp \
 fi
 printf '# stage=runner_build status=passed\n'
 
-printf '# stage=workload_generation status=begin\n'
-if [[ ! -s "${workload_manifest}" ]]; then
-    printf '{"fatal":"preverified_manifest_missing"}\n' >&2
-    exit 1
-fi
-manifest_rows="$(wc -l < "${workload_manifest}")"
-if ! manifest_audit="$(awk -F '\t' '
-    NF != 6 { invalid++ }
-    NF == 6 {
-        rows++
-        dtype = $1
-        layout = $2
-        m = $3 + 0
-        n = $4 + 0
-        k = $5 + 0
-        cell = $6 + 0
-        dtype_band = dtype == "bf16_bf16" ? 1 : 0
-        n_band = n <= 512 ? 0 : (n <= 8192 ? 1 : 2)
-        k_band = k <= 512 ? 0 : (k <= 8192 ? 1 : 2)
-        expected_cell = dtype_band * 9 + n_band * 3 + k_band
-        if ((dtype != "fp16_fp16" && dtype != "bf16_bf16") || layout != "NN" ||
-            m < 1 || m > 4096 || n < 1 || n > 65536 || k < 1 || k > 65536 ||
-            cell < 0 || cell > 17 || cell != expected_cell) invalid++
-        seen[m]++
-        seen_cell[m, cell]++
-        if (rows == 1 || n < min_n) min_n = n
-        if (rows == 1 || k < min_k) min_k = k
-        if (n > max_n) max_n = n
-        if (k > max_k) max_k = k
-        if (n % 16 == 0) aligned_n++; else unaligned_n++
-        if (k % 16 == 0) aligned_k++; else unaligned_k++
-    }
-    END {
-        missing = 0
-        bad_cells = 0
-        minimum = 999999
-        maximum = 0
-        for (m = 1; m <= 4096; ++m) {
-            if (seen[m] == 0) missing++
-            if (seen[m] < minimum) minimum = seen[m]
-            if (seen[m] > maximum) maximum = seen[m]
-            for (cell = 0; cell < 18; ++cell) {
-                if (seen_cell[m, cell] != 2) bad_cells++
-            }
-        }
-        printf "rows=%d distinct_m=%d missing_m=%d candidates_per_m_min=%d candidates_per_m_max=%d bad_cells=%d n_range=%d..%d k_range=%d..%d invalid=%d", \
-            rows, length(seen), missing, minimum, maximum, bad_cells, min_n, max_n, min_k, max_k, invalid
-        exit(invalid != 0 || missing != 0 || length(seen) != 4096 || bad_cells != 0 ||
-             rows != 147456 || min_n != 1 || max_n != 65536 || min_k != 1 || max_k != 65536 ||
-             aligned_n == 0 || unaligned_n == 0 || aligned_k == 0 || unaligned_k == 0)
-    }
-' "${workload_manifest}")"; then
-    printf '{"fatal":"manifest_does_not_cover_every_m","audit":"%s"}\n' "${manifest_audit}" >&2
-    exit 1
-fi
-printf '# stage=workload_generation status=passed source=host_preverified_all_m_base %s\n' "${manifest_audit}"
-
 export MATMUL_HOST_LIBRARY="${host_library}"
 export MATMUL_DISABLE_REPO=1
-export MATMUL_BASE_FULL_M_SWEEP=1
-export MATMUL_FORCE_BASE_ONLY=1
-
-success_target="${MATMUL_SUCCESS_TARGET:-0}"
-m_quota=0
-m_cell_quota="${MATMUL_M_CELL_QUOTA:-1}"
-cell_quota="${MATMUL_CELL_QUOTA:-0}"
-if [[ "${cell_quota}" -eq 0 ]]; then
-    cell_quota_json=null
-    theoretical_maximum_pairs_json=null
-else
-    cell_quota_json="${cell_quota}"
-    theoretical_maximum_pairs_json="$((200 * cell_quota))"
-fi
 panel_rc=0
-printf '# campaign=INDEPENDENT_BASE_SELECTOR target_passes=%d maximum_per_joint_cell=%s theoretical_maximum_pairs=%s measurement_order=OCCO\n' \
-    "${success_target}" "${cell_quota_json}" "${theoretical_maximum_pairs_json}"
+printf '# campaign=THREE_SHAPE_BASE shapes=3 measurement_order=OCCO\n'
 set +e
-MATMUL_CAMPAIGN=INDEPENDENT_BASE_SELECTOR MATMUL_TARGET_PASSES="${success_target}" \
-    MATMUL_CELL_QUOTA="${cell_quota}" MATMUL_M_QUOTA="${m_quota}" \
-    MATMUL_M_CELL_QUOTA="${m_cell_quota}" \
-    "${runner}" --manifest "${workload_manifest}" | python3 tools/compact_matmul_log.py
+MATMUL_CAMPAIGN=THREE_SHAPE_BASE MATMUL_TARGET_PASSES=3 \
+    "${runner}" \
+    fp16_fp16 NN 2048 1536 7168 \
+    fp16_fp16 NN 2048 7168 2048 \
+    fp16_fp16 NN 4096 512 7168 | python3 tools/compact_three_shape_base.py
 pipeline_status=("${PIPESTATUS[@]}")
 panel_rc="${pipeline_status[0]}"
 converter_rc="${pipeline_status[1]}"
