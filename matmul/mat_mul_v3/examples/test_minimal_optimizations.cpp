@@ -209,7 +209,10 @@ int RunCube(const Shape &shape, aclrtStream stream)
     const std::vector<uint8_t> optimised = rc == ACL_SUCCESS ? CopyOutput(c) : std::vector<uint8_t>{};
     if (rc == ACL_SUCCESS && !SameOutput(original, optimised, shape.scalar)) rc = 3;
     if (rc == ACL_SUCCESS) {
-        std::printf("{\"branch\":\"%s\",\"original_latency\":%.9f,\"optimised_latency\":%.9f}\n",
+        std::printf("{\"shape\":\"M%lld_N%lld_K%lld_%s\",\"branch\":\"%s\","
+                    "\"original_latency\":%.9f,\"optimised_latency\":%.9f}\n",
+                    static_cast<long long>(shape.m), static_cast<long long>(shape.n),
+                    static_cast<long long>(shape.k), shape.transB ? "NT" : "NN",
                     shape.branch, originalLatency, optimisedLatency);
         std::fflush(stdout);
     }
@@ -292,7 +295,10 @@ int RunVector(const Shape &shape, aclrtStream stream, aclrtFuncHandle function)
     const std::vector<uint8_t> optimised = rc == ACL_SUCCESS ? CopyOutput(c) : std::vector<uint8_t>{};
     if (rc == ACL_SUCCESS && !SameOutput(original, optimised, shape.scalar)) rc = 3;
     if (rc == ACL_SUCCESS) {
-        std::printf("{\"branch\":\"%s\",\"original_latency\":%.9f,\"optimised_latency\":%.9f}\n",
+        std::printf("{\"shape\":\"M%lld_N%lld_K%lld_%s\",\"branch\":\"%s\","
+                    "\"original_latency\":%.9f,\"optimised_latency\":%.9f}\n",
+                    static_cast<long long>(shape.m), static_cast<long long>(shape.n),
+                    static_cast<long long>(shape.k), shape.transB ? "NT" : "NN",
                     shape.branch, originalLatency, optimisedLatency);
         std::fflush(stdout);
     }
@@ -323,14 +329,94 @@ int main()
     const ScalarType fp16{ACL_FLOAT16, sizeof(uint16_t), 0x3c};
     const ScalarType bf16{ACL_BF16, sizeof(uint16_t), 0x3f};
     const Shape shapes[] = {
-        {"VECTOR_DOT", 1, 64, 10240, true, fp32},
+        {"VECTOR_DOT", 1, 23, 8192, true, fp32},
+        {"VECTOR_DOT", 1, 24, 8192, true, fp32},
+        {"VECTOR_DOT", 1, 31, 8192, true, fp32},
+        {"VECTOR_DOT", 1, 32, 8192, true, fp32},
+        {"VECTOR_DOT", 1, 33, 8192, true, fp32},
+        {"VECTOR_DOT", 1, 40, 8192, true, fp32},
+        {"VECTOR_DOT", 1, 47, 8192, true, fp32},
+        {"VECTOR_DOT", 1, 48, 8192, true, fp32},
+        {"VECTOR_DOT", 1, 63, 8192, true, fp32},
+        {"VECTOR_DOT", 1, 64, 8192, true, fp32},
+        {"VECTOR_DOT", 2, 17, 16384, true, fp32},
+        {"VECTOR_DOT", 2, 18, 16384, true, fp32},
+        {"VECTOR_DOT", 2, 23, 16384, true, fp32},
+        {"VECTOR_DOT", 2, 32, 16384, true, fp32},
+        {"VECTOR_DOT", 2, 48, 16384, true, fp32},
+        {"VECTOR_DOT", 3, 17, 16384, true, fp32},
+        {"VECTOR_DOT", 3, 18, 16384, true, fp32},
+        {"VECTOR_DOT", 3, 20, 16384, true, fp32},
+        {"VECTOR_DOT", 3, 24, 16384, true, fp32},
+        {"VECTOR_DOT", 3, 32, 16384, true, fp32},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 30, 5120, 32771, true, bf16},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 22, 3840, 36864, false, fp16},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 12, 3072, 49157, true, fp16},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 23, 3328, 32768, false, fp16},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 28, 3072, 45056, true, fp16},
         {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 11, 3328, 28672, false, fp16},
-        {"SMALL_M_WIDE_N", 10, 25856, 15104, false, bf16},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 29, 3072, 32771, true, fp16},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 21, 5120, 49152, false, bf16},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 9, 3328, 49152, true, fp16},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 48, 3328, 65536, true, fp16},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 21, 5120, 28672, false, fp16},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 27, 4608, 57344, false, bf16},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 32, 5120, 49152, false, fp16},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 14, 3840, 40960, true, fp16},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 14, 5120, 49152, false, bf16},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 27, 3840, 32768, true, fp32},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 64, 3328, 36864, false, bf16},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 25, 3328, 65521, true, bf16},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 8, 3584, 49152, false, bf16},
+        {"ADAPTIVE_DETERMINISTIC_SPLIT_K", 13, 5120, 28672, false, bf16},
+        {"SMALL_M_WIDE_N", 14, 26880, 15488, false, bf16},
+        {"SMALL_M_WIDE_N", 12, 26368, 20480, false, fp16},
+        {"SMALL_M_WIDE_N", 13, 31744, 18304, false, fp16},
+        {"SMALL_M_WIDE_N", 16, 26880, 19968, false, fp16},
+        {"SMALL_M_WIDE_N", 12, 32512, 18176, false, bf16},
+        {"SMALL_M_WIDE_N", 8, 32768, 16128, false, fp16},
+        {"SMALL_M_WIDE_N", 12, 31232, 16000, false, bf16},
+        {"SMALL_M_WIDE_N", 10, 31744, 15232, false, bf16},
+        {"SMALL_M_WIDE_N", 13, 25856, 18432, false, bf16},
+        {"SMALL_M_WIDE_N", 15, 26624, 17920, false, fp16},
+        {"SMALL_M_WIDE_N", 14, 31232, 19072, false, bf16},
+        {"SMALL_M_WIDE_N", 9, 31232, 16512, false, fp16},
+        {"SMALL_M_WIDE_N", 13, 27136, 18688, false, fp16},
+        {"SMALL_M_WIDE_N", 10, 26624, 17152, false, fp16},
+        {"SMALL_M_WIDE_N", 11, 32768, 15488, false, bf16},
+        {"SMALL_M_WIDE_N", 8, 32256, 20352, false, bf16},
+        {"SMALL_M_WIDE_N", 12, 31488, 15104, false, bf16},
+        {"SMALL_M_WIDE_N", 10, 26368, 16768, false, fp16},
+        {"SMALL_M_WIDE_N", 10, 27392, 16640, false, fp16},
+        {"SMALL_M_WIDE_N", 11, 27136, 18176, false, bf16},
+        {"TWO_WAVE_N_PANEL", 3808, 48, 15360, false, fp16},
         {"TWO_WAVE_N_PANEL", 3008, 64, 16384, false, fp16},
+        {"TWO_WAVE_N_PANEL", 3104, 32, 17920, false, bf16},
+        {"TWO_WAVE_N_PANEL", 2976, 80, 27136, false, fp16},
+        {"TWO_WAVE_N_PANEL", 3072, 80, 15872, false, fp16},
+        {"TWO_WAVE_N_PANEL", 3616, 96, 18944, false, fp16},
+        {"TWO_WAVE_N_PANEL", 3008, 48, 19968, false, bf16},
+        {"TWO_WAVE_N_PANEL", 3584, 64, 15360, false, fp16},
+        {"TWO_WAVE_N_PANEL", 3200, 80, 16896, false, bf16},
+        {"TWO_WAVE_N_PANEL", 3840, 32, 24064, false, fp16},
+        {"TWO_WAVE_N_PANEL", 3168, 48, 22528, false, fp16},
+        {"TWO_WAVE_N_PANEL", 3104, 32, 23040, false, bf16},
+        {"TWO_WAVE_N_PANEL", 3616, 48, 19456, false, fp16},
+        {"TWO_WAVE_N_PANEL", 2976, 48, 18432, false, bf16},
+        {"TWO_WAVE_N_PANEL", 3616, 96, 25600, false, fp16},
+        {"TWO_WAVE_N_PANEL", 3616, 80, 20480, false, bf16},
+        {"TWO_WAVE_N_PANEL", 3200, 64, 17920, false, fp16},
+        {"TWO_WAVE_N_PANEL", 3712, 80, 20992, false, fp16},
+        {"TWO_WAVE_N_PANEL", 3008, 32, 24576, false, bf16},
+        {"TWO_WAVE_N_PANEL", 2976, 48, 24064, false, bf16},
     };
-    if (rc == ACL_SUCCESS) rc = RunVector(shapes[0], stream, function);
-    for (size_t index = 1; rc == ACL_SUCCESS && index < 4; ++index) {
-        rc = RunCube(shapes[index], stream);
+    for (const Shape &shape : shapes) {
+        if (rc != ACL_SUCCESS) break;
+        if (std::strcmp(shape.branch, "VECTOR_DOT") == 0) {
+            rc = RunVector(shape, stream, function);
+        } else {
+            rc = RunCube(shape, stream);
+        }
     }
     if (rc != ACL_SUCCESS) std::fprintf(stderr, "fatal: comparison failed rc=%d\n", rc);
     if (binary != nullptr) (void)aclrtBinaryUnLoad(binary);
